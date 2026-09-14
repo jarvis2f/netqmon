@@ -37,7 +37,7 @@ define Build/Prepare
 			agent_bin="netqmon-agent_aarch64" ;; \
 		riscv64*) \
 			agent_bin="netqmon-agent_riscv64" ;; \
-		mipsel_24kc|mipsel_74kc|mipsel_24kc_24kf) \
+		mipsel*|mipsel_24kc|mipsel_74kc|mipsel_24kc_24kf) \
 			agent_bin="netqmon-agent_mipsel32r2" ;; \
 		arm*) \
 			if [ "$(CONFIG_HAS_FPU)" = "y" ] || [ "$(CONFIG_SOFT_FLOAT)" != "y" ] || echo "$(TARGET_CROSS)" | grep -q "hf"; then \

@@ -244,56 +244,6 @@ jobs:
             ver: "ipk"
             arch: armv7hf
 
-          # --- snapshots (apk) ---
-          - platform: x86_64
-            sdk_ver: snapshots
-            ver: "apk"
-            arch: x86_64
-          - platform: aarch64_generic
-            sdk_ver: snapshots
-            ver: "apk"
-            arch: aarch64
-          - platform: aarch64_cortex-a53
-            sdk_ver: snapshots
-            ver: "apk"
-            arch: aarch64
-          - platform: aarch64_cortex-a72
-            sdk_ver: snapshots
-            ver: "apk"
-            arch: aarch64
-          - platform: aarch64_cortex-a76
-            sdk_ver: snapshots
-            ver: "apk"
-            arch: aarch64
-          - platform: arm_cortex-a7_vfpv4
-            sdk_ver: snapshots
-            ver: "apk"
-            arch: armv7hf
-          - platform: arm_cortex-a7_neon-vfpv4
-            sdk_ver: snapshots
-            ver: "apk"
-            arch: armv7hf
-          - platform: arm_cortex-a9_neon
-            sdk_ver: snapshots
-            ver: "apk"
-            arch: armv7hf
-          - platform: arm_cortex-a9_vfpv3-d16
-            sdk_ver: snapshots
-            ver: "apk"
-            arch: armv7hf
-          - platform: arm_cortex-a15_neon-vfpv4
-            sdk_ver: snapshots
-            ver: "apk"
-            arch: armv7hf
-          - platform: arm_cortex-a5_vfpv4
-            sdk_ver: snapshots
-            ver: "apk"
-            arch: armv7hf
-          - platform: arm_cortex-a8_vfpv3
-            sdk_ver: snapshots
-            ver: "apk"
-            arch: armv7hf
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -409,28 +359,6 @@ jobs:
           - platform: mipsel_24kc_24kf
             sdk_ver: 24.10.2
             ver: "ipk"
-            arch: mipsel32r2
-            status: "Compatibility Test"
-
-          # --- snapshots (apk) ---
-          - platform: riscv64_riscv64
-            sdk_ver: snapshots
-            ver: "apk"
-            arch: riscv64
-            status: "Candidate Official"
-          - platform: mipsel_24kc
-            sdk_ver: snapshots
-            ver: "apk"
-            arch: mipsel32r2
-            status: "Experimental"
-          - platform: mipsel_74kc
-            sdk_ver: snapshots
-            ver: "apk"
-            arch: mipsel32r2
-            status: "Experimental"
-          - platform: mipsel_24kc_24kf
-            sdk_ver: snapshots
-            ver: "apk"
             arch: mipsel32r2
             status: "Compatibility Test"
 
