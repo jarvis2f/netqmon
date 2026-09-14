@@ -38,8 +38,24 @@ jobs:
       - name: Check Compose configuration
         run: docker compose config
 
+      - name: Validate classifier component trust key
+        env:
+          NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX: ${{ vars.NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX }}
+        run: |
+          test "${#NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX}" -eq 64
+          case "${NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX}" in
+            (*[!0-9a-fA-F]*) echo "NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX must contain only hexadecimal characters" >&2; exit 1 ;;
+          esac
+
       - name: Build Controller image for smoke test
-        run: docker build -f deploy/docker/Dockerfile.controller -t ghcr.io/${{ github.repository }}:latest .
+        env:
+          NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX: ${{ vars.NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX }}
+        run: >-
+          docker build
+          --build-arg "NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX=${NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX}"
+          -f deploy/docker/Dockerfile.controller
+          -t ghcr.io/${{ github.repository }}:latest
+          .
 
       - name: Smoke test Controller compose startup
         env:
@@ -98,6 +114,8 @@ jobs:
           context: .
           file: deploy/docker/Dockerfile.controller
           platforms: ${{ matrix.platform }}
+          build-args: |
+            NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX=${{ vars.NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX }}
           outputs: type=image,"name=ghcr.io/${{ github.repository }}",push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=controller-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=controller-${{ matrix.arch }}
@@ -162,4 +180,3 @@ jobs:
             target="ghcr.io/${{ github.repository }}:dev-latest"
           fi
           docker buildx imagetools inspect "$target"
-
