@@ -21,10 +21,10 @@ ip link set "${interface}" up
 output=$("${agent}" doctor --interface "${interface}")
 printf '%s\n' "${output}"
 
-for check in Architecture Kernel Interfaces "BPF syscall" Ringbuf "TC/TCX attach" HFO; do
+for check in Architecture Kernel Interfaces "BPF syscall" BPF_MAP_TYPE_RINGBUF "TC/TCX attach" HFO; do
   grep -Eq "^${check}[[:space:]]+" <<<"${output}"
 done
-for required in Architecture Kernel Interfaces "BPF syscall" Ringbuf "TC/TCX attach"; do
+for required in Architecture Kernel Interfaces "BPF syscall" BPF_MAP_TYPE_RINGBUF "TC/TCX attach"; do
   grep -Eq "^${required}[[:space:]]+OK" <<<"${output}"
 done
 
