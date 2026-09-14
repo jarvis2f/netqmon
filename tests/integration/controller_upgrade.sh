@@ -6,7 +6,7 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
-image_old="${NETQMON_UPGRADE_OLD_IMAGE:-ghcr.io/jarvis2f/netqmon/collector:latest}"
+image_old="${NETQMON_UPGRADE_OLD_IMAGE:-ghcr.io/jarvis2f/netqmon:latest}"
 image_new="${NETQMON_UPGRADE_NEW_IMAGE:-netqmon-controller:phase21}"
 volume="${NETQMON_UPGRADE_VOLUME:-netqmon_phase21_upgrade_data}"
 container_old="netqmon-upgrade-old"

@@ -45,6 +45,9 @@ RUN pnpm --filter @netqmon/controller-ui build
 
 FROM node:22-alpine
 
+LABEL org.opencontainers.image.source=https://github.com/jarvis2f/netqmon
+LABEL org.opencontainers.image.description="Netqmon Controller"
+
 RUN apk add --no-cache ca-certificates tini tzdata wget libgcc
 
 COPY --from=collector-builder /usr/local/lib/libndpi.so* /usr/local/lib/

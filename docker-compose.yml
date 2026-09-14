@@ -4,7 +4,7 @@ services:
     build:
       context: .
       dockerfile: deploy/docker/Dockerfile.controller
-    image: ${NETQMON_CONTROLLER_IMAGE:-ghcr.io/jarvis2f/netqmon/controller:latest}
+    image: ${NETQMON_CONTROLLER_IMAGE:-ghcr.io/jarvis2f/netqmon:latest}
     environment:
       - NETQMON_STORAGE_BACKEND=${NETQMON_STORAGE_BACKEND:-sqlite}
       - NETQMON_COLLECTOR_DATABASE_PATH=/data/netqmon.db
