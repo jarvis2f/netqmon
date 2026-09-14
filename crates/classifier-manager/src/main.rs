@@ -10,7 +10,7 @@ use netqmon_classifier_client::{ClassifierClient, ClassifierClientConfig};
 use netqmon_classifier_manager::{
     ComponentManifest, IPC_PROTOCOL_VERSION, MAX_BINARY_BYTES, TEST_KEY_ID, TEST_PUBLIC_KEY_HEX,
     current_binary, current_platform, install_binary, previous_binary, prune_releases,
-    switch_current, verify_installed_binary, verify_manifest,
+    same_release_content, switch_current, verify_installed_binary, verify_manifest,
 };
 use nix::{
     sys::signal::{Signal, kill},
@@ -330,11 +330,19 @@ async fn update(
         config.trusted_key_version,
         &config.trusted_public_key,
     )?;
-    if current
-        .and_then(|path| path.parent())
-        .and_then(Path::file_name)
-        .and_then(|v| v.to_str())
-        == Some(manifest.version.as_str())
+    let installed_manifest = current.and_then(|path| {
+        verify_installed_binary(
+            path,
+            &netqmon,
+            &config.trusted_key_id,
+            config.trusted_key_version,
+            &config.trusted_public_key,
+        )
+        .ok()
+    });
+    if installed_manifest
+        .as_ref()
+        .is_some_and(|installed| same_release_content(installed, &manifest))
     {
         return Ok(None);
     }

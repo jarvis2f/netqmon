@@ -67,6 +67,18 @@ pub struct ComponentManifest {
     pub signature: ManifestSignature,
 }
 
+/// Returns whether an installed manifest already contains the same release
+/// content as the manifest advertised by Cloud.
+///
+/// Version alone is not sufficient here: Cloud may republish a corrected
+/// binary under the same component version during a beta release.
+#[must_use]
+pub fn same_release_content(installed: &ComponentManifest, advertised: &ComponentManifest) -> bool {
+    installed.version == advertised.version
+        && installed.channel == advertised.channel
+        && installed.sha256 == advertised.sha256
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ManifestSignature {
     pub algorithm: String,
@@ -426,6 +438,16 @@ mod tests {
         verify_binary(&value, bytes).unwrap();
         value.sha256 = "00".repeat(32);
         assert!(verify_binary(&value, bytes).is_err());
+    }
+
+    #[test]
+    fn detects_same_version_binary_replacement_by_checksum() {
+        let installed = manifest(b"old-binary");
+        let same_content = manifest(b"old-binary");
+        let corrected_content = manifest(b"corrected-binary");
+
+        assert!(same_release_content(&installed, &same_content));
+        assert!(!same_release_content(&installed, &corrected_content));
     }
 
     #[test]
