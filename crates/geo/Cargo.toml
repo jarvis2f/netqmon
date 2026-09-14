@@ -1,0 +1,18 @@
+[package]
+name = "netqmon-geo"
+description = "GeoIP and ASN provider abstraction for netqmon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+maxminddb = "0.30.3"
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

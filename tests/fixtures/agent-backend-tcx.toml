@@ -1,0 +1,3 @@
+[bpf]
+backend = "tcx"
+tcx_order = "first"

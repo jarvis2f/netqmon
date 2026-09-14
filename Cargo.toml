@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/agent",
+    "crates/classifier-client",
+    "crates/classifier-manager",
+    "crates/collector",
+    "crates/geo",
+    "crates/protocol",
+    "crates/storage",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/jarvis2f/netqmon"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

@@ -1,0 +1,51 @@
+FROM ghcr.io/cross-rs/armv7-unknown-linux-musleabihf:edge
+
+# 1. Install host build-time dependencies required by libbpf-cargo and host crates
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install --no-install-recommends -y \
+    clang \
+    llvm \
+    pkg-config \
+    libelf-dev \
+    zlib1g-dev \
+    curl \
+    ca-certificates \
+    file \
+    tar \
+    gzip && \
+    rm -rf /var/lib/apt/lists/*
+
+# 2. Download and unpack reliable, musl-patched target static C libraries from Alpine Linux (armv7)
+# Note: Alpine armv7 is ARMv7-A with VFPv3-D16 / hard-float (armhf ABI)
+RUN mkdir -p /tmp/target-pkgs && cd /tmp/target-pkgs && \
+    curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/armv7/elfutils-dev-0.191-r0.apk -o elfutils-dev.apk && \
+    curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/armv7/zlib-dev-1.3.2-r0.apk -o zlib-dev.apk && \
+    curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/armv7/zlib-static-1.3.2-r0.apk -o zlib-static.apk && \
+    curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/armv7/zstd-dev-1.5.6-r2.apk -o zstd-dev.apk && \
+    curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/armv7/zstd-static-1.5.6-r2.apk -o zstd-static.apk && \
+    curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/armv7/libbpf-dev-1.5.0-r0.apk -o libbpf-dev.apk && \
+    for f in *.apk; do \
+        tar -xzf "$f" -C /usr/local/arm-linux-musleabihf 2>/dev/null || true; \
+    done && \
+    rm -rf /tmp/target-pkgs
+
+# 3. Create target gcc wrapper to ensure -lzstd -lz are linked with -lelf
+RUN mv /usr/local/bin/arm-linux-musleabihf-gcc /usr/local/bin/arm-linux-musleabihf-gcc.real && \
+    printf '#!/bin/sh\nfor arg in "$@"; do\n  if [ "$arg" = "-c" ] || [ "$arg" = "-E" ] || [ "$arg" = "-S" ]; then\n    exec /usr/local/bin/arm-linux-musleabihf-gcc.real "$@"\n  fi\ndone\nexec /usr/local/bin/arm-linux-musleabihf-gcc.real "$@" -lzstd -lz\n' > /usr/local/bin/arm-linux-musleabihf-gcc && \
+    chmod +x /usr/local/bin/arm-linux-musleabihf-gcc
+
+# 4. Smoke check target static libraries
+RUN file /usr/local/arm-linux-musleabihf/usr/lib/libelf.a && \
+    file /usr/local/arm-linux-musleabihf/usr/lib/libz.a && \
+    file /usr/local/arm-linux-musleabihf/usr/lib/libbpf.a
+
+# 5. Compile and link minimal probe test using target cross compiler
+RUN printf '#include <libelf.h>\n#include <zlib.h>\nint main(void) { return elf_version(EV_CURRENT) == EV_NONE; }\n' > /tmp/test_target.c && \
+    /usr/local/bin/arm-linux-musleabihf-gcc -I/usr/local/arm-linux-musleabihf/usr/include /tmp/test_target.c -L/usr/local/arm-linux-musleabihf/usr/lib -lelf -lz -o /tmp/test_target && \
+    file /tmp/test_target && \
+    rm -f /tmp/test_target.c /tmp/test_target
+
+# 6. Set environment variables so libbpf-sys and clang find the headers and static libraries
+ENV LIBBPF_SYS_EXTRA_CFLAGS="-I/usr/local/arm-linux-musleabihf/usr/include"
+ENV LIBBPF_SYS_LIBRARY_PATH_armv7_unknown_linux_musleabihf="/usr/local/arm-linux-musleabihf/usr/lib"
+ENV BPF_CLANG_EXTRA_CFLAGS="-I/usr/local/arm-linux-musleabihf/usr/include"

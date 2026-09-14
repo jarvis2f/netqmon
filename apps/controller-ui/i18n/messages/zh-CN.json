@@ -1,0 +1,1160 @@
+{
+  "common": {
+    "metadata": {
+      "title": "netqmon · 本地网络观测平台",
+      "description": "OpenWrt 本地网络观测平台"
+    },
+    "actions": {
+      "save": "保存",
+      "saveChanges": "保存更改",
+      "cancel": "取消",
+      "retry": "重试",
+      "refresh": "刷新",
+      "copy": "复制",
+      "copied": "已复制",
+      "filter": "筛选",
+      "clearAll": "清除全部",
+      "viewAll": "查看全部",
+      "apply": "应用",
+      "applyRange": "应用范围",
+      "applyFilters": "应用筛选",
+      "runNow": "立即执行",
+      "openFullDetails": "查看完整详情",
+      "close": "关闭",
+      "expand": "展开",
+      "collapse": "折叠"
+    },
+    "status": {
+      "online": "在线",
+      "offline": "离线",
+      "degraded": "降级",
+      "active": "活跃",
+      "idle": "空闲",
+      "ended": "已结束",
+      "unknown": "未知",
+      "warning": "警告",
+      "live": "实时",
+      "delayed": "延迟",
+      "review": "需复核",
+      "clear": "正常"
+    },
+    "direction": {
+      "upload": "上行",
+      "download": "下行",
+      "bidirectional": "双向",
+      "local": "本机",
+      "unknown": "未知"
+    },
+    "timeRange": {
+      "range15m": "15分钟",
+      "range1h": "1小时",
+      "range24h": "24小时",
+      "range7d": "7天",
+      "range30d": "30天",
+      "custom": "自定义",
+      "live15m": "实时 15分钟",
+      "customRange": "自定义范围",
+      "lastRange": "最近 {range}"
+    },
+    "pagination": {
+      "previous": "上一页",
+      "next": "下一页",
+      "showingCount": "显示 {count} 条",
+      "showingItems": "显示 {count} 条",
+      "totalItems": "共 {total} 项"
+    },
+    "language": {
+      "switchLanguage": "切换语言"
+    },
+    "user": {
+      "userMenu": "用户菜单",
+      "signedInAs": "当前登录为",
+      "logout": "退出登录"
+    },
+    "theme": {
+      "switchTheme": "当前主题：{theme}。点击切换主题。",
+      "themeTitle": "主题：{theme} (点击切换)"
+    }
+  },
+  "topologyValues": {
+    "mode": {
+      "router": "路由器",
+      "one-arm-router": "单臂路由器",
+      "bridge": "网桥",
+      "host": "主机",
+      "unknown": "未知"
+    },
+    "role": {
+      "lan": "LAN 网络",
+      "routed_lan": "路由 LAN 网络",
+      "tunnel": "隧道网络",
+      "wan": "WAN 网络",
+      "unknown": "未知",
+      "unresolved": "未识别"
+    },
+    "nat": {
+      "unknown": "未知",
+      "disabled": "已禁用",
+      "masquerade": "地址伪装",
+      "none": "无 NAT",
+      "snat": "源地址转换",
+      "dnat": "目标地址转换",
+      "both": "源和目标地址转换"
+    },
+    "backend": {
+      "tcx": "TCX",
+      "netlink": "Netlink",
+      "unknown": "未知"
+    },
+    "order": {
+      "first": "最先执行",
+      "last": "最后执行",
+      "netlink": "优先级 {priority} / 句柄 {handle}"
+    },
+    "coverage": {
+      "full": "完整",
+      "partial": "部分",
+      "none": "无覆盖",
+      "unknown": "未知"
+    },
+    "status": {
+      "enabled": "已启用",
+      "disabled": "已禁用",
+      "unknown": "未知",
+      "unspecified": "未指定"
+    },
+    "scope": {
+      "internet": "互联网",
+      "internal": "内部网络",
+      "tunnel": "隧道",
+      "unknown": "未知"
+    },
+    "path": {
+      "forwarded": "转发",
+      "internal": "内部通信",
+      "tunnel": "隧道",
+      "unknown": "未知"
+    },
+    "warnings": {
+      "icmpRedirect": "客户端可能通过 ICMP 重定向绕过此 Agent。",
+      "ipv6Unavailable": "未发现 IPv6 默认路由，无法覆盖 IPv6 互联网流量。",
+      "flowOffload": "流量卸载已启用，部分流量可能绕过 eBPF/TC 可见性。",
+      "asymmetricRouting": "疑似存在非对称路由：应答报文覆盖率低于 5%。"
+    }
+  },
+  "navigation": {
+    "overview": "概览",
+    "traffic": "流量",
+    "applications": "应用",
+    "clients": "客户端",
+    "destinations": "目标",
+    "flows": "连接流",
+    "insights": "洞察",
+    "settings": "设置",
+    "mainNavigation": "主导航",
+    "settingsNavigation": "设置导航",
+    "primaryNavigationSidebar": "主导航侧边栏",
+    "mobileNavigation": "移动端导航",
+    "collapseSidebar": "折叠侧边栏",
+    "expandSidebar": "展开侧边栏",
+    "closeNavigation": "关闭导航菜单",
+    "systemStatus": "系统状态",
+    "statusNormal": "正常运行",
+    "statusNormalDesc": "所有系统运行正常",
+    "statusDegraded": "运行降级",
+    "statusDegradedDesc": "部分系统存在异常",
+    "statusOffline": "离线",
+    "statusOfflineDesc": "无法连接到网关"
+  },
+  "auth": {
+    "controlPlane": "netqmon · 路由器流量监控",
+    "nodeTitle": "LOCAL OBSERVABILITY NODE",
+    "heroTitle": "掌控实时流量，\n洞悉网络全貌。",
+    "heroSubtitle": "轻量高效的路由流量监控与分析，数据完全保留在本地网关。",
+    "badge01": "本地存储",
+    "badge02": "实时遥测",
+    "badge03": "安全隔离",
+    "setupStep": "系统初始化",
+    "loginStep": "管理员验证",
+    "createAdmin": "创建本地管理员",
+    "enterConsole": "进入控制台",
+    "setupDesc": "初次使用请设置管理员凭据以保护控制台。",
+    "loginDesc": "请输入管理员账号密码以访问控制台。",
+    "username": "用户名",
+    "password": "密码",
+    "loginButton": "登录",
+    "setupButton": "完成初始化",
+    "establishingSession": "正在登录…",
+    "sessionFooter": "安全控制台 · 数据全程保留在本地网关设备",
+    "wan": "广域网 (WAN)",
+    "gateway": "netqmon 网关",
+    "clients": "局域网终端",
+    "telemetryLive": "实时流分析",
+    "bandwidth": "实时吞吐",
+    "latency": "时延",
+    "activeFlows": "活跃连接",
+    "errors": {
+      "cannotConnectCollector": "无法连接本机 Collector，请确认服务已启动。",
+      "failed": "认证失败，请检查输入后重试。",
+      "serviceUnavailable": "认证服务暂时不可用，请稍后重试。"
+    }
+  },
+  "overview": {
+    "title": "概览",
+    "subtitle": "实时网络流量与网关状态",
+    "download": "互联网下行",
+    "upload": "互联网上行",
+    "activeFlows": "活跃互联网连接流",
+    "onlineClients": "在线客户端",
+    "realtime": "实时",
+    "waitingTelemetry": "等待网关遥测数据",
+    "currentTrackedSessions": "当前跟踪的会话",
+    "seenLatestInterval": "最近采集周期内活跃",
+    "knownClients": "已知 {count} 个客户端",
+    "trafficLast15m": "流量 — 最近 15 分钟",
+    "waitingTraffic": "等待实时流量数据",
+    "gatewayOffline": "网关离线",
+    "topApplications": "热门应用",
+    "topClients": "活跃客户端",
+    "topDestinations": "主要目标",
+    "categoryDistribution": "流量类别分布",
+    "gatewayHealth": "网关健康状态",
+    "noGatewayEnrolled": "未注册网关",
+    "lastSeen": "最后活跃",
+    "openwrt": "OpenWrt",
+    "kernel": "内核",
+    "agent": "Agent",
+    "offloading": "硬件流卸载",
+    "counterCheck": "计数校验",
+    "noCaptureWarnings": "未报告抓包警告",
+    "unknownClient": "未知客户端",
+    "destination": "目标",
+    "other": "其他",
+    "captureDegradedHfo": "硬件流卸载已启用",
+    "captureDegradedBatches": "丢弃了 {count} 批遥测数据",
+    "captureDegradedDns": "丢弃了 {count} 个 DNS 事件",
+    "captureDegradedProbes": "丢弃了 {count} 个协议探测事件",
+    "captureDegradedCounters": "接口计数增量超出捕获连接流增量（接口 {interfaceDelta}B，连接流 {flowDelta}B）",
+    "captureDegradedPrefix": "抓包降级：{reasons}",
+    "captureNoTelemetry": "尚未报告抓包健康遥测数据",
+    "offlineThreshold": "在离线阈值时间内未收到网关遥测",
+    "decodeError": "实时快照数据无法解析",
+    "loadError": "无法加载概览数据"
+  },
+  "traffic": {
+    "title": "流量",
+    "subtitle": "按客户端、应用或类别的历史吞吐量",
+    "direction": "方向",
+    "both": "下行 + 上行",
+    "downloadOption": "下行",
+    "uploadOption": "上行",
+    "groupBy": "分组方式",
+    "none": "无",
+    "client": "客户端",
+    "application": "应用",
+    "category": "类别",
+    "flowObservations": "连接流观测样本",
+    "breakdownGroups": "细分分组",
+    "aggregatedSamples": "汇总样本",
+    "groupedBy": "按{group}分组",
+    "historyUnavailable": "流量历史数据不可用",
+    "trafficBreakdown": "流量细分",
+    "breakdownDesc": "选定时间范围内的总量，按流量大小排序。",
+    "groupsCount": "{count} 个分组",
+    "noTrafficRecorded": "未记录到流量",
+    "noTelemetryDesc": "选定时间范围内没有存储的遥测数据。",
+    "scope": "范围",
+    "scopes": {
+      "internet": "互联网",
+      "internal": "内部网络",
+      "tunnel": "隧道",
+      "all": "全部"
+    },
+    "historicalScope": "历史流量与细分",
+    "loadError": "无法加载历史流量",
+    "columns": {
+      "download": "下行",
+      "upload": "上行",
+      "total": "总量",
+      "packets": "数据包",
+      "flows": "连接流",
+      "lastSeen": "最后活跃"
+    }
+  },
+  "applications": {
+    "title": "应用",
+    "subtitle": "已分类的网络活动",
+    "searchPlaceholder": "搜索应用、组织或类别",
+    "searchAria": "搜索应用",
+    "applicationsCount": "{count} 个应用",
+    "unavailable": "应用数据不可用",
+    "summariesScope": "应用汇总",
+    "notFound": "未找到应用",
+    "notFoundSearch": "没有应用匹配当前搜索条件。",
+    "notFoundEmpty": "尚未记录到分类流量。",
+    "openFullDetails": "查看完整详情",
+    "columns": {
+      "application": "应用",
+      "organization": "组织",
+      "trafficClass": "流量类别",
+      "download": "下行",
+      "upload": "上行",
+      "total": "总量",
+      "clients": "客户端",
+      "flows": "连接流",
+      "lastSeen": "最后活跃"
+    },
+    "properties": {
+      "properties": "属性",
+      "organization": "组织",
+      "trafficClass": "流量类别",
+      "clients": "客户端",
+      "flows": "连接流",
+      "packets": "数据包",
+      "lastSeen": "最后活跃"
+    },
+    "detail": {
+      "back": "应用",
+      "unknownApp": "未知应用",
+      "subtitle": "流量类别：{category} · 分类置信度 {confidence}%",
+      "fallbackSubtitle": "应用流量及关联活动",
+      "allRecordedTraffic": "所有已记录流量",
+      "distinctClients": "分类关联的客户端数",
+      "persistedObservations": "持久化观测样本",
+      "classification": "分类信息",
+      "classifierConfidence": "分类置信度",
+      "classificationSource": "分类来源",
+      "domainCount": "关联域名数",
+      "observedProtocols": "观测到的协议",
+      "noMatchingRule": "无匹配规则",
+      "rulesSource": "规则匹配",
+      "trafficLast24h": "流量 — 最近 24 小时",
+      "topClients": "主要客户端",
+      "topDomains": "主要域名",
+      "tabs": {
+        "overview": "概览",
+        "clients": "客户端",
+        "domains": "域名",
+        "destinations": "目标",
+        "flows": "连接流"
+      },
+      "empty": {
+        "noClients": "无客户端",
+        "noClientsDesc": "选定时间窗口内没有客户端使用此应用。",
+        "noDomains": "无域名",
+        "noDomainsDesc": "此应用暂无 DNS 归因信息。",
+        "noDestinations": "无目标",
+        "noDestinationsDesc": "未记录到此应用的远端端点。",
+        "noFlows": "无连接流",
+        "noFlowsDesc": "没有与此应用关联的持久化连接流。"
+      }
+    }
+  },
+  "clients": {
+    "title": "客户端",
+    "subtitle": "网关上观测到的设备",
+    "searchPlaceholder": "搜索名称、IP、MAC、厂商或设备类型",
+    "searchAria": "搜索客户端",
+    "clientsCount": "{count} 个客户端",
+    "unavailable": "客户端数据不可用",
+    "inventoryScope": "客户端列表",
+    "notFound": "未找到客户端",
+    "notFoundSearch": "没有客户端匹配当前搜索条件。",
+    "notFoundEmpty": "尚未收到来自网关的设备观测数据。",
+    "openClientDetails": "查看客户端详情",
+    "topology": {
+      "title": "实时网络流量拓扑",
+      "subtitle": "客户端 · 路由器 · 互联网流量流向",
+      "internet": "Internet / WAN",
+      "gateway": "OpenWrt 网关",
+      "otherClients": "其他终端",
+      "devicesCount": "{count} 台设备",
+      "drilldownCategory": "当前分组：{category}",
+      "backToAllGroups": "返回全部类别",
+      "groupMode": "展示模式",
+      "byType": "按设备类型",
+      "byActivity": "按活跃排行",
+      "all": "全量展开",
+      "showFlow": "显示拓扑",
+      "hideFlow": "隐藏拓扑",
+      "realtimeThroughput": "实时吞吐",
+      "totalDown": "总下载",
+      "totalUp": "总上传",
+      "activeFlows": "活跃连接",
+      "onlineDevices": "在线设备",
+      "paused": "已暂停",
+      "pauseAnimation": "暂停流量动画",
+      "resumeAnimation": "继续流量动画",
+      "laneHint": "链路宽度与粒子密度实时反映瞬时上下行带宽",
+      "legend": {
+        "download": "下行",
+        "upload": "上行",
+        "wan": "WAN 链路"
+      },
+      "categories": {
+        "computer": "电脑 / 工作站",
+        "mobile": "移动设备",
+        "tv": "影音娱乐",
+        "server": "服务器 / NAS",
+        "iot": "智能家居 / IoT",
+        "other": "其他终端"
+      }
+    },
+    "logicalTopology": {
+      "title": "逻辑拓扑",
+      "description": "展示观测到的路由关系，不代表物理交换机或 Mesh 连接",
+      "internet": "互联网",
+      "publicNetwork": "公网",
+      "upstreamGateway": "上游网关",
+      "nextHop": "默认路由下一跳",
+      "agent": "netqmon Agent",
+      "agentFallback": "netqmon Agent",
+      "unknownAddress": "地址未知",
+      "unknownMode": "拓扑未知",
+      "lanNetworks": "LAN 与路由网络",
+      "tunnelNetworks": "隧道网络",
+      "onlineClients": "{count} 个在线客户端",
+      "globalActiveFlows": "全局 {count} 条互联网连接流",
+      "noSegments": "Agent 未报告 LAN 网段",
+      "noTunnels": "Agent 未报告隧道网段",
+      "tunnel": "隧道",
+      "unresolvedClients": "未匹配网段的客户端",
+      "unresolvedDescription": "客户端地址未匹配 Agent 报告的路由网段",
+      "backToSegment": "返回网段",
+      "backToTopology": "返回完整拓扑",
+      "networksCount": "{count} 个路由网段"
+    },
+    "columns": {
+      "status": "状态",
+      "name": "名称",
+      "ip": "IP",
+      "mac": "MAC",
+      "vendor": "厂商",
+      "deviceType": "类型",
+      "download": "下行",
+      "upload": "上行",
+      "flows": "连接流",
+      "lastSeen": "最后活跃"
+    },
+    "properties": {
+      "identity": "身份标识",
+      "ip": "IP",
+      "mac": "MAC",
+      "serverApplication": "服务端应用",
+      "vendor": "厂商",
+      "deviceType": "设备类型",
+      "osFamily": "操作系统",
+      "model": "型号",
+      "confidence": "置信度",
+      "privateMac": "私有/随机 MAC",
+      "yes": "是",
+      "no": "否",
+      "flows": "连接流",
+      "lastSeen": "最后活跃"
+    },
+    "detail": {
+      "back": "客户端",
+      "title": "客户端详情",
+      "fallbackSubtitle": "客户端流量与身份",
+      "realtimeDownload": "{scope}实时下行",
+      "realtimeUpload": "{scope}实时上行",
+      "activeFlows": "活跃连接流",
+      "totalToday": "今日总量",
+      "latestInterval": "最新周期",
+      "realtimeUnavailable": "实时数据不可用",
+      "currentSessions": "当前会话",
+      "recordedTraffic": "已记录的{scope}客户端流量",
+      "scopeMix": "按范围划分的实时流量",
+      "scopes": {
+        "internet": "互联网",
+        "internal": "内部网络",
+        "tunnel": "隧道",
+        "all": "全部"
+      },
+      "identity": "设备身份",
+      "realtimeTraffic15m": "实时流量 — 最近 15 分钟",
+      "trafficHistory24h": "流量历史 — 最近 24 小时",
+      "waitingTraffic": "等待客户端流量",
+      "clientOffline": "客户端离线",
+      "knownAddresses": "已知网络地址",
+      "evidence": {
+        "source": "来源",
+        "field": "字段",
+        "value": "值",
+        "confidence": "置信度",
+        "hitCount": "命中次数",
+        "observedAt": "观测时间"
+      },
+      "tabs": {
+        "overview": "概览",
+        "applications": "应用",
+        "domains": "域名",
+        "destinations": "目标",
+        "flows": "连接流"
+      },
+      "empty": {
+        "noApps": "无应用",
+        "noAppsDesc": "没有与此客户端关联的分类应用流量。",
+        "noDomains": "无域名",
+        "noDomainsDesc": "此客户端暂无 DNS 归因信息。",
+        "noDestinations": "无目标",
+        "noDestinationsDesc": "未记录到此客户端访问的远端端点。",
+        "noFlows": "无连接流",
+        "noFlowsDesc": "没有与此客户端关联的持久化连接流。"
+      }
+    }
+  },
+  "destinations": {
+    "title": "目标",
+    "subtitle": "网络流量中观测到的远端端点",
+    "unavailable": "目标数据不可用",
+    "summariesScope": "目标汇总",
+    "geoError": "目标流量可用，但无法加载地理位置汇总：{error}",
+    "geoNotEnabled": "目标流量可用。国家与自治系统 (ASN) 信息未启用。请向配置的 Geo 目录添加受支持的 MMDB 文件。",
+    "topCountries": "主要国家/地区",
+    "topAsns": "主要自治系统 (ASN)",
+    "countryDistribution": "国家/地区流量分布",
+    "noCountryMatches": "已安装数据库中无匹配国家/地区",
+    "noAsnMatches": "已安装数据库中无匹配 ASN",
+    "notEnabled": "未启用",
+    "destinationsCount": "{count} 个目标",
+    "emptyTitle": "无目标",
+    "emptyDesc": "尚未记录到任何远端端点。",
+    "view": "视图",
+    "viewTable": "表格视图",
+    "viewMap": "地图视图",
+    "table": "表格",
+    "map": "地图",
+    "mapTitle": "网络流量去向分布",
+    "mapSubtitle": "从网关到全球外部目的地的流量流向",
+    "sourceGateway": "源节点：{name}",
+    "download": "下载",
+    "upload": "上传",
+    "total": "总计",
+    "country": "国家/地区",
+    "noGeoPoints": "暂无可定位的目标",
+    "noGeoPointsDesc": "当前时间范围内观测到的目标缺少地理坐标定位数据。",
+    "viewRelatedFlows": "查看关联连接流",
+    "columns": {
+      "ip": "IP",
+      "domain": "域名",
+      "asn": "ASN",
+      "country": "国家/地区",
+      "traffic": "流量",
+      "clients": "客户端",
+      "flows": "连接流"
+    },
+    "properties": {
+      "identity": "身份标识",
+      "ip": "IP",
+      "domain": "域名",
+      "country": "国家/地区",
+      "region": "区域",
+      "asn": "ASN",
+      "organization": "组织",
+      "traffic": "流量",
+      "download": "下行",
+      "upload": "上行",
+      "clients": "客户端",
+      "flows": "连接流",
+      "lastSeen": "最后活跃"
+    }
+  },
+  "flows": {
+    "title": "连接流",
+    "subtitle": "带有分类证据的持久化网络会话",
+    "unavailable": "连接流数据不可用",
+    "sessionsScope": "已筛选的连接流会话",
+    "searchPlaceholder": "搜索 IP、域名、客户端或应用",
+    "exactFilters": "精确筛选",
+    "applyFilters": "应用筛选",
+    "showingCount": "显示 {count} 条连接流",
+    "emptyTitle": "未找到连接流",
+    "emptyDesc": "没有匹配当前筛选条件和时间范围的连接流会话。",
+    "columns": {
+      "time": "时间",
+      "client": "客户端",
+      "classification": "分类",
+      "destination": "目标",
+      "transport": "传输层",
+      "direction": "方向",
+      "download": "下行",
+      "upload": "上行",
+      "duration": "持续时间",
+      "scope": "范围",
+      "path": "路径"
+    },
+    "filterLabels": {
+      "client": "客户端",
+      "application": "应用",
+      "domain": "域名",
+      "ip": "IP",
+      "protocol": "协议",
+      "port": "端口",
+      "direction": "方向",
+      "scope": "范围",
+      "path": "路径",
+      "nat": "NAT"
+    },
+    "values": {
+      "internet": "互联网",
+      "internal": "内部网络",
+      "tunnel": "隧道",
+      "forwarded": "转发",
+      "none": "无",
+      "snat": "源地址转换",
+      "dnat": "目标地址转换",
+      "both": "两者"
+    },
+    "panel": {
+      "identity": "身份标识",
+      "client": "客户端",
+      "clientIp": "客户端 IP",
+      "remote": "远端地址",
+      "domain": "域名",
+      "organization": "组织",
+      "application": "应用",
+      "trafficClass": "流量类别",
+      "trafficRole": "流量角色",
+      "session": "会话信息",
+      "transport": "传输协议",
+      "detectedProtocol": "识别协议",
+      "direction": "方向",
+      "clientPort": "客户端端口",
+      "remotePort": "远端端口",
+      "download": "下行",
+      "upload": "上行",
+      "packets": "数据包",
+      "started": "开始时间",
+      "lastSeen": "最后活跃",
+      "duration": "持续时间",
+      "classification": "分类判定",
+      "result": "判定结果",
+      "overallConfidence": "总体置信度",
+      "organizationConfidence": "组织置信度",
+      "applicationConfidence": "应用置信度",
+      "protocolConfidence": "协议置信度",
+      "reason": "命中原因",
+      "evidence": "匹配证据",
+      "noEvidence": "无匹配证据",
+      "noMatchingRule": "无匹配规则",
+      "likelyApp": "疑似 {app}",
+      "protocolNamed": "协议 {protocol}",
+      "organizationNamed": "组织 {org}",
+      "networkPath": "网络路径",
+      "scope": "范围",
+      "path": "路径",
+      "sourceSegment": "源网段",
+      "destinationSegment": "目标网段",
+      "nat": "NAT",
+      "topology": "拓扑模式",
+      "internet": "互联网"
+    }
+  },
+  "insights": {
+    "title": "洞察",
+    "subtitle": "基于规则和可审查证据的网络观察",
+    "unavailable": "洞察数据不可用",
+    "observationsScope": "规则观测",
+    "captureWarningBanner": "{count} 个抓包质量状况可能影响流量观测准确性。",
+    "refreshAria": "刷新洞察",
+    "observed24h": "已观测 · 24h",
+    "findingsDetail": "可解释结论",
+    "unknownTraffic": "未知流量",
+    "coverageDetail": "分类覆盖率",
+    "captureQuality": "抓包质量",
+    "conditionsDetail": "{count} 项当前状况",
+    "noDegradation": "未报告质量下降",
+    "filters": {
+      "all": "全部证据",
+      "devices": "设备发现",
+      "traffic": "流量与突发",
+      "security": "安全与隧道",
+      "quality": "质量与分类",
+      "system": "系统与抓包"
+    },
+    "matchesCount": "{count} 条匹配",
+    "noMatching": "无匹配洞察",
+    "noMatchingDesc": "最近 24 小时内没有匹配此筛选条件的规则观测。",
+    "observationReason": "观测结论 / 原因",
+    "time": "时间",
+    "whyAppeared": "触发原因",
+    "provenance": "来源追踪",
+    "ruleSource": "规则源",
+    "observedAt": "观测时间",
+    "severity": "严重程度",
+    "affectedClient": "受影响客户端",
+    "clientIp": "客户端 IP",
+    "clientMac": "客户端 MAC",
+    "evidence": "观测证据",
+    "encryptedDnsDisclaimer": "此结果来自传输层/服务商规则推断。netqmon 不会解密加密 DNS 内容，也不会从此观测中断言具体域名。",
+    "inspectAria": "查看 {title} 的证据详情",
+    "categories": {
+      "device": "设备",
+      "traffic": "流量",
+      "classification": "流量分类",
+      "dns": "DNS",
+      "protocol": "协议与隧道",
+      "destination": "目的端",
+      "capture": "抓包质量"
+    },
+    "severities": {
+      "info": "信息",
+      "warning": "警告",
+      "critical": "严重"
+    },
+    "sources": {
+      "device-discovery": "设备发现",
+      "classification-coverage": "分类覆盖率监测",
+      "client-classification-coverage": "客户端分类覆盖率监测",
+      "dns-service-inference": "DNS 服务推断",
+      "traffic-history": "流量历史分析",
+      "traffic-spike-detector": "流量突发检测器",
+      "application-spike-detector": "应用流量突发检测器",
+      "p2p-tracker-rule": "P2P Tracker 规则",
+      "vpn-ike-esp-rule": "VPN IKE/ESP 规则",
+      "vpn-pptp-gre-rule": "VPN PPTP/GRE 规则",
+      "vpn-l2tp-ipsec-rule": "VPN L2TP/IPsec 规则",
+      "protocol-discovery": "新协议发现",
+      "destination-fanout-detector": "目的端扇出异常检测器",
+      "capture-health": "抓包健康度监测"
+    },
+    "evidenceLabels": {
+      "first_seen": "首次出现",
+      "last_seen": "最后出现",
+      "last_observed": "最后观测",
+      "observed_at": "观测时间",
+      "mac": "MAC 地址",
+      "ip": "IP 地址",
+      "client_id": "客户端 ID",
+      "client_name": "客户端名称",
+      "client_mac": "客户端 MAC",
+      "client_ip": "客户端 IP",
+      "total_bytes": "总流量",
+      "unknown_bytes": "未识别流量",
+      "ratio": "比例",
+      "threshold": "阈值",
+      "threshold_bytes": "流量阈值",
+      "tx_bytes": "上传流量",
+      "rx_bytes": "下载流量",
+      "bytes": "近期流量",
+      "baseline_bytes": "基线流量",
+      "window_minutes": "统计窗口",
+      "provider": "服务商",
+      "protocol": "协议",
+      "domain": "域名",
+      "remote_ip": "远端 IP",
+      "remote_port": "远端端口",
+      "transport": "传输协议",
+      "query_count": "查询次数",
+      "correlation": "关联类型",
+      "protocol_type": "协议类型",
+      "protocol_id": "协议 ID",
+      "protocol_name": "协议名称",
+      "category_name": "分类名称",
+      "destination_count": "独立目的端数",
+      "flow_count": "流数量",
+      "status": "抓包状态",
+      "condition": "状况",
+      "count": "丢弃数量",
+      "interface_delta": "网卡计数增量",
+      "flow_delta": "流汇总增量",
+      "lag_ms": "接收延迟",
+      "threshold_ms": "延迟阈值"
+    },
+    "evidenceValues": {
+      "yes": "是",
+      "no": "否",
+      "notVisible": "不可见"
+    },
+    "events": {
+      "device": {
+        "new_device": {
+          "title": "发现新设备",
+          "reason": "记录到设备 {name} ({mac}) 的首次网络活动。"
+        }
+      },
+      "classification": {
+        "unknown_ratio_high": {
+          "title": "未分类流量占比过高",
+          "reason": "未分类流量占总流量（{total_bytes}）的 {ratio}（{unknown_bytes}），已超过阈值 {threshold}。"
+        },
+        "client_unknown_ratio_high": {
+          "title": "客户端未分类流量占比过高",
+          "reason": "客户端 {name} 的未分类流量在总流量（{total_bytes}）中占 {ratio}（{unknown_bytes}），已超过阈值 {threshold}。"
+        }
+      },
+      "dns": {
+        "encrypted_dns_detected": {
+          "title": "检测到加密 DNS 活动",
+          "reason": "检测到客户端 {name} 发往 {remote_ip} 的加密 DNS 流量（{provider}，经由 {protocol}）。"
+        }
+      },
+      "traffic": {
+        "high_upload": {
+          "title": "高出站流量",
+          "reason": "客户端 {name} 出站流量达 {upload_bytes}，超过设定的阈值 {threshold_bytes}。"
+        },
+        "client_spike": {
+          "title": "客户端流量突发",
+          "reason": "客户端 {name} 近 15 分钟流量达到 {bytes}，达到基线（{baseline_bytes}）的 {ratio}。"
+        },
+        "application_spike": {
+          "title": "应用流量突发",
+          "reason": "应用 {application_name} 近 15 分钟流量达到 {bytes}，达到基线（{baseline_bytes}）的 {ratio}。"
+        }
+      },
+      "protocol": {
+        "p2p_tracker_correlation": {
+          "title": "检测到 P2P Tracker 通信",
+          "reason": "检测到客户端 {name} 的 BitTorrent / P2P Tracker 关联通信（{tracker_flows} 个 Tracker 流，{peer_flows} 个 Peer 流）。"
+        },
+        "ipsec_detected": {
+          "title": "检测到 IPsec VPN 隧道",
+          "reason": "检测到与 {remote_ip} 关联的 IPsec 隧道协商及 ESP 数据传输。"
+        },
+        "pptp_detected": {
+          "title": "检测到 PPTP VPN 隧道",
+          "reason": "检测到与 {remote_ip} 关联的 PPTP 控制会话及 GRE 数据封装。"
+        },
+        "l2tp_ipsec_detected": {
+          "title": "检测到 L2TP/IPsec VPN 隧道",
+          "reason": "检测到与 {remote_ip} 关联的基于 IPsec 传输的 L2TP 隧道会话。"
+        },
+        "new_protocol": {
+          "title": "发现新网络协议",
+          "reason": "首次在网络中观测到协议 {protocol_name}。"
+        }
+      },
+      "destination": {
+        "fanout_spike": {
+          "title": "客户端目的端扇出异常",
+          "reason": "客户端 {name} 在短时间内连接了 {destination_count} 个独立目的端。"
+        }
+      },
+      "capture": {
+        "icmp_redirect_enabled": {
+          "title": "ICMP Redirect 已启用",
+          "reason": "客户端可能在 {topology_mode} 模式下学习直达路由并绕过 netqmon。"
+        },
+        "ipv4_coverage": {
+          "title": "IPv4 抓包覆盖不完整",
+          "reason": "拓扑引擎报告的 IPv4 覆盖状态为 {ipv4_coverage}。"
+        },
+        "ipv6_coverage": {
+          "title": "IPv6 抓包覆盖不完整",
+          "reason": "拓扑引擎报告的 IPv6 覆盖状态为 {ipv6_coverage}。"
+        },
+        "software_flow_offload": {
+          "title": "软件流卸载已启用",
+          "reason": "软件流卸载可能绕过当前选择的观测点。"
+        },
+        "topology_confidence": {
+          "title": "拓扑置信度较低",
+          "reason": "拓扑推断置信度为 {confidence}%，请检查 Agent 网络诊断。"
+        },
+        "asymmetric_routing": {
+          "title": "疑似非对称路由",
+          "reason": "拓扑引擎检测到与非对称路径一致的数据包覆盖特征。"
+        },
+        "hardware_flow_offload": {
+          "title": "硬件流卸载已开启",
+          "reason": "硬件流卸载绕过了内核 conntrack/软件统计，可能导致流量统计值低于实际网络流量。"
+        },
+        "interface_counter_gap": {
+          "title": "网卡计数与流增量不符",
+          "reason": "底层网卡计数超过采集到的流增量（网卡增量 {interface_delta}，流增量 {flow_delta}）。"
+        },
+        "dns_event_drops": {
+          "title": "DNS 事件丢弃",
+          "reason": "Agent 上报了 {count} 个 DNS 抓包丢弃事件。"
+        },
+        "protocol_probe_drops": {
+          "title": "协议探测事件丢弃",
+          "reason": "Agent 上报了 {count} 个协议探测丢弃事件。"
+        },
+        "telemetry_queue_drops": {
+          "title": "遥测批次丢弃",
+          "reason": "Agent 遥测队列已丢弃 {count} 个批次。"
+        },
+        "collector_lag": {
+          "title": "采集器接收延迟",
+          "reason": "采集器接收时间落后 Agent 批次时间戳 {lag_ms} ms（阈值: {threshold_ms} ms）。"
+        }
+      }
+    }
+  },
+  "settings": {
+    "title": "设置",
+    "subtitle": "管理网关偏好、遥测存储保留、分类规则、Geo 数据库与系统诊断",
+    "tabs": {
+      "general": "偏好设置",
+      "license": "许可证",
+      "iconCache": "图标缓存",
+      "retention": "存储与保留",
+      "classification": "分类规则",
+      "geo": "Geo 数据库",
+      "networkDataplane": "网络与数据面",
+      "diagnostics": "系统诊断"
+    },
+    "interface": {
+      "title": "界面偏好",
+      "description": "自定义控制台的显示语言与色彩主题偏好",
+      "language": "显示语言",
+      "languageDescription": "选择您偏好的界面显示语言。该设置将保存在您的浏览器中。",
+      "theme": "外观主题",
+      "themeDescription": "自定义界面深浅色彩模式，亦可自动跟随系统偏好设置。",
+      "themeLight": "浅色模式",
+      "themeDark": "深色模式",
+      "themeSystem": "跟随系统",
+      "account": "当前账户",
+      "accountDescription": "当前控制台会话登录身份。",
+      "role": "系统权限",
+      "adminRole": "系统管理员 (Admin)"
+    },
+    "license": {
+      "title": "许可证与版本",
+      "description": "激活 Pro，并查看 Collector 的云端授权租约状态。",
+      "cardTitle": "NetQMon 许可证",
+      "cardDescription": "许可证密钥只交换一次，本地仅保存设备凭据。",
+      "edition": "当前版本",
+      "status": "授权状态",
+      "installationId": "安装实例 ID",
+      "ruleVersion": "规则版本",
+      "lastCheck": "最近成功校验",
+      "leaseUntil": "离线租约截止",
+      "keyLabel": "许可证密钥",
+      "keyPlaceholder": "粘贴许可证密钥",
+      "activate": "激活",
+      "activating": "正在激活…",
+      "activated": "已激活",
+      "checkNow": "立即校验",
+      "checking": "正在校验…",
+      "checked": "已校验",
+      "retry": "重试",
+      "keyNotice": "许可证密钥会直接发送到 NetQMon Cloud，Collector 不会保存它。",
+      "loadError": "无法读取许可证状态",
+      "actionError": "许可证操作失败",
+      "activateSuccess": "Pro 许可证已激活",
+      "checkSuccess": "许可证状态已刷新"
+    },
+    "geo": {
+      "title": "地理位置与 ASN 数据库",
+      "description": "管理用于丰富流量目标 IP 地理位置、省份城市、经纬度与自治系统 (ASN) 归属的本地 MMDB 数据库。支持自动从 GeoLite2 镜像源下载并热重载。",
+      "directory": "数据库目录",
+      "status": "状态",
+      "enabled": "已启用",
+      "disabled": "未启用",
+      "updateNow": "立即更新",
+      "updating": "正在下载并加载数据库…",
+      "updateSuccess": "Geo 数据库已成功更新并热重载",
+      "updateError": "更新 Geo 数据库失败",
+      "loadError": "无法加载 Geo 数据库信息",
+      "installed": "已安装",
+      "notInstalled": "未安装",
+      "database": "数据库文件",
+      "databaseType": "类型",
+      "buildDate": "发布/构建日期",
+      "fileSize": "文件体积",
+      "lastModified": "修改时间",
+      "source": "官方源",
+      "autoSourceNotice": "自动从 GeoLite2 同步镜像源拉取最新的 City 与 ASN 数据库，并原子更新至本地目录。"
+    },
+    "classification": {
+      "title": "分类规则",
+      "description": "规则引擎由 classifierd 独立管理，统计与重载请求均转发至分类引擎执行。",
+      "reloadHint": "触发 classifierd 重载规则库",
+      "reloadButton": "重新加载规则",
+      "reloading": "正在重新加载…",
+      "success": "规则重新加载成功",
+      "loadedApps": "已加载 {count} 个应用。",
+      "loadedSelfhostApps": "其中 Self-hosted 应用 {count} 个。",
+      "reloadedAt": "重载时间：{time}",
+      "error": "重新加载分类规则失败。",
+      "rulesBreakdown": "规则库统计",
+      "rulesBreakdownDesc": "来自 classifierd 的规则集统计",
+      "classifierdStatus": "分类引擎状态",
+      "classifierdVersion": "分类引擎版本",
+      "applications": "应用数",
+      "selfhostApplications": "Self-hosted 应用数",
+      "clients": "客户端指纹规则数",
+      "protocols": "协议规则数",
+      "statsRuleVersion": "规则版本",
+      "updatedAt": "更新日期",
+      "availability": {
+        "ready": "运行中",
+        "unavailable": "不可用",
+        "connecting": "连接中"
+      }
+    },
+    "diagnostics": {
+      "title": "系统诊断",
+      "description": "控制器系统运行状态、遥测指标与硬件网关运行详情",
+      "copy": "复制诊断信息至剪贴板",
+      "copied": "已复制到剪贴板",
+      "collectorVersion": "Collector 版本",
+      "dbBackend": "数据库后端",
+      "dbSize": "数据库体积",
+      "activeFlows": "活跃连接流",
+      "unknownRatio": "未知流量占比",
+      "geoDb": "Geo 数据库",
+      "enabled": "已启用",
+      "disabled": "未启用",
+      "gatewayInfo": "网关硬件与系统",
+      "gatewayName": "网关名称",
+      "gatewayId": "网关 ID",
+      "agentVersion": "Agent 版本",
+      "kernel": "内核版本",
+      "notConnected": "未连接",
+      "failed": "加载系统诊断失败。"
+    },
+    "networkDataplane": {
+      "title": "网络与数据面",
+      "description": "Agent 上报的逻辑拓扑发现、抓包覆盖、挂载方式与旁路风险",
+      "logicalTopology": "逻辑拓扑",
+      "dataplaneHealth": "数据面健康状态",
+      "topologyMode": "拓扑模式",
+      "agentAddress": "Agent 地址",
+      "captureInterface": "抓包接口",
+      "upstreamGateway": "上游网关",
+      "nat": "NAT",
+      "confidence": "拓扑置信度",
+      "attachBackend": "挂载后端",
+      "attachOrder": "挂载顺序",
+      "ipv4Coverage": "IPv4 覆盖",
+      "ipv6Coverage": "IPv6 覆盖",
+      "icmpRedirect": "ICMP Redirect",
+      "softwareOffload": "软件流卸载",
+      "hardwareOffload": "硬件流卸载",
+      "networks": "LAN、路由与隧道网络",
+      "warnings": "拓扑告警",
+      "unavailable": "拓扑遥测暂不可用"
+    },
+    "iconCache": {
+      "title": "图标缓存",
+      "description": "存储在 Collector 内存中的远程 favicon 缓存。",
+      "badge": "展示层",
+      "cardDescription": "通过 Collector 图标服务获取的外部图标。",
+      "clear": "清空图标缓存",
+      "confirmClear": "确认清空已缓存的外部图标？\n\n当前可见的图标可能会在需要时重新下载。",
+      "clearSuccess": "图标缓存已清空",
+      "clearError": "清空图标缓存失败",
+      "loadError": "加载图标缓存统计失败",
+      "cachedRemoteIcons": "已缓存远程图标",
+      "cacheSize": "缓存体积",
+      "capacity": "容量上限",
+      "positiveTtl": "正缓存 TTL",
+      "negativeTtl": "负缓存 TTL",
+      "ttlDays": "{count} 天",
+      "ttlHours": "{count} 小时",
+      "ttlSeconds": "{count} 秒"
+    },
+    "retention": {
+      "title": "数据保留",
+      "description": "配置历史数据保留时长。设置为 0 表示永久保留，DNS 观测记录除外（0 表示仅保留至 TTL 到期）。",
+      "storageOverview": "存储概况",
+      "presets": "快速预设策略",
+      "presetStandard": "标准策略 (30天)",
+      "presetCompact": "精简策略 (7天)",
+      "presetExtended": "扩展策略 (90天)",
+      "daysUnit": "天",
+      "flowSessions": "连接流会话保留 (天)",
+      "flowSessionsMin": "最小: 1",
+      "dnsObservations": "DNS 观测记录保留 (天)",
+      "dnsObservationsMin": "最小: 0 (0 = 仅保留至 TTL)",
+      "minuteRollups": "分钟聚合数据保留 (天)",
+      "minuteRollupsMin": "最小: 1",
+      "hourRollups": "小时聚合数据保留 (天)",
+      "hourRollupsMin": "最小: 0 (0 = 永久)",
+      "dayRollups": "天聚合数据保留 (天)",
+      "dayRollupsMin": "最小: 0 (0 = 永久)",
+      "save": "保存更改",
+      "saving": "正在保存…",
+      "runNow": "立即执行清理",
+      "running": "正在执行…",
+      "saveSuccess": "数据保留策略保存成功。",
+      "saveError": "保存数据保留策略失败。",
+      "runSuccess": "数据清理任务执行完成。",
+      "runError": "执行数据清理任务失败。",
+      "loadError": "加载数据保留策略失败。",
+      "validationMin1": "连接流会话与分钟聚合数据保留时长至少为 1 天。",
+      "validationNonNegative": "天数不能为负数。"
+    },
+    "sampling": {
+      "title": "DPI / 数据包采样",
+      "window": "最近 {minutes} 分钟实际观测（最多 1 小时）",
+      "unavailable": "不可用",
+      "enabled": "已启用",
+      "disabled": "已关闭",
+      "available": "可用",
+      "configuration": "当前配置",
+      "engine": "DPI 引擎",
+      "dpiEnabled": "DPI 开关",
+      "engineAvailable": "引擎可用性",
+      "waiting": "等待 Agent 上报采样配置。",
+      "sampleEnabled": "采样开关",
+      "bytesFlow": "每 Flow 最大字节数",
+      "packetsDirection": "每方向最大包数",
+      "bytesPacket": "每包最大字节数",
+      "observations": "采样统计",
+      "sampleCount": "Sample 消息数",
+      "sampledFlows": "已采样 Flow",
+      "bytes": "Sample 总大小",
+      "average": "平均 Sample 大小",
+      "p95": "P95 Sample 大小",
+      "maximum": "最大 Sample 大小",
+      "success": "DPI 识别率",
+      "drops": "丢弃的采样包",
+      "impactTitle": "网络影响",
+      "impact": "影响评级",
+      "Low": "低",
+      "Moderate": "中等",
+      "High": "高",
+      "bandwidth": "平均额外带宽",
+      "ratio": "占网络流量比例",
+      "newFlows": "新增 Flow",
+      "flowRate": "新增 Flow 速率",
+      "dropRate": "Sample 丢弃率",
+      "theoretical": "理论最大带宽",
+      "basis": "根据实际采样量、网络流量和丢弃情况评估影响。理论上限按当前 Flow 预算与近期新增 Flow 速率计算；新增 Flow 数根据观测到的五元组估算。",
+      "privacy": "启用采样会捕获部分原始网络载荷，仅在 Collector 内存中用于 DPI。分析后释放原始载荷，不持久化、不写日志，也不通过 API 返回。可在 Agent 或 LuCI 中调整采样配置。"
+    }
+  },
+  "states": {
+    "empty": {
+      "noRecords": "未找到记录",
+      "adjustFilters": "请尝试调整筛选条件或时间范围",
+      "noItems": "暂无排行数据"
+    },
+    "error": {
+      "defaultTitle": "加载数据失败",
+      "defaultMessage": "与控制器服务通信时发生错误。",
+      "affectedScope": "受影响组件：{scope}",
+      "retry": "重试"
+    },
+    "loading": {
+      "chart": "正在加载图表..."
+    }
+  },
+  "accessibility": {
+    "sidebar": {
+      "open": "打开导航菜单"
+    },
+    "search": {
+      "clear": "清除搜索"
+    },
+    "filter": {
+      "filterRecords": "筛选记录",
+      "removeFilter": "移除 {label} 筛选"
+    },
+    "customTimeRange": {
+      "title": "自定义时间范围",
+      "startTime": "开始时间",
+      "endTime": "结束时间"
+    },
+    "panel": {
+      "close": "关闭属性面板",
+      "copy": "复制 {label}"
+    }
+  }
+}

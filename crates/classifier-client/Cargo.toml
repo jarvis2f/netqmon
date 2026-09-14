@@ -1,0 +1,21 @@
+[package]
+name = "netqmon-classifier-client"
+description = "Lightweight Unix socket client and public DTOs for the netqmon classifier service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["netqmon", "classifier", "ipc"]
+categories = ["network-programming"]
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

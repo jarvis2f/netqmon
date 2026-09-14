@@ -1,0 +1,57 @@
+FROM ghcr.io/cross-rs/riscv64gc-unknown-linux-musl:edge
+
+# 1. Install host build-time dependencies required by libbpf-cargo and host crates
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install --no-install-recommends -y \
+    clang \
+    llvm \
+    pkg-config \
+    libelf-dev \
+    zlib1g-dev \
+    curl \
+    ca-certificates \
+    file \
+    tar \
+    gzip && \
+    rm -rf /var/lib/apt/lists/*
+
+# 2. Download and unpack reliable, musl-patched target static C libraries from Alpine Linux (riscv64)
+# Cross riscv64 sysroot is at /x-tools/riscv64-unknown-linux-musl/riscv64-unknown-linux-musl/sysroot
+RUN mkdir -p /tmp/target-pkgs && cd /tmp/target-pkgs && \
+    curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/riscv64/elfutils-dev-0.191-r0.apk -o elfutils-dev.apk && \
+    curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/riscv64/zlib-dev-1.3.2-r0.apk -o zlib-dev.apk && \
+    curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/riscv64/zlib-static-1.3.2-r0.apk -o zlib-static.apk && \
+    curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/riscv64/zstd-dev-1.5.6-r2.apk -o zstd-dev.apk && \
+    curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/riscv64/zstd-static-1.5.6-r2.apk -o zstd-static.apk && \
+    curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/riscv64/libbpf-dev-1.5.0-r0.apk -o libbpf-dev.apk && \
+    for f in *.apk; do \
+        tar -xzf "$f" -C /x-tools/riscv64-unknown-linux-musl/riscv64-unknown-linux-musl/sysroot 2>/dev/null || true; \
+    done && \
+    rm -rf /tmp/target-pkgs
+
+# 3. Create target gcc wrapper to ensure -lzstd -lz are linked with -lelf
+RUN mv /x-tools/riscv64-unknown-linux-musl/bin/riscv64-unknown-linux-musl-gcc /x-tools/riscv64-unknown-linux-musl/bin/riscv64-unknown-linux-musl-gcc.real && \
+    printf '#!/bin/sh\nfor arg in "$@"; do\n  if [ "$arg" = "-c" ] || [ "$arg" = "-E" ] || [ "$arg" = "-S" ]; then\n    exec /x-tools/riscv64-unknown-linux-musl/bin/riscv64-unknown-linux-musl-gcc.real "$@"\n  fi\ndone\nexec /x-tools/riscv64-unknown-linux-musl/bin/riscv64-unknown-linux-musl-gcc.real "$@" -lzstd -lz\n' > /x-tools/riscv64-unknown-linux-musl/bin/riscv64-unknown-linux-musl-gcc && \
+    chmod +x /x-tools/riscv64-unknown-linux-musl/bin/riscv64-unknown-linux-musl-gcc
+
+# 4. Smoke check target static libraries
+RUN file /x-tools/riscv64-unknown-linux-musl/riscv64-unknown-linux-musl/sysroot/usr/lib/libelf.a && \
+    file /x-tools/riscv64-unknown-linux-musl/riscv64-unknown-linux-musl/sysroot/usr/lib/libz.a && \
+    file /x-tools/riscv64-unknown-linux-musl/riscv64-unknown-linux-musl/sysroot/usr/lib/libbpf.a
+
+# 5. Compile and link minimal probe test using target cross compiler
+RUN printf '#include <libelf.h>\n#include <zlib.h>\nint main(void) { return elf_version(EV_CURRENT) == EV_NONE; }\n' > /tmp/test_target.c && \
+    /x-tools/riscv64-unknown-linux-musl/bin/riscv64-unknown-linux-musl-gcc -I/x-tools/riscv64-unknown-linux-musl/riscv64-unknown-linux-musl/sysroot/usr/include /tmp/test_target.c -L/x-tools/riscv64-unknown-linux-musl/riscv64-unknown-linux-musl/sysroot/usr/lib -lelf -lz -o /tmp/test_target && \
+    file /tmp/test_target && \
+    rm -f /tmp/test_target.c /tmp/test_target
+
+# 6. Target-specific compiler environment variables for libbpf-sys and cc crate
+ENV CC_riscv64gc_unknown_linux_musl=riscv64-unknown-linux-musl-gcc
+ENV AR_riscv64gc_unknown_linux_musl=riscv64-unknown-linux-musl-ar
+ENV CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER=riscv64-unknown-linux-musl-gcc
+ENV TARGET_CC=riscv64-unknown-linux-musl-gcc
+ENV TARGET_AR=riscv64-unknown-linux-musl-ar
+ENV CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C target-feature=+crt-static"
+
+# 7. Library paths for target linking (no host-side extra include paths)
+ENV LIBBPF_SYS_LIBRARY_PATH_riscv64gc_unknown_linux_musl="/x-tools/riscv64-unknown-linux-musl/riscv64-unknown-linux-musl/sysroot/usr/lib"

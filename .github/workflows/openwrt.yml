@@ -1,0 +1,520 @@
+name: OpenWrt Packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openwrt-packages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 1. Official Release Blocking Native Agent Builds
+  build-agent-binaries:
+    name: Build Agent Binary (${{ matrix.arch }}) [Official]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build agent binary via Docker
+        run: |
+          docker build \
+            --target builder \
+            -f deploy/docker/Dockerfile.agent \
+            -t netqmon-agent-builder:${{ matrix.arch }} \
+            .
+          mkdir -p dist
+          id=$(docker create netqmon-agent-builder:${{ matrix.arch }})
+          docker cp "$id:/netqmon-agent" "dist/netqmon-agent_${{ matrix.arch }}"
+          docker rm "$id"
+          chmod 0755 "dist/netqmon-agent_${{ matrix.arch }}"
+          file "dist/netqmon-agent_${{ matrix.arch }}"
+
+      - name: Upload agent binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-binaries-${{ matrix.arch }}
+          path: dist/netqmon-agent_${{ matrix.arch }}
+
+  # 2. Official Cross-Compilation for armv7hf (Release Blocking)
+  build-agent-armv7hf:
+    name: Build Agent Binary (armv7hf) [Official]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-musleabihf
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with cross
+        run: |
+          cross build --release --package netqmon-agent --target armv7-unknown-linux-musleabihf
+          mkdir -p dist
+          cp target/armv7-unknown-linux-musleabihf/release/netqmon-agent dist/netqmon-agent_armv7hf
+          chmod 0755 dist/netqmon-agent_armv7hf
+
+      - name: Smoke test binary metadata
+        run: |
+          file dist/netqmon-agent_armv7hf
+          readelf -h dist/netqmon-agent_armv7hf
+          readelf -d dist/netqmon-agent_armv7hf || true
+
+      - name: Smoke test execution via QEMU user
+        run: |
+          sudo apt-get update && sudo apt-get install -y qemu-user-static
+          qemu-arm-static dist/netqmon-agent_armv7hf --version
+
+      - name: Upload agent binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-binaries-armv7hf
+          path: dist/netqmon-agent_armv7hf
+
+  # 3. Candidate Official Cross-Compilation for RISC-V64 (Non-blocking)
+  build-agent-riscv64:
+    name: Build Agent Binary (riscv64) [Candidate Official]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv64gc-unknown-linux-musl
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with cross
+        run: |
+          RUSTFLAGS="-C target-feature=+crt-static" cross build --release --package netqmon-agent --target riscv64gc-unknown-linux-musl
+          mkdir -p dist
+          cp target/riscv64gc-unknown-linux-musl/release/netqmon-agent dist/netqmon-agent_riscv64
+          chmod 0755 dist/netqmon-agent_riscv64
+
+      - name: Verify riscv64 artifact
+        run: |
+          file dist/netqmon-agent_riscv64
+          readelf -h dist/netqmon-agent_riscv64
+          readelf -d dist/netqmon-agent_riscv64 || true
+
+          # Check static linkage and architecture
+          file dist/netqmon-agent_riscv64 | grep -q "statically linked"
+          readelf -h dist/netqmon-agent_riscv64 | grep -q "RISC-V"
+
+          # Smoke test execution via QEMU user
+          sudo apt-get update && sudo apt-get install -y qemu-user-static
+          qemu-riscv64-static dist/netqmon-agent_riscv64 --version
+
+      - name: Upload agent binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-binaries-riscv64
+          path: dist/netqmon-agent_riscv64
+
+  # 3b. Experimental: MIPSEL (MIPS32r2 little-endian, soft-float)
+  build-agent-mipsel:
+    name: Build Agent [mipsel-unknown-linux-musl] (Experimental)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly toolchain (required for Tier 3 build-std)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with cross
+        run: |
+          RUSTFLAGS="-C target-feature=+crt-static" cross build --release --package netqmon-agent --target mipsel-unknown-linux-musl
+          mkdir -p dist
+          cp target/mipsel-unknown-linux-musl/release/netqmon-agent dist/netqmon-agent_mipsel32r2
+          chmod 0755 dist/netqmon-agent_mipsel32r2
+
+      - name: Verify mipsel artifact
+        run: |
+          file dist/netqmon-agent_mipsel32r2
+          readelf -h dist/netqmon-agent_mipsel32r2
+          readelf -A dist/netqmon-agent_mipsel32r2
+          readelf -d dist/netqmon-agent_mipsel32r2 || true
+
+          # Check static linkage and architecture
+          file dist/netqmon-agent_mipsel32r2 | grep -q "statically linked"
+          readelf -h dist/netqmon-agent_mipsel32r2 | grep -q "MIPS"
+          readelf -A dist/netqmon-agent_mipsel32r2 | grep -i "soft float"
+
+          # Smoke test execution via QEMU user
+          sudo apt-get update && sudo apt-get install -y qemu-user-static
+          qemu-mipsel-static dist/netqmon-agent_mipsel32r2 --version
+
+      - name: Upload agent binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-binaries-mipsel32r2
+          path: dist/netqmon-agent_mipsel32r2
+
+  # 4. Official OpenWrt Packages (Blocking: x86_64, aarch64, and armv7hf)
+  job_build:
+    name: Build OpenWrt Package [${{ matrix.platform }}-${{ matrix.ver }}]
+    needs: [build-agent-binaries, build-agent-armv7hf]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- 24.10.2 (ipk) ---
+          - platform: x86_64
+            sdk_ver: 24.10.2
+            ver: "ipk"
+            arch: x86_64
+          - platform: aarch64_generic
+            sdk_ver: 24.10.2
+            ver: "ipk"
+            arch: aarch64
+          - platform: aarch64_cortex-a53
+            sdk_ver: 24.10.2
+            ver: "ipk"
+            arch: aarch64
+          - platform: aarch64_cortex-a72
+            sdk_ver: 24.10.2
+            ver: "ipk"
+            arch: aarch64
+          - platform: aarch64_cortex-a76
+            sdk_ver: 24.10.2
+            ver: "ipk"
+            arch: aarch64
+          - platform: arm_cortex-a7_vfpv4
+            sdk_ver: 24.10.2
+            ver: "ipk"
+            arch: armv7hf
+          - platform: arm_cortex-a7_neon-vfpv4
+            sdk_ver: 24.10.2
+            ver: "ipk"
+            arch: armv7hf
+          - platform: arm_cortex-a9_neon
+            sdk_ver: 24.10.2
+            ver: "ipk"
+            arch: armv7hf
+          - platform: arm_cortex-a9_vfpv3-d16
+            sdk_ver: 24.10.2
+            ver: "ipk"
+            arch: armv7hf
+          - platform: arm_cortex-a15_neon-vfpv4
+            sdk_ver: 24.10.2
+            ver: "ipk"
+            arch: armv7hf
+          - platform: arm_cortex-a5_vfpv4
+            sdk_ver: 24.10.2
+            ver: "ipk"
+            arch: armv7hf
+          - platform: arm_cortex-a8_vfpv3
+            sdk_ver: 24.10.2
+            ver: "ipk"
+            arch: armv7hf
+
+          # --- snapshots (apk) ---
+          - platform: x86_64
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: x86_64
+          - platform: aarch64_generic
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: aarch64
+          - platform: aarch64_cortex-a53
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: aarch64
+          - platform: aarch64_cortex-a72
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: aarch64
+          - platform: aarch64_cortex-a76
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: aarch64
+          - platform: arm_cortex-a7_vfpv4
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: armv7hf
+          - platform: arm_cortex-a7_neon-vfpv4
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: armv7hf
+          - platform: arm_cortex-a9_neon
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: armv7hf
+          - platform: arm_cortex-a9_vfpv3-d16
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: armv7hf
+          - platform: arm_cortex-a15_neon-vfpv4
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: armv7hf
+          - platform: arm_cortex-a5_vfpv4
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: armv7hf
+          - platform: arm_cortex-a8_vfpv3
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: armv7hf
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download agent binary
+        uses: actions/download-artifact@v4
+        with:
+          name: agent-binaries-${{ matrix.arch }}
+          path: packaging/openwrt/netqmon/bin
+
+      - name: Prepare packaging files
+        run: |
+          chmod 0755 packaging/openwrt/netqmon/bin/*
+          mkdir -p packaging/openwrt/bin
+          cp -r packaging/openwrt/netqmon/bin/* packaging/openwrt/bin/
+          echo "CONFIG_PACKAGE_netqmon-agent=m" > .config
+          echo "CONFIG_PACKAGE_luci-app-netqmon=m" >> .config
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${version}/" packaging/openwrt/netqmon/Makefile
+            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${version}/" packaging/openwrt/luci-app-netqmon/Makefile
+          fi
+
+      - name: Build with OpenWrt SDK
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: ${{ matrix.sdk_ver == 'snapshots' && matrix.platform || format('{0}-{1}', matrix.platform, matrix.sdk_ver) }}
+          FEED_DIR: ${{ github.workspace }}/packaging/openwrt
+          PACKAGES: netqmon luci-app-netqmon
+          NO_SHFMT_CHECK: "1"
+          NO_REFRESH_CHECK: "1"
+          V: s
+
+      - name: Process and Rename Artifacts
+        id: compile
+        run: |
+          mkdir -p ${{ github.workspace }}/upload
+          
+          find bin/packages/ -type f \( -name 'netqmon-*.ipk' -o -name 'netqmon-*.apk' -o -name 'netqmon_*.ipk' -o -name 'netqmon_*.apk' -o -name 'luci-app-netqmon*.ipk' -o -name 'luci-app-netqmon*.apk' \) -exec cp {} ${{ github.workspace }}/upload/ \;
+          
+          cd ${{ github.workspace }}/upload
+          
+          if [ -z "$(ls -A . 2>/dev/null)" ]; then
+            echo "Error: no ipk/apk artifacts found"
+            exit 1
+          fi
+          
+          ARCH="${{ matrix.platform }}"
+          ARCH_ESCAPED=$(echo "$ARCH" | sed 's/[.*+?^${}()|[\]\\]/\\&/g')
+          
+          for file in *; do
+            if [[ -f "$file" ]]; then
+              filename="${file%.*}"
+              extension="${file##*.}"
+              
+              if [[ ! "$filename" =~ _all$ ]] && [[ ! "$filename" =~ (^|[_-])${ARCH_ESCAPED}$ ]]; then
+                new_name="${filename}_${ARCH}.${extension}"
+                mv "$file" "$new_name"
+                echo "Renamed: $file -> $new_name"
+              else
+                echo "Skipped: $file already contains architecture or is all."
+              fi
+            fi
+          done
+          
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "FIRMWARE=${{ github.workspace }}/upload" >> $GITHUB_ENV
+
+      - name: Upload OpenWrt artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-${{ matrix.platform }}-${{ matrix.ver }}
+          path: upload/
+
+      - name: Publish GitHub release assets
+        if: startsWith(github.ref, 'refs/tags/v') && steps.compile.outputs.status == 'success'
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          files: ${{ env.FIRMWARE }}/*
+
+  # 5. Experimental OpenWrt Packages (Non-blocking: RISC-V64 & MIPSEL)
+  job_build_experimental:
+    name: Build OpenWrt Package [${{ matrix.platform }}-${{ matrix.ver }}] [${{ matrix.status }}]
+    needs: [build-agent-riscv64, build-agent-mipsel]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- 24.10.2 (ipk) ---
+          - platform: riscv64_riscv64
+            sdk_ver: 24.10.2
+            ver: "ipk"
+            arch: riscv64
+            status: "Candidate Official"
+          - platform: mipsel_24kc
+            sdk_ver: 24.10.2
+            ver: "ipk"
+            arch: mipsel32r2
+            status: "Experimental"
+          - platform: mipsel_74kc
+            sdk_ver: 24.10.2
+            ver: "ipk"
+            arch: mipsel32r2
+            status: "Experimental"
+          - platform: mipsel_24kc_24kf
+            sdk_ver: 24.10.2
+            ver: "ipk"
+            arch: mipsel32r2
+            status: "Compatibility Test"
+
+          # --- snapshots (apk) ---
+          - platform: riscv64_riscv64
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: riscv64
+            status: "Candidate Official"
+          - platform: mipsel_24kc
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: mipsel32r2
+            status: "Experimental"
+          - platform: mipsel_74kc
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: mipsel32r2
+            status: "Experimental"
+          - platform: mipsel_24kc_24kf
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: mipsel32r2
+            status: "Compatibility Test"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download agent binary
+        uses: actions/download-artifact@v4
+        with:
+          name: agent-binaries-${{ matrix.arch }}
+          path: packaging/openwrt/netqmon/bin
+
+      - name: Prepare packaging files
+        run: |
+          chmod 0755 packaging/openwrt/netqmon/bin/*
+          mkdir -p packaging/openwrt/bin
+          cp -r packaging/openwrt/netqmon/bin/* packaging/openwrt/bin/
+          echo "CONFIG_PACKAGE_netqmon-agent=m" > .config
+          echo "CONFIG_PACKAGE_luci-app-netqmon=m" >> .config
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${version}/" packaging/openwrt/netqmon/Makefile
+            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${version}/" packaging/openwrt/luci-app-netqmon/Makefile
+          fi
+
+      - name: Build with OpenWrt SDK
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: ${{ matrix.sdk_ver == 'snapshots' && matrix.platform || format('{0}-{1}', matrix.platform, matrix.sdk_ver) }}
+          FEED_DIR: ${{ github.workspace }}/packaging/openwrt
+          PACKAGES: netqmon luci-app-netqmon
+          NO_SHFMT_CHECK: "1"
+          NO_REFRESH_CHECK: "1"
+          V: s
+
+      - name: Process and Rename Artifacts
+        id: compile
+        run: |
+          mkdir -p ${{ github.workspace }}/upload
+          
+          find bin/packages/ -type f \( -name 'netqmon-*.ipk' -o -name 'netqmon-*.apk' -o -name 'netqmon_*.ipk' -o -name 'netqmon_*.apk' -o -name 'luci-app-netqmon*.ipk' -o -name 'luci-app-netqmon*.apk' \) -exec cp {} ${{ github.workspace }}/upload/ \;
+          
+          cd ${{ github.workspace }}/upload
+          
+          if [ -z "$(ls -A . 2>/dev/null)" ]; then
+            echo "Error: no ipk/apk artifacts found"
+            exit 1
+          fi
+          
+          ARCH="${{ matrix.platform }}"
+          ARCH_ESCAPED=$(echo "$ARCH" | sed 's/[.*+?^${}()|[\]\\]/\\&/g')
+          
+          for file in *; do
+            if [[ -f "$file" ]]; then
+              filename="${file%.*}"
+              extension="${file##*.}"
+              
+              if [[ ! "$filename" =~ _all$ ]] && [[ ! "$filename" =~ (^|[_-])${ARCH_ESCAPED}$ ]]; then
+                new_name="${filename}_${ARCH}.${extension}"
+                mv "$file" "$new_name"
+                echo "Renamed: $file -> $new_name"
+              else
+                echo "Skipped: $file already contains architecture or is all."
+              fi
+            fi
+          done
+          
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "FIRMWARE=${{ github.workspace }}/upload" >> $GITHUB_ENV
+
+      - name: Upload OpenWrt artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-${{ matrix.platform }}-${{ matrix.ver }}
+          path: upload/
+
+      - name: Publish GitHub release assets
+        if: startsWith(github.ref, 'refs/tags/v') && steps.compile.outputs.status == 'success'
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          files: ${{ env.FIRMWARE }}/*
+

@@ -1,0 +1,45 @@
+{
+  "admin/services/netqmon": {
+    "title": "NetQMon",
+    "order": 60,
+    "action": {
+      "type": "firstchild"
+    },
+    "depends": {
+      "acl": ["luci-app-netqmon"],
+      "uci": { "netqmon": true }
+    }
+  },
+  "admin/services/netqmon/status": {
+    "title": "Status",
+    "order": 10,
+    "action": {
+      "type": "view",
+      "path": "netqmon/status"
+    }
+  },
+  "admin/services/netqmon/general": {
+    "title": "General",
+    "order": 20,
+    "action": {
+      "type": "view",
+      "path": "netqmon/general"
+    }
+  },
+  "admin/services/netqmon/advanced": {
+    "title": "Advanced",
+    "order": 30,
+    "action": {
+      "type": "view",
+      "path": "netqmon/advanced"
+    }
+  },
+  "admin/services/netqmon/update": {
+    "title": "Update",
+    "order": 40,
+    "action": {
+      "type": "view",
+      "path": "netqmon/update"
+    }
+  }
+}

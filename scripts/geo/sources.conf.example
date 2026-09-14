@@ -1,0 +1,10 @@
+# filename.mmdb URL SHA256
+#
+# Default GeoLite2 databases (provided via P3TERX/GeoLite.mmdb mirror):
+# update.sh and Collector will automatically download and install the latest MMDB databases.
+GeoLite2-City.mmdb https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-City.mmdb -
+GeoLite2-ASN.mmdb https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-ASN.mmdb -
+#
+# Or configure provider-specific direct MMDB download URLs with SHA-256 digests:
+# GeoLite2-City.mmdb https://geo.example.invalid/latest/city.mmdb REPLACE_WITH_SHA256
+# GeoLite2-ASN.mmdb https://geo.example.invalid/latest/asn.mmdb REPLACE_WITH_SHA256

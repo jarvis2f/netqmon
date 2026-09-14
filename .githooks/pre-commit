@@ -1,0 +1,28 @@
+#!/bin/sh
+
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+echo "Checking Rust formatting (cargo fmt)..."
+if ! cargo fmt --all --check; then
+    echo >&2
+    echo "Commit blocked: Rust formatting check failed." >&2
+    echo "Run 'cargo fmt --all', review changes, and commit again." >&2
+    exit 1
+fi
+
+echo "Checking Web staged formatting..."
+staged_web_files=$(git diff --cached --name-only --diff-filter=d | grep -E '\.(ts|tsx|js|jsx|json|mjs)$' || true)
+if [ -n "$staged_web_files" ]; then
+    echo "Running prettier check on staged Web files..."
+    if ! echo "$staged_web_files" | xargs npx prettier --check; then
+        echo >&2
+        echo "Commit blocked: Web code formatting check failed." >&2
+        echo "Run 'echo \"\$staged_web_files\" | xargs npx prettier --write' on staged files and commit again." >&2
+        exit 1
+    fi
+fi
+
+echo "Pre-commit checks passed successfully."

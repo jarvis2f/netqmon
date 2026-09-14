@@ -1,0 +1,1160 @@
+{
+  "common": {
+    "metadata": {
+      "title": "netqmon · Local Network Observatory",
+      "description": "OpenWrt network observability"
+    },
+    "actions": {
+      "save": "Save",
+      "saveChanges": "Save Changes",
+      "cancel": "Cancel",
+      "retry": "Retry",
+      "refresh": "Refresh",
+      "copy": "Copy",
+      "copied": "Copied",
+      "filter": "Filter",
+      "clearAll": "Clear all",
+      "viewAll": "View all",
+      "apply": "Apply",
+      "applyRange": "Apply Range",
+      "applyFilters": "Apply filters",
+      "runNow": "Run Now",
+      "openFullDetails": "Open full details",
+      "close": "Close",
+      "expand": "Expand",
+      "collapse": "Collapse"
+    },
+    "status": {
+      "online": "Online",
+      "offline": "Offline",
+      "degraded": "Degraded",
+      "active": "Active",
+      "idle": "Idle",
+      "ended": "Ended",
+      "unknown": "Unknown",
+      "warning": "Warning",
+      "live": "LIVE",
+      "delayed": "Delayed",
+      "review": "Review",
+      "clear": "Clear"
+    },
+    "direction": {
+      "upload": "Upload",
+      "download": "Download",
+      "bidirectional": "Bidirectional",
+      "local": "Local",
+      "unknown": "Unknown"
+    },
+    "timeRange": {
+      "range15m": "15m",
+      "range1h": "1h",
+      "range24h": "24h",
+      "range7d": "7d",
+      "range30d": "30d",
+      "custom": "Custom",
+      "live15m": "Live 15m",
+      "customRange": "Custom range",
+      "lastRange": "Last {range}"
+    },
+    "pagination": {
+      "previous": "Previous",
+      "next": "Next",
+      "showingCount": "Showing {count} items",
+      "showingItems": "Showing {count} items",
+      "totalItems": "{total} items"
+    },
+    "language": {
+      "switchLanguage": "Switch language"
+    },
+    "user": {
+      "userMenu": "User menu",
+      "signedInAs": "Signed in as",
+      "logout": "Log out"
+    },
+    "theme": {
+      "switchTheme": "Current theme: {theme}. Click to switch theme.",
+      "themeTitle": "Theme: {theme} (Click to cycle)"
+    }
+  },
+  "topologyValues": {
+    "mode": {
+      "router": "Router",
+      "one-arm-router": "One-arm router",
+      "bridge": "Bridge",
+      "host": "Host",
+      "unknown": "Unknown"
+    },
+    "role": {
+      "lan": "LAN",
+      "routed_lan": "Routed LAN",
+      "tunnel": "Tunnel",
+      "wan": "WAN",
+      "unknown": "Unknown",
+      "unresolved": "Unresolved"
+    },
+    "nat": {
+      "unknown": "Unknown",
+      "disabled": "Disabled",
+      "masquerade": "Masquerade",
+      "none": "None",
+      "snat": "SNAT",
+      "dnat": "DNAT",
+      "both": "SNAT + DNAT"
+    },
+    "backend": {
+      "tcx": "TCX",
+      "netlink": "Netlink",
+      "unknown": "Unknown"
+    },
+    "order": {
+      "first": "First",
+      "last": "Last",
+      "netlink": "Priority {priority} / handle {handle}"
+    },
+    "coverage": {
+      "full": "Full",
+      "partial": "Partial",
+      "none": "None",
+      "unknown": "Unknown"
+    },
+    "status": {
+      "enabled": "Enabled",
+      "disabled": "Disabled",
+      "unknown": "Unknown",
+      "unspecified": "Unspecified"
+    },
+    "scope": {
+      "internet": "Internet",
+      "internal": "Internal",
+      "tunnel": "Tunnel",
+      "unknown": "Unknown"
+    },
+    "path": {
+      "forwarded": "Forwarded",
+      "internal": "Internal",
+      "tunnel": "Tunnel",
+      "unknown": "Unknown"
+    },
+    "warnings": {
+      "icmpRedirect": "Clients may bypass this agent through ICMP redirects.",
+      "ipv6Unavailable": "IPv6 Internet coverage is unavailable because no IPv6 default route was found.",
+      "flowOffload": "Flow offloading is enabled and may bypass eBPF/TC traffic visibility.",
+      "asymmetricRouting": "Asymmetric routing is suspected because reply-packet coverage is below 5%."
+    }
+  },
+  "navigation": {
+    "overview": "Overview",
+    "traffic": "Traffic",
+    "applications": "Applications",
+    "clients": "Clients",
+    "destinations": "Destinations",
+    "flows": "Flows",
+    "insights": "Insights",
+    "settings": "Settings",
+    "mainNavigation": "Main Navigation",
+    "settingsNavigation": "Settings Navigation",
+    "primaryNavigationSidebar": "Primary navigation sidebar",
+    "mobileNavigation": "Mobile navigation",
+    "collapseSidebar": "Collapse sidebar",
+    "expandSidebar": "Expand sidebar",
+    "closeNavigation": "Close navigation menu",
+    "systemStatus": "System Status",
+    "statusNormal": "Operational",
+    "statusNormalDesc": "All systems operational",
+    "statusDegraded": "Degraded",
+    "statusDegradedDesc": "Some services degraded",
+    "statusOffline": "Offline",
+    "statusOfflineDesc": "Unable to reach gateway"
+  },
+  "auth": {
+    "controlPlane": "netqmon · Network Observability",
+    "nodeTitle": "LOCAL OBSERVABILITY NODE",
+    "heroTitle": "Visualize traffic,\nmaster your network.",
+    "heroSubtitle": "High-performance local network monitoring & flow analytics.",
+    "badge01": "100% Local",
+    "badge02": "Real-time",
+    "badge03": "Zero Cloud",
+    "setupStep": "System Setup",
+    "loginStep": "Admin Authentication",
+    "createAdmin": "Create Local Administrator",
+    "enterConsole": "Sign in to Console",
+    "setupDesc": "Set up your administrator credentials to secure your console.",
+    "loginDesc": "Enter your administrator credentials to continue.",
+    "username": "Username",
+    "password": "Password",
+    "loginButton": "Sign in",
+    "setupButton": "Complete Setup",
+    "establishingSession": "Signing in…",
+    "sessionFooter": "Secure Console · Telemetry stays local on your gateway",
+    "wan": "WAN / Internet",
+    "gateway": "netqmon Gateway",
+    "clients": "LAN Clients",
+    "telemetryLive": "Live Flow Telemetry",
+    "bandwidth": "Throughput",
+    "latency": "Latency",
+    "activeFlows": "Active Flows",
+    "errors": {
+      "cannotConnectCollector": "Unable to connect to local Collector. Please verify the service is running.",
+      "failed": "Authentication failed. Please check your credentials and try again.",
+      "serviceUnavailable": "Authentication service is temporarily unavailable. Please try again later."
+    }
+  },
+  "overview": {
+    "title": "Overview",
+    "subtitle": "Live network traffic and gateway status",
+    "download": "Internet Download",
+    "upload": "Internet Upload",
+    "activeFlows": "Active Internet Flows",
+    "onlineClients": "Online Clients",
+    "realtime": "Realtime",
+    "waitingTelemetry": "Waiting for gateway telemetry",
+    "currentTrackedSessions": "Current tracked sessions",
+    "seenLatestInterval": "Seen in the latest interval",
+    "knownClients": "{count} known clients",
+    "trafficLast15m": "Traffic — Last 15 minutes",
+    "waitingTraffic": "Waiting for realtime traffic",
+    "gatewayOffline": "Gateway is offline",
+    "topApplications": "Top Applications",
+    "topClients": "Top Clients",
+    "topDestinations": "Top Destinations",
+    "categoryDistribution": "Category Distribution",
+    "gatewayHealth": "Gateway Health",
+    "noGatewayEnrolled": "No gateway enrolled",
+    "lastSeen": "Last seen",
+    "openwrt": "OpenWrt",
+    "kernel": "Kernel",
+    "agent": "Agent",
+    "offloading": "Offloading",
+    "counterCheck": "Counter Check",
+    "noCaptureWarnings": "No capture warnings reported",
+    "unknownClient": "Unknown client",
+    "destination": "Destination",
+    "other": "Other",
+    "captureDegradedHfo": "hardware flow offloading is enabled",
+    "captureDegradedBatches": "{count} dropped telemetry batches",
+    "captureDegradedDns": "{count} dropped DNS events",
+    "captureDegradedProbes": "{count} dropped protocol probe events",
+    "captureDegradedCounters": "interface counters exceeded captured flow deltas ({interfaceDelta}B interface, {flowDelta}B flows)",
+    "captureDegradedPrefix": "Capture degraded: {reasons}",
+    "captureNoTelemetry": "Capture health telemetry has not been reported",
+    "offlineThreshold": "No gateway telemetry has arrived within the offline threshold",
+    "decodeError": "Realtime snapshot could not be decoded",
+    "loadError": "Unable to load overview"
+  },
+  "traffic": {
+    "title": "Traffic",
+    "subtitle": "Historical throughput by client, application, or category",
+    "direction": "Direction",
+    "both": "Download + Upload",
+    "downloadOption": "Download",
+    "uploadOption": "Upload",
+    "groupBy": "Group by",
+    "none": "None",
+    "client": "Client",
+    "application": "Application",
+    "category": "Category",
+    "flowObservations": "Flow observations",
+    "breakdownGroups": "Breakdown groups",
+    "aggregatedSamples": "Aggregated samples",
+    "groupedBy": "Grouped by {group}",
+    "historyUnavailable": "Traffic history unavailable",
+    "trafficBreakdown": "Traffic breakdown",
+    "breakdownDesc": "Totals for the selected range, ordered by traffic volume.",
+    "groupsCount": "{count} groups",
+    "noTrafficRecorded": "No traffic recorded",
+    "noTelemetryDesc": "No telemetry was stored in the selected time range.",
+    "scope": "Scope",
+    "scopes": {
+      "internet": "Internet",
+      "internal": "Internal",
+      "tunnel": "Tunnel",
+      "all": "All"
+    },
+    "historicalScope": "Historical traffic and breakdown",
+    "loadError": "Unable to load traffic history",
+    "columns": {
+      "download": "Download",
+      "upload": "Upload",
+      "total": "Total",
+      "packets": "Packets",
+      "flows": "Flows",
+      "lastSeen": "Last Seen"
+    }
+  },
+  "applications": {
+    "title": "Applications",
+    "subtitle": "Classified network activity",
+    "searchPlaceholder": "Search application, organization, or class",
+    "searchAria": "Search applications",
+    "applicationsCount": "{count, plural, one {# application} other {# applications}}",
+    "unavailable": "Applications unavailable",
+    "summariesScope": "Application summaries",
+    "notFound": "No applications found",
+    "notFoundSearch": "No application matches the current search.",
+    "notFoundEmpty": "No classified traffic has been recorded yet.",
+    "openFullDetails": "Open full details",
+    "columns": {
+      "application": "Application",
+      "organization": "Organization",
+      "trafficClass": "Traffic Class",
+      "download": "Download",
+      "upload": "Upload",
+      "total": "Total",
+      "clients": "Clients",
+      "flows": "Flows",
+      "lastSeen": "Last Seen"
+    },
+    "properties": {
+      "properties": "Properties",
+      "organization": "Organization",
+      "trafficClass": "Traffic Class",
+      "clients": "Clients",
+      "flows": "Flows",
+      "packets": "Packets",
+      "lastSeen": "Last seen"
+    },
+    "detail": {
+      "back": "Applications",
+      "unknownApp": "Unknown application",
+      "subtitle": "Traffic Class: {category} · {confidence}% classifier confidence",
+      "fallbackSubtitle": "Application traffic and related activity",
+      "allRecordedTraffic": "All recorded traffic",
+      "distinctClients": "Distinct classified clients",
+      "persistedObservations": "Persisted observations",
+      "classification": "Classification",
+      "classifierConfidence": "Classifier Confidence",
+      "classificationSource": "Classification Source",
+      "domainCount": "Domain Count",
+      "observedProtocols": "Observed Protocols",
+      "noMatchingRule": "No matching rule",
+      "rulesSource": "rules",
+      "trafficLast24h": "Traffic — Last 24 hours",
+      "topClients": "Top clients",
+      "topDomains": "Top domains",
+      "tabs": {
+        "overview": "Overview",
+        "clients": "Clients",
+        "domains": "Domains",
+        "destinations": "Destinations",
+        "flows": "Flows"
+      },
+      "empty": {
+        "noClients": "No clients",
+        "noClientsDesc": "No clients used this application in the selected window.",
+        "noDomains": "No domains",
+        "noDomainsDesc": "No DNS attribution is available for this application.",
+        "noDestinations": "No destinations",
+        "noDestinationsDesc": "No remote endpoints were recorded for this application.",
+        "noFlows": "No flows",
+        "noFlowsDesc": "No persisted flows are associated with this application."
+      }
+    }
+  },
+  "clients": {
+    "title": "Clients",
+    "subtitle": "Devices observed on the gateway",
+    "searchPlaceholder": "Search name, IP, MAC, vendor, or device type",
+    "searchAria": "Search clients",
+    "clientsCount": "{count, plural, one {# client} other {# clients}}",
+    "unavailable": "Clients unavailable",
+    "inventoryScope": "Client inventory",
+    "notFound": "No clients found",
+    "notFoundSearch": "No client matches the current search.",
+    "notFoundEmpty": "No device observations have arrived from the gateway.",
+    "openClientDetails": "Open client details",
+    "topology": {
+      "title": "Realtime Traffic Flow",
+      "subtitle": "Clients · Gateway · Internet Traffic Visualization",
+      "internet": "Internet / WAN",
+      "gateway": "OpenWrt Gateway",
+      "otherClients": "Other Clients",
+      "devicesCount": "{count, plural, one {# device} other {# devices}}",
+      "drilldownCategory": "Group: {category}",
+      "backToAllGroups": "Back to All Groups",
+      "groupMode": "Display Mode",
+      "byType": "By Device Type",
+      "byActivity": "By Activity",
+      "all": "Expand All",
+      "showFlow": "Show Topology",
+      "hideFlow": "Hide Topology",
+      "realtimeThroughput": "Live Throughput",
+      "totalDown": "Total Down",
+      "totalUp": "Total Up",
+      "activeFlows": "Active Flows",
+      "onlineDevices": "Online Devices",
+      "paused": "Paused",
+      "pauseAnimation": "Pause traffic animation",
+      "resumeAnimation": "Resume traffic animation",
+      "laneHint": "Lane width and particle density represent instantaneous throughput",
+      "legend": {
+        "download": "Download",
+        "upload": "Upload",
+        "wan": "WAN Uplink"
+      },
+      "categories": {
+        "computer": "Computers",
+        "mobile": "Mobile Devices",
+        "tv": "Media & TV",
+        "server": "Servers & NAS",
+        "iot": "Smart Home / IoT",
+        "other": "Other Devices"
+      }
+    },
+    "logicalTopology": {
+      "title": "Logical Topology",
+      "description": "Observed routing relationships, not a physical switch or mesh diagram",
+      "internet": "Internet",
+      "publicNetwork": "Public network",
+      "upstreamGateway": "Upstream Gateway",
+      "nextHop": "Default route next hop",
+      "agent": "netqmon Agent",
+      "agentFallback": "netqmon Agent",
+      "unknownAddress": "Address unknown",
+      "unknownMode": "Topology unknown",
+      "lanNetworks": "LAN & Routed Networks",
+      "tunnelNetworks": "Tunnel Networks",
+      "onlineClients": "{count} online clients",
+      "globalActiveFlows": "{count} global Internet flows",
+      "noSegments": "No LAN segments reported",
+      "noTunnels": "No tunnel segments reported",
+      "tunnel": "Tunnel",
+      "unresolvedClients": "Unresolved clients",
+      "unresolvedDescription": "Client addresses not matched to an agent-reported routed segment",
+      "backToSegment": "Back to segment",
+      "backToTopology": "Back to full topology",
+      "networksCount": "{count, plural, one {# routed network} other {# routed networks}}"
+    },
+    "columns": {
+      "status": "Status",
+      "name": "Name",
+      "ip": "IP",
+      "mac": "MAC",
+      "vendor": "Vendor",
+      "deviceType": "Type",
+      "download": "Download",
+      "upload": "Upload",
+      "flows": "Flows",
+      "lastSeen": "Last Seen"
+    },
+    "properties": {
+      "identity": "Identity",
+      "ip": "IP",
+      "mac": "MAC",
+      "serverApplication": "Server application",
+      "vendor": "Vendor",
+      "deviceType": "Device type",
+      "osFamily": "OS family",
+      "model": "Model",
+      "confidence": "Confidence",
+      "privateMac": "Private/random MAC",
+      "yes": "Yes",
+      "no": "No",
+      "flows": "Flows",
+      "lastSeen": "Last seen"
+    },
+    "detail": {
+      "back": "Clients",
+      "title": "Client details",
+      "fallbackSubtitle": "Client traffic and identity",
+      "realtimeDownload": "{scope} Realtime Download",
+      "realtimeUpload": "{scope} Realtime Upload",
+      "activeFlows": "Active Flows",
+      "totalToday": "Total Today",
+      "latestInterval": "Latest interval",
+      "realtimeUnavailable": "Realtime unavailable",
+      "currentSessions": "Current sessions",
+      "recordedTraffic": "Recorded {scope} client traffic",
+      "scopeMix": "Realtime traffic by scope",
+      "scopes": {
+        "internet": "Internet",
+        "internal": "Internal",
+        "tunnel": "Tunnel",
+        "all": "All"
+      },
+      "identity": "Device identity",
+      "realtimeTraffic15m": "Realtime traffic — Last 15 minutes",
+      "trafficHistory24h": "Traffic history — Last 24 hours",
+      "waitingTraffic": "Waiting for client traffic",
+      "clientOffline": "Client is offline",
+      "knownAddresses": "Known addresses",
+      "evidence": {
+        "source": "Source",
+        "field": "Field",
+        "value": "Value",
+        "confidence": "Confidence",
+        "hitCount": "Hits",
+        "observedAt": "Observed"
+      },
+      "tabs": {
+        "overview": "Overview",
+        "applications": "Applications",
+        "domains": "Domains",
+        "destinations": "Destinations",
+        "flows": "Flows"
+      },
+      "empty": {
+        "noApps": "No applications",
+        "noAppsDesc": "No classified application traffic is associated with this client.",
+        "noDomains": "No domains",
+        "noDomainsDesc": "No DNS attribution is available for this client.",
+        "noDestinations": "No destinations",
+        "noDestinationsDesc": "No remote endpoints were recorded for this client.",
+        "noFlows": "No flows",
+        "noFlowsDesc": "No persisted flows are associated with this client."
+      }
+    }
+  },
+  "destinations": {
+    "title": "Destinations",
+    "subtitle": "Remote endpoints observed in network traffic",
+    "unavailable": "Destinations unavailable",
+    "summariesScope": "Destination summaries",
+    "geoError": "Destination traffic is available, but Geo summaries could not be loaded: {error}",
+    "geoNotEnabled": "Destination traffic is available. Country and ASN enrichment are not enabled. Add supported MMDB files to the configured Geo directory.",
+    "topCountries": "Top Countries",
+    "topAsns": "Top ASNs",
+    "countryDistribution": "Country Distribution",
+    "noCountryMatches": "No country matches in the installed database",
+    "noAsnMatches": "No ASN matches in the installed database",
+    "notEnabled": "Not enabled",
+    "destinationsCount": "{count, plural, one {# destination} other {# destinations}}",
+    "emptyTitle": "No destinations",
+    "emptyDesc": "No remote endpoints have been recorded yet.",
+    "view": "View",
+    "viewTable": "Table View",
+    "viewMap": "Map View",
+    "table": "Table",
+    "map": "Map",
+    "mapTitle": "Network Traffic Destination Map",
+    "mapSubtitle": "Traffic flow from gateway to external destinations",
+    "sourceGateway": "Source: {name}",
+    "download": "Download",
+    "upload": "Upload",
+    "total": "Total",
+    "country": "Country/Region",
+    "noGeoPoints": "No geolocated destinations",
+    "noGeoPointsDesc": "Destinations observed in this time range lack geographic coordinate data.",
+    "viewRelatedFlows": "View related flows",
+    "columns": {
+      "ip": "IP",
+      "domain": "Domain",
+      "asn": "ASN",
+      "country": "Country",
+      "traffic": "Traffic",
+      "clients": "Clients",
+      "flows": "Flows"
+    },
+    "properties": {
+      "identity": "Identity",
+      "ip": "IP",
+      "domain": "Domain",
+      "country": "Country",
+      "region": "Region",
+      "asn": "ASN",
+      "organization": "Organization",
+      "traffic": "Traffic",
+      "download": "Download",
+      "upload": "Upload",
+      "clients": "Clients",
+      "flows": "Flows",
+      "lastSeen": "Last seen"
+    }
+  },
+  "flows": {
+    "title": "Flows",
+    "subtitle": "Persisted network sessions with classification evidence",
+    "unavailable": "Flows unavailable",
+    "sessionsScope": "Filtered Flow sessions",
+    "searchPlaceholder": "Search IP, domain, client, or application",
+    "exactFilters": "Exact filters",
+    "applyFilters": "Apply filters",
+    "showingCount": "Showing {count} flows",
+    "emptyTitle": "No flows found",
+    "emptyDesc": "No Flow sessions match the current filters and time range.",
+    "columns": {
+      "time": "Time",
+      "client": "Client",
+      "classification": "Classification",
+      "destination": "Destination",
+      "transport": "Transport",
+      "direction": "Direction",
+      "download": "Download",
+      "upload": "Upload",
+      "duration": "Duration",
+      "scope": "Scope",
+      "path": "Path"
+    },
+    "filterLabels": {
+      "client": "Client",
+      "application": "Application",
+      "domain": "Domain",
+      "ip": "IP",
+      "protocol": "Protocol",
+      "port": "Port",
+      "direction": "Direction",
+      "scope": "Scope",
+      "path": "Path",
+      "nat": "NAT"
+    },
+    "values": {
+      "internet": "Internet",
+      "internal": "Internal",
+      "tunnel": "Tunnel",
+      "forwarded": "Forwarded",
+      "none": "None",
+      "snat": "SNAT",
+      "dnat": "DNAT",
+      "both": "Both"
+    },
+    "panel": {
+      "identity": "Identity",
+      "client": "Client",
+      "clientIp": "Client IP",
+      "remote": "Remote",
+      "domain": "Domain",
+      "organization": "Organization",
+      "application": "Application",
+      "trafficClass": "Traffic class",
+      "trafficRole": "Traffic role",
+      "session": "Session",
+      "transport": "Transport",
+      "detectedProtocol": "Detected protocol",
+      "direction": "Direction",
+      "clientPort": "Client port",
+      "remotePort": "Remote port",
+      "download": "Download",
+      "upload": "Upload",
+      "packets": "Packets",
+      "started": "Started",
+      "lastSeen": "Last seen",
+      "duration": "Duration",
+      "classification": "Classification",
+      "result": "Result",
+      "overallConfidence": "Overall confidence",
+      "organizationConfidence": "Organization confidence",
+      "applicationConfidence": "Application confidence",
+      "protocolConfidence": "Protocol confidence",
+      "reason": "Reason",
+      "evidence": "Evidence",
+      "noEvidence": "No matching evidence",
+      "noMatchingRule": "No matching rule",
+      "likelyApp": "Likely {app}",
+      "protocolNamed": "Protocol {protocol}",
+      "organizationNamed": "Organization {org}",
+      "networkPath": "Network Path",
+      "scope": "Scope",
+      "path": "Path",
+      "sourceSegment": "Source Segment",
+      "destinationSegment": "Destination Segment",
+      "nat": "NAT",
+      "topology": "Topology",
+      "internet": "Internet"
+    }
+  },
+  "insights": {
+    "title": "Insights",
+    "subtitle": "Rule-based observations with inspectable evidence",
+    "unavailable": "Insights unavailable",
+    "observationsScope": "Rule-based observations",
+    "captureWarningBanner": "{count, plural, one {# capture quality condition may affect traffic visibility.} other {# capture quality conditions may affect traffic visibility.}}",
+    "refreshAria": "Refresh insights",
+    "observed24h": "Observed · 24h",
+    "findingsDetail": "explainable findings",
+    "unknownTraffic": "Unknown traffic",
+    "coverageDetail": "classifier coverage",
+    "captureQuality": "Capture quality",
+    "conditionsDetail": "{count} active conditions",
+    "noDegradation": "no reported degradation",
+    "filters": {
+      "all": "All evidence",
+      "devices": "Devices",
+      "traffic": "Traffic & Spikes",
+      "security": "Security & Tunnel",
+      "quality": "Quality & Classification",
+      "system": "System & Capture"
+    },
+    "matchesCount": "{count} MATCHES",
+    "noMatching": "No matching insights",
+    "noMatchingDesc": "No rule-based observations matched this filter in the last 24 hours.",
+    "observationReason": "Observation / reason",
+    "time": "Time",
+    "whyAppeared": "Why this appeared",
+    "provenance": "Provenance",
+    "ruleSource": "Rule source",
+    "observedAt": "Observed at",
+    "severity": "Severity",
+    "affectedClient": "Affected client",
+    "clientIp": "Client IP",
+    "clientMac": "Client MAC",
+    "evidence": "Evidence",
+    "encryptedDnsDisclaimer": "This is a transport/provider rule inference. netqmon does not inspect encrypted DNS contents and does not claim a domain from this observation.",
+    "inspectAria": "Inspect evidence for {title}",
+    "categories": {
+      "device": "Device",
+      "traffic": "Traffic",
+      "classification": "Classification",
+      "dns": "DNS",
+      "protocol": "Protocol & Tunnel",
+      "destination": "Destination",
+      "capture": "Capture Quality"
+    },
+    "severities": {
+      "info": "Info",
+      "warning": "Warning",
+      "critical": "Critical"
+    },
+    "sources": {
+      "device-discovery": "Device Discovery",
+      "classification-coverage": "Classification Coverage",
+      "client-classification-coverage": "Client Classification Coverage",
+      "dns-service-inference": "DNS Service Inference",
+      "traffic-history": "Traffic History",
+      "traffic-spike-detector": "Traffic Spike Detector",
+      "application-spike-detector": "Application Spike Detector",
+      "p2p-tracker-rule": "P2P Tracker Rule",
+      "vpn-ike-esp-rule": "VPN IKE/ESP Rule",
+      "vpn-pptp-gre-rule": "VPN PPTP/GRE Rule",
+      "vpn-l2tp-ipsec-rule": "VPN L2TP/IPsec Rule",
+      "protocol-discovery": "Protocol Discovery",
+      "destination-fanout-detector": "Destination Fanout Detector",
+      "capture-health": "Capture Health"
+    },
+    "evidenceLabels": {
+      "first_seen": "First Seen",
+      "last_seen": "Last Seen",
+      "last_observed": "Last Observed",
+      "observed_at": "Observed At",
+      "mac": "MAC Address",
+      "ip": "IP Address",
+      "client_id": "Client ID",
+      "client_name": "Client Name",
+      "client_mac": "Client MAC",
+      "client_ip": "Client IP",
+      "total_bytes": "Total Bytes",
+      "unknown_bytes": "Unknown Bytes",
+      "ratio": "Ratio",
+      "threshold": "Threshold",
+      "threshold_bytes": "Threshold Bytes",
+      "tx_bytes": "Upload Bytes",
+      "rx_bytes": "Download Bytes",
+      "bytes": "Recent Bytes",
+      "baseline_bytes": "Baseline Bytes",
+      "window_minutes": "Time Window",
+      "provider": "Provider",
+      "protocol": "Protocol",
+      "domain": "Domain",
+      "remote_ip": "Remote IP",
+      "remote_port": "Remote Port",
+      "transport": "Transport",
+      "query_count": "Query Count",
+      "correlation": "Correlation Type",
+      "protocol_type": "Protocol Type",
+      "protocol_id": "Protocol ID",
+      "protocol_name": "Protocol Name",
+      "category_name": "Category Name",
+      "destination_count": "Unique Destination Count",
+      "flow_count": "Flow Count",
+      "status": "Capture Status",
+      "condition": "Condition",
+      "count": "Dropped Count",
+      "interface_delta": "Interface Delta Bytes",
+      "flow_delta": "Flow Delta Bytes",
+      "lag_ms": "Collector Lag",
+      "threshold_ms": "Lag Threshold"
+    },
+    "evidenceValues": {
+      "yes": "Yes",
+      "no": "No",
+      "notVisible": "Not visible"
+    },
+    "events": {
+      "device": {
+        "new_device": {
+          "title": "New device discovered",
+          "reason": "First network activity recorded for {name} ({mac})."
+        }
+      },
+      "classification": {
+        "unknown_ratio_high": {
+          "title": "High unclassified traffic ratio",
+          "reason": "{ratio} ({unknown_bytes}) of total traffic ({total_bytes}) is unclassified, exceeding the {threshold} threshold."
+        },
+        "client_unknown_ratio_high": {
+          "title": "High unclassified client traffic",
+          "reason": "Client {name} has {ratio} ({unknown_bytes}) unclassified traffic out of {total_bytes}, exceeding {threshold}."
+        }
+      },
+      "dns": {
+        "encrypted_dns_detected": {
+          "title": "Encrypted DNS activity detected",
+          "reason": "Encrypted DNS traffic detected ({provider} via {protocol}) from {name} to {remote_ip}."
+        }
+      },
+      "traffic": {
+        "high_upload": {
+          "title": "High outbound traffic",
+          "reason": "Client {name} uploaded {upload_bytes}, exceeding the configured {threshold_bytes} threshold."
+        },
+        "client_spike": {
+          "title": "Client traffic burst",
+          "reason": "Client {name} traffic reached {bytes} in the last 15 minutes, {ratio} of baseline ({baseline_bytes})."
+        },
+        "application_spike": {
+          "title": "Application traffic burst",
+          "reason": "Application {application_name} traffic reached {bytes} in the last 15 minutes, {ratio} of baseline ({baseline_bytes})."
+        }
+      },
+      "protocol": {
+        "p2p_tracker_correlation": {
+          "title": "P2P tracker communication detected",
+          "reason": "Correlated BitTorrent / P2P tracker communication detected for {name} ({tracker_flows} tracker flows, {peer_flows} peer flows)."
+        },
+        "ipsec_detected": {
+          "title": "IPsec VPN tunnel detected",
+          "reason": "Correlated IPsec tunnel negotiation and ESP data transport with {remote_ip}."
+        },
+        "pptp_detected": {
+          "title": "PPTP VPN tunnel detected",
+          "reason": "Correlated PPTP control session and GRE data encapsulation with {remote_ip}."
+        },
+        "l2tp_ipsec_detected": {
+          "title": "L2TP/IPsec VPN tunnel detected",
+          "reason": "Correlated L2TP tunnel session over IPsec transport with {remote_ip}."
+        },
+        "new_protocol": {
+          "title": "New protocol observed",
+          "reason": "Protocol {protocol_name} was observed on the network for the first time."
+        }
+      },
+      "destination": {
+        "fanout_spike": {
+          "title": "Client destination fanout anomaly",
+          "reason": "Client {name} contacted {destination_count} distinct destinations in a short window."
+        }
+      },
+      "capture": {
+        "icmp_redirect_enabled": {
+          "title": "ICMP Redirect is enabled",
+          "reason": "Clients may learn a direct route and bypass netqmon in {topology_mode} mode."
+        },
+        "ipv4_coverage": {
+          "title": "IPv4 capture coverage is incomplete",
+          "reason": "The topology engine reports IPv4 coverage as {ipv4_coverage}."
+        },
+        "ipv6_coverage": {
+          "title": "IPv6 capture coverage is incomplete",
+          "reason": "The topology engine reports IPv6 coverage as {ipv6_coverage}."
+        },
+        "software_flow_offload": {
+          "title": "Software flow offload is enabled",
+          "reason": "Software flow offload may bypass the selected observation point."
+        },
+        "topology_confidence": {
+          "title": "Topology confidence is low",
+          "reason": "Topology inference confidence is {confidence}%. Review the agent network diagnosis."
+        },
+        "asymmetric_routing": {
+          "title": "Asymmetric routing suspected",
+          "reason": "The topology engine detected packet coverage consistent with an asymmetric path."
+        },
+        "hardware_flow_offload": {
+          "title": "Hardware flow offloading is enabled",
+          "reason": "Hardware flow offloading bypasses kernel conntrack/software accounting, which may cause under-reporting of traffic volume."
+        },
+        "interface_counter_gap": {
+          "title": "Interface counter mismatch",
+          "reason": "Raw interface counters exceeded captured flow deltas ({interface_delta} interface vs {flow_delta} flows)."
+        },
+        "dns_event_drops": {
+          "title": "DNS events dropped",
+          "reason": "The agent reported {count} dropped DNS capture events."
+        },
+        "protocol_probe_drops": {
+          "title": "Protocol probe events dropped",
+          "reason": "The agent reported {count} dropped protocol probe events."
+        },
+        "telemetry_queue_drops": {
+          "title": "Telemetry batches dropped",
+          "reason": "The bounded agent telemetry queue dropped {count} batches."
+        },
+        "collector_lag": {
+          "title": "Collector ingestion lag detected",
+          "reason": "Collector receipt trailed the agent batch timestamp by {lag_ms} ms (threshold: {threshold_ms} ms)."
+        }
+      }
+    }
+  },
+  "settings": {
+    "title": "Settings",
+    "subtitle": "Manage gateway preferences, telemetry retention, classification rules, Geo databases and system diagnostics",
+    "tabs": {
+      "general": "General",
+      "license": "License",
+      "iconCache": "Icon Cache",
+      "retention": "Storage & Retention",
+      "classification": "Classification Rules",
+      "geo": "Geo Databases",
+      "networkDataplane": "Network & Dataplane",
+      "diagnostics": "System Diagnostics"
+    },
+    "interface": {
+      "title": "Interface Preferences",
+      "description": "Customize console language and appearance theme preferences",
+      "language": "Display Language",
+      "languageDescription": "Choose your preferred display language. Preference is stored in your browser.",
+      "theme": "Appearance Theme",
+      "themeDescription": "Customize light or dark color mode, or automatically follow system preferences.",
+      "themeLight": "Light",
+      "themeDark": "Dark",
+      "themeSystem": "System",
+      "account": "Active Account",
+      "accountDescription": "Current authenticated console session identity.",
+      "role": "Role & Scope",
+      "adminRole": "System Administrator (Admin)"
+    },
+    "license": {
+      "title": "License & Edition",
+      "description": "Activate Pro and monitor the Collector's Cloud authorization lease.",
+      "cardTitle": "NetQMon License",
+      "cardDescription": "The key is exchanged once. Only the device credential is retained locally.",
+      "edition": "Current Edition",
+      "status": "Authorization Status",
+      "installationId": "Installation ID",
+      "ruleVersion": "Rule Version",
+      "lastCheck": "Last Successful Check",
+      "leaseUntil": "Offline Lease Until",
+      "keyLabel": "License key",
+      "keyPlaceholder": "Paste your License Key",
+      "activate": "Activate",
+      "activating": "Activating…",
+      "activated": "Activated",
+      "checkNow": "Check Now",
+      "checking": "Checking…",
+      "checked": "Checked",
+      "retry": "Try Again",
+      "keyNotice": "The License Key is sent directly to NetQMon Cloud and is never saved by Collector.",
+      "loadError": "Unable to load license status",
+      "actionError": "License operation failed",
+      "activateSuccess": "Pro license activated",
+      "checkSuccess": "License status refreshed"
+    },
+    "geo": {
+      "title": "GeoIP & ASN Databases",
+      "description": "Manage local MMDB databases used to enrich destination IP geolocation, region, city, coordinates, and Autonomous System (ASN) attribution. Supports automatic download from GeoLite2 mirror and live hot-reloading.",
+      "directory": "Database Directory",
+      "status": "Status",
+      "enabled": "Enabled",
+      "disabled": "Disabled",
+      "updateNow": "Update Now",
+      "updating": "Downloading and reloading databases…",
+      "updateSuccess": "Geo databases updated and hot-reloaded successfully",
+      "updateError": "Failed to update Geo databases",
+      "loadError": "Failed to load Geo database information",
+      "installed": "Installed",
+      "notInstalled": "Not Installed",
+      "database": "Database File",
+      "databaseType": "Type",
+      "buildDate": "Release / Build Date",
+      "fileSize": "File Size",
+      "lastModified": "Modified At",
+      "source": "Official Source",
+      "autoSourceNotice": "Automatically downloads and installs the latest GeoLite2 City and ASN MMDB databases from the community-synced mirror."
+    },
+    "classification": {
+      "title": "Classification Rules",
+      "description": "The rule engine is owned by classifierd; statistics and reload requests are forwarded to it.",
+      "reloadHint": "Trigger a classifierd rule reload",
+      "reloadButton": "Reload Rules",
+      "reloading": "Reloading…",
+      "success": "Rules reloaded successfully",
+      "loadedApps": "Loaded {count} applications.",
+      "loadedSelfhostApps": "Including {count} self-hosted applications.",
+      "reloadedAt": "Reloaded at {time}",
+      "error": "Failed to reload classification rules.",
+      "rulesBreakdown": "Rule Library Statistics",
+      "rulesBreakdownDesc": "Rule-set statistics reported by classifierd",
+      "classifierdStatus": "Classifier Engine Status",
+      "classifierdVersion": "Classifier Engine Version",
+      "applications": "Applications",
+      "selfhostApplications": "Self-hosted Applications",
+      "clients": "Client Fingerprint Rules",
+      "protocols": "Protocol Rules",
+      "statsRuleVersion": "Rule Version",
+      "updatedAt": "Updated",
+      "availability": {
+        "ready": "Ready",
+        "unavailable": "Unavailable",
+        "connecting": "Connecting"
+      }
+    },
+    "diagnostics": {
+      "title": "System Diagnostics",
+      "description": "Controller service operational status, telemetry metrics and gateway hardware details",
+      "copy": "Copy diagnostics to clipboard",
+      "copied": "Copied to clipboard",
+      "collectorVersion": "Collector Version",
+      "dbBackend": "Database Backend",
+      "dbSize": "Database Size",
+      "activeFlows": "Active Flows",
+      "unknownRatio": "Unknown Ratio",
+      "geoDb": "Geo DB",
+      "enabled": "Enabled",
+      "disabled": "Disabled",
+      "gatewayInfo": "Gateway Hardware & System",
+      "gatewayName": "Gateway Name",
+      "gatewayId": "Gateway ID",
+      "agentVersion": "Agent Version",
+      "kernel": "Kernel Version",
+      "notConnected": "Not connected",
+      "failed": "Failed to load diagnostics."
+    },
+    "networkDataplane": {
+      "title": "Network & Dataplane",
+      "description": "Logical topology discovery, capture coverage, attachment and bypass risks reported by the agent",
+      "logicalTopology": "Logical Topology",
+      "dataplaneHealth": "Dataplane Health",
+      "topologyMode": "Topology Mode",
+      "agentAddress": "Agent Address",
+      "captureInterface": "Capture Interface",
+      "upstreamGateway": "Upstream Gateway",
+      "nat": "NAT",
+      "confidence": "Topology Confidence",
+      "attachBackend": "Attach Backend",
+      "attachOrder": "Attach Order",
+      "ipv4Coverage": "IPv4 Coverage",
+      "ipv6Coverage": "IPv6 Coverage",
+      "icmpRedirect": "ICMP Redirect",
+      "softwareOffload": "Software Flow Offload",
+      "hardwareOffload": "Hardware Flow Offload",
+      "networks": "LAN, Routed & Tunnel Networks",
+      "warnings": "Topology Warnings",
+      "unavailable": "Topology telemetry is unavailable"
+    },
+    "iconCache": {
+      "title": "Icon Cache",
+      "description": "Remote favicon cache stored in Collector memory.",
+      "badge": "Presentation",
+      "cardDescription": "External icons fetched through the Collector icon service.",
+      "clear": "Clear icon cache",
+      "confirmClear": "Clear cached external icons?\n\nIcons currently visible may be downloaded again when needed.",
+      "clearSuccess": "Icon cache cleared",
+      "clearError": "Failed to clear icon cache",
+      "loadError": "Failed to load icon cache stats",
+      "cachedRemoteIcons": "Cached remote icons",
+      "cacheSize": "Cache size",
+      "capacity": "Capacity",
+      "positiveTtl": "Positive TTL",
+      "negativeTtl": "Negative TTL",
+      "ttlDays": "{count} days",
+      "ttlHours": "{count} hours",
+      "ttlSeconds": "{count}s"
+    },
+    "retention": {
+      "title": "Data Retention",
+      "description": "Configure how long historical data is kept. Setting a value to 0 keeps data forever, except for DNS observations where 0 means keeping only until TTL expires.",
+      "storageOverview": "Storage Overview",
+      "presets": "Retention Presets",
+      "presetStandard": "Standard (30d)",
+      "presetCompact": "Compact (7d)",
+      "presetExtended": "Extended (90d)",
+      "daysUnit": "days",
+      "flowSessions": "Flow sessions (days)",
+      "flowSessionsMin": "Min: 1",
+      "dnsObservations": "DNS observations (days)",
+      "dnsObservationsMin": "Min: 0 (0 = TTL only)",
+      "minuteRollups": "Minute rollups (days)",
+      "minuteRollupsMin": "Min: 1",
+      "hourRollups": "Hour rollups (days)",
+      "hourRollupsMin": "Min: 0 (0 = forever)",
+      "dayRollups": "Day rollups (days)",
+      "dayRollupsMin": "Min: 0 (0 = forever)",
+      "save": "Save Changes",
+      "saving": "Saving…",
+      "runNow": "Run Cleanup Now",
+      "running": "Running…",
+      "saveSuccess": "Retention policy saved successfully.",
+      "saveError": "Failed to save retention policy.",
+      "runSuccess": "Retention job completed successfully.",
+      "runError": "Failed to run retention job.",
+      "loadError": "Failed to load retention policy.",
+      "validationMin1": "Flow sessions and minute rollups must be at least 1 day.",
+      "validationNonNegative": "Values cannot be negative."
+    },
+    "sampling": {
+      "title": "DPI / Sampling",
+      "window": "Observed during the last {minutes} minutes (up to 1 hour)",
+      "unavailable": "Unavailable",
+      "enabled": "Enabled",
+      "disabled": "Disabled",
+      "available": "Available",
+      "configuration": "Configuration",
+      "engine": "DPI engine",
+      "dpiEnabled": "DPI enabled",
+      "engineAvailable": "Engine available",
+      "waiting": "Waiting for Agent sampling configuration.",
+      "sampleEnabled": "Sample enabled",
+      "bytesFlow": "Max bytes / flow",
+      "packetsDirection": "Packets / direction",
+      "bytesPacket": "Max bytes / packet",
+      "observations": "Sample observations",
+      "sampleCount": "Sample messages",
+      "sampledFlows": "Sampled flows",
+      "bytes": "Sample data",
+      "average": "Average sample size",
+      "p95": "P95 sample size",
+      "maximum": "Maximum sample size",
+      "success": "DPI recognition rate",
+      "drops": "Dropped packets",
+      "impactTitle": "Network impact",
+      "impact": "Impact",
+      "Low": "Low",
+      "Moderate": "Moderate",
+      "High": "High",
+      "bandwidth": "Extra bandwidth",
+      "ratio": "Share of network traffic",
+      "newFlows": "New flows",
+      "flowRate": "New flow rate",
+      "dropRate": "Sample drop rate",
+      "theoretical": "Theoretical maximum",
+      "basis": "Impact uses observed sample bytes, network traffic and drops. The theoretical maximum uses the current flow budget and recent flow rate. New flows are estimated from observed tuples.",
+      "privacy": "Sampling captures portions of original network payload for Collector DPI in memory. Raw payload is released after analysis and is never stored, logged or returned by the API. Configure sampling on the Agent or in LuCI."
+    }
+  },
+  "states": {
+    "empty": {
+      "noRecords": "No records found",
+      "adjustFilters": "Try adjusting your filters or time range",
+      "noItems": "No items to rank"
+    },
+    "error": {
+      "defaultTitle": "Failed to load data",
+      "defaultMessage": "An error occurred while communicating with the controller service.",
+      "affectedScope": "Affected component: {scope}",
+      "retry": "Retry"
+    },
+    "loading": {
+      "chart": "Loading chart..."
+    }
+  },
+  "accessibility": {
+    "sidebar": {
+      "open": "Open navigation menu"
+    },
+    "search": {
+      "clear": "Clear search"
+    },
+    "filter": {
+      "filterRecords": "Filter records",
+      "removeFilter": "Remove filter for {label}"
+    },
+    "customTimeRange": {
+      "title": "Custom Time Range",
+      "startTime": "Start Time",
+      "endTime": "End Time"
+    },
+    "panel": {
+      "close": "Close property panel",
+      "copy": "Copy {label}"
+    }
+  }
+}

@@ -1,0 +1,67 @@
+name: Bug Report
+description: File a bug report to help us fix an issue in NetQmon
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report an issue! Please fill out the sections below.
+        If this is a security vulnerability, please refer to our [Security Policy](SECURITY.md).
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected Component
+      options:
+        - "Agent (eBPF / OpenWrt)"
+        - "Collector (Backend / Storage)"
+        - "Controller UI (Web Console)"
+        - "Packaging / OpenWrt LuCI"
+        - "Docker / Compose"
+        - "Other"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Steps to reproduce the behavior.
+      placeholder: |
+        1. Deploy controller via docker compose
+        2. Install netqmon-agent on OpenWrt 24.10.x
+        3. Observe error...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment Info
+      description: Operating system, hardware architecture, OpenWrt version, kernel, Docker version, etc.
+      placeholder: |
+        - NetQmon Version: 
+        - OpenWrt Version & Target: (e.g. OpenWrt 24.10.2 x86_64 or aarch64)
+        - Router / Hardware Model:
+        - Linux Kernel Version:
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs or Screenshots
+      description: Paste relevant logs (`logread -e netqmon`, `docker compose logs controller`) or drag & drop screenshots.
+      render: shell
+    validations:
+      required: false

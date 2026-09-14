@@ -1,0 +1,20 @@
+{
+  "luci-app-netqmon": {
+    "description": "Grant access to NetQMon Agent configuration, status, diagnostics, and updates",
+    "read": {
+      "ubus": {
+        "netqmon": ["status", "doctor", "update_status", "update_check"],
+        "luci-rpc": ["getNetworkDevices"],
+        "uci": ["get"]
+      },
+      "uci": ["netqmon"]
+    },
+    "write": {
+      "ubus": {
+        "netqmon": ["service", "update_apply"],
+        "uci": ["add", "apply", "confirm", "delete", "order", "rename", "set"]
+      },
+      "uci": ["netqmon"]
+    }
+  }
+}

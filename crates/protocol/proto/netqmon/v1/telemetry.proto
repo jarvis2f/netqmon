@@ -1,0 +1,304 @@
+syntax = "proto3";
+
+package netqmon.v1;
+
+// Independent, best-effort sample stream. Sequence numbers are independent of
+// TelemetryBatch. Identity is scoped by gateway_id + boot_id.
+message FlowSampleBatch {
+  string gateway_id = 1;
+  string boot_id = 2;
+  uint64 sequence = 3;
+  uint64 sent_at = 4;
+  string agent_version = 5;
+  uint32 protocol_version = 6;
+  repeated FlowSample samples = 7;
+}
+
+message FlowSample {
+  // Agent-assigned ID, unique for a flow lifetime within this gateway boot.
+  string flow_id = 1;
+  // Explicit tuple allows sample processing even when flow telemetry is lost.
+  FlowSampleKey key = 2;
+  repeated SamplePacket packets = 3;
+  uint32 total_captured_bytes = 4;
+}
+
+message FlowSampleKey {
+  uint32 ip_version = 1;
+  uint32 protocol = 2;
+  bytes client_ip = 3;
+  uint32 client_port = 4;
+  bytes remote_ip = 5;
+  uint32 remote_port = 6;
+  uint64 first_seen_unix_ms = 7;
+}
+
+message SamplePacket {
+  Direction direction = 1;
+  uint64 timestamp_unix_ms = 2;
+  uint32 original_length = 3;
+  uint32 captured_length = 4;
+  // Starts at the IPv4/IPv6 header (no Ethernet header), possibly truncated.
+  // Memory-only DPI input: never log, persist, or return through query APIs.
+  bytes payload = 5;
+}
+
+// A versioned telemetry envelope. gateway_id + boot_id + sequence is the
+// collector-side idempotency key.
+message TelemetryBatch {
+  string gateway_id = 1;
+  string boot_id = 2;
+  uint64 sequence = 3;
+  // Unix epoch milliseconds.
+  uint64 sent_at = 4;
+  string agent_version = 5;
+  uint32 protocol_version = 6;
+  repeated FlowDelta flows = 7;
+  repeated DnsObservation dns_observations = 8;
+  repeated DeviceObservation device_observations = 9;
+  AgentHealth health = 10;
+  repeated DeviceDiscoveryObservation device_discovery_observations = 11;
+  // Results for probes requested by the Collector in a prior response.
+  repeated ProbeResult probe_results = 12;
+}
+
+// Returned by the Collector after a telemetry upload. Probe requests are
+// best-effort and are executed by the Agent from the monitored LAN.
+message TelemetryResponse {
+  repeated ProbeRequest probe_requests = 1;
+}
+
+// Extensible Collector-to-Agent probe envelope. New probe types add a oneof
+// variant without changing telemetry transport semantics.
+message ProbeRequest {
+  string request_id = 1;
+  oneof target {
+    FaviconProbe favicon = 2;
+  }
+}
+
+message FaviconProbe {
+  bytes target_ip = 1;
+  uint32 port = 2;
+}
+
+// Extensible Agent-to-Collector probe result envelope.
+message ProbeResult {
+  string request_id = 1;
+  uint64 observed_at_unix_ms = 2;
+  oneof outcome {
+    FaviconProbeResult favicon = 3;
+  }
+  string status = 4;
+}
+
+message FaviconProbeResult {
+  bytes target_ip = 1;
+  uint32 port = 2;
+  // SHA-256 digests of raw favicon response bodies. Multiple values allow a
+  // page-declared icon and the conventional /favicon.ico to be reported.
+  repeated bytes sha256 = 3;
+}
+
+message FlowDelta {
+  uint32 ip_version = 1;
+  uint32 protocol = 2;
+  bytes client_ip = 3;
+  uint32 client_port = 4;
+  bytes remote_ip = 5;
+  uint32 remote_port = 6;
+  Direction direction = 7;
+  uint64 upload_bytes = 8;
+  uint64 download_bytes = 9;
+  uint64 packets = 10;
+  uint64 first_seen_unix_ms = 11;
+  uint64 last_seen_unix_ms = 12;
+  uint32 tcp_flags = 13;
+  FlowLifecycle lifecycle = 14;
+  // Canonical six-byte MAC address. Empty when identity is not yet known.
+  bytes client_mac = 15;
+  // Legacy wire compatibility only. Agent emits empty; Collector ignores this field.
+  string protocol_hint = 16;
+  FlowScope scope = 17;
+  PathType path_type = 18;
+  NatType nat = 19;
+  string source_segment = 20;
+  string destination_segment = 21;
+}
+
+message DnsObservation {
+  bytes client_ip = 1;
+  string domain = 2;
+  bytes answer_ip = 3;
+  DnsRecordType record_type = 4;
+  uint32 ttl_seconds = 5;
+  uint64 observed_at_unix_ms = 6;
+}
+
+message DeviceObservation {
+  // Canonical six-byte MAC address.
+  bytes mac = 1;
+  // Four bytes for IPv4 or sixteen bytes for IPv6.
+  bytes ip = 2;
+  string hostname = 3;
+  uint64 last_seen_unix_ms = 4;
+  DhcpMetadata dhcp = 5;
+}
+
+message DhcpMetadata {
+  // Raw DHCP option 55 parameter request list, in observed order.
+  repeated uint32 parameter_request_list = 1;
+  // Raw DHCP option 60 vendor class identifier.
+  string vendor_class = 2;
+  // Raw DHCP option 61 client identifier, if observed.
+  bytes client_identifier = 3;
+}
+
+message DeviceDiscoveryObservation {
+  // Canonical source MAC observed on the LAN frame.
+  bytes mac = 1;
+  // Source address: four bytes for IPv4 or sixteen bytes for IPv6.
+  bytes ip = 2;
+  // mdns, ssdp, matter, dhcp6, or http.
+  string protocol = 3;
+  string service = 4;
+  string instance = 5;
+  string hostname = 6;
+  uint32 port = 7;
+  // Parsed protocol attributes only. Raw packet payload is never transmitted.
+  map<string, string> attributes = 8;
+  uint64 observed_at_unix_ms = 9;
+}
+
+message AgentHealth {
+  uint64 observed_at_unix_ms = 1;
+  uint64 uptime_seconds = 2;
+  uint64 dropped_batches = 3;
+  uint64 dns_dropped_events = 4;
+  uint64 tracked_flows = 5;
+  string kernel_version = 6;
+  string openwrt_version = 7;
+  OffloadStatus hardware_flow_offload = 8;
+  uint64 protocol_probe_dropped_events = 9;
+  string capture_interface = 10;
+  uint64 interface_rx_bytes = 11;
+  uint64 interface_tx_bytes = 12;
+  uint64 interface_rx_packets = 13;
+  uint64 interface_tx_packets = 14;
+  uint64 interface_delta_bytes = 15;
+  uint64 interface_delta_packets = 16;
+  uint64 flow_delta_bytes = 17;
+  uint64 flow_delta_packets = 18;
+  CounterSanityStatus interface_counter_sanity = 19;
+  uint64 sampled_flows = 20;
+  uint64 sampled_bytes = 21;
+  uint64 dropped_samples = 22;
+  uint64 dropped_sample_bytes = 23;
+  SampleConfig sample_config = 24;
+  TopologySummary topology = 25;
+  // Ordered observation interfaces; the first entry is capture_interface.
+  repeated string capture_interfaces = 26;
+}
+
+message TopologySummary {
+  string topology_mode = 1;
+  repeated string agent_addresses = 2;
+  string upstream_gateway = 3;
+  repeated TopologySegment segments = 4;
+  string nat_status = 5;
+  string attach_backend = 6;
+  string attach_order = 7;
+  string ipv4_coverage = 8;
+  string ipv6_coverage = 9;
+  string icmp_redirect = 10;
+  OffloadStatus software_flow_offload = 11;
+  OffloadStatus hardware_flow_offload = 12;
+  repeated string topology_warnings = 13;
+  uint32 confidence = 14;
+}
+
+message TopologySegment {
+  string subnet = 1;
+  string interface = 2;
+  string role = 3;
+  uint32 confidence = 4;
+}
+
+message EnrollRequest {
+  string enrollment_token = 1;
+  string agent_version = 2;
+  uint32 protocol_version = 3;
+  string boot_id = 4;
+  string gateway_name = 5;
+}
+
+message EnrollResponse {
+  string gateway_id = 1;
+  string agent_token = 2;
+  uint32 protocol_version = 3;
+}
+
+enum Direction {
+  DIRECTION_UNSPECIFIED = 0;
+  DIRECTION_UPLOAD = 1;
+  DIRECTION_DOWNLOAD = 2;
+}
+
+enum FlowLifecycle {
+  FLOW_LIFECYCLE_UNSPECIFIED = 0;
+  FLOW_LIFECYCLE_ACTIVE = 1;
+  FLOW_LIFECYCLE_IDLE = 2;
+  FLOW_LIFECYCLE_ENDED = 3;
+}
+
+enum DnsRecordType {
+  DNS_RECORD_TYPE_UNSPECIFIED = 0;
+  DNS_RECORD_TYPE_A = 1;
+  DNS_RECORD_TYPE_AAAA = 2;
+}
+
+enum OffloadStatus {
+  OFFLOAD_STATUS_UNSPECIFIED = 0;
+  OFFLOAD_STATUS_DISABLED = 1;
+  OFFLOAD_STATUS_ENABLED = 2;
+}
+
+enum CounterSanityStatus {
+  COUNTER_SANITY_STATUS_UNSPECIFIED = 0;
+  COUNTER_SANITY_STATUS_OK = 1;
+  COUNTER_SANITY_STATUS_DEGRADED = 2;
+  COUNTER_SANITY_STATUS_UNKNOWN = 3;
+  COUNTER_SANITY_STATUS_DISABLED = 4;
+}
+
+enum FlowScope {
+  FLOW_SCOPE_UNSPECIFIED = 0;
+  FLOW_SCOPE_INTERNET = 1;
+  FLOW_SCOPE_INTERNAL = 2;
+  FLOW_SCOPE_TUNNEL = 3;
+  FLOW_SCOPE_UNKNOWN = 4;
+}
+
+enum PathType {
+  PATH_TYPE_UNSPECIFIED = 0;
+  PATH_TYPE_FORWARDED = 1;
+  PATH_TYPE_INTERNAL = 2;
+  PATH_TYPE_TUNNEL = 3;
+  PATH_TYPE_UNKNOWN = 4;
+}
+
+enum NatType {
+  NAT_TYPE_UNSPECIFIED = 0;
+  NAT_TYPE_NONE = 1;
+  NAT_TYPE_SNAT = 2;
+  NAT_TYPE_DNAT = 3;
+  NAT_TYPE_BOTH = 4;
+  NAT_TYPE_UNKNOWN = 5;
+}
+
+message SampleConfig {
+  bool enabled = 1;
+  uint32 max_bytes_per_flow = 2;
+  uint32 max_packets_per_direction = 3;
+  uint32 max_bytes_per_packet = 4;
+}

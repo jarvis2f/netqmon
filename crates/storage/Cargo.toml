@@ -1,0 +1,20 @@
+[package]
+name = "netqmon-storage"
+description = "Storage abstraction library for netqmon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+netqmon-protocol = { path = "../protocol" }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

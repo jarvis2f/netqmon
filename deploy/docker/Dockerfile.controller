@@ -1,0 +1,88 @@
+FROM rust:alpine AS collector-builder
+
+RUN apk add --no-cache musl-dev protobuf-dev make gcc autoconf automake libtool pkgconf git
+
+COPY scripts/build-ndpi.sh /tmp/build-ndpi.sh
+RUN /tmp/build-ndpi.sh /usr/local
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+# nDPI is LGPL and remains a replaceable shared library on musl.
+ENV RUSTFLAGS="-C target-feature=-crt-static"
+
+WORKDIR /usr/src/netqmon
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY migrations ./migrations
+
+ARG NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX=d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+ENV NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX=${NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX}
+
+ARG TARGETARCH
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/usr/src/netqmon/target \
+    CARGO_TARGET_DIR="/usr/src/netqmon/target/${TARGETARCH:-local}" \
+    cargo build --release --bin netqmon-collector --bin netqmon-classifier-manager && \
+    cp "/usr/src/netqmon/target/${TARGETARCH:-local}/release/netqmon-collector" /netqmon-collector && \
+    cp "/usr/src/netqmon/target/${TARGETARCH:-local}/release/netqmon-classifier-manager" /netqmon-classifier-manager
+
+
+FROM node:22-alpine AS ui-builder
+
+WORKDIR /usr/src/netqmon
+
+RUN corepack enable
+
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY apps/controller-ui/package.json ./apps/controller-ui/package.json
+
+RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
+    pnpm install --frozen-lockfile
+
+COPY apps/controller-ui ./apps/controller-ui
+
+RUN pnpm --filter @netqmon/controller-ui build
+
+FROM node:22-alpine
+
+RUN apk add --no-cache ca-certificates tini tzdata wget libgcc
+
+COPY --from=collector-builder /usr/local/lib/libndpi.so* /usr/local/lib/
+COPY --from=collector-builder /usr/local/share/licenses/ndpi /usr/local/share/licenses/ndpi
+ENV LD_LIBRARY_PATH=/usr/local/lib
+
+WORKDIR /app
+
+COPY --from=collector-builder /netqmon-collector /usr/local/bin/netqmon-collector
+COPY --from=collector-builder /netqmon-classifier-manager /usr/local/bin/netqmon-classifier-manager
+COPY --from=collector-builder /usr/src/netqmon/migrations /app/migrations
+COPY --from=ui-builder /usr/src/netqmon/apps/controller-ui/.next/standalone /app
+COPY --from=ui-builder /usr/src/netqmon/apps/controller-ui/.next/static /app/apps/controller-ui/.next/static
+COPY deploy/docker/controller-entrypoint.sh /usr/local/bin/netqmon-controller-entrypoint
+COPY deploy/docker/controller-healthcheck.sh /usr/local/bin/netqmon-controller-healthcheck
+
+RUN chmod +x /usr/local/bin/netqmon-controller-entrypoint /usr/local/bin/netqmon-controller-healthcheck
+
+ENV NODE_ENV=production
+ENV HOSTNAME=0.0.0.0
+ENV PORT=3000
+ENV NETQMON_COLLECTOR_PUBLIC_ADDR=0.0.0.0:8090
+ENV NETQMON_COLLECTOR_INTERNAL_ADDR=127.0.0.1:8091
+ENV NETQMON_COLLECTOR_INTERNAL_URL=http://127.0.0.1:8091
+ENV NETQMON_COLLECTOR_GEO_DIR=/data/geo
+ENV NETQMON_STORAGE_BACKEND=sqlite
+ENV NETQMON_COLLECTOR_DATABASE_PATH=/data/netqmon.db
+ENV NETQMON_COLLECTOR_MAC_DATASET_PATH=/data/mac-prefixes.json
+ENV NETQMON_CLASSIFIER_MANAGED=true
+ENV NETQMON_CLASSIFIER_COMPONENT_DIR=/data/components/classifierd
+ENV NETQMON_CLASSIFIER_SOCKET=/run/netqmon/classifierd.sock
+ENV NETQMON_CLASSIFIER_UPDATE_CHANNEL=stable
+ENV NETQMON_CLASSIFIER_UPDATE_INTERVAL_SECONDS=21600
+
+VOLUME ["/data"]
+EXPOSE 3000 8090
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=6 \
+    CMD ["netqmon-controller-healthcheck"]
+
+ENTRYPOINT ["/sbin/tini", "--", "netqmon-controller-entrypoint"]

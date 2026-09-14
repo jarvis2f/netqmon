@@ -1,0 +1,61 @@
+services:
+  controller:
+    container_name: netqmon-controller
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.controller
+    image: ${NETQMON_CONTROLLER_IMAGE:-ghcr.io/jarvis2f/netqmon/controller:latest}
+    environment:
+      - NETQMON_STORAGE_BACKEND=${NETQMON_STORAGE_BACKEND:-sqlite}
+      - NETQMON_COLLECTOR_DATABASE_PATH=/data/netqmon.db
+      - NETQMON_COLLECTOR_MAC_DATASET_PATH=/data/mac-prefixes.json
+      - NETQMON_COLLECTOR_ENROLLMENT_TOKEN=${NETQMON_COLLECTOR_ENROLLMENT_TOKEN:-netqmon-dev-enrollment-token}
+      - NETQMON_COLLECTOR_PUBLIC_ADDR=0.0.0.0:8090
+      - NETQMON_COLLECTOR_INTERNAL_ADDR=127.0.0.1:8091
+      - NETQMON_COLLECTOR_INTERNAL_URL=http://127.0.0.1:8091
+      - NETQMON_COMPONENT_API_URL=${NETQMON_COMPONENT_API_URL:-https://netqmon.com}
+      - NETQMON_CLASSIFIER_MANAGED=${NETQMON_CLASSIFIER_MANAGED:-true}
+      - NETQMON_CLASSIFIER_UPDATE_CHANNEL=${NETQMON_CLASSIFIER_UPDATE_CHANNEL:-stable}
+      - NETQMON_CLASSIFIER_UPDATE_INTERVAL_SECONDS=${NETQMON_CLASSIFIER_UPDATE_INTERVAL_SECONDS:-21600}
+      - NETQMON_CLICKHOUSE_URL=http://clickhouse:8123
+      - NETQMON_CLICKHOUSE_DATABASE=${NETQMON_CLICKHOUSE_DATABASE:-default}
+      - NETQMON_SESSION_SECRET=${NETQMON_SESSION_SECRET:-netqmon-dev-session-secret-change-me-32}
+      - RUST_LOG=info
+    volumes:
+      - controller_data:/data
+    ports:
+      - "3000:3000"
+      - "8090:8090"
+    healthcheck:
+      test: ["CMD", "netqmon-controller-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+    restart: unless-stopped
+
+  clickhouse:
+    profiles: ["clickhouse"]
+    image: clickhouse/clickhouse-server:24.3-alpine
+    container_name: netqmon-clickhouse
+    environment:
+      - CLICKHOUSE_DB=default
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./migrations/clickhouse:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider 'http://localhost:8123/ping' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  controller_data:
+  clickhouse_data:

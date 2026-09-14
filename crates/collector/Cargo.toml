@@ -1,0 +1,44 @@
+[package]
+name = "netqmon-collector"
+description = "Telemetry collector for netqmon"
+default-run = "netqmon-collector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+argon2 = "0.5.3"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
+getrandom = "0.3.4"
+netqmon-classifier-client = { path = "../classifier-client" }
+netqmon-geo = { path = "../geo" }
+netqmon-protocol = { path = "../protocol" }
+netqmon-storage = { path = "../storage" }
+prost = "0.14.4"
+reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rusqlite = "0.40.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+chrono = { version = "0.4.42", default-features = false, features = ["clock", "serde"] }
+uuid = { version = "1.19.0", features = ["serde", "v4"] }
+sha2 = "0.11.0"
+subtle = "2.6.1"
+futures-util = "0.3.34"
+moka = { version = "0.12.16", features = ["future"] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower-http = { version = "0.7.0", features = ["limit", "timeout"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.22"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tower = { version = "0.5.2", features = ["util"] }
+
+[lints]
+workspace = true
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"

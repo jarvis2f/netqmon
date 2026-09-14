@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="netqmon">
+  <defs>
+    <linearGradient id="main" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2D8CFF"/>
+      <stop offset="1" stop-color="#3478F6"/>
+    </linearGradient>
+    <linearGradient id="accentTop" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4BB8FF"/>
+      <stop offset="1" stop-color="#3294F5"/>
+    </linearGradient>
+    <linearGradient id="accentBottom" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2E86FA"/>
+      <stop offset="1" stop-color="#256BE8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Three rounded network-link strokes forming the netqmon mark -->
+  <g transform="rotate(45 32 32)">
+    <rect x="8" y="24" width="48" height="16" rx="8" fill="url(#main)"/>
+    <rect x="34" y="7" width="24" height="14" rx="7" fill="url(#accentTop)"/>
+    <rect x="6" y="43" width="24" height="14" rx="7" fill="url(#accentBottom)"/>
+  </g>
+</svg>

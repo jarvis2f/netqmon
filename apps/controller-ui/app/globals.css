@@ -1,0 +1,264 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-heading: var(--font-sans);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-subtle: var(--surface-subtle);
+  --color-surface-hover: var(--surface-hover);
+
+  --color-foreground: var(--foreground);
+  --color-foreground-secondary: var(--foreground-secondary);
+  --color-foreground-muted: var(--foreground-muted);
+
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-soft: var(--accent-soft);
+
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+
+  --color-purple: var(--purple);
+  --color-purple-soft: var(--purple-soft);
+
+  --color-card: var(--surface);
+  --color-card-foreground: var(--foreground);
+  --color-popover: var(--surface);
+  --color-popover-foreground: var(--foreground);
+
+  --color-primary: var(--accent);
+  --color-primary-foreground: #ffffff;
+  --color-secondary: var(--surface-subtle);
+  --color-secondary-foreground: var(--foreground);
+
+  --color-muted: var(--surface-subtle);
+  --color-muted-foreground: var(--foreground-muted);
+
+  --color-destructive: var(--danger);
+  --color-destructive-foreground: #ffffff;
+
+  --color-ring: var(--accent);
+  --color-input: var(--border);
+
+  --color-sidebar: var(--surface);
+  --color-sidebar-foreground: var(--foreground);
+  --color-sidebar-primary: var(--accent);
+  --color-sidebar-primary-foreground: #ffffff;
+  --color-sidebar-accent: var(--surface-hover);
+  --color-sidebar-accent-foreground: var(--foreground);
+  --color-sidebar-border: var(--border);
+  --color-sidebar-ring: var(--accent);
+
+  --color-chart-download: var(--chart-download);
+  --color-chart-upload: var(--chart-upload);
+  --color-chart-total: var(--chart-total);
+  --color-chart-grid: var(--chart-grid);
+  --color-chart-axis: var(--chart-axis);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius: 8px;
+}
+
+:root {
+  --background: #f6f7f9;
+  --surface: #ffffff;
+  --surface-subtle: #f9fafb;
+  --surface-hover: #f2f4f7;
+
+  --foreground: #171a1f;
+  --foreground-secondary: #5f6672;
+  --foreground-muted: #8a919d;
+
+  --border: #e3e6ea;
+  --border-strong: #d4d8de;
+
+  --accent: #1688f8;
+  --accent-hover: #0877e6;
+  --accent-soft: #eaf4ff;
+
+  --success: #169b70;
+  --success-soft: #e8f7f1;
+
+  --warning: #c77918;
+  --warning-soft: #fff4e2;
+
+  --danger: #d84a4a;
+  --danger-soft: #fdecec;
+
+  --purple: #7967e8;
+  --purple-soft: #f0eeff;
+
+  --chart-download: #1688f8;
+  --chart-upload: #169b70;
+  --chart-total: #7967e8;
+  --chart-grid: #e3e6ea;
+  --chart-axis: #8a919d;
+  --chart-1: #1688f8;
+  --chart-2: #169b70;
+  --chart-3: #7967e8;
+  --chart-4: #c77918;
+  --chart-5: #d84a4a;
+
+  --radius: 8px;
+}
+
+.dark {
+  --background: #111317;
+  --surface: #181b20;
+  --surface-subtle: #1d2026;
+  --surface-hover: #23272e;
+
+  --foreground: #f1f3f5;
+  --foreground-secondary: #aeb4be;
+  --foreground-muted: #777f8b;
+
+  --border: #2b3038;
+  --border-strong: #363c46;
+
+  --accent: #3a9aff;
+  --accent-hover: #5babff;
+  --accent-soft: #142a41;
+
+  --success: #35b98a;
+  --success-soft: #173229;
+
+  --warning: #dea044;
+  --warning-soft: #3a2c17;
+
+  --danger: #eb6868;
+  --danger-soft: #3a2020;
+
+  --purple: #9787ff;
+  --purple-soft: #292443;
+
+  --chart-download: #3a9aff;
+  --chart-upload: #35b98a;
+  --chart-total: #9787ff;
+  --chart-grid: #2b3038;
+  --chart-axis: #777f8b;
+  --chart-1: #3a9aff;
+  --chart-2: #35b98a;
+  --chart-3: #9787ff;
+  --chart-4: #dea044;
+  --chart-5: #eb6868;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+  html {
+    @apply font-sans;
+  }
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]):not(:disabled),
+  select:not(:disabled),
+  summary {
+    cursor: pointer;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Auth Canvas styling for setup/login views */
+html:has(.auth-canvas),
+body:has(.auth-canvas) {
+  background-color: #06090e !important;
+  overflow: hidden !important;
+  height: 100% !important;
+  max-height: 100dvh !important;
+}
+
+.auth-canvas {
+  background-color: #06090e;
+  background-image:
+    radial-gradient(
+      circle at 18% 20%,
+      rgba(37, 99, 235, 0.14),
+      transparent 45%
+    ),
+    radial-gradient(
+      circle at 82% 80%,
+      rgba(56, 189, 248, 0.1),
+      transparent 45%
+    ),
+    radial-gradient(
+      circle at 50% 50%,
+      rgba(16, 185, 129, 0.04),
+      transparent 55%
+    ),
+    linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+  background-size:
+    auto,
+    auto,
+    auto,
+    40px 40px,
+    40px 40px;
+  background-attachment: fixed;
+}
+
+.auth-input {
+  width: 100%;
+  height: 2.75rem;
+  border-radius: 0.5rem;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(15, 23, 42, 0.5);
+  padding: 0 0.875rem;
+  color: #f8fafc;
+  font-size: 0.875rem;
+  outline: none;
+  transition: all 200ms ease;
+}
+
+.auth-input:hover {
+  border-color: rgba(255, 255, 255, 0.2);
+  background: rgba(15, 23, 42, 0.65);
+}
+
+.auth-input:focus {
+  border-color: rgba(56, 189, 248, 0.65);
+  background: rgba(15, 23, 42, 0.8);
+  box-shadow: 0 0 16px rgba(56, 189, 248, 0.15);
+}

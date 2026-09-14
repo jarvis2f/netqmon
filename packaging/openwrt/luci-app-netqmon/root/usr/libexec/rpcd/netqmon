@@ -1,0 +1,177 @@
+#!/bin/sh
+
+SERVICE=/etc/init.d/netqmon
+AGENT=/usr/bin/netqmon-agent
+UPDATE_HELPER=/usr/libexec/netqmon/update-agent
+
+[ -r /lib/functions.sh ] && . /lib/functions.sh
+
+json_escape() {
+    printf '%s' "$1" | sed ':a;N;$!ba;s/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g; s/\r/\\r/g; s/\n/\\n/g'
+}
+
+json_string() {
+    printf '"%s"' "$(json_escape "$1")"
+}
+
+read_stdin() {
+    local input line
+    input=
+    while IFS= read -r line || [ -n "$line" ]; do
+        input="${input}${line}"
+        line=
+    done
+    printf '%s' "$input"
+}
+
+read_action() {
+    jsonfilter -s "$1" -e '@.action' 2>/dev/null || true
+}
+
+agent_version() {
+    if [ -x "$AGENT" ]; then
+        "$AGENT" --version 2>/dev/null | awk '{print $2; exit}'
+    fi
+}
+
+service_pid() {
+    local pid
+    pid="$(pidof netqmon-agent 2>/dev/null | awk '{print $1; exit}')"
+    if [ -n "$pid" ]; then
+        printf '%s' "$pid"
+        return 0
+    fi
+    pgrep -x netqmon-agent 2>/dev/null | head -n 1
+}
+
+service_uptime() {
+    local pid="$1" ticks boot now start hz
+    [ -n "$pid" ] || return 0
+    [ -r "/proc/$pid/stat" ] || return 0
+    ticks="$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null)"
+    boot="$(awk '/^btime / {print $2}' /proc/stat 2>/dev/null)"
+    now="$(date +%s)"
+    hz="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+    [ -n "$ticks" ] && [ -n "$boot" ] && [ -n "$now" ] && [ -n "$hz" ] || return 0
+    start=$((boot + ticks / hz))
+    [ "$now" -ge "$start" ] && printf '%s' "$((now - start))"
+}
+
+service_state() {
+    local pid="$1" enabled="$2"
+    if [ -n "$pid" ]; then
+        printf running
+    elif [ "$enabled" -eq 0 ]; then
+        printf disabled
+    elif [ -x "$SERVICE" ] && "$SERVICE" enabled >/dev/null 2>&1; then
+        printf stopped
+    else
+        printf disabled
+    fi
+}
+
+last_error() {
+    logread -e netqmon 2>/dev/null \
+        | grep -Ei 'error|fail|panic|configuration' \
+        | grep -Fv 'libbpf: Kernel error message: Exclusivity flag on, cannot modify' \
+        | grep -Fv 'libbpf: Kernel error message: Cannot find specified filter chain' \
+        | grep -Fv 'runtime error: failed to detach TC hooks: egress: No such file or directory (os error 2), ingress: No such file or directory (os error 2)' \
+        | tail -n 1
+}
+
+status_call() {
+    local pid state version uptime enabled interface controller_url log_level error
+    config_load netqmon 2>/dev/null || true
+    config_get_bool enabled main enabled 1
+    config_get interface main interface br-lan
+    config_get controller_url main controller_url http://127.0.0.1:8090
+    config_get log_level main log_level info
+    pid="$(service_pid)"
+    state="$(service_state "$pid" "$enabled")"
+    version="$(agent_version)"
+    uptime="$(service_uptime "$pid")"
+    error="$(last_error)"
+
+    printf '{'
+    printf '"running":%s,' "$([ "$state" = running ] && echo true || echo false)"
+    printf '"state":'; json_string "$state"; printf ','
+    printf '"pid":%s,' "${pid:-0}"
+    printf '"version":'; json_string "${version:-unknown}"; printf ','
+    printf '"uptime":%s,' "${uptime:-0}"
+    printf '"interface":'; json_string "$interface"; printf ','
+    printf '"interfaces":['
+    STATUS_INTERFACES_FIRST=1
+    status_interface_json_item() {
+        if [ "$STATUS_INTERFACES_FIRST" -eq 0 ]; then
+            printf ','
+        fi
+        json_string "$1"
+        STATUS_INTERFACES_FIRST=0
+    }
+    config_list_foreach main interfaces status_interface_json_item
+    if [ "$STATUS_INTERFACES_FIRST" -eq 1 ]; then
+        status_interface_json_item "$interface"
+    fi
+    unset STATUS_INTERFACES_FIRST
+    printf '],'
+    printf '"controller_url":'; json_string "$controller_url"; printf ','
+    printf '"log_level":'; json_string "$log_level"; printf ','
+    printf '"last_error":'; json_string "$error"
+    printf '}\n'
+}
+
+doctor_call() {
+    local output rc
+    output="$("$AGENT" doctor 2>&1)"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        output="$(printf '%s\n' "$output" | sed '/^libbpf: Kernel error message: Exclusivity flag on, cannot modify$/d')"
+    fi
+    printf '{"ok":%s,"exit_code":%s,"output":' "$([ "$rc" -eq 0 ] && echo true || echo false)" "$rc"
+    json_string "$output"
+    printf '}\n'
+}
+
+service_call() {
+    local payload action output rc
+    payload="${1:-$(read_stdin)}"
+    action="$(read_action "$payload")"
+    case "$action" in
+        start|stop|restart|reload) ;;
+        *) printf '{"ok":false,"error":"invalid action"}\n'; return 0 ;;
+    esac
+    output="$("$SERVICE" "$action" 2>&1)"
+    rc=$?
+    printf '{"ok":%s,"exit_code":%s,"output":' "$([ "$rc" -eq 0 ] && echo true || echo false)" "$rc"
+    json_string "$output"
+    printf '}\n'
+}
+
+update_check_call() {
+    "$UPDATE_HELPER" check
+}
+
+update_status_call() {
+    "$UPDATE_HELPER" status
+}
+
+update_apply_call() {
+    "$UPDATE_HELPER" apply
+}
+
+case "$1" in
+    list)
+        printf '{"status":{},"doctor":{},"service":{"action":"start"},"update_status":{},"update_check":{},"update_apply":{}}\n'
+        ;;
+    call)
+        case "$2" in
+            status) status_call ;;
+            doctor) doctor_call ;;
+            service) service_call "$3" ;;
+            update_status) update_status_call ;;
+            update_check) update_check_call ;;
+            update_apply) update_apply_call ;;
+            *) printf '{"error":"unknown method"}\n' ;;
+        esac
+        ;;
+esac

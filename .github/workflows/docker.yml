@@ -1,0 +1,165 @@
+name: Docker
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Controller Image (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Check Compose configuration
+        run: docker compose config
+
+      - name: Build Controller image for smoke test
+        run: docker build -f deploy/docker/Dockerfile.controller -t ghcr.io/${{ github.repository }}/controller:latest .
+
+      - name: Smoke test Controller compose startup
+        env:
+          NETQMON_CONTROLLER_IMAGE: ghcr.io/${{ github.repository }}/controller:latest
+        run: |
+          docker compose up -d --no-build controller
+          for attempt in {1..30}; do
+            if docker exec netqmon-controller netqmon-controller-healthcheck; then
+              docker compose ps
+              exit 0
+            fi
+            docker compose ps
+            docker logs --tail 50 netqmon-controller
+            sleep 2
+          done
+          docker compose ps
+          docker logs netqmon-controller
+          exit 1
+
+      - name: Smoke test Controller docker restart
+        env:
+          NETQMON_CONTROLLER_IMAGE: ghcr.io/${{ github.repository }}/controller:latest
+        run: |
+          docker compose restart controller
+          for attempt in {1..30}; do
+            if docker exec netqmon-controller netqmon-controller-healthcheck; then
+              docker compose ps
+
+              exit 0
+            fi
+            docker compose ps
+            docker logs --tail 50 netqmon-controller
+            sleep 2
+          done
+          docker compose ps
+          docker logs netqmon-controller
+          exit 1
+
+      - name: Stop smoke test services
+        if: always()
+        run: docker compose down --volumes
+
+      - name: Log in to GitHub Container Registry
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.controller
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,"name=ghcr.io/${{ github.repository }}/controller",push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=controller-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=controller-${{ matrix.arch }}
+
+      - name: Export digest
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge and Publish Manifest List
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          tags=()
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tags+=("-t" "ghcr.io/${{ github.repository }}/controller:${GITHUB_REF_NAME}")
+            tags+=("-t" "ghcr.io/${{ github.repository }}/controller:latest")
+          else
+            tags+=("-t" "ghcr.io/${{ github.repository }}/controller:dev-${GITHUB_SHA}")
+            tags+=("-t" "ghcr.io/${{ github.repository }}/controller:dev-latest")
+          fi
+          docker buildx imagetools create "${tags[@]}" \
+            $(printf 'ghcr.io/${{ github.repository }}/controller@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          target="ghcr.io/${{ github.repository }}/controller:latest"
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            target="ghcr.io/${{ github.repository }}/controller:dev-latest"
+          fi
+          docker buildx imagetools inspect "$target"
+

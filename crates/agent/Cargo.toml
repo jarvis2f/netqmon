@@ -1,0 +1,39 @@
+[package]
+name = "netqmon-agent"
+description = "OpenWrt userspace agent for netqmon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.0", features = ["derive"] }
+http = "1.4.0"
+hickory-proto = { version = "0.25.2", default-features = false }
+netqmon-protocol = { path = "../protocol" }
+prost = "0.14.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "rustls-tls"] }
+sha2 = "0.11.0"
+toml = "1.0.3"
+portable-atomic = "1.15"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libbpf-rs = "0.27.0"
+netlink-packet-core = "0.9.0"
+netlink-packet-route = "0.33.0"
+netlink-sys = "0.8.8"
+nix = { version = "0.31.3", features = ["net", "time"] }
+signal-hook = "0.3.18"
+
+[target.'cfg(target_os = "linux")'.build-dependencies]
+libbpf-cargo = "0.27.0"
+
+[lints]
+workspace = true

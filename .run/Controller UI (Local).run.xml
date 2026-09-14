@@ -1,0 +1,15 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Controller UI (Local)" type="js.build_tools.npm" factoryName="npm">
+    <package-json value="$PROJECT_DIR$/apps/controller-ui/package.json" />
+    <command value="run" />
+    <scripts>
+      <script value="dev" />
+    </scripts>
+    <node-interpreter value="project" />
+    <envs>
+      <env name="NETQMON_COLLECTOR_INTERNAL_URL" value="http://127.0.0.1:8091" />
+      <env name="NETQMON_SESSION_SECRET" value="netqmon-local-session-secret-change-me" />
+    </envs>
+    <method v="2" />
+  </configuration>
+</component>

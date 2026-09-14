@@ -1,0 +1,62 @@
+FROM rust:alpine AS builder
+
+RUN apk add --no-cache \
+    bash \
+    clang \
+    elfutils-dev \
+    file \
+    gcc \
+    git \
+    libbpf-dev \
+    linux-headers \
+    llvm \
+    make \
+    musl-dev \
+    pkgconfig \
+    protobuf-dev \
+    zlib-dev \
+    zlib-static \
+    zstd-dev \
+    zstd-static && \
+    rustup component add rustfmt
+
+
+
+# In Alpine, libelf.a requires zstd and zlib symbols.
+# On aarch64, libbpf compiled with gcc outline atomics may require libgcc symbols (__aarch64_ldadd4_sync)
+# A gcc wrapper guarantees that whenever gcc is invoked for linking,
+# -lzstd, -lz, and -lgcc are available to satisfy symbols without failing proc-macros or compile-only jobs.
+RUN mv /usr/bin/gcc /usr/bin/gcc.real && \
+    printf '#!/bin/sh\nfor arg in "$@"; do\n  if [ "$arg" = "-c" ] || [ "$arg" = "-E" ] || [ "$arg" = "-S" ]; then\n    exec /usr/bin/gcc.real "$@"\n  fi\ndone\nexec /usr/bin/gcc.real "$@" -lzstd -lz -lgcc\n' > /usr/bin/gcc && \
+    chmod +x /usr/bin/gcc
+
+ENV CARGO_TARGET_DIR=/tmp/target
+ENV RUSTFLAGS="-C link-arg=-static"
+
+
+
+# Ensure standard ld-musl symlink exists in /lib and /lib64
+RUN ARCH=$(uname -m) && \
+    MUSL_SO=$(ls /lib/ld-musl-*.so.1 2>/dev/null | head -n 1) && \
+    if [ -n "$MUSL_SO" ]; then \
+        mkdir -p /lib64 && \
+        ln -sf "$MUSL_SO" /lib/ld-linux-$ARCH.so.1 2>/dev/null || true; \
+    fi
+
+WORKDIR /usr/src/netqmon
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY bpf ./bpf
+
+# Native build without --target flag
+RUN cargo build --release --package netqmon-agent && \
+    cp /tmp/target/release/netqmon-agent /netqmon-agent && \
+    file /netqmon-agent
+
+
+FROM scratch
+
+COPY --from=builder /netqmon-agent /netqmon-agent
+ENTRYPOINT ["/netqmon-agent"]
+

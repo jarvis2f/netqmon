@@ -1,0 +1,97 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=99
+STOP=10
+
+PROG=/usr/bin/netqmon-agent
+
+append_capture_interface() {
+    [ -z "$interfaces" ] || interfaces="${interfaces},"
+    interfaces="${interfaces}$1"
+}
+
+start_service() {
+    config_load netqmon
+
+    local enabled
+    config_get_bool enabled main enabled 1
+    [ "$enabled" -eq 1 ] || return 0
+
+    local interface interfaces controller_url token poll_interval_ms batch_interval_ms max_flows retry_buffer_seconds telemetry_retry_buffer_bytes tcp_idle_timeout_seconds udp_idle_timeout_seconds sample_enabled sample_bool sample_max_packets_per_direction sample_max_bytes_per_packet sample_max_bytes_per_flow interface_counter_sanity_enabled interface_counter_sanity_bool interface_counter_min_bytes interface_counter_max_unaccounted_ratio log_level diagnostics_enabled diagnostics_bool
+    config_get interface main interface "br-lan"
+    interfaces=
+    config_list_foreach main interfaces append_capture_interface
+    [ -n "$interfaces" ] || interfaces="$interface"
+    config_get controller_url main controller_url "http://127.0.0.1:8090"
+    config_get token main token ""
+    config_get poll_interval_ms main poll_interval_ms 1000
+    config_get batch_interval_ms main batch_interval_ms 1000
+    config_get max_flows main max_flows 65536
+    config_get retry_buffer_seconds main retry_buffer_seconds 60
+    config_get telemetry_retry_buffer_bytes main telemetry_retry_buffer_bytes 8388608
+    config_get tcp_idle_timeout_seconds main tcp_idle_timeout_seconds 120
+    config_get udp_idle_timeout_seconds main udp_idle_timeout_seconds 30
+    config_get sample_enabled main sample_enabled 1
+    config_get sample_max_packets_per_direction main sample_max_packets_per_direction 4
+    config_get sample_max_bytes_per_packet main sample_max_bytes_per_packet 1024
+    config_get sample_max_bytes_per_flow main sample_max_bytes_per_flow 4096
+    config_get interface_counter_sanity_enabled main interface_counter_sanity_enabled 1
+    config_get interface_counter_min_bytes main interface_counter_min_bytes 65536
+    config_get interface_counter_max_unaccounted_ratio main interface_counter_max_unaccounted_ratio 4
+    config_get log_level main log_level info
+    config_get diagnostics_enabled main diagnostics_enabled 0
+
+    case "$sample_enabled" in
+        1|true|TRUE|on|ON|yes|YES) sample_bool=true ;;
+        0|false|FALSE|off|OFF|no|NO) sample_bool=false ;;
+        *) sample_bool="$sample_enabled" ;;
+    esac
+    case "$interface_counter_sanity_enabled" in
+        1|true|TRUE|on|ON|yes|YES) interface_counter_sanity_bool=true ;;
+        0|false|FALSE|off|OFF|no|NO) interface_counter_sanity_bool=false ;;
+        *) interface_counter_sanity_bool="$interface_counter_sanity_enabled" ;;
+    esac
+    case "$diagnostics_enabled" in
+        1|true|TRUE|on|ON|yes|YES) diagnostics_bool=true ;;
+        0|false|FALSE|off|OFF|no|NO) diagnostics_bool=false ;;
+        *) diagnostics_bool="$diagnostics_enabled" ;;
+    esac
+
+    procd_open_instance
+    procd_set_param command "$PROG" run
+    procd_set_param env \
+        NETQMON_INTERFACE="$interface" \
+        NETQMON_INTERFACES="$interfaces" \
+        NETQMON_CONTROLLER_URL="$controller_url" \
+        NETQMON_TOKEN="$token" \
+        NETQMON_POLL_INTERVAL_MS="$poll_interval_ms" \
+        NETQMON_BATCH_INTERVAL_MS="$batch_interval_ms" \
+        NETQMON_MAX_FLOWS="$max_flows" \
+        NETQMON_RETRY_BUFFER_SECONDS="$retry_buffer_seconds" \
+        NETQMON_TELEMETRY_RETRY_BUFFER_BYTES="$telemetry_retry_buffer_bytes" \
+        NETQMON_TCP_IDLE_TIMEOUT_SECONDS="$tcp_idle_timeout_seconds" \
+        NETQMON_UDP_IDLE_TIMEOUT_SECONDS="$udp_idle_timeout_seconds" \
+        NETQMON_SAMPLE_ENABLED="$sample_bool" \
+        NETQMON_SAMPLE_MAX_PACKETS_PER_DIRECTION="$sample_max_packets_per_direction" \
+        NETQMON_SAMPLE_MAX_BYTES_PER_PACKET="$sample_max_bytes_per_packet" \
+        NETQMON_SAMPLE_MAX_BYTES_PER_FLOW="$sample_max_bytes_per_flow" \
+        NETQMON_INTERFACE_COUNTER_SANITY_ENABLED="$interface_counter_sanity_bool" \
+        NETQMON_INTERFACE_COUNTER_MIN_BYTES="$interface_counter_min_bytes" \
+        NETQMON_INTERFACE_COUNTER_MAX_UNACCOUNTED_RATIO="$interface_counter_max_unaccounted_ratio" \
+        NETQMON_LOG_LEVEL="$log_level" \
+        NETQMON_DIAGNOSTICS_ENABLED="$diagnostics_bool"
+    procd_set_param respawn 3600 5 0
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+reload_service() {
+    stop
+    start
+}
+
+service_triggers() {
+    procd_add_reload_trigger "netqmon"
+}

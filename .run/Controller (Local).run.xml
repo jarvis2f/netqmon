@@ -1,0 +1,7 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Controller (Local)" type="CompoundRunConfigurationType" factoryName="Compound">
+    <toRun name="Controller Backend (Local)" type="CargoCommandRunConfiguration" />
+    <toRun name="Controller UI (Local)" type="js.build_tools.npm" />
+    <method v="2" />
+  </configuration>
+</component>

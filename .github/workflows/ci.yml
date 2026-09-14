@@ -1,0 +1,216 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - '.github/workflows/**'
+      - '.github/actions/**'
+      - '.cargo/**'
+      - '.dockerignore'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'clippy.toml'
+      - 'docker-compose.yml'
+      - 'rust-toolchain*'
+      - 'rustfmt.toml'
+      - 'bpf/**'
+      - 'crates/**'
+      - 'apps/**'
+      - 'deploy/**'
+      - 'packaging/**'
+      - 'migrations/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - 'package.json'
+      - 'Makefile'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - '!**/*.md'
+  pull_request:
+    branches:
+      - main
+      - dev
+    paths:
+      - '.github/workflows/**'
+      - '.github/actions/**'
+      - '.cargo/**'
+      - '.dockerignore'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'clippy.toml'
+      - 'docker-compose.yml'
+      - 'rust-toolchain*'
+      - 'rustfmt.toml'
+      - 'bpf/**'
+      - 'crates/**'
+      - 'apps/**'
+      - 'deploy/**'
+      - 'packaging/**'
+      - 'migrations/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - 'package.json'
+      - 'Makefile'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - '!**/*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install eBPF build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            clang \
+            autoconf automake libtool pkg-config \
+            iproute2 ripgrep \
+            libelf-dev \
+            linux-tools-generic \
+            zlib1g-dev
+
+      - name: Build pinned nDPI
+        run: sudo scripts/build-ndpi.sh /usr/local && sudo ldconfig
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Check workspace
+        run: cargo check --workspace
+
+      - name: Build agent and eBPF object
+        run: cargo build --package netqmon-agent
+
+      - name: Test bounded bidirectional packet sampling
+        run: sudo bash tests/integration/flow_sample.sh target/debug/netqmon-agent
+
+      - name: Build Collector, load generator, and mock classifierd
+        run: cargo build --package netqmon-collector --bins --examples --package netqmon-classifier-client --example mock-classifierd
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+      - name: Test SQLite migrations and persistence
+        run: cargo test --package netqmon-storage
+
+      - name: Test classifier IPC integration and DNS attribution
+        run: cargo test --package netqmon-classifier-client --package netqmon-collector
+
+      - name: Test Geo database updater
+        run: bash tests/integration/geo_update.sh
+
+      - name: Test realtime state, SSE, and internal query API
+        run: |
+          cargo test --package netqmon-collector realtime
+          cargo test --package netqmon-collector internal_query_api
+
+      - name: Test protobuf metadata and compression round-trip
+        run: cargo test --package netqmon-protocol --package netqmon-collector
+
+      - name: Test Collector ingestion
+        run: bash tests/integration/collector_ingestion.sh target/debug/netqmon-collector target/debug/netqmon-loadgen target/debug/examples/mock-classifierd
+
+      - name: Test Phase 22 end-to-end pipeline
+        run: sudo bash tests/integration/phase22_e2e.sh target/debug/netqmon-collector target/debug/netqmon-loadgen target/debug/netqmon-agent target/debug/examples/mock-classifierd
+
+      - name: Test TC hook lifecycle
+        run: sudo bash tests/integration/tc_hook.sh target/debug/netqmon-agent
+
+      - name: Test startup diagnostics
+        run: sudo bash tests/integration/startup_errors.sh target/debug/netqmon-agent
+
+      - name: Test capability doctor
+        run: sudo bash tests/integration/doctor.sh target/debug/netqmon-agent
+
+      - name: Test flow map poller
+        run: sudo bash tests/integration/map_poller.sh target/debug/netqmon-agent
+
+      - name: Test multi-interface routing and deduplication
+        run: sudo bash tests/integration/multi_interface.sh target/debug/netqmon-agent
+
+      - name: Test flow idle lifecycle
+        run: sudo bash tests/integration/flow_lifecycle.sh target/debug/netqmon-agent
+
+      - name: Test DNS response event and observation
+        run: sudo bash tests/integration/dns_event.sh target/debug/netqmon-agent
+
+      - name: Test device discovery and flow identity
+        run: sudo bash tests/integration/device_discovery.sh target/debug/netqmon-agent
+
+      - name: Test IPv4 parser
+        run: sudo bash tests/integration/ipv4_parser.sh target/debug/netqmon-agent
+
+      - name: Test IPv6 parser
+        run: sudo bash tests/integration/ipv6_parser.sh target/debug/netqmon-agent
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Type-check
+        run: pnpm typecheck
+
+      - name: Build
+        run: pnpm build
+
+  clickhouse-dpi:
+    name: ClickHouse late DPI
+    runs-on: ubuntu-latest
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.3-alpine
+        env:
+          CLICKHOUSE_DB: default
+          CLICKHOUSE_USER: default
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --query 'SELECT 1'"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify late classification on real ClickHouse
+        env:
+          NETQMON_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
+        run: cargo test -p netqmon-storage --test late_dpi_clickhouse -- --ignored

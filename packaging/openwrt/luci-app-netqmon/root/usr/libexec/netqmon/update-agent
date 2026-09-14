@@ -1,0 +1,161 @@
+#!/bin/sh
+set -u
+
+MANIFEST_URL="${NETQMON_UPDATE_MANIFEST_URL:-https://github.com/jarvis2f/netqmon/releases/latest/download/openwrt-agent-manifest.json}"
+TMP_DIR="${TMPDIR:-/tmp}/netqmon-update"
+MANIFEST="$TMP_DIR/manifest.json"
+PACKAGE="$TMP_DIR/netqmon-agent.ipk"
+SERVICE=/etc/init.d/netqmon
+AGENT=/usr/bin/netqmon-agent
+
+json_escape() {
+    printf '%s' "$1" | sed ':a;N;$!ba;s/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g; s/\r/\\r/g; s/\n/\\n/g'
+}
+
+json_string() {
+    printf '"%s"' "$(json_escape "$1")"
+}
+
+fail() {
+    printf '{"ok":false,'
+    emit_common_fields
+    printf ',"error":'
+    json_string "$1"
+    printf '}\n'
+    exit 0
+}
+
+current_version() {
+    local version
+    version="$(opkg list-installed netqmon-agent 2>/dev/null | awk '$1 == "netqmon-agent" {print $3; exit}')"
+    if [ -n "$version" ]; then
+        printf '%s' "$version"
+        return 0
+    fi
+
+    if [ -x "$AGENT" ]; then
+        "$AGENT" --version 2>/dev/null | awk '{print $2; exit}'
+    fi
+}
+
+openwrt_arch() {
+    opkg print-architecture 2>/dev/null | awk '
+        NF >= 3 && $2 != "all" && $2 != "noarch" && $3 >= best {
+            arch = $2
+            best = $3
+        }
+        END { print arch }
+    '
+}
+
+update_channel() {
+    local channel
+    channel="${NETQMON_UPDATE_CHANNEL:-$(uci -q get netqmon.main.update_channel || echo stable)}"
+    case "$channel" in
+        stable|beta) printf '%s' "$channel" ;;
+        *) fail "unsupported update channel" ;;
+    esac
+}
+
+configured_update_channel() {
+    printf '%s' "${NETQMON_UPDATE_CHANNEL:-$(uci -q get netqmon.main.update_channel || echo stable)}"
+}
+
+emit_common_fields() {
+    printf '"current_version":'
+    json_string "$(current_version)"
+    printf ',"latest_version":'
+    json_string "${latest_version:-}"
+    printf ',"channel":'
+    json_string "${channel:-$(configured_update_channel)}"
+    printf ',"architecture":'
+    json_string "${arch:-$(openwrt_arch)}"
+    printf ',"last_check":'
+    json_string "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+
+status_call() {
+    channel="$(update_channel)"
+    arch="$(openwrt_arch)"
+    printf '{"ok":true,'
+    emit_common_fields
+    printf '}\n'
+}
+
+download_manifest() {
+    local output
+    mkdir -p "$TMP_DIR" || fail "failed to create update workspace"
+    output="$(wget -O "$MANIFEST" "$MANIFEST_URL" 2>&1)" || fail "failed to download release manifest from $MANIFEST_URL: $output"
+}
+
+manifest_field() {
+    local channel="$1" arch="$2" expr="$3"
+    jsonfilter -i "$MANIFEST" -e "@.channels.${channel}.packages[@.name='netqmon-agent'][@.openwrt_arch='${arch}'].${expr}" 2>/dev/null | head -n 1
+}
+
+channel_field() {
+    local channel="$1" expr="$2"
+    jsonfilter -i "$MANIFEST" -e "@.channels.${channel}.${expr}" 2>/dev/null | head -n 1
+}
+
+validate_package_url() {
+    case "$1" in
+        https://github.com/jarvis2f/netqmon/releases/download/*/netqmon-agent_*.ipk) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+resolve_update() {
+    channel="$(update_channel)"
+    arch="$(openwrt_arch)"
+    [ -n "$arch" ] || fail "failed to detect OpenWrt architecture"
+
+    latest_version="$(channel_field "$channel" version)"
+    package_url="$(manifest_field "$channel" "$arch" url)"
+    sha256="$(manifest_field "$channel" "$arch" sha256)"
+    package_arch="$(manifest_field "$channel" "$arch" openwrt_arch)"
+
+    [ -n "$latest_version" ] || fail "manifest channel has no version"
+    [ "$package_arch" = "$arch" ] || fail "manifest has no package for this architecture"
+    [ -n "$package_url" ] || fail "manifest package has no URL"
+    [ -n "$sha256" ] || fail "manifest package has no SHA256"
+    validate_package_url "$package_url" || fail "manifest package URL is not trusted"
+}
+
+check_call() {
+    download_manifest
+    resolve_update
+    printf '{"ok":true,'
+    emit_common_fields
+    printf '}\n'
+}
+
+apply_call() {
+    local actual rc
+    download_manifest
+    resolve_update
+    wget -q -O "$PACKAGE" "$package_url" || fail "failed to download agent package"
+    actual="$(sha256sum "$PACKAGE" | awk '{print $1}')"
+    [ "$actual" = "$sha256" ] || fail "downloaded package checksum mismatch"
+
+    "$SERVICE" stop >/dev/null 2>&1 || true
+    if ! opkg install "$PACKAGE" >/tmp/netqmon-opkg.log 2>&1; then
+        "$SERVICE" start >/dev/null 2>&1 || true
+        fail "opkg install failed; existing agent was restarted"
+    fi
+    "$SERVICE" start >/dev/null 2>&1 || true
+    "$AGENT" doctor >/tmp/netqmon-doctor.log 2>&1
+    rc=$?
+    [ "$rc" -eq 0 ] || fail "agent updated but doctor reported a failure"
+
+    printf '{"ok":true,'
+    emit_common_fields
+    printf '}\n'
+}
+
+case "${1:-}" in
+    status) status_call ;;
+    check) check_call ;;
+    apply) apply_call ;;
+    *) fail "usage: update-agent status|check|apply" ;;
+esac

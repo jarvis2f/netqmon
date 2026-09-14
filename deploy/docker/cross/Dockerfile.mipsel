@@ -1,0 +1,143 @@
+FROM ghcr.io/cross-rs/mipsel-unknown-linux-musl:edge
+
+# 1. Install host build-time dependencies
+# Install LLVM/Clang 15 from apt.llvm.org because Ubuntu 20.04 default clang-10 crashes on BPF atomic_cmpxchg
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install --no-install-recommends -y \
+    curl \
+    ca-certificates \
+    gnupg && \
+    curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | apt-key add - && \
+    echo "deb http://apt.llvm.org/focal/ llvm-toolchain-focal-15 main" > /etc/apt/sources.list.d/llvm15.list && \
+    (for i in 1 2 3 4 5; do apt-get update && break || sleep 5; done) && \
+    (for i in 1 2 3 4 5; do apt-get install --no-install-recommends -y \
+    clang-15 \
+    llvm-15 \
+    pkg-config \
+    libelf-dev \
+    zlib1g-dev \
+    file \
+    tar \
+    gzip \
+    bzip2 \
+    xz-utils \
+    make \
+    patch && break || sleep 5; done) && \
+    ln -sf /usr/bin/clang-15 /usr/bin/clang && \
+    ln -sf /usr/bin/clang++-15 /usr/bin/clang++ && \
+    ln -sf /usr/bin/llvm-strip-15 /usr/bin/llvm-strip && \
+    rm -rf /var/lib/apt/lists/*
+
+# The musl-cross-make toolchain prefix and sysroot in ghcr.io/cross-rs/mipsel-unknown-linux-musl:edge
+ENV TOOLCHAIN_DIR=/usr/local/mipsel-linux-muslsf
+ENV TARGET_TRIPLE=mipsel-linux-muslsf
+ENV CC=mipsel-linux-muslsf-gcc
+ENV AR=mipsel-linux-muslsf-ar
+ENV RANLIB=mipsel-linux-muslsf-ranlib
+
+# 2. Build target zlib static library
+RUN mkdir -p /tmp/build && cd /tmp/build && \
+    curl -fsSL https://zlib.net/fossils/zlib-1.3.1.tar.gz -o zlib-1.3.1.tar.gz && \
+    tar -xzf zlib-1.3.1.tar.gz && cd zlib-1.3.1 && \
+    CC="${TARGET_TRIPLE}-gcc" AR="${TARGET_TRIPLE}-ar" RANLIB="${TARGET_TRIPLE}-ranlib" \
+    ./configure --prefix=${TOOLCHAIN_DIR} --static && \
+    make -j$(nproc) && make install && \
+    cd / && rm -rf /tmp/build
+
+# 3. Build target zstd static library
+RUN mkdir -p /tmp/build && cd /tmp/build && \
+    curl -fsSL https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz -o zstd-1.5.6.tar.gz && \
+    tar -xzf zstd-1.5.6.tar.gz && cd zstd-1.5.6 && \
+    make -j$(nproc) -C lib libzstd.a CC="${TARGET_TRIPLE}-gcc" AR="${TARGET_TRIPLE}-ar" && \
+    cp lib/libzstd.a ${TOOLCHAIN_DIR}/lib/ && \
+    cp lib/zstd.h ${TOOLCHAIN_DIR}/include/ && \
+    cp lib/zstd_errors.h ${TOOLCHAIN_DIR}/include/ && \
+    cd / && rm -rf /tmp/build
+
+# 4. Build target elfutils (libelf.a only)
+# Replace color.c, error.c, printversion.c with stubs (libelf.a does not use them, but lib/ Makefile compiles them into libeu.a)
+RUN mkdir -p /tmp/build && cd /tmp/build && \
+    curl -fsSL https://sourceware.org/elfutils/ftp/0.191/elfutils-0.191.tar.bz2 -o elfutils-0.191.tar.bz2 && \
+    tar -xjf elfutils-0.191.tar.bz2 && cd elfutils-0.191 && \
+    printf 'void color_dummy(void){}\n' > lib/color.c && \
+    printf 'void error_dummy(void){}\n' > lib/error.c && \
+    printf 'void printversion_dummy(void){}\n' > lib/printversion.c && \
+    CC="${TARGET_TRIPLE}-gcc" AR="${TARGET_TRIPLE}-ar" RANLIB="${TARGET_TRIPLE}-ranlib" \
+    ac_cv_search_argp_parse="none required" \
+    ac_cv_search_fts_close="none required" \
+    ac_cv_search__obstack_free=yes \
+    ac_cv_search_ZSTD_decompress="-lzstd" \
+    ./configure \
+      --host=${TARGET_TRIPLE} \
+      --prefix=${TOOLCHAIN_DIR} \
+      --disable-debuginfod \
+      --disable-libdebuginfod \
+      --disable-nls \
+      --disable-shared \
+      --enable-static \
+      --without-bzlib \
+      --with-zlib \
+      --with-zstd \
+      CFLAGS="-I${TOOLCHAIN_DIR}/include -O2" \
+      LDFLAGS="-L${TOOLCHAIN_DIR}/lib" && \
+    make -C lib -j$(nproc) && \
+    make -C libelf -j$(nproc) libelf.a && \
+    cp libelf/libelf.a ${TOOLCHAIN_DIR}/lib/ && \
+    cp libelf/libelf.h ${TOOLCHAIN_DIR}/include/ && \
+    cp libelf/gelf.h ${TOOLCHAIN_DIR}/include/ && \
+    cp libelf/nlist.h ${TOOLCHAIN_DIR}/include/ 2>/dev/null || true && \
+    cd / && rm -rf /tmp/build
+
+# 5. Build target libbpf static library
+RUN mkdir -p /tmp/build && cd /tmp/build && \
+    curl -fsSL https://github.com/libbpf/libbpf/archive/refs/tags/v1.5.0.tar.gz -o libbpf-1.5.0.tar.gz && \
+    tar -xzf libbpf-1.5.0.tar.gz && cd libbpf-1.5.0/src && \
+    make -j$(nproc) libbpf.a \
+      CC="${TARGET_TRIPLE}-gcc" \
+      AR="${TARGET_TRIPLE}-ar" \
+      EXTRA_CFLAGS="-I${TOOLCHAIN_DIR}/include" \
+      BUILD_STATIC_ONLY=1 && \
+    cp libbpf.a ${TOOLCHAIN_DIR}/lib/ && \
+    make install_headers \
+      DESTDIR=${TOOLCHAIN_DIR} \
+      PREFIX="" && \
+    cd / && rm -rf /tmp/build
+
+# Unset temporary host build CC/AR
+ENV CC=
+ENV AR=
+ENV RANLIB=
+
+# 6. Create target gcc wrapper to resolve crtbegin/crtend paths for Rust linker and ensure -lzstd -lz for -lelf
+RUN mv /usr/local/bin/${TARGET_TRIPLE}-gcc /usr/local/bin/${TARGET_TRIPLE}-gcc.real && \
+    printf '#!/bin/bash\nGCC_LIB="/usr/local/lib/gcc/mipsel-linux-muslsf/9.2.0"\nargs=()\nis_compile_only=0\nhas_elf=0\nfor arg in "$@"; do\n  if [ "$arg" = "-c" ] || [ "$arg" = "-E" ] || [ "$arg" = "-S" ]; then\n    is_compile_only=1\n  fi\n  if [ "$arg" = "-lelf" ]; then\n    has_elf=1\n  fi\n  if [ "$arg" = "crtbegin.o" ] || [ "$arg" = "crtend.o" ] || [ "$arg" = "crtbeginS.o" ] || [ "$arg" = "crtendS.o" ] || [ "$arg" = "crtbeginT.o" ]; then\n    args+=("$GCC_LIB/$arg")\n  else\n    args+=("$arg")\n  fi\ndone\nif [ "$is_compile_only" -eq 1 ]; then\n  exec /usr/local/bin/'${TARGET_TRIPLE}'-gcc.real "${args[@]}"\nfi\nif [ "$has_elf" -eq 1 ]; then\n  exec /usr/local/bin/'${TARGET_TRIPLE}'-gcc.real "${args[@]}" -lzstd -lz\nelse\n  exec /usr/local/bin/'${TARGET_TRIPLE}'-gcc.real "${args[@]}"\nfi\n' > /usr/local/bin/${TARGET_TRIPLE}-gcc && \
+    chmod +x /usr/local/bin/${TARGET_TRIPLE}-gcc
+
+# 7. Smoke check target static libraries
+RUN file ${TOOLCHAIN_DIR}/lib/libelf.a && \
+    file ${TOOLCHAIN_DIR}/lib/libz.a && \
+    file ${TOOLCHAIN_DIR}/lib/libbpf.a
+
+# 8. Compile and link minimal probe test using target cross compiler
+RUN printf '#include <libelf.h>\n#include <zlib.h>\nint main(void) { return elf_version(EV_CURRENT) == EV_NONE; }\n' > /tmp/test_target.c && \
+    ${TARGET_TRIPLE}-gcc -I${TOOLCHAIN_DIR}/include /tmp/test_target.c -L${TOOLCHAIN_DIR}/lib -lelf -lz -o /tmp/test_target && \
+    file /tmp/test_target && \
+    rm -f /tmp/test_target.c /tmp/test_target
+
+# 9. Target-specific compiler and archiver environment variables
+# Provide both target and generic fallbacks for ar and rcs, and libunwind fallback to libgcc_eh
+RUN ln -sf /usr/local/bin/mipsel-linux-muslsf-ar /usr/local/bin/ar && \
+    ln -sf /usr/local/bin/mipsel-linux-muslsf-ar /usr/bin/ar && \
+    ln -sf /usr/local/lib/gcc/mipsel-linux-muslsf/9.2.0/libgcc_eh.a /usr/local/mipsel-linux-muslsf/lib/libunwind.a && \
+    printf '#!/bin/sh\nexec /usr/local/bin/mipsel-linux-muslsf-ar rcs "$@"\n' > /usr/local/bin/rcs && \
+    chmod +x /usr/local/bin/rcs
+ENV CC_mipsel_unknown_linux_musl=mipsel-linux-muslsf-gcc
+ENV AR_mipsel_unknown_linux_musl=mipsel-linux-muslsf-ar
+ENV CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER=mipsel-linux-muslsf-gcc
+ENV TARGET_CC=mipsel-linux-muslsf-gcc
+ENV TARGET_AR=mipsel-linux-muslsf-ar
+ENV AR=mipsel-linux-muslsf-ar
+ENV CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C target-feature=+crt-static"
+
+# 10. Target library and include paths
+ENV LIBBPF_SYS_LIBRARY_PATH_mipsel_unknown_linux_musl="/usr/local/mipsel-linux-muslsf/lib"

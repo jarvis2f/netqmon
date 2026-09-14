@@ -1,0 +1,11 @@
+{
+  "name": "netqmon",
+  "private": true,
+  "packageManager": "pnpm@9.10.0",
+  "scripts": {
+    "build": "pnpm --filter @netqmon/controller-ui build",
+    "e2e": "pnpm --filter @netqmon/controller-ui e2e",
+    "lint": "pnpm --filter @netqmon/controller-ui lint",
+    "typecheck": "pnpm --filter @netqmon/controller-ui typecheck"
+  }
+}

@@ -1,0 +1,15 @@
+# Cross.toml
+# Custom cross-compilation images with pre-installed target C libraries (libelf, zlib, zstd, libbpf)
+
+[target.armv7-unknown-linux-musleabihf]
+dockerfile = "deploy/docker/cross/Dockerfile.armv7hf"
+
+[target.armv7-unknown-linux-musleabi]
+dockerfile = "deploy/docker/cross/Dockerfile.armv7"
+
+[target.riscv64gc-unknown-linux-musl]
+dockerfile = "deploy/docker/cross/Dockerfile.riscv64"
+
+[target.mipsel-unknown-linux-musl]
+dockerfile = "deploy/docker/cross/Dockerfile.mipsel"
+build-std = true

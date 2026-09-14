@@ -1,0 +1,39 @@
+FROM rust:alpine AS builder
+
+RUN apk add --no-cache musl-dev protobuf-dev make gcc autoconf automake libtool pkgconf git
+
+COPY scripts/build-ndpi.sh /tmp/build-ndpi.sh
+RUN /tmp/build-ndpi.sh /usr/local
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+# nDPI is LGPL and remains a replaceable shared library on musl.
+ENV RUSTFLAGS="-C target-feature=-crt-static"
+
+WORKDIR /usr/src/netqmon
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY migrations ./migrations
+
+RUN cargo build --release --bin netqmon-collector
+
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates tzdata wget libgcc
+
+COPY --from=builder /usr/local/lib/libndpi.so* /usr/local/lib/
+COPY --from=builder /usr/local/share/licenses/ndpi /usr/local/share/licenses/ndpi
+ENV LD_LIBRARY_PATH=/usr/local/lib
+
+WORKDIR /app
+
+COPY --from=builder /usr/src/netqmon/target/release/netqmon-collector /usr/local/bin/netqmon-collector
+COPY --from=builder /usr/src/netqmon/migrations /app/migrations
+
+ENV NETQMON_COLLECTOR_GEO_DIR=/app/geo
+ENV NETQMON_STORAGE_BACKEND=sqlite
+ENV NETQMON_COLLECTOR_DATABASE_PATH=/var/lib/netqmon/netqmon.db
+ENV NETQMON_COLLECTOR_MAC_DATASET_PATH=/var/lib/netqmon/mac-prefixes.json
+
+EXPOSE 8090 8091
+
+ENTRYPOINT ["netqmon-collector"]
