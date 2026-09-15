@@ -606,7 +606,7 @@ function handleInternal(request, response, pathname, params, state) {
       response,
       200,
       envelope({
-        collector_version: "0.1.0",
+        collector_version: "0.1.0-beta.4",
         db_backend: "sqlite",
         db_size_bytes: 1048576,
         gateway: null,

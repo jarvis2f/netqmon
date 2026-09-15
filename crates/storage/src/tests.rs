@@ -149,6 +149,49 @@ fn migration_and_gateway_survive_reopen() {
 }
 
 #[test]
+fn stale_gateway_credentials_rotate_without_changing_identity() {
+    let mut storage = SqliteStorage::open_in_memory().unwrap();
+    assert!(
+        storage
+            .save_gateway("gateway-1", "router", "0.1.0", &[7; 32], NOW)
+            .unwrap()
+    );
+
+    assert!(
+        storage
+            .replace_stale_gateway(
+                "gateway-1",
+                "replacement-router",
+                "0.1.0-beta.4",
+                &[9; 32],
+                NOW,
+                NOW + 1_000,
+            )
+            .unwrap()
+    );
+    let gateway = storage.gateway().unwrap().unwrap();
+    assert_eq!(gateway.id, "gateway-1");
+    assert_eq!(gateway.agent_token_hash, [9; 32]);
+    assert_eq!(gateway.last_seen_ms, NOW + 1_000);
+
+    assert!(
+        !storage
+            .replace_stale_gateway(
+                "gateway-1",
+                "another-router",
+                "0.1.0-beta.4",
+                &[11; 32],
+                NOW,
+                NOW + 2_000,
+            )
+            .unwrap()
+    );
+    let gateway = storage.gateway().unwrap().unwrap();
+    assert_eq!(gateway.agent_token_hash, [9; 32]);
+    assert_eq!(gateway.last_seen_ms, NOW + 1_000);
+}
+
+#[test]
 fn self_host_client_enrichment_is_per_ip_and_rejects_shared_ip_apps() {
     let mut storage = setup();
     let mut first = batch(1, FlowLifecycle::Ended);

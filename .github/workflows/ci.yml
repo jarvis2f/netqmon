@@ -67,6 +67,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  version-contract:
+    name: Version Contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Validate workspace and package versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --no-deps --format-version 1 >/dev/null
+          workspace_version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
+          test -n "${workspace_version}"
+          for makefile in packaging/openwrt/netqmon/Makefile packaging/openwrt/luci-app-netqmon/Makefile; do
+            package_version="$(sed -n 's/^PKG_VERSION:=//p' "${makefile}")"
+            test "${package_version}" = "${workspace_version}" \
+              || { echo "${makefile} has ${package_version}, expected ${workspace_version}" >&2; exit 1; }
+          done
+          ui_version="$(sed -n 's/^  "version": "\([^"]*\)",$/\1/p' apps/controller-ui/package.json)"
+          test "${ui_version}" = "${workspace_version}" \
+            || { echo "controller UI has ${ui_version}, expected ${workspace_version}" >&2; exit 1; }
+
   rust:
     name: Rust
     runs-on: ubuntu-latest

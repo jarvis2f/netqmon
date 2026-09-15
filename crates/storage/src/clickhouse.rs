@@ -1020,7 +1020,7 @@ impl ClickHouseStorage {
 
 impl StorageBackend for ClickHouseStorage {
     fn gateway(&self) -> StorageResult<Option<GatewayRecord>> {
-        let sql = "SELECT id, agent_token_hash FROM gateways FINAL ORDER BY created_at LIMIT 1 FORMAT JSON";
+        let sql = "SELECT id, agent_token_hash, last_seen FROM gateways FINAL ORDER BY created_at LIMIT 1 FORMAT JSON";
         let result = self.client.query_json(sql)?;
         let first = result["data"].as_array().and_then(|rows| rows.first());
         if let Some(row) = first {
@@ -1033,6 +1033,7 @@ impl StorageBackend for ClickHouseStorage {
             Ok(Some(GatewayRecord {
                 id,
                 agent_token_hash,
+                last_seen_ms: json_u64(&row["last_seen"]),
             }))
         } else {
             Ok(None)
@@ -1078,6 +1079,44 @@ impl StorageBackend for ClickHouseStorage {
         });
         self.client.insert_json_each_row("gateways", &[record])?;
         Ok(true)
+    }
+
+    fn replace_stale_gateway(
+        &mut self,
+        gateway_id: &str,
+        name: &str,
+        agent_version: &str,
+        agent_token_hash: &[u8],
+        stale_before_ms: u64,
+        now_ms: u64,
+    ) -> StorageResult<bool> {
+        // ReplacingMergeTree has no row-level UPDATE transaction. An
+        // INSERT ... SELECT keeps the stale predicate in the same ClickHouse
+        // statement and preserves all metadata that is not part of enrollment.
+        let sql = format!(
+            "INSERT INTO gateways (
+                id, site_id, name, agent_token_hash, agent_version, arch,
+                kernel_version, openwrt_version, status, last_seen, created_at
+             )
+             SELECT id, site_id, '{}', '{}', '{}', arch, kernel_version,
+                    openwrt_version, 'online', {}, created_at
+             FROM gateways FINAL
+             WHERE id = '{}' AND last_seen <= {} LIMIT 1",
+            escape_sql(name),
+            escape_sql(&to_hex(agent_token_hash)),
+            escape_sql(agent_version),
+            to_i64(now_ms),
+            escape_sql(gateway_id),
+            to_i64(stale_before_ms),
+        );
+        self.client.execute(&sql)?;
+
+        let replaced = self.gateway()?.is_some_and(|gateway| {
+            gateway.id == gateway_id
+                && gateway.agent_token_hash.as_slice() == agent_token_hash
+                && gateway.last_seen_ms == now_ms
+        });
+        Ok(replaced)
     }
 
     fn admin_exists(&self) -> StorageResult<bool> {
@@ -1227,11 +1266,21 @@ impl StorageBackend for ClickHouseStorage {
 
         // 2. Gateway record update
         let health = batch.health.as_ref();
+        let agent_token_hash = self
+            .gateway()?
+            .filter(|gateway| gateway.id == batch.gateway_id)
+            .map(|gateway| to_hex(&gateway.agent_token_hash))
+            .ok_or_else(|| {
+                StorageError::Other(format!(
+                    "cannot update unknown gateway {} without credentials",
+                    batch.gateway_id
+                ))
+            })?;
         let gw_update = json!({
             "id": batch.gateway_id,
             "site_id": "default",
             "name": batch.gateway_id,
-            "agent_token_hash": "",
+            "agent_token_hash": agent_token_hash,
             "agent_version": batch.agent_version,
             "arch": "",
             "kernel_version": health.map_or("", |h| h.kernel_version.as_str()),

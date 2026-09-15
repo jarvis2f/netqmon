@@ -1873,7 +1873,8 @@ fn default_geo_directory_uses_database_directory() {
 
 #[tokio::test]
 async fn enrollment_requires_token_and_allows_only_one_active_gateway() {
-    let router = public_router(test_state());
+    let state = test_state();
+    let router = public_router(state.clone());
     let missing = router
         .clone()
         .oneshot(enrollment_request(""))
@@ -1896,6 +1897,103 @@ async fn enrollment_requires_token_and_allows_only_one_active_gateway() {
 
     let repeated_invalid = router.oneshot(enrollment_request("wrong")).await.unwrap();
     assert_eq!(repeated_invalid.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn stale_gateway_enrollment_rotates_token_and_preserves_history() {
+    let state = test_state();
+    let router = public_router(state.clone());
+    let enrolled = enroll_agent(&router).await;
+    let batch = sample_batch(&enrolled.gateway_id, 1);
+    let response = router
+        .clone()
+        .oneshot(telemetry_request(&batch, &enrolled.agent_token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let stale_at = unix_time_ms().saturating_sub(GATEWAY_REPLACEMENT_STALE_AFTER_MS + 1);
+    state
+        .lock()
+        .storage
+        .connection()
+        .execute(
+            "UPDATE gateways SET last_seen = ?1",
+            [i64::try_from(stale_at).unwrap()],
+        )
+        .unwrap();
+
+    let replacement = enroll_agent(&router).await;
+    assert_eq!(replacement.gateway_id, enrolled.gateway_id);
+    assert_ne!(replacement.agent_token, enrolled.agent_token);
+
+    let old_token_response = router
+        .clone()
+        .oneshot(telemetry_request(
+            &sample_batch(&replacement.gateway_id, 2),
+            &enrolled.agent_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(old_token_response.status(), StatusCode::UNAUTHORIZED);
+
+    let new_token_response = router
+        .clone()
+        .oneshot(telemetry_request(
+            &sample_batch(&replacement.gateway_id, 2),
+            &replacement.agent_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(new_token_response.status(), StatusCode::NO_CONTENT);
+
+    let history_count: i64 = state
+        .lock()
+        .storage
+        .connection()
+        .query_row("SELECT COUNT(*) FROM ingest_batches", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(history_count, 2);
+}
+
+#[tokio::test]
+async fn concurrent_stale_enrollment_rotates_gateway_only_once() {
+    let state = test_state();
+    let router = public_router(state.clone());
+    let enrolled = enroll_agent(&router).await;
+    let stale_at = unix_time_ms().saturating_sub(GATEWAY_REPLACEMENT_STALE_AFTER_MS + 1);
+    state
+        .lock()
+        .storage
+        .connection()
+        .execute(
+            "UPDATE gateways SET last_seen = ?1",
+            [i64::try_from(stale_at).unwrap()],
+        )
+        .unwrap();
+
+    let first = router.clone().oneshot(enrollment_request(ENROLLMENT_TOKEN));
+    let second = router.clone().oneshot(enrollment_request(ENROLLMENT_TOKEN));
+    let (first, second) = tokio::join!(first, second);
+    let statuses = [first.unwrap().status(), second.unwrap().status()];
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::OK)
+            .count(),
+        1
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CONFLICT)
+            .count(),
+        1
+    );
+
+    let gateway = state.lock().storage.gateway().unwrap().unwrap();
+    assert_eq!(gateway.id, enrolled.gateway_id);
+    assert_ne!(gateway.agent_token_hash, hash_token(&enrolled.agent_token));
 }
 
 #[tokio::test]
@@ -2039,6 +2137,42 @@ fn gateway_auth_and_traffic_survive_collector_restart() {
         )
         .unwrap();
     assert_eq!(traffic, 150);
+}
+
+#[test]
+fn rotated_gateway_credentials_survive_collector_restart() {
+    let directory = tempdir().unwrap();
+    let database_path = directory.path().join("netqmon.db");
+    let request = EnrollRequest {
+        enrollment_token: ENROLLMENT_TOKEN.to_owned(),
+        agent_version: "0.1.0-beta.4".to_owned(),
+        protocol_version: PROTOCOL_VERSION,
+        boot_id: "boot-1".to_owned(),
+        gateway_name: "router".to_owned(),
+    };
+    let state = CollectorState::open(ENROLLMENT_TOKEN, &database_path).unwrap();
+    let initial = state.enroll(&request).unwrap();
+    let stale_at = unix_time_ms().saturating_sub(GATEWAY_REPLACEMENT_STALE_AFTER_MS + 1);
+    state
+        .lock()
+        .storage
+        .connection()
+        .execute(
+            "UPDATE gateways SET last_seen = ?1",
+            [i64::try_from(stale_at).unwrap()],
+        )
+        .unwrap();
+    let replacement = state.enroll(&request).unwrap();
+    assert_eq!(replacement.gateway_id, initial.gateway_id);
+    assert_ne!(replacement.agent_token, initial.agent_token);
+    drop(state);
+
+    let restarted = CollectorState::open(ENROLLMENT_TOKEN, &database_path).unwrap();
+    assert_eq!(
+        restarted.authenticate(&replacement.agent_token),
+        Some(replacement.gateway_id)
+    );
+    assert_eq!(restarted.authenticate(&initial.agent_token), None);
 }
 
 #[test]

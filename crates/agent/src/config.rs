@@ -600,7 +600,7 @@ mod tests {
         DEFAULT_RETRY_BUFFER_SECONDS, DEFAULT_TCP_IDLE_TIMEOUT_SECONDS,
         DEFAULT_UDP_IDLE_TIMEOUT_SECONDS, LogLevel,
     };
-    use clap::Parser as _;
+    use clap::{CommandFactory as _, Parser as _};
     use std::collections::HashMap;
     use std::ffi::OsString;
     use std::fs;
@@ -694,6 +694,14 @@ interface = "tun0"
         );
         assert_eq!(config.log_level, DEFAULT_LOG_LEVEL);
         assert!(config.token.is_empty());
+    }
+
+    #[test]
+    fn cli_version_comes_from_the_workspace_package_version() {
+        assert_eq!(
+            Cli::command().get_version(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]

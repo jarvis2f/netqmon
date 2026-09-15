@@ -26,6 +26,7 @@ pub const DEFAULT_DATABASE_PATH: &str = "/data/netqmon.db";
 pub struct GatewayRecord {
     pub id: String,
     pub agent_token_hash: [u8; 32],
+    pub last_seen_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -214,6 +215,24 @@ pub trait StorageBackend {
         name: &str,
         agent_version: &str,
         agent_token_hash: &[u8],
+        now_ms: u64,
+    ) -> StorageResult<bool>;
+    /// Replaces credentials for a stale Gateway without changing its identity.
+    ///
+    /// The replacement must be conditional on `last_seen` being at or before
+    /// `stale_before_ms`, so concurrent enrollment attempts cannot both rotate
+    /// the same Gateway.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backend cannot execute the conditional update.
+    fn replace_stale_gateway(
+        &mut self,
+        gateway_id: &str,
+        name: &str,
+        agent_version: &str,
+        agent_token_hash: &[u8],
+        stale_before_ms: u64,
         now_ms: u64,
     ) -> StorageResult<bool>;
     /// Returns whether the administrator account exists.
@@ -408,7 +427,7 @@ impl SqliteStorage {
     pub fn gateway(&self) -> rusqlite::Result<Option<GatewayRecord>> {
         self.connection
             .query_row(
-                "SELECT id, agent_token_hash FROM gateways ORDER BY created_at LIMIT 1",
+                "SELECT id, agent_token_hash, last_seen FROM gateways ORDER BY created_at LIMIT 1",
                 [],
                 |row| {
                     let token_hash: Vec<u8> = row.get(1)?;
@@ -422,9 +441,21 @@ impl SqliteStorage {
                             )),
                         )
                     })?;
+                    let last_seen = row.get::<_, i64>(2)?;
+                    let last_seen_ms = u64::try_from(last_seen).map_err(|_| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            Type::Integer,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "gateway last_seen must be non-negative",
+                            )),
+                        )
+                    })?;
                     Ok(GatewayRecord {
                         id: row.get(0)?,
                         agent_token_hash,
+                        last_seen_ms,
                     })
                 },
             )
@@ -463,6 +494,37 @@ impl SqliteStorage {
             ],
         )?;
         Ok(true)
+    }
+
+    /// Rotates credentials when the persisted Gateway has been stale long
+    /// enough, preserving the Gateway ID and all child history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot execute the conditional update.
+    pub fn replace_stale_gateway(
+        &mut self,
+        gateway_id: &str,
+        name: &str,
+        agent_version: &str,
+        agent_token_hash: &[u8],
+        stale_before_ms: u64,
+        now_ms: u64,
+    ) -> rusqlite::Result<bool> {
+        let updated = self.connection.execute(
+            "UPDATE gateways SET name = ?2, agent_token_hash = ?3,
+                agent_version = ?4, status = 'online', last_seen = ?5
+             WHERE id = ?1 AND last_seen <= ?6",
+            params![
+                gateway_id,
+                name,
+                agent_token_hash,
+                agent_version,
+                to_i64(now_ms),
+                to_i64(stale_before_ms),
+            ],
+        )?;
+        Ok(updated == 1)
     }
 
     /// Returns whether the first local administrator has been created.
@@ -930,6 +992,27 @@ impl StorageBackend for SqliteStorage {
         .map_err(Into::into)
     }
 
+    fn replace_stale_gateway(
+        &mut self,
+        gateway_id: &str,
+        name: &str,
+        agent_version: &str,
+        agent_token_hash: &[u8],
+        stale_before_ms: u64,
+        now_ms: u64,
+    ) -> StorageResult<bool> {
+        Self::replace_stale_gateway(
+            self,
+            gateway_id,
+            name,
+            agent_version,
+            agent_token_hash,
+            stale_before_ms,
+            now_ms,
+        )
+        .map_err(Into::into)
+    }
+
     fn admin_exists(&self) -> StorageResult<bool> {
         Self::admin_exists(self).map_err(Into::into)
     }
@@ -1152,6 +1235,26 @@ impl Storage {
         )
     }
 
+    pub fn replace_stale_gateway(
+        &mut self,
+        gateway_id: &str,
+        name: &str,
+        agent_version: &str,
+        agent_token_hash: &[u8],
+        stale_before_ms: u64,
+        now_ms: u64,
+    ) -> StorageResult<bool> {
+        StorageBackend::replace_stale_gateway(
+            self,
+            gateway_id,
+            name,
+            agent_version,
+            agent_token_hash,
+            stale_before_ms,
+            now_ms,
+        )
+    }
+
     pub fn admin_exists(&self) -> StorageResult<bool> {
         StorageBackend::admin_exists(self)
     }
@@ -1306,6 +1409,37 @@ impl StorageBackend for Storage {
                 name,
                 agent_version,
                 agent_token_hash,
+                now_ms,
+            ),
+        }
+    }
+
+    fn replace_stale_gateway(
+        &mut self,
+        gateway_id: &str,
+        name: &str,
+        agent_version: &str,
+        agent_token_hash: &[u8],
+        stale_before_ms: u64,
+        now_ms: u64,
+    ) -> StorageResult<bool> {
+        match self {
+            Self::Sqlite(s) => StorageBackend::replace_stale_gateway(
+                s,
+                gateway_id,
+                name,
+                agent_version,
+                agent_token_hash,
+                stale_before_ms,
+                now_ms,
+            ),
+            Self::ClickHouse(c) => StorageBackend::replace_stale_gateway(
+                c,
+                gateway_id,
+                name,
+                agent_version,
+                agent_token_hash,
+                stale_before_ms,
                 now_ms,
             ),
         }

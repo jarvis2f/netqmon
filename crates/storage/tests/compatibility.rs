@@ -185,11 +185,68 @@ fn handle_client(stream: &mut TcpStream, db: &Arc<Mutex<MockClickHouseDb>>) {
         } else {
             serde_json::to_string(&json!({ "data": [] })).unwrap()
         }
-    } else if body_str.contains("FROM gateways") {
-        let mock = db.lock().unwrap();
-        let rows: Vec<Value> = mock
+    } else if body_str.contains("INSERT INTO gateways") {
+        let mut mock = db.lock().unwrap();
+        let Some(current) = mock
             .gateways
             .iter()
+            .max_by_key(|gateway| gateway["last_seen"].as_i64().unwrap_or(0))
+            .cloned()
+        else {
+            return;
+        };
+        let current_last_seen = current["last_seen"].as_i64().unwrap_or(0);
+        let cutoff = body_str
+            .split("AND last_seen <= ")
+            .nth(1)
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(i64::MIN);
+        if current_last_seen <= cutoff {
+            let Some(select_values) = body_str.split("SELECT id, site_id, '").nth(1) else {
+                return;
+            };
+            let Some((name, select_values)) = select_values.split_once("', '") else {
+                return;
+            };
+            let Some((agent_hash, select_values)) = select_values.split_once("', '") else {
+                return;
+            };
+            let Some((agent_version, select_values)) = select_values.split_once("', arch") else {
+                return;
+            };
+            let Some(now) = select_values
+                .split("openwrt_version, 'online', ")
+                .nth(1)
+                .and_then(|value| value.split(", created_at").next())
+                .and_then(|value| value.trim().parse::<i64>().ok())
+            else {
+                return;
+            };
+            let mut replacement = current;
+            replacement["name"] = Value::String(name.to_owned());
+            replacement["agent_token_hash"] = Value::String(agent_hash.to_owned());
+            replacement["agent_version"] = Value::String(agent_version.to_owned());
+            replacement["status"] = Value::String("online".to_owned());
+            replacement["last_seen"] = json!(now);
+            mock.gateways.push(replacement);
+        }
+        String::new()
+    } else if body_str.contains("FROM gateways") {
+        let mock = db.lock().unwrap();
+        let mut latest = HashMap::<String, Value>::new();
+        for gateway in &mock.gateways {
+            let id = gateway["id"].as_str().unwrap_or("").to_owned();
+            let is_newer = latest.get(&id).is_none_or(|current| {
+                gateway["last_seen"].as_i64().unwrap_or(0)
+                    >= current["last_seen"].as_i64().unwrap_or(0)
+            });
+            if is_newer {
+                latest.insert(id, gateway.clone());
+            }
+        }
+        let rows: Vec<Value> = latest
+            .values()
             .map(|g| {
                 json!({
                     "id": g["id"],
@@ -379,6 +436,36 @@ fn backend_compatibility_identical_fixtures_and_semantic_parity() {
 
     assert_eq!(sqlite_gw.id, ch_gw.id);
     assert_eq!(sqlite_gw.agent_token_hash, ch_gw.agent_token_hash);
+    assert_eq!(sqlite_gw.last_seen_ms, ch_gw.last_seen_ms);
+
+    assert!(
+        clickhouse
+            .replace_stale_gateway(
+                "gw-100",
+                "Replacement Gateway",
+                "0.1.0-beta.4",
+                &[9; 32],
+                1_000,
+                2_000,
+            )
+            .unwrap()
+    );
+    let replaced = clickhouse.gateway().unwrap().expect("replaced gateway");
+    assert_eq!(replaced.id, "gw-100");
+    assert_eq!(replaced.agent_token_hash, [9; 32]);
+    assert_eq!(replaced.last_seen_ms, 2_000);
+    assert!(
+        !clickhouse
+            .replace_stale_gateway(
+                "gw-100",
+                "Should Not Replace",
+                "0.1.0-beta.4",
+                &[11; 32],
+                1_999,
+                3_000,
+            )
+            .unwrap()
+    );
 
     // 2. Admin user management
     assert!(!sqlite.admin_exists().unwrap());
@@ -490,6 +577,8 @@ fn backend_compatibility_identical_fixtures_and_semantic_parity() {
 
     assert_eq!(s_disp, PersistDisposition::Accepted);
     assert_eq!(ch_disp, PersistDisposition::Accepted);
+    let gateway_after_batch = clickhouse.gateway().unwrap().expect("gateway after batch");
+    assert_eq!(gateway_after_batch.agent_token_hash, [9; 32]);
 
     // Duplicate batch check
     let s_dup = sqlite

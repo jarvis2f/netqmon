@@ -4,10 +4,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 export COPYFILE_DISABLE=1
+WORKSPACE_VERSION="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' "${ROOT_DIR}/Cargo.toml")"
+test -n "${WORKSPACE_VERSION}"
 
 BINARY_PATH="${1:-}"
 ARCH="${2:-x86_64}"
-VERSION="${3:-0.1.0-1}"
+VERSION="${3:-${WORKSPACE_VERSION}-1}"
 OUTPUT_DIR="${4:-${ROOT_DIR}/dist}"
 LUCI_VERSION="${LUCI_VERSION:-${VERSION}}"
 

@@ -30,6 +30,16 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Validate release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
+          release_version="${GITHUB_REF_NAME#v}"
+          test "${cargo_version}" = "${release_version}" \
+            || { echo "Cargo workspace version ${cargo_version} does not match tag ${release_version}" >&2; exit 1; }
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -47,6 +57,13 @@ jobs:
           chmod 0755 "dist/netqmon-agent_${{ matrix.arch }}"
           file "dist/netqmon-agent_${{ matrix.arch }}"
 
+      - name: Smoke test agent version
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
+          test "$("dist/netqmon-agent_${{ matrix.arch }}" --version)" = "netqmon-agent ${expected}"
+
       - name: Upload agent binary artifact
         uses: actions/upload-artifact@v4
         with:
@@ -60,6 +77,16 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Validate release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
+          release_version="${GITHUB_REF_NAME#v}"
+          test "${cargo_version}" = "${release_version}" \
+            || { echo "Cargo workspace version ${cargo_version} does not match tag ${release_version}" >&2; exit 1; }
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -85,7 +112,8 @@ jobs:
       - name: Smoke test execution via QEMU user
         run: |
           sudo apt-get update && sudo apt-get install -y qemu-user-static
-          qemu-arm-static dist/netqmon-agent_armv7hf --version
+          expected="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
+          test "$(qemu-arm-static dist/netqmon-agent_armv7hf --version)" = "netqmon-agent ${expected}"
 
       - name: Upload agent binary artifact
         uses: actions/upload-artifact@v4
@@ -101,6 +129,16 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Validate release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
+          release_version="${GITHUB_REF_NAME#v}"
+          test "${cargo_version}" = "${release_version}" \
+            || { echo "Cargo workspace version ${cargo_version} does not match tag ${release_version}" >&2; exit 1; }
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -129,7 +167,8 @@ jobs:
 
           # Smoke test execution via QEMU user
           sudo apt-get update && sudo apt-get install -y qemu-user-static
-          qemu-riscv64-static dist/netqmon-agent_riscv64 --version
+          expected="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
+          test "$(qemu-riscv64-static dist/netqmon-agent_riscv64 --version)" = "netqmon-agent ${expected}"
 
       - name: Upload agent binary artifact
         uses: actions/upload-artifact@v4
@@ -145,6 +184,16 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Validate release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
+          release_version="${GITHUB_REF_NAME#v}"
+          test "${cargo_version}" = "${release_version}" \
+            || { echo "Cargo workspace version ${cargo_version} does not match tag ${release_version}" >&2; exit 1; }
 
       - name: Install Rust nightly toolchain (required for Tier 3 build-std)
         uses: dtolnay/rust-toolchain@nightly
@@ -175,7 +224,8 @@ jobs:
 
           # Smoke test execution via QEMU user
           sudo apt-get update && sudo apt-get install -y qemu-user-static
-          qemu-mipsel-static dist/netqmon-agent_mipsel32r2 --version
+          expected="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
+          test "$(qemu-mipsel-static dist/netqmon-agent_mipsel32r2 --version)" = "netqmon-agent ${expected}"
 
       - name: Upload agent binary artifact
         uses: actions/upload-artifact@v4
@@ -265,6 +315,8 @@ jobs:
           echo "CONFIG_PACKAGE_luci-app-netqmon=m" >> .config
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             version="${GITHUB_REF_NAME#v}"
+            cargo_version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
+            test "${version}" = "${cargo_version}"
             sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${version}/" packaging/openwrt/netqmon/Makefile
             sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${version}/" packaging/openwrt/luci-app-netqmon/Makefile
           fi
@@ -383,6 +435,8 @@ jobs:
           echo "CONFIG_PACKAGE_luci-app-netqmon=m" >> .config
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             version="${GITHUB_REF_NAME#v}"
+            cargo_version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
+            test "${version}" = "${cargo_version}"
             sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${version}/" packaging/openwrt/netqmon/Makefile
             sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${version}/" packaging/openwrt/luci-app-netqmon/Makefile
           fi
@@ -445,4 +499,3 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           files: ${{ env.FIRMWARE }}/*
-

@@ -4,6 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DIST_DIR="${ROOT_DIR}/dist"
+WORKSPACE_VERSION="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' "${ROOT_DIR}/Cargo.toml")"
+test -n "${WORKSPACE_VERSION}"
 
 mkdir -p "${DIST_DIR}"
 
@@ -41,7 +43,7 @@ build_arch() {
     "${ROOT_DIR}/packaging/openwrt/build-ipk.sh" \
         "${DIST_DIR}/netqmon-agent_${arch}" \
         "${arch}" \
-        "0.1.0-1" \
+        "${WORKSPACE_VERSION}-1" \
         "${DIST_DIR}"
 }
 

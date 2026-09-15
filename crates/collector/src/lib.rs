@@ -73,6 +73,7 @@ const MAX_FLOWS_PER_BATCH: usize = 10_000;
 const MAX_DISCOVERY_OBSERVATIONS_PER_BATCH: usize = 10_000;
 const MAX_PROBE_RESULTS_PER_BATCH: usize = 64;
 const MAX_HASHES_PER_FAVICON_RESULT: usize = 8;
+const GATEWAY_REPLACEMENT_STALE_AFTER_MS: u64 = 5 * 60 * 1_000;
 const ROLLUP_INTERVAL: Duration = Duration::from_secs(60);
 const RETENTION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAC_DATASET_UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -406,7 +407,55 @@ impl CollectorState {
 
     fn enroll(&self, request: &EnrollRequest) -> Result<Enrollment, EnrollError> {
         let mut inner = self.lock();
+        let now_ms = unix_time_ms();
+        if let Some(record) = inner.storage.gateway().map_err(|_| EnrollError::Storage)? {
+            let stale_before_ms = now_ms.saturating_sub(GATEWAY_REPLACEMENT_STALE_AFTER_MS);
+            if record.last_seen_ms <= stale_before_ms {
+                let agent_token = random_hex(32).map_err(|_| EnrollError::Random)?;
+                let agent_token_hash = hash_token(&agent_token);
+                let replaced = inner
+                    .storage
+                    .replace_stale_gateway(
+                        &record.id,
+                        &request.gateway_name,
+                        &request.agent_version,
+                        &agent_token_hash,
+                        stale_before_ms,
+                        now_ms,
+                    )
+                    .map_err(|_| EnrollError::Storage)?;
+                if !replaced {
+                    tracing::debug!(gateway_id = %record.id, "stale gateway enrollment lost a concurrent replacement");
+                    return Err(EnrollError::GatewayAlreadyEnrolled);
+                }
+                inner.gateway = Some(GatewayCredential {
+                    gateway_id: record.id.clone(),
+                    agent_token_hash,
+                });
+                inner
+                    .realtime
+                    .gateway_status(&record.id, "enrolled", now_ms);
+                tracing::info!(
+                    gateway_id = %record.id,
+                    previous_last_seen_ms = record.last_seen_ms,
+                    "stale gateway credentials rotated during enrollment"
+                );
+                return Ok(Enrollment {
+                    gateway_id: record.id,
+                    agent_token,
+                });
+            }
+            tracing::debug!(
+                gateway_id = %record.id,
+                last_seen_ms = record.last_seen_ms,
+                "enrollment rejected because gateway is still active"
+            );
+            return Err(EnrollError::GatewayAlreadyEnrolled);
+        }
         if inner.gateway.is_some() {
+            tracing::warn!(
+                "enrollment rejected because the in-memory gateway has no persisted record"
+            );
             return Err(EnrollError::GatewayAlreadyEnrolled);
         }
         let gateway_id = random_hex(16).map_err(|_| EnrollError::Random)?;
@@ -419,7 +468,7 @@ impl CollectorState {
                 &request.gateway_name,
                 &request.agent_version,
                 &agent_token_hash,
-                unix_time_ms(),
+                now_ms,
             )
             .map_err(|_| EnrollError::Storage)?;
         if !saved {
@@ -431,7 +480,7 @@ impl CollectorState {
         });
         inner
             .realtime
-            .gateway_status(&gateway_id, "enrolled", unix_time_ms());
+            .gateway_status(&gateway_id, "enrolled", now_ms);
         Ok(Enrollment {
             gateway_id,
             agent_token,

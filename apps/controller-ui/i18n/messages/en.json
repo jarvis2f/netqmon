@@ -331,6 +331,16 @@
       "trafficLast24h": "Traffic — Last 24 hours",
       "topClients": "Top clients",
       "topDomains": "Top domains",
+      "scope": {
+        "title": "Statistics scope",
+        "tabs": {
+          "overview": "Summary cards use all recorded application traffic. The chart and top lists use persisted observations from the last 24 hours.",
+          "clients": "Groups persisted flow observations by LAN client and sums upload, download, and flow count for the last 24 hours. Shows up to 100 clients.",
+          "domains": "Groups persisted flow observations by observed domain and sums upload, download, packets, and flows for the last 24 hours. Shows up to 100 domains.",
+          "destinations": "Groups persisted flow observations by remote IP, with the latest associated domain when available, for the last 24 hours. Shows up to 100 destinations.",
+          "flows": "Lists individual persisted flow sessions associated with this application from the last 24 hours, ordered by most recently seen. Shows up to 100 flows."
+        }
+      },
       "tabs": {
         "overview": "Overview",
         "clients": "Clients",

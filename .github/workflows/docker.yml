@@ -32,6 +32,16 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Validate release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
+          release_version="${GITHUB_REF_NAME#v}"
+          test "${cargo_version}" = "${release_version}" \
+            || { echo "Cargo workspace version ${cargo_version} does not match tag ${release_version}" >&2; exit 1; }
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 

@@ -7,6 +7,7 @@ import {
   ArrowDown,
   ArrowLeft,
   ArrowUp,
+  Info,
   Network,
   Users,
   ExternalLink,
@@ -94,6 +95,29 @@ export function ApplicationDetailDashboard({
     { id: "destinations", label: t("detail.tabs.destinations") },
     { id: "flows", label: t("detail.tabs.flows") },
   ];
+
+  const tabScope = {
+    overview: {
+      label: t("detail.tabs.overview"),
+      description: t("detail.scope.tabs.overview"),
+    },
+    clients: {
+      label: t("detail.tabs.clients"),
+      description: t("detail.scope.tabs.clients"),
+    },
+    domains: {
+      label: t("detail.tabs.domains"),
+      description: t("detail.scope.tabs.domains"),
+    },
+    destinations: {
+      label: t("detail.tabs.destinations"),
+      description: t("detail.scope.tabs.destinations"),
+    },
+    flows: {
+      label: t("detail.tabs.flows"),
+      description: t("detail.scope.tabs.flows"),
+    },
+  }[initialTab];
 
   useEffect(() => {
     const controller = new AbortController();
@@ -524,6 +548,22 @@ export function ApplicationDetailDashboard({
         </nav>
       }
     >
+      <section
+        aria-label={t("detail.scope.title")}
+        className="mb-4 rounded-md border border-border bg-surface-subtle/60 px-3 py-2.5"
+      >
+        <div className="flex items-start gap-2.5">
+          <Info className="mt-0.5 size-4 shrink-0 text-foreground-muted" />
+          <div className="min-w-0 text-xs">
+            <div className="font-semibold text-foreground">
+              {t("detail.scope.title")} · {tabScope.label}
+            </div>
+            <p className="mt-0.5 text-foreground-secondary">
+              {tabScope.description}
+            </p>
+          </div>
+        </div>
+      </section>
       {error ? (
         <ErrorState
           title={t("unavailable")}
