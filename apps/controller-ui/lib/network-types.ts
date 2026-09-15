@@ -1,7 +1,9 @@
 export interface ApplicationSummary {
   application_id: string;
   category_id: string;
+  name?: string | null;
   organization_id?: string;
+  organization_name?: string | null;
   icon?: IconMetadata | null;
   upload_bytes: number;
   download_bytes: number;
@@ -93,6 +95,7 @@ export interface DestinationSummary {
   flow_count: number;
   client_count: number;
   last_seen: number;
+  application_name?: string | null;
 }
 
 export interface GeoSummary {
@@ -124,6 +127,7 @@ export interface FlowSummary {
   domain: string | null;
   organization?: string;
   application: string;
+  application_name?: string | null;
   category: string;
   traffic_role?: string;
   protocol_id?: string;

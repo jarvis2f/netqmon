@@ -4,7 +4,7 @@ import React, { useEffect, useRef, useState } from "react";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import { useTranslations } from "next-intl";
-import { formatBytes, formatPackets } from "@/lib/formatters";
+import { formatBytes, formatIdentifier, formatPackets } from "@/lib/formatters";
 import type { DestinationSummary } from "@/lib/network-types";
 import { CountryFlag } from "@/components/icons/country-flag";
 import { Loader2 } from "lucide-react";
@@ -330,7 +330,8 @@ export function DestinationsMap({
 
         // Destination Label: Priority is Application Name -> Domain -> City/Country -> IP
         const labelText =
-          flow.application ||
+          flow.application_name ||
+          (flow.application ? formatIdentifier(flow.application) : null) ||
           flow.domain ||
           flow.city ||
           flow.country_name ||

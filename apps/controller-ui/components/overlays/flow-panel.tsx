@@ -11,6 +11,7 @@ import {
   cloudflareDomainUrl,
   formatBytes,
   formatDuration,
+  formatIdentifier,
   formatPackets,
   formatPercent,
   formatTimestamp,
@@ -77,10 +78,14 @@ export function FlowPanel({
     ((flow.ended_at ?? flow.last_seen) - flow.started_at) / 1_000,
   );
   const evidence = evidenceItems(flow.evidence);
+  const applicationName =
+    flow.application === "unknown"
+      ? tStatus("unknown")
+      : flow.application_name || formatIdentifier(flow.application);
 
   const getResultLabel = () => {
     if (flow.application && flow.application !== "unknown") {
-      return t("likelyApp", { app: flow.application });
+      return t("likelyApp", { app: applicationName });
     }
     if (flow.protocol_id && flow.protocol_id !== "unknown") {
       return t("protocolNamed", { protocol: flow.protocol_id });
@@ -145,10 +150,7 @@ export function FlowPanel({
           label={t("organization")}
           value={flow.organization || tStatus("unknown")}
         />
-        <PropertyRow
-          label={t("application")}
-          value={flow.application || tStatus("unknown")}
-        />
+        <PropertyRow label={t("application")} value={applicationName} />
         <PropertyRow
           label={t("trafficClass")}
           value={flow.category || tStatus("unknown")}

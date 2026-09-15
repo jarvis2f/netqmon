@@ -28,7 +28,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { formatBytes, formatPackets, formatTimestamp } from "@/lib/formatters";
+import {
+  formatBytes,
+  formatIdentifier,
+  formatPackets,
+  formatTimestamp,
+} from "@/lib/formatters";
 
 type Direction = "both" | "download" | "upload";
 type TrafficScope = "internet" | "internal" | "tunnel" | "all";
@@ -44,7 +49,7 @@ interface TrafficPoint {
 
 interface BreakdownRow {
   id: string;
-  name: string;
+  name: string | null;
   mac: string | null;
   icon?: import("@/lib/network-types").IconMetadata | null;
   upload_bytes: number;
@@ -238,7 +243,10 @@ export function TrafficDashboard({
           )}
           <div className="min-w-0">
             <div className="truncate font-medium text-foreground">
-              {row.name || row.mac || tStatus("unknown")}
+              {row.name ||
+                (initialGroupBy === "application"
+                  ? formatIdentifier(row.id)
+                  : row.mac || tStatus("unknown"))}
             </div>
             {row.mac && (
               <div className="truncate font-mono text-[10px] text-foreground-muted">

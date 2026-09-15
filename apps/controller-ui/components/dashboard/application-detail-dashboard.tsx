@@ -30,6 +30,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   cloudflareDomainUrl,
   formatBytes,
+  formatIdentifier,
   formatPackets,
   formatPercent,
   formatTimestamp,
@@ -125,7 +126,11 @@ export function ApplicationDetailDashboard({
       setLoading(true);
       try {
         const encoded = encodeURIComponent(applicationId);
-        const query = new URLSearchParams({ limit: "100" });
+        const query = new URLSearchParams({
+          limit: "100",
+          from: "0",
+          to: String(Date.now()),
+        });
         if (categoryId) query.set("category", categoryId);
         const relationQuery = query.toString();
         const responses = await Promise.all([
@@ -497,7 +502,7 @@ export function ApplicationDetailDashboard({
       title={
         app?.application_id === "unknown"
           ? t("detail.unknownApp")
-          : (app?.application_id ?? applicationId)
+          : app?.name || formatIdentifier(app?.application_id ?? applicationId)
       }
       subtitle={
         app
@@ -524,6 +529,7 @@ export function ApplicationDetailDashboard({
         >
           <ApplicationIdentity
             id={applicationId}
+            name={app?.name}
             category={app?.category_id}
             icon={app?.icon}
           />
@@ -615,7 +621,8 @@ export function ApplicationDetailDashboard({
                   </dt>
                   <dd className="mt-1 font-medium">
                     {app.organization_id && app.organization_id !== "unknown"
-                      ? app.organization_id
+                      ? app.organization_name ||
+                        formatIdentifier(app.organization_id)
                       : tStatus("unknown")}
                   </dd>
                 </div>
@@ -671,7 +678,7 @@ export function ApplicationDetailDashboard({
           )}
           <TrafficChart
             data={chartData}
-            title={t("detail.trafficLast24h")}
+            title={t("detail.trafficRecorded")}
             height={300}
             loading={loading}
             maxPoints={200}

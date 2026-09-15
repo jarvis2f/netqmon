@@ -526,17 +526,16 @@ fn traffic_breakdown(
             });
             if group_by == "application" {
                 if let Some(object) = value.as_object_mut() {
+                    let application_id = object
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let metadata = inner.classifier.application_metadata(application_id);
                     object.insert(
-                        "icon".to_owned(),
-                        icon_json(
-                            inner.classifier.application_metadata(
-                                object
-                                    .get("id")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("unknown"),
-                            ),
-                        ),
+                        "name".to_owned(),
+                        json!(metadata.as_ref().map(|metadata| metadata.name.clone())),
                     );
+                    object.insert("icon".to_owned(), icon_json(metadata));
                 }
             }
             Ok(value)
@@ -758,10 +757,12 @@ async fn client_related(
     let connection = inner.storage.connection();
     let result = match relation.as_str() {
         "traffic" => query_client_traffic(connection, id, from, to, scope),
-        "applications" => query_client_applications(connection, id, page, from, to, scope),
+        "applications" => {
+            query_client_applications(connection, &inner.classifier, id, page, from, to, scope)
+        }
         "domains" => query_client_domains(connection, id, page, from, to, scope),
         "destinations" => query_client_destinations(connection, id, page, from, to, scope),
-        "flows" => query_client_flows(connection, id, page, from, to, scope),
+        "flows" => query_client_flows(connection, &inner.classifier, id, page, from, to, scope),
         _ => {
             return api_error(
                 StatusCode::NOT_FOUND,
@@ -806,6 +807,7 @@ fn query_client_traffic(
 
 fn query_client_applications(
     connection: &Connection,
+    classifier: &crate::classifier::ClassifierHandle,
     id: i64,
     page: Page,
     from: u64,
@@ -821,16 +823,32 @@ fn query_client_applications(
          GROUP BY application_id, category_id ORDER BY SUM(upload_bytes + download_bytes) DESC
          LIMIT ?5 OFFSET ?6",
     )?;
-    let items = statement.query_map(
-        params![id, to_i64(from), to_i64(to), scope, i64::from(page.limit), to_i64(page.offset)],
-        |row| Ok(json!({
-            "application_id": row.get::<_, String>(0)?, "category_id": row.get::<_, String>(1)?,
-            "upload_bytes": row.get::<_, i64>(2)?, "download_bytes": row.get::<_, i64>(3)?,
-            "packets": row.get::<_, i64>(4)?, "flow_count": row.get::<_, i64>(5)?,
-            "last_seen": row.get::<_, i64>(6)?, "confidence": row.get::<_, f64>(7)?,
-            "client_count": 1,
-        })),
-    )?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let items = statement
+        .query_map(
+            params![
+                id,
+                to_i64(from),
+                to_i64(to),
+                scope,
+                i64::from(page.limit),
+                to_i64(page.offset)
+            ],
+            |row| {
+                let application_id = row.get::<_, String>(0)?;
+                let metadata = classifier.application_metadata(&application_id);
+                Ok(json!({
+                    "application_id": application_id,
+                    "name": metadata.as_ref().map(|metadata| metadata.name.clone()),
+                    "category_id": row.get::<_, String>(1)?,
+                    "upload_bytes": row.get::<_, i64>(2)?, "download_bytes": row.get::<_, i64>(3)?,
+                    "packets": row.get::<_, i64>(4)?, "flow_count": row.get::<_, i64>(5)?,
+                    "last_seen": row.get::<_, i64>(6)?, "confidence": row.get::<_, f64>(7)?,
+                    "client_count": 1,
+                    "icon": icon_json(metadata),
+                }))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(json!(items))
 }
 
@@ -911,6 +929,7 @@ fn query_client_destinations(
 
 fn query_client_flows(
     connection: &Connection,
+    classifier: &crate::classifier::ClassifierHandle,
     id: i64,
     page: Page,
     from: u64,
@@ -929,11 +948,19 @@ fn query_client_flows(
     )?;
     let items = statement.query_map(
         params![id, to_i64(from), to_i64(to), scope, i64::from(page.limit), to_i64(page.offset)],
-        |row| { let client_ip: Vec<u8> = row.get(1)?; let remote_ip: Vec<u8> = row.get(3)?; Ok(json!({
+        |row| {
+            let client_ip: Vec<u8> = row.get(1)?;
+            let remote_ip: Vec<u8> = row.get(3)?;
+            let application = row.get::<_, String>(8)?;
+            let application_name = classifier
+                .application_metadata(&application)
+                .as_ref()
+                .map(|metadata| metadata.name.clone());
+            Ok(json!({
             "id": row.get::<_, String>(0)?, "client_ip": format_ip(&client_ip), "client_port": row.get::<_, i64>(2)?,
             "remote_ip": format_ip(&remote_ip), "remote_port": row.get::<_, i64>(4)?, "protocol": row.get::<_, i64>(5)?,
             "direction": row.get::<_, i64>(6)?, "domain": row.get::<_, Option<String>>(7)?,
-            "application": row.get::<_, String>(8)?, "category": row.get::<_, String>(9)?,
+            "application": application, "application_name": application_name, "category": row.get::<_, String>(9)?,
             "confidence": row.get::<_, f64>(10)?, "reason": row.get::<_, String>(11)?,
             "upload_bytes": row.get::<_, i64>(12)?, "download_bytes": row.get::<_, i64>(13)?,
             "packets": row.get::<_, i64>(14)?, "started_at": row.get::<_, i64>(15)?,
@@ -943,7 +970,8 @@ fn query_client_flows(
             "nat": flow_nat_name(row.get::<_, i32>(20)?),
             "source_segment": row.get::<_, String>(21)?,
             "destination_segment": row.get::<_, String>(22)?,
-        })) },
+        }))
+        },
     )?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(json!(items))
 }
@@ -970,7 +998,9 @@ async fn applications(
                     (SELECT COUNT(DISTINCT f.device_id) FROM flow_sessions f
                      WHERE f.application_id = t.application_id AND f.device_id IS NOT NULL),
                     (SELECT f.organization_id FROM flow_sessions f
-                     WHERE f.application_id = t.application_id AND f.organization_id IS NOT NULL LIMIT 1)
+                     WHERE f.application_id = t.application_id
+                       AND f.organization_id IS NOT NULL AND f.organization_id != 'unknown'
+                     LIMIT 1)
              FROM traffic_application_minute t GROUP BY t.application_id, t.category_id
              ORDER BY SUM(t.upload_bytes + t.download_bytes) DESC, t.application_id
              LIMIT ?1 OFFSET ?2",
@@ -978,8 +1008,17 @@ async fn applications(
         let items = statement
             .query_map(params![i64::from(page.limit), to_i64(page.offset)], |row| {
                 let application_id = row.get::<_, String>(0)?;
+                let application_metadata = inner.classifier.application_metadata(&application_id);
+                let organization_id = row.get::<_, Option<String>>(8)?;
+                let organization_metadata = organization_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty() && *id != "unknown")
+                    .and_then(|id| inner.classifier.organization_metadata(id));
                 Ok(json!({
                     "application_id": application_id,
+                    "name": application_metadata
+                        .as_ref()
+                        .map(|metadata| metadata.name.clone()),
                     "category_id": row.get::<_, String>(1)?,
                     "upload_bytes": row.get::<_, i64>(2)?,
                     "download_bytes": row.get::<_, i64>(3)?,
@@ -987,8 +1026,9 @@ async fn applications(
                     "flow_count": row.get::<_, i64>(5)?,
                     "last_seen": row.get::<_, i64>(6)?,
                     "client_count": row.get::<_, i64>(7)?,
-                    "organization_id": row.get::<_, Option<String>>(8)?,
-                    "icon": icon_json(inner.classifier.application_metadata(&application_id)),
+                    "organization_id": organization_id,
+                    "organization_name": organization_metadata.as_ref().map(|metadata| metadata.name.clone()),
+                    "icon": icon_json(application_metadata),
                 }))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1021,10 +1061,11 @@ async fn organizations(
         let items = statement
             .query_map(params![i64::from(page.limit), to_i64(page.offset)], |row| {
                 let id: String = row.get(0)?;
+                let metadata = inner.classifier.organization_metadata(&id);
                 Ok(json!({
                     "id": id.clone(),
-                    "name": id,
-                    "icon": icon_json(inner.classifier.organization_metadata(&id)),
+                    "name": metadata_name(metadata.as_ref(), &id),
+                    "icon": icon_json(metadata),
                     "upload_bytes": row.get::<_, i64>(1)?,
                     "download_bytes": row.get::<_, i64>(2)?,
                     "flows": row.get::<_, i64>(3)?,
@@ -1134,7 +1175,10 @@ async fn application_detail(
                 "SELECT COUNT(DISTINCT device_id), COUNT(DISTINCT domain),
                         COUNT(DISTINCT hex(remote_ip)), AVG(COALESCE(classification_confidence, 0)),
                         COALESCE(MAX(classification_reason), 'no matching rule'),
-                        COALESCE(MAX(organization_id), 'unknown')
+                        COALESCE(MAX(CASE
+                            WHEN organization_id IS NOT NULL AND organization_id != 'unknown'
+                            THEN organization_id
+                        END), 'unknown')
                  FROM flow_sessions
                  WHERE application_id = ?1
                    AND (?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)",
@@ -1154,18 +1198,35 @@ async fn application_detail(
                 Ok((clients, domains, destinations, confidence, reason, organization)) => {
                     let observed_protocols = query_application_protocols(connection, &id, category)
                         .unwrap_or_else(|_| Vec::new());
+                    let application_metadata = inner.classifier.application_metadata(&id);
+                    let organization_metadata = (organization != "unknown")
+                        .then(|| inner.classifier.organization_metadata(&organization))
+                        .flatten();
                     if let Some(object) = value.as_object_mut() {
+                        object.insert(
+                            "name".to_owned(),
+                            json!(
+                                application_metadata
+                                    .as_ref()
+                                    .map(|metadata| metadata.name.clone())
+                            ),
+                        );
                         object.insert("client_count".to_owned(), json!(clients));
                         object.insert("domain_count".to_owned(), json!(domains));
                         object.insert("destination_count".to_owned(), json!(destinations));
                         object.insert("confidence".to_owned(), json!(confidence));
                         object.insert("classifier_reason".to_owned(), json!(reason));
                         object.insert("organization_id".to_owned(), json!(organization));
-                        object.insert("observed_protocols".to_owned(), json!(observed_protocols));
                         object.insert(
-                            "icon".to_owned(),
-                            icon_json(inner.classifier.application_metadata(&id)),
+                            "organization_name".to_owned(),
+                            json!(
+                                organization_metadata
+                                    .as_ref()
+                                    .map(|metadata| metadata.name.clone())
+                            ),
                         );
+                        object.insert("observed_protocols".to_owned(), json!(observed_protocols));
+                        object.insert("icon".to_owned(), icon_json(application_metadata));
                     }
                     api_ok(value)
                 }
@@ -1268,7 +1329,9 @@ async fn application_related(
         "clients" => query_application_clients(connection, &id, category, page, from, to),
         "domains" => query_application_domains(connection, &id, category, page, from, to),
         "destinations" => query_application_destinations(connection, &id, category, page, from, to),
-        "flows" => query_application_flows(connection, &id, category, page, from, to),
+        "flows" => {
+            query_application_flows(connection, &inner.classifier, &id, category, page, from, to)
+        }
         _ => {
             return api_error(
                 StatusCode::NOT_FOUND,
@@ -1445,12 +1508,17 @@ fn query_application_destinations(
 
 fn query_application_flows(
     connection: &Connection,
+    classifier: &crate::classifier::ClassifierHandle,
     id: &str,
     category: Option<&str>,
     page: Page,
     from: u64,
     to: u64,
 ) -> rusqlite::Result<Value> {
+    let application_name = classifier
+        .application_metadata(id)
+        .as_ref()
+        .map(|metadata| metadata.name.clone());
     let mut statement = connection.prepare(
         "SELECT id, client_ip, client_port, remote_ip, remote_port, protocol, direction,
                 domain, category_id, classification_confidence, classification_reason,
@@ -1471,7 +1539,8 @@ fn query_application_flows(
                 "client_port": row.get::<_, i64>(2)?, "remote_ip": format_ip(&remote_ip),
                 "remote_port": row.get::<_, i64>(4)?, "protocol": row.get::<_, i64>(5)?,
                 "direction": row.get::<_, i64>(6)?, "domain": row.get::<_, Option<String>>(7)?,
-                "application": id, "category": row.get::<_, Option<String>>(8)?.unwrap_or_else(|| "unknown".to_owned()),
+                "application": id, "application_name": application_name,
+                "category": row.get::<_, Option<String>>(8)?.unwrap_or_else(|| "unknown".to_owned()),
                 "confidence": row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
                 "reason": row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "no matching rule".to_owned()),
                 "upload_bytes": row.get::<_, i64>(11)?, "download_bytes": row.get::<_, i64>(12)?,
@@ -1644,6 +1713,11 @@ fn map_destination_row(
             }
         })
         .unwrap_or_default();
+    let application_id = row.get::<_, Option<String>>(8)?;
+    let application_metadata = application_id
+        .as_deref()
+        .filter(|id| !id.is_empty() && *id != "unknown")
+        .and_then(|id| inner.classifier.application_metadata(id));
     Ok(json!({
         "remote_ip": remote_ip,
         "upload_bytes": row.get::<_, i64>(1)?,
@@ -1653,7 +1727,10 @@ fn map_destination_row(
         "last_seen": row.get::<_, i64>(5)?,
         "domain": row.get::<_, Option<String>>(6)?,
         "client_count": row.get::<_, i64>(7)?,
-        "application": row.get::<_, Option<String>>(8)?,
+        "application": application_id,
+        "application_name": application_metadata
+            .as_ref()
+            .map(|metadata| metadata.name.clone()),
         "country_code": geo.country_code,
         "country_name": geo.country_name,
         "region": geo.region,
@@ -1877,7 +1954,12 @@ async fn flows(
         Err(response) => return *response,
     };
     let inner = state.lock();
-    let result = query_flow_page(inner.storage.connection(), &query, &options);
+    let result = query_flow_page(
+        inner.storage.connection(),
+        &inner.classifier,
+        &query,
+        &options,
+    );
     match result {
         Ok((items, next_cursor)) => Json(json!({
             "schema_version": SCHEMA_VERSION,
@@ -1955,6 +2037,7 @@ fn parse_flow_page_options(query: &FlowQuery) -> Result<FlowPageOptions, Box<Res
 
 fn query_flow_page(
     connection: &Connection,
+    classifier: &crate::classifier::ClassifierHandle,
     query: &FlowQuery,
     options: &FlowPageOptions,
 ) -> rusqlite::Result<(Vec<Value>, Option<String>)> {
@@ -1993,7 +2076,9 @@ fn query_flow_page(
     values.push(SqlValue::Integer(i64::from(options.limit) + 1));
     let mut statement = connection.prepare(&sql)?;
     let mut items = statement
-        .query_map(rusqlite::params_from_iter(values), flow_row_json)?
+        .query_map(rusqlite::params_from_iter(values), |row| {
+            flow_row_json(row, classifier)
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let has_more = items.len() > options.limit as usize;
     items.truncate(options.limit as usize);
@@ -2170,16 +2255,27 @@ fn add_flow_transport_filters(
     Ok(())
 }
 
-fn flow_row_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+fn flow_row_json(
+    row: &rusqlite::Row<'_>,
+    classifier: &crate::classifier::ClassifierHandle,
+) -> rusqlite::Result<Value> {
     let client_ip: Vec<u8> = row.get(1)?;
     let remote_ip: Vec<u8> = row.get(3)?;
+    let application = row
+        .get::<_, Option<String>>(9)?
+        .unwrap_or_else(|| "unknown".to_owned());
+    let application_name = classifier
+        .application_metadata(&application)
+        .as_ref()
+        .map(|metadata| metadata.name.clone());
     Ok(json!({
         "id": row.get::<_, String>(0)?, "client_ip": format_ip(&client_ip),
         "client_port": row.get::<_, i64>(2)?, "remote_ip": format_ip(&remote_ip),
         "remote_port": row.get::<_, i64>(4)?, "protocol": row.get::<_, i64>(5)?,
         "direction": row.get::<_, i64>(6)?, "domain": row.get::<_, Option<String>>(7)?,
         "organization": row.get::<_, Option<String>>(8)?.unwrap_or_else(|| "unknown".to_owned()),
-        "application": row.get::<_, Option<String>>(9)?.unwrap_or_else(|| "unknown".to_owned()),
+        "application": application,
+        "application_name": application_name,
         "category": row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "unknown".to_owned()),
         "traffic_role": row.get::<_, Option<String>>(11)?.unwrap_or_else(|| "unknown".to_owned()),
         "protocol_id": row.get::<_, Option<String>>(12)?.unwrap_or_else(|| "unknown".to_owned()),
@@ -2719,6 +2815,10 @@ fn page_ok(items: Vec<Value>, page: Page, total: u64) -> Response {
 
 fn icon_json(metadata: Option<crate::classifier::EntityMetadata>) -> Value {
     metadata.map_or(Value::Null, |metadata| json!(metadata.icon))
+}
+
+fn metadata_name(metadata: Option<&crate::classifier::EntityMetadata>, fallback: &str) -> String {
+    metadata.map_or_else(|| fallback.to_owned(), |metadata| metadata.name.clone())
 }
 
 fn api_error(status: StatusCode, code: &str, message: &str) -> Response {

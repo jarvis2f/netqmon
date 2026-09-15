@@ -34,6 +34,7 @@ import { useTopologyLabels } from "@/hooks/use-topology-labels";
 import {
   formatBytes,
   formatDuration,
+  formatIdentifier,
   formatTimestamp,
   ipInfoUrl,
   isLocalIp,
@@ -487,16 +488,17 @@ export function FlowsDashboard(props: Props) {
       id: "application",
       header: t("columns.classification"),
       cell: (row) => {
+        const applicationId = row.application;
         const name =
-          row.application === "unknown"
+          applicationId === "unknown"
             ? !row.protocol_id || row.protocol_id === "unknown"
               ? tStatus("unknown")
               : row.protocol_id
-            : row.application;
+            : row.application_name || formatIdentifier(applicationId);
         return (
           <div className="flex min-w-0 items-center gap-2">
-            {row.application !== "unknown" ? (
-              <ApplicationIcon applicationId={row.application} size="md" />
+            {applicationId !== "unknown" ? (
+              <ApplicationIcon applicationId={applicationId} size="md" />
             ) : (
               <ProtocolIcon protocol={row.protocol_id ?? "unknown"} size="md" />
             )}

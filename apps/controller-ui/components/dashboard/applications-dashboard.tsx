@@ -13,7 +13,12 @@ import { EmptyState } from "@/components/states/empty-state";
 import { ErrorState } from "@/components/states/error-state";
 import { buttonVariants } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { formatBytes, formatPackets, formatTimestamp } from "@/lib/formatters";
+import {
+  formatBytes,
+  formatIdentifier,
+  formatPackets,
+  formatTimestamp,
+} from "@/lib/formatters";
 import type { ApiEnvelope, ApplicationSummary } from "@/lib/network-types";
 
 export function ApplicationsDashboard({
@@ -118,8 +123,10 @@ export function ApplicationsDashboard({
     return items.filter(
       (item) =>
         item.application_id.toLowerCase().includes(query) ||
+        (item.name ?? "").toLowerCase().includes(query) ||
         item.category_id.toLowerCase().includes(query) ||
-        (item.organization_id ?? "").toLowerCase().includes(query),
+        (item.organization_id ?? "").toLowerCase().includes(query) ||
+        (item.organization_name ?? "").toLowerCase().includes(query),
     );
   }, [items, search]);
 
@@ -130,6 +137,7 @@ export function ApplicationsDashboard({
       cell: (row) => (
         <ApplicationIdentity
           id={row.application_id}
+          name={row.name}
           category={row.category_id}
           icon={row.icon}
         />
@@ -140,7 +148,7 @@ export function ApplicationsDashboard({
       header: t("columns.organization"),
       cell: (row) =>
         row.organization_id && row.organization_id !== "unknown"
-          ? row.organization_id
+          ? row.organization_name || formatIdentifier(row.organization_id)
           : tStatus("unknown"),
     },
     {
@@ -253,7 +261,10 @@ export function ApplicationsDashboard({
         title={
           selected?.application_id === "unknown"
             ? tStatus("unknown")
-            : (selected?.application_id ?? t("columns.application"))
+            : selected?.name ||
+              (selected?.application_id
+                ? formatIdentifier(selected.application_id)
+                : t("columns.application"))
         }
         subtitle={
           selected?.category_id
@@ -302,7 +313,8 @@ export function ApplicationsDashboard({
                 value={
                   selected.organization_id &&
                   selected.organization_id !== "unknown"
-                    ? selected.organization_id
+                    ? selected.organization_name ||
+                      formatIdentifier(selected.organization_id)
                     : tStatus("unknown")
                 }
               />

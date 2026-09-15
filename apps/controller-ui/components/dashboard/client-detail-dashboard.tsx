@@ -329,6 +329,7 @@ export function ClientDetailDashboard({
       cell: (row) => (
         <ApplicationIdentity
           id={row.application_id}
+          name={row.name}
           category={row.category_id}
           icon={row.icon}
         />
@@ -472,7 +473,10 @@ export function ClientDetailDashboard({
     {
       id: "application",
       header: tFlows("classification"),
-      cell: (row) => row.application || tStatus("unknown"),
+      cell: (row) =>
+        row.application === "unknown"
+          ? tStatus("unknown")
+          : row.application_name || formatIdentifier(row.application),
     },
     {
       id: "destination",

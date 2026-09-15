@@ -22,7 +22,7 @@ import {
   TrafficChart,
   type TrafficDataPoint,
 } from "@/components/data/traffic-chart";
-import { splitBitrate } from "@/lib/formatters";
+import { formatIdentifier, splitBitrate } from "@/lib/formatters";
 import type { IconMetadata } from "@/lib/network-types";
 
 const MAX_REALTIME_POINTS = 900;
@@ -147,7 +147,7 @@ export function OverviewDashboard({ username }: { username: string }) {
           const id = item.application_id ?? "unknown";
           return {
             id,
-            name: id,
+            name: item.name || formatIdentifier(id),
             subtitle: item.category_id ?? t("other"),
             value,
             percentage: total ? value / total : 0,

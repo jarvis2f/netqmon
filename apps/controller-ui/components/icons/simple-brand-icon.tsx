@@ -280,7 +280,7 @@ export function SimpleBrandIcon({
       className={cn("size-4", className)}
       role="img"
     >
-      <path d={icon.path} fill="currentColor" />
+      <path d={icon.path} fill={`#${icon.hex}`} />
     </svg>
   );
 }
