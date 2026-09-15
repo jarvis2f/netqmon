@@ -40,6 +40,7 @@ NetQmon Controller 是整个网络监控系统的核心服务端，通常通过 
 | :--- | :--- | :--- |
 | `NETQMON_STORAGE_BACKEND` | `sqlite` | 数据存储后端类型，可选 `sqlite` 或 `clickhouse`。普通家庭环境推荐 `sqlite`，千万级流数据推荐 `clickhouse`。 |
 | `NETQMON_COLLECTOR_DATABASE_PATH` | `/data/netqmon.db` | SQLite 数据库文件存储路径（位于持久化卷 `/data` 中）。 |
+| `NETQMON_LICENSE_STATE_PATH` | `/data/license.json` | 持久化许可证身份与安装凭据。必须位于持久化的 `/data` 中，确保替换容器后安装实例 ID 不变。 |
 | `NETQMON_CLICKHOUSE_URL` | `http://clickhouse:8123` | ClickHouse HTTP 连接地址（当后端为 `clickhouse` 时生效）。 |
 | `NETQMON_CLICKHOUSE_DATABASE` | `default` | ClickHouse 数据库名称。 |
 | `NETQMON_CLICKHOUSE_USER` | `default` | ClickHouse 认证用户名（可选）。 |
@@ -66,11 +67,8 @@ NetQmon Controller 是整个网络监控系统的核心服务端，通常通过 
 
 | 环境变量 | 默认值 | 作用说明 |
 | :--- | :--- | :--- |
-| `NETQMON_CLASSIFIER_MANAGED` | `true` | 是否在后台启动分类组件管理器（设为 `false` 则不自动拉起管理子进程）。 |
-| `NETQMON_CLASSIFIER_SOCKET` | `/run/netqmon/classifierd.sock` | 本地分类守护进程通信的 Unix Domain Socket 路径。 |
-| `NETQMON_COMPONENT_API_URL` | `https://netqmon.com` | 分类组件 Manifest 查询与更新服务器地址。 |
-| `NETQMON_CLASSIFIER_UPDATE_CHANNEL` | `stable` | 分类器组件更新通道，可选 `stable` / `beta` / `dev`。 |
-| `NETQMON_CLASSIFIER_UPDATE_INTERVAL_SECONDS` | `21600` | 自动检查组件更新的周期（秒，默认 6 小时）。 |
+| `NETQMON_CLASSIFIER_UPDATE_CHANNEL` | `beta` | 分类器组件更新通道，可选 `stable` / `beta` / `dev`。 |
+| `NETQMON_CLASSIFIER_UPDATE_INTERVAL_SECONDS` | `300` | 自动检查组件更新的周期（秒，默认 5 分钟）。 |
 
 ### 2.6 日志与调试
 

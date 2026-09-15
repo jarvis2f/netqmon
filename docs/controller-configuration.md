@@ -40,6 +40,7 @@ In a standard deployment (such as via `docker-compose.yml`), the Controller cont
 | :--- | :--- | :--- |
 | `NETQMON_STORAGE_BACKEND` | `sqlite` | Storage backend type: `sqlite` or `clickhouse`. SQLite is recommended for typical home/homelab networks; ClickHouse is recommended for multi-gigabit workloads with high flow retention requirements. |
 | `NETQMON_COLLECTOR_DATABASE_PATH` | `/data/netqmon.db` | Filesystem path for the SQLite database (located inside the persistent `/data` volume). |
+| `NETQMON_LICENSE_STATE_PATH` | `/data/license.json` | Persistent license identity and installation credential state. Keep this path on the persistent `/data` volume so the installation ID survives container replacement. |
 | `NETQMON_CLICKHOUSE_URL` | `http://clickhouse:8123` | ClickHouse HTTP endpoint URL (applicable when `NETQMON_STORAGE_BACKEND=clickhouse`). |
 | `NETQMON_CLICKHOUSE_DATABASE` | `default` | ClickHouse database name. |
 | `NETQMON_CLICKHOUSE_USER` | `default` | ClickHouse authentication username (optional). |
@@ -66,11 +67,8 @@ In a standard deployment (such as via `docker-compose.yml`), the Controller cont
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `NETQMON_CLASSIFIER_MANAGED` | `true` | Whether to automatically supervise and manage the classifier daemon background process (set to `false` to disable). |
-| `NETQMON_CLASSIFIER_SOCKET` | `/run/netqmon/classifierd.sock` | Filesystem path to the local classifier IPC Unix domain socket. |
-| `NETQMON_COMPONENT_API_URL` | `https://netqmon.com` | Upstream component manifest and update check API URL. |
-| `NETQMON_CLASSIFIER_UPDATE_CHANNEL` | `stable` | Classifier component update channel: `stable`, `beta`, or `dev`. |
-| `NETQMON_CLASSIFIER_UPDATE_INTERVAL_SECONDS` | `21600` | Periodic check interval for component updates (in seconds, default 6 hours). |
+| `NETQMON_CLASSIFIER_UPDATE_CHANNEL` | `beta` | Classifier component update channel: `stable`, `beta`, or `dev`. |
+| `NETQMON_CLASSIFIER_UPDATE_INTERVAL_SECONDS` | `300` | Periodic check interval for component updates (in seconds, default 5 minutes). |
 
 ### 2.6 Logging & Debugging
 

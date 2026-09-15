@@ -16,8 +16,8 @@ use uuid::Uuid;
 
 use crate::classifier::ClassifierHandle;
 
-const DEFAULT_CLOUD_API_URL: &str = "http://127.0.0.1:8080";
-const DEFAULT_IDENTITY_PATH: &str = "/var/lib/netqmon/license.json";
+const DEFAULT_CLOUD_API_URL: &str = "https://netqmon.com";
+const DEFAULT_IDENTITY_PATH: &str = "/data/license.json";
 const CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const OFFLINE_GRACE_SECONDS: i64 = 24 * 60 * 60;
 

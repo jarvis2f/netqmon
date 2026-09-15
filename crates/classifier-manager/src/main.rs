@@ -8,9 +8,9 @@ use std::{
 
 use netqmon_classifier_client::{ClassifierClient, ClassifierClientConfig};
 use netqmon_classifier_manager::{
-    ComponentManifest, IPC_PROTOCOL_VERSION, MAX_BINARY_BYTES, TEST_KEY_ID, TEST_PUBLIC_KEY_HEX,
-    current_binary, current_platform, install_binary, previous_binary, prune_releases,
-    same_release_content, switch_current, verify_installed_binary, verify_manifest,
+    ComponentManifest, IPC_PROTOCOL_VERSION, MAX_BINARY_BYTES, TEST_PUBLIC_KEY_HEX, current_binary,
+    current_platform, install_binary, previous_binary, prune_releases, same_release_content,
+    switch_current, verify_installed_binary, verify_manifest,
 };
 use nix::{
     sys::signal::{Signal, kill},
@@ -22,7 +22,11 @@ use tokio::process::{Child, Command};
 
 const DEFAULT_COMPONENT_ROOT: &str = "/data/components/classifierd";
 const DEFAULT_SOCKET: &str = "/run/netqmon/classifierd.sock";
-const DEFAULT_UPDATE_SECONDS: u64 = 6 * 60 * 60;
+const DEFAULT_COMPONENT_API_URL: &str = "https://netqmon.com";
+const DEFAULT_UPDATE_CHANNEL: &str = "beta";
+const DEFAULT_UPDATE_SECONDS: u64 = 5 * 60;
+const DEFAULT_TRUSTED_KEY_ID: &str = "production-classifier-component";
+const DEFAULT_TRUSTED_KEY_VERSION: u32 = 1;
 const MAX_UPGRADE_CRASHES: u32 = 3;
 const UPGRADE_STABILIZATION_SECONDS: u64 = 60;
 
@@ -262,7 +266,7 @@ impl Config {
     fn from_env() -> Result<Self, String> {
         let api_url = env::var("NETQMON_COMPONENT_API_URL")
             .or_else(|_| env::var("NETQMON_CLOUD_API_URL"))
-            .unwrap_or_else(|_| "https://netqmon.com".into())
+            .unwrap_or_else(|_| DEFAULT_COMPONENT_API_URL.into())
             .trim_end_matches('/')
             .to_owned();
         let interval = env::var("NETQMON_CLASSIFIER_UPDATE_INTERVAL_SECONDS")
@@ -276,18 +280,18 @@ impl Config {
             .map(|value| value.parse::<u32>())
             .transpose()
             .map_err(|error| error.to_string())?
-            .unwrap_or(1);
+            .unwrap_or(DEFAULT_TRUSTED_KEY_VERSION);
         Ok(Self {
             api_url,
             channel: env::var("NETQMON_CLASSIFIER_UPDATE_CHANNEL")
-                .unwrap_or_else(|_| "stable".into()),
+                .unwrap_or_else(|_| DEFAULT_UPDATE_CHANNEL.into()),
             root: env::var_os("NETQMON_CLASSIFIER_COMPONENT_DIR")
                 .map_or_else(|| PathBuf::from(DEFAULT_COMPONENT_ROOT), PathBuf::from),
             socket: env::var_os("NETQMON_CLASSIFIER_SOCKET")
                 .map_or_else(|| PathBuf::from(DEFAULT_SOCKET), PathBuf::from),
             interval: Duration::from_secs(interval.max(60)),
             trusted_key_id: env::var("NETQMON_CLASSIFIER_COMPONENT_KEY_ID")
-                .unwrap_or_else(|_| TEST_KEY_ID.into()),
+                .unwrap_or_else(|_| DEFAULT_TRUSTED_KEY_ID.into()),
             trusted_key_version,
             trusted_public_key: option_env!("NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX")
                 .unwrap_or(TEST_PUBLIC_KEY_HEX)
