@@ -664,6 +664,7 @@ fn fixture_rule_stats() -> netqmon_classifier_client::RuleStats {
         protocol_count: 2,
         rule_version: "test-rule-version".to_owned(),
         updated_at_unix_ms: 1_800_000_000_000,
+        ..Default::default()
     }
 }
 

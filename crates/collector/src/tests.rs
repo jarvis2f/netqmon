@@ -2713,6 +2713,18 @@ async fn settings_diagnostics_endpoint() {
     assert_eq!(json["data"]["classification"]["stats"]["client_count"], 1);
     assert_eq!(json["data"]["classification"]["stats"]["protocol_count"], 2);
     assert_eq!(
+        json["data"]["classification"]["stats"]["sample_match_requests"],
+        0
+    );
+    assert_eq!(
+        json["data"]["classification"]["stats"]["signature_match_count"],
+        0
+    );
+    assert_eq!(
+        json["data"]["classification"]["stats"]["signature_match_application_count"],
+        0
+    );
+    assert_eq!(
         json["data"]["classification"]["stats"]["rule_version"],
         "test-rule-version"
     );

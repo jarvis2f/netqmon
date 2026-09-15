@@ -219,6 +219,7 @@ pub struct RuleVersion {
 
 /// Rule-set statistics owned and reported by the classifier.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RuleStats {
     /// Number of known applications.
     pub application_count: u64,
@@ -232,6 +233,12 @@ pub struct RuleStats {
     pub rule_version: String,
     /// Rule-set last update time in Unix milliseconds.
     pub updated_at_unix_ms: u64,
+    /// Number of valid flow-sample matching requests received by the classifier.
+    pub sample_match_requests: u64,
+    /// Number of flow-sample matching requests with at least one signature hit.
+    pub signature_match_count: u64,
+    /// Number of application matches returned by signature matching.
+    pub signature_match_application_count: u64,
 }
 
 /// The one Cloud-selected artifact an installation may activate.
@@ -1573,6 +1580,9 @@ mod tests {
             protocol_count: 200,
             rule_version: "2026.09".into(),
             updated_at_unix_ms: 1_800_000_012_345,
+            sample_match_requests: 7,
+            signature_match_count: 3,
+            signature_match_application_count: 4,
         };
         let json = serde_json::to_string(&ServerResponse::ReloadRules {
             request_id: "reload-1".into(),
@@ -1581,7 +1591,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             json,
-            "{\"type\":\"reload_rules\",\"request_id\":\"reload-1\",\"stats\":{\"application_count\":120,\"selfhost_application_count\":8,\"client_count\":45,\"protocol_count\":200,\"rule_version\":\"2026.09\",\"updated_at_unix_ms\":1800000012345}}"
+            "{\"type\":\"reload_rules\",\"request_id\":\"reload-1\",\"stats\":{\"application_count\":120,\"selfhost_application_count\":8,\"client_count\":45,\"protocol_count\":200,\"rule_version\":\"2026.09\",\"updated_at_unix_ms\":1800000012345,\"sample_match_requests\":7,\"signature_match_count\":3,\"signature_match_application_count\":4}}"
         );
         let decoded: ServerResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(

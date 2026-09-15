@@ -465,6 +465,7 @@ fn mock_stats(state: &Arc<Mutex<MockState>>) -> RuleStats {
             .clone()
             .unwrap_or_else(|| MOCK_RULE_VERSION.to_owned()),
         updated_at_unix_ms: 1_800_000_000_000,
+        ..Default::default()
     }
 }
 
