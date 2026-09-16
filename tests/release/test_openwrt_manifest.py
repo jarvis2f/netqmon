@@ -52,39 +52,39 @@ class OpenWrtManifestTests(unittest.TestCase):
             make_ipk(agent, "netqmon-agent", "x86_64", "0.1.0-beta.4-r1")
             make_ipk(luci, "luci-app-netqmon", "all", "0.1.0-beta.4-r1")
             make_ipk(
-                beta / "netqmon-agent_0.1.0-beta.7-r1_x86_64.ipk",
+                beta / "netqmon-agent_0.1.0-beta.8-r1_x86_64.ipk",
                 "netqmon-agent",
                 "x86_64",
-                "0.1.0-beta.7-r1",
+                "0.1.0-beta.8-r1",
             )
             make_ipk(
-                beta / "luci-app-netqmon_0.1.0-beta.7-r1_all.ipk",
+                beta / "luci-app-netqmon_0.1.0-beta.8-r1_all.ipk",
                 "luci-app-netqmon",
                 "all",
-                "0.1.0-beta.7-r1",
+                "0.1.0-beta.8-r1",
             )
 
             manifest = create_manifest(
                 "jarvis2f/netqmon",
                 [
                     f"stable:v0.1.0-beta.4:{stable}",
-                    f"beta:v0.1.0-beta.7:{beta}",
+                    f"beta:v0.1.0-beta.8:{beta}",
                 ],
             )
 
             self.assertEqual(manifest["channels"]["stable"]["version"], "0.1.0-beta.4")
-            self.assertEqual(manifest["channels"]["beta"]["version"], "0.1.0-beta.7")
+            self.assertEqual(manifest["channels"]["beta"]["version"], "0.1.0-beta.8")
             record = next(
                 item
                 for item in manifest["channels"]["beta"]["packages"]
                 if item["name"] == "netqmon-agent"
             )
-            package_path = beta / "netqmon-agent_0.1.0-beta.7-r1_x86_64.ipk"
+            package_path = beta / "netqmon-agent_0.1.0-beta.8-r1_x86_64.ipk"
             self.assertEqual(record["openwrt_arch"], "x86_64")
             self.assertEqual(
                 record["url"],
-                "https://github.com/jarvis2f/netqmon/releases/download/v0.1.0-beta.7/"
-                "netqmon-agent_0.1.0-beta.7-r1_x86_64.ipk",
+                "https://github.com/jarvis2f/netqmon/releases/download/v0.1.0-beta.8/"
+                "netqmon-agent_0.1.0-beta.8-r1_x86_64.ipk",
             )
             self.assertEqual(record["sha256"], hashlib.sha256(package_path.read_bytes()).hexdigest())
 
