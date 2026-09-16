@@ -19,6 +19,46 @@ use super::*;
 
 const ENROLLMENT_TOKEN: &str = "test-enrollment-token";
 
+#[test]
+fn analytics_replay_yields_only_while_large_backlogs_remain() {
+    assert_eq!(
+        analytics_replay_delay(
+            Duration::from_millis(80),
+            ANALYTICS_OUTBOX_BATCH_SIZE,
+            ANALYTICS_REPLAY_BACKLOG_THRESHOLD + 1,
+            false,
+        ),
+        Some(Duration::from_millis(80))
+    );
+    assert_eq!(
+        analytics_replay_delay(
+            Duration::from_millis(10),
+            ANALYTICS_OUTBOX_BATCH_SIZE,
+            ANALYTICS_REPLAY_BACKLOG_THRESHOLD + 1,
+            false,
+        ),
+        Some(ANALYTICS_REPLAY_MIN_YIELD)
+    );
+    assert_eq!(
+        analytics_replay_delay(
+            Duration::from_millis(80),
+            ANALYTICS_OUTBOX_BATCH_SIZE,
+            ANALYTICS_REPLAY_BACKLOG_THRESHOLD,
+            false,
+        ),
+        None
+    );
+    assert_eq!(
+        analytics_replay_delay(
+            Duration::from_millis(80),
+            ANALYTICS_OUTBOX_BATCH_SIZE,
+            ANALYTICS_REPLAY_BACKLOG_THRESHOLD + 1,
+            true,
+        ),
+        None
+    );
+}
+
 fn strong_self_host_attribution(application_id: &str) -> FlowAttribution {
     FlowAttribution {
         organization_id: "self_host_org".to_owned(),

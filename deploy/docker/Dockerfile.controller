@@ -1,14 +1,40 @@
+FROM rust:alpine AS cargo-planner
+
+RUN cargo install cargo-chef --locked --version 0.1.78
+
+WORKDIR /usr/src/netqmon
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY migrations ./migrations
+
+RUN cargo chef prepare --recipe-path recipe.json
+
+
 FROM rust:alpine AS collector-builder
 
-RUN apk add --no-cache musl-dev protobuf-dev make gcc g++ autoconf automake libtool pkgconf git
+RUN apk add --no-cache musl-dev protobuf-dev make gcc g++ autoconf automake libtool pkgconf git binutils
 
 COPY scripts/build-ndpi.sh /tmp/build-ndpi.sh
-RUN /tmp/build-ndpi.sh /usr/local
+RUN /tmp/build-ndpi.sh /usr/local && \
+    find /usr/local/lib -maxdepth 1 -type f -name 'libndpi.so*' -exec strip --strip-unneeded {} +
 ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
 # nDPI is LGPL and remains a replaceable shared library on musl.
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 
 WORKDIR /usr/src/netqmon
+
+COPY --from=cargo-planner /usr/local/cargo/bin/cargo-chef /usr/local/bin/cargo-chef
+COPY --from=cargo-planner /usr/src/netqmon/recipe.json ./recipe.json
+
+ARG TARGETARCH
+ENV CARGO_TARGET_DIR=/usr/src/netqmon/target/${TARGETARCH:-local}
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo chef cook --locked --release --recipe-path recipe.json \
+    --package netqmon-collector \
+    --package netqmon-classifier-manager
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
@@ -17,12 +43,9 @@ COPY migrations ./migrations
 ARG NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX=d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
 ENV NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX=${NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX}
 
-ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/usr/src/netqmon/target \
-    CARGO_TARGET_DIR="/usr/src/netqmon/target/${TARGETARCH:-local}" \
-    cargo build --release --bin netqmon-collector --bin netqmon-classifier-manager && \
+    cargo build --locked --release --bin netqmon-collector --bin netqmon-classifier-manager && \
     cp "/usr/src/netqmon/target/${TARGETARCH:-local}/release/netqmon-collector" /netqmon-collector && \
     cp "/usr/src/netqmon/target/${TARGETARCH:-local}/release/netqmon-classifier-manager" /netqmon-classifier-manager
 

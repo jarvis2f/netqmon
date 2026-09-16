@@ -1,9 +1,11 @@
 #!/bin/sh
 set -u
 
-MANIFEST_URL="${NETQMON_UPDATE_MANIFEST_URL:-https://github.com/jarvis2f/netqmon/releases/latest/download/openwrt-agent-manifest.json}"
+MANIFEST_URL="${NETQMON_UPDATE_MANIFEST_URL:-}"
+RELEASES_API_URL="https://api.github.com/repos/jarvis2f/netqmon/releases?per_page=100"
 TMP_DIR="${TMPDIR:-/tmp}/netqmon-update"
 MANIFEST="$TMP_DIR/manifest.json"
+RELEASES="$TMP_DIR/releases.json"
 PACKAGE="$TMP_DIR/netqmon-agent.ipk"
 SERVICE=/etc/init.d/netqmon
 AGENT=/usr/bin/netqmon-agent
@@ -70,6 +72,7 @@ emit_common_fields() {
     json_string "${channel:-$(configured_update_channel)}"
     printf ',"architecture":'
     json_string "${arch:-$(openwrt_arch)}"
+    printf ',"update_available":%s' "${update_available:-false}"
     printf ',"last_check":'
     json_string "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
@@ -82,10 +85,43 @@ status_call() {
     printf '}\n'
 }
 
-download_manifest() {
-    local output
+release_manifest_url() {
+    local output index tag prerelease draft asset_name
+    channel="$(update_channel)"
     mkdir -p "$TMP_DIR" || fail "failed to create update workspace"
-    output="$(wget -O "$MANIFEST" "$MANIFEST_URL" 2>&1)" || fail "failed to download release manifest from $MANIFEST_URL: $output"
+    output="$(wget -O "$RELEASES" "$RELEASES_API_URL" 2>&1)" || return 1
+    [ -s "$RELEASES" ] || return 1
+
+    index=0
+    while [ "$index" -lt 100 ]; do
+        tag="$(jsonfilter -i "$RELEASES" -e "@[$index].tag_name" 2>/dev/null | head -n 1)"
+        [ -n "$tag" ] || break
+        prerelease="$(jsonfilter -i "$RELEASES" -e "@[$index].prerelease" 2>/dev/null | head -n 1)"
+        draft="$(jsonfilter -i "$RELEASES" -e "@[$index].draft" 2>/dev/null | head -n 1)"
+        asset_name="$(jsonfilter -i "$RELEASES" -e "@[$index].assets[@.name='openwrt-agent-manifest.json'].name" 2>/dev/null | head -n 1)"
+
+        if [ "$draft" != "true" ] && [ "$asset_name" = "openwrt-agent-manifest.json" ]; then
+            if { [ "$channel" = "beta" ] && [ "$prerelease" = "true" ]; } || \
+                { [ "$channel" = "stable" ] && [ "$prerelease" = "false" ]; }; then
+                printf 'https://github.com/jarvis2f/netqmon/releases/download/%s/openwrt-agent-manifest.json' "$tag"
+                return 0
+            fi
+        fi
+        index=$((index + 1))
+    done
+    return 1
+}
+
+download_manifest() {
+    local output resolved_url
+    mkdir -p "$TMP_DIR" || fail "failed to create update workspace"
+    if [ -n "$MANIFEST_URL" ]; then
+        resolved_url="$MANIFEST_URL"
+    else
+        resolved_url="$(release_manifest_url)" || fail "no ${channel:-$(configured_update_channel)} release with an OpenWrt manifest was found"
+        MANIFEST_URL="$resolved_url"
+    fi
+    output="$(wget -O "$MANIFEST" "$resolved_url" 2>&1)" || fail "failed to download release manifest from $resolved_url: $output"
 }
 
 manifest_field() {
@@ -114,12 +150,21 @@ resolve_update() {
     package_url="$(manifest_field "$channel" "$arch" url)"
     sha256="$(manifest_field "$channel" "$arch" sha256)"
     package_arch="$(manifest_field "$channel" "$arch" openwrt_arch)"
+    latest_package_version="$(manifest_field "$channel" "$arch" version)"
 
     [ -n "$latest_version" ] || fail "manifest channel has no version"
     [ "$package_arch" = "$arch" ] || fail "manifest has no package for this architecture"
     [ -n "$package_url" ] || fail "manifest package has no URL"
     [ -n "$sha256" ] || fail "manifest package has no SHA256"
+    [ -n "$latest_package_version" ] || fail "manifest package has no version"
     validate_package_url "$package_url" || fail "manifest package URL is not trusted"
+
+    current="$(current_version)"
+    if opkg compare-versions "$latest_package_version" '>' "$current" >/dev/null 2>&1; then
+        update_available=true
+    else
+        update_available=false
+    fi
 }
 
 check_call() {
@@ -134,6 +179,7 @@ apply_call() {
     local actual rc
     download_manifest
     resolve_update
+    [ "$update_available" = true ] || fail "no newer package is available on the selected update channel"
     wget -q -O "$PACKAGE" "$package_url" || fail "failed to download agent package"
     actual="$(sha256sum "$PACKAGE" | awk '{print $1}')"
     [ "$actual" = "$sha256" ] || fail "downloaded package checksum mismatch"

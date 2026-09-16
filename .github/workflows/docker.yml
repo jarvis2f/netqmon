@@ -57,57 +57,6 @@ jobs:
             (*[!0-9a-fA-F]*) echo "NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX must contain only hexadecimal characters" >&2; exit 1 ;;
           esac
 
-      - name: Build Controller image for smoke test
-        env:
-          NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX: ${{ vars.NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX }}
-        run: >-
-          docker build
-          --build-arg "NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX=${NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX}"
-          -f deploy/docker/Dockerfile.controller
-          -t ghcr.io/${{ github.repository }}:latest
-          .
-
-      - name: Smoke test Controller compose startup
-        env:
-          NETQMON_CONTROLLER_IMAGE: ghcr.io/${{ github.repository }}:latest
-        run: |
-          docker compose up -d --no-build controller
-          for attempt in {1..30}; do
-            if docker exec netqmon-controller netqmon-controller-healthcheck; then
-              docker compose ps
-              exit 0
-            fi
-            docker compose ps
-            docker logs --tail 50 netqmon-controller
-            sleep 2
-          done
-          docker compose ps
-          docker logs netqmon-controller
-          exit 1
-
-      - name: Smoke test Controller docker restart
-        env:
-          NETQMON_CONTROLLER_IMAGE: ghcr.io/${{ github.repository }}:latest
-        run: |
-          docker compose restart controller
-          for attempt in {1..30}; do
-            if docker exec netqmon-controller netqmon-controller-healthcheck; then
-              docker compose ps
-
-              exit 0
-            fi
-            docker compose ps
-            docker logs --tail 50 netqmon-controller
-            sleep 2
-          done
-          docker compose ps
-          docker logs netqmon-controller
-          exit 1
-
-      - name: Stop smoke test services
-        if: always()
-        run: docker compose down --volumes
-
       - name: Log in to GitHub Container Registry
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         uses: docker/login-action@v3
@@ -129,6 +78,54 @@ jobs:
           outputs: type=image,"name=ghcr.io/${{ github.repository }}",push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=controller-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=controller-${{ matrix.arch }}
+
+      - name: Pull image for smoke test
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        env:
+          IMAGE_DIGEST: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+        run: docker pull "$IMAGE_DIGEST"
+
+      - name: Smoke test Controller compose startup
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        env:
+          NETQMON_CONTROLLER_IMAGE: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+        run: |
+          docker compose up -d --no-build controller
+          for attempt in {1..30}; do
+            if docker exec netqmon-controller netqmon-controller-healthcheck; then
+              docker compose ps
+              exit 0
+            fi
+            docker compose ps
+            docker logs --tail 50 netqmon-controller
+            sleep 2
+          done
+          docker compose ps
+          docker logs netqmon-controller
+          exit 1
+
+      - name: Smoke test Controller docker restart
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        env:
+          NETQMON_CONTROLLER_IMAGE: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+        run: |
+          docker compose restart controller
+          for attempt in {1..30}; do
+            if docker exec netqmon-controller netqmon-controller-healthcheck; then
+              docker compose ps
+              exit 0
+            fi
+            docker compose ps
+            docker logs --tail 50 netqmon-controller
+            sleep 2
+          done
+          docker compose ps
+          docker logs netqmon-controller
+          exit 1
+
+      - name: Stop smoke test services
+        if: always()
+        run: docker compose down --volumes
 
       - name: Export digest
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'

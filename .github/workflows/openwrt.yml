@@ -372,14 +372,6 @@ jobs:
           name: openwrt-${{ matrix.platform }}-${{ matrix.ver }}
           path: upload/
 
-      - name: Publish GitHub release assets
-        if: startsWith(github.ref, 'refs/tags/v') && steps.compile.outputs.status == 'success'
-        uses: softprops/action-gh-release@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          files: ${{ env.FIRMWARE }}/*
-
   # 5. Experimental OpenWrt Packages (Non-blocking: RISC-V64 & MIPSEL)
   job_build_experimental:
     name: Build OpenWrt Package [${{ matrix.platform }}-${{ matrix.ver }}] [${{ matrix.status }}]
@@ -492,10 +484,52 @@ jobs:
           name: openwrt-${{ matrix.platform }}-${{ matrix.ver }}
           path: upload/
 
-      - name: Publish GitHub release assets
-        if: startsWith(github.ref, 'refs/tags/v') && steps.compile.outputs.status == 'success'
+
+  publish-release-assets:
+    name: Publish OpenWrt packages and manifest
+    needs: [job_build, job_build_experimental]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: openwrt-*-ipk
+          path: ${{ runner.temp }}/openwrt-packages
+
+      - name: Prepare release assets and channel manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_root="${{ runner.temp }}/openwrt-packages"
+          release_assets="${{ runner.temp }}/openwrt-release-assets"
+          mkdir -p "$release_assets"
+          while IFS= read -r -d '' package; do
+            name="$(basename "$package")"
+            if [ ! -e "$release_assets/$name" ]; then
+              cp "$package" "$release_assets/$name"
+            fi
+          done < <(find "$package_root" -type f -name '*.ipk' -print0 | sort -z)
+
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "$version" == *-* ]]; then
+            channel=beta
+          else
+            channel=stable
+          fi
+          python3 scripts/release/generate_openwrt_manifest.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --release "$channel:$GITHUB_REF_NAME:$release_assets" \
+            --output "$release_assets/openwrt-agent-manifest.json"
+
+      - name: Publish packages and manifest to GitHub Release
         uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          files: ${{ env.FIRMWARE }}/*
+          files: ${{ runner.temp }}/openwrt-release-assets/*

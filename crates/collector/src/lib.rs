@@ -1716,9 +1716,24 @@ fn spawn_maintenance(state: CollectorState, interval: Duration, retention: bool)
 }
 
 const ANALYTICS_OUTBOX_BATCH_SIZE: u32 = 64;
+const ANALYTICS_REPLAY_BACKLOG_THRESHOLD: u64 = 256;
+const ANALYTICS_REPLAY_MIN_YIELD: Duration = Duration::from_millis(50);
 const ANALYTICS_RETRY_MIN: Duration = Duration::from_millis(250);
 const ANALYTICS_RETRY_MAX: Duration = Duration::from_secs(30);
 const ANALYTICS_SHUTDOWN_ATTEMPTS: u8 = 5;
+
+fn analytics_replay_delay(
+    batch_elapsed: Duration,
+    processed: u32,
+    remaining: u64,
+    shutting_down: bool,
+) -> Option<Duration> {
+    if processed == 0 || remaining <= ANALYTICS_REPLAY_BACKLOG_THRESHOLD || shutting_down {
+        return None;
+    }
+
+    Some(batch_elapsed.max(ANALYTICS_REPLAY_MIN_YIELD))
+}
 
 fn spawn_analytics_writer(
     state: CollectorState,
@@ -1734,15 +1749,16 @@ fn spawn_analytics_writer(
             let should_shutdown = *shutdown_rx.borrow();
             let worker_state = state.clone();
             let result = tokio::task::spawn_blocking(move || {
-                worker_state
-                    .lock()
-                    .storage
-                    .process_outbox(ANALYTICS_OUTBOX_BATCH_SIZE)
+                let started_at = std::time::Instant::now();
+                let mut inner = worker_state.lock();
+                let processed = inner.storage.process_outbox(ANALYTICS_OUTBOX_BATCH_SIZE)?;
+                let remaining = inner.storage.outbox_depth()?;
+                Ok::<_, StorageError>((processed, remaining, started_at.elapsed()))
             })
             .await;
 
             match result {
-                Ok(Ok(processed)) => {
+                Ok(Ok((processed, remaining, batch_elapsed))) => {
                     {
                         let mut inner = state.lock();
                         inner.analytics_last_success_at_ms = Some(unix_time_ms());
@@ -1750,6 +1766,26 @@ fn spawn_analytics_writer(
                     }
                     backoff = ANALYTICS_RETRY_MIN;
                     shutdown_failures = 0;
+                    let shutting_down = *shutdown_rx.borrow();
+                    if let Some(delay) =
+                        analytics_replay_delay(batch_elapsed, processed, remaining, shutting_down)
+                    {
+                        tracing::debug!(
+                            processed,
+                            remaining,
+                            ?delay,
+                            "yielding between analytics replay batches"
+                        );
+                        tokio::select! {
+                            () = tokio::time::sleep(delay) => {},
+                            changed = shutdown_rx.changed() => {
+                                if changed.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if processed > 0 {
                         continue;
                     }

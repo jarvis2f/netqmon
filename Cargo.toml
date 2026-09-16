@@ -11,11 +11,14 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0-beta.6"
+version = "0.1.0-beta.7"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/jarvis2f/netqmon"
+
+[profile.release]
+strip = "symbols"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

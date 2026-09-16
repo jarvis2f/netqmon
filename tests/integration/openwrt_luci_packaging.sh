@@ -15,6 +15,8 @@ MENU_JSON="${LUCI_DIR}/root/usr/share/luci/menu.d/luci-app-netqmon.json"
 ACL_JSON="${LUCI_DIR}/root/usr/share/rpcd/acl.d/luci-app-netqmon.json"
 BUILD_SCRIPT="${ROOT_DIR}/packaging/openwrt/build-ipk.sh"
 INSTALLER="${ROOT_DIR}/scripts/install-agent.sh"
+OPENWRT_WORKFLOW="${ROOT_DIR}/.github/workflows/openwrt.yml"
+MANIFEST_GENERATOR="${ROOT_DIR}/scripts/release/generate_openwrt_manifest.py"
 
 fail() {
     echo "FAIL: $*" >&2
@@ -57,6 +59,8 @@ assert_file "$UPDATE_JS"
 assert_file "$RPC_PLUGIN"
 assert_file "$UPDATE_HELPER"
 assert_file "$INSTALLER"
+assert_file "$OPENWRT_WORKFLOW"
+assert_file "$MANIFEST_GENERATOR"
 
 for page in status general advanced update; do
     assert_contains "$MENU_JSON" "netqmon/${page}"
@@ -96,11 +100,11 @@ assert_env_bridge interface_counter_max_unaccounted_ratio NETQMON_INTERFACE_COUN
 
 assert_contains "$RPC_PLUGIN" "netqmon-agent"
 assert_contains "$RPC_PLUGIN" "doctor"
-assert_contains "$GENERAL_JS" "form.DynamicList, 'interfaces'"
+assert_contains "$GENERAL_JS" 'form.DynamicList, "interfaces"'
 assert_contains "$GENERAL_JS" "callNetworkDevices"
-assert_contains "$GENERAL_JS" "uci.get.*'interface'"
-assert_contains "$GENERAL_JS" "uci.set.*'interfaces'.*interfaces"
-assert_contains "$GENERAL_JS" "uci.set.*'interface'.*interfaces\[0\]"
+assert_contains "$GENERAL_JS" 'uci.get.*"interface"'
+assert_contains "$GENERAL_JS" 'uci.set.*"interfaces".*interfaces'
+assert_contains "$GENERAL_JS" 'uci.set.*"interface".*interfaces\[0\]'
 assert_contains "$GENERAL_JS" "interfaces.length < 1 \|\| interfaces.length > 32"
 assert_contains "$GENERAL_JS" "o.isValid.*function"
 assert_contains "$RPC_PLUGIN" "config_list_foreach main interfaces"
@@ -112,6 +116,13 @@ assert_contains "$UPDATE_HELPER" "sha256sum"
 assert_contains "$UPDATE_HELPER" "opkg install"
 assert_contains "$UPDATE_HELPER" "github.com/jarvis2f/netqmon/releases/download/.*/netqmon-agent_.*\\.ipk"
 assert_contains "$UPDATE_HELPER" "unsupported update channel"
+assert_contains "$UPDATE_HELPER" "api.github.com/repos/jarvis2f/netqmon/releases"
+assert_contains "$UPDATE_HELPER" "prerelease"
+assert_contains "$UPDATE_HELPER" "no newer package is available"
+assert_contains "$OPENWRT_WORKFLOW" "generate_openwrt_manifest.py"
+assert_contains "$OPENWRT_WORKFLOW" "publish-release-assets"
+assert_contains "$MANIFEST_GENERATOR" "openwrt_arch"
+assert_contains "$MANIFEST_GENERATOR" "sha256"
 assert_contains "$BUILD_SCRIPT" "luci-app-netqmon_"
 assert_contains "$BUILD_SCRIPT" "Package: luci-app-netqmon"
 assert_contains "$INSTALLER" "openwrt-agent-manifest\\.json"

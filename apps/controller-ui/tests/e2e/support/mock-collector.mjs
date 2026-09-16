@@ -606,7 +606,7 @@ function handleInternal(request, response, pathname, params, state) {
       response,
       200,
       envelope({
-        collector_version: "0.1.0-beta.6",
+        collector_version: "0.1.0-beta.7",
         analytics_backend: "duckdb",
         metadata_database_size_bytes: 1048576,
         analytics_database_size_bytes: 2097152,
