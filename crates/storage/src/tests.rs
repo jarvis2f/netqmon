@@ -121,7 +121,7 @@ fn migration_and_gateway_survive_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(migrations, 1);
+    assert_eq!(migrations, 2);
     let index_exists: bool = storage
         .connection()
         .query_row(
@@ -600,19 +600,30 @@ fn batch_is_deduplicated_and_rollup_matches_raw_delta() {
         )
         .unwrap();
     assert_eq!(metrics, (100, 50, 3, 1));
-    let scoped: (i32, i32, i64, String) = storage
+    let scoped: (i32, i32, i64, String, i32, String) = storage
         .connection()
         .query_row(
-            "SELECT scope, direction, device_id, application_id
+            "SELECT scope, direction, device_id, application_id, protocol, protocol_id
              FROM traffic_scope_minute",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )
         .unwrap();
     assert_eq!(scoped.0, FlowScope::Internet as i32);
     assert_eq!(scoped.1, Direction::Upload as i32);
     assert!(scoped.2 > 0);
     assert_eq!(scoped.3, "unknown");
+    assert_eq!(scoped.4, 6);
+    assert_eq!(scoped.5, "unknown");
     for dimension in DIMENSIONS {
         let total: i64 = storage
             .connection()

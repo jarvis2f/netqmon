@@ -445,13 +445,21 @@ async fn traffic(
         );
     }
     let group_by = query.group_by.as_deref().unwrap_or("none");
-    if !matches!(group_by, "none" | "client" | "application" | "category") {
+    if !matches!(
+        group_by,
+        "none" | "client" | "application" | "category" | "protocol_l7" | "protocol_l4" | "protocol"
+    ) {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_group_by",
-            "group_by must be one of none, client, application, or category",
+            "group_by must be one of none, client, application, category, protocol_l7, or protocol_l4",
         );
     }
+    let normalized_group_by = if group_by == "protocol" {
+        "protocol_l7"
+    } else {
+        group_by
+    };
     let scope = match traffic_scope(query.scope.as_deref().unwrap_or("internet")) {
         Ok(value) => value,
         Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_scope", message),
@@ -460,7 +468,15 @@ async fn traffic(
         Ok(value) => value,
         Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_direction", message),
     };
-    traffic_breakdown(&state, from, to, group_by, page, scope, direction)
+    traffic_breakdown(
+        &state,
+        from,
+        to,
+        normalized_group_by,
+        page,
+        scope,
+        direction,
+    )
 }
 
 fn traffic_breakdown(
@@ -603,6 +619,28 @@ fn traffic_breakdown_query(group_by: &str) -> (&'static str, bool) {
              FROM traffic_scope_minute t WHERE timestamp >= ?1 AND timestamp < ?2
                AND (?3 IS NULL OR t.scope = ?3) AND (?4 IS NULL OR t.direction = ?4)
              GROUP BY t.category_id ORDER BY SUM(upload_bytes + download_bytes) DESC
+             LIMIT ?5 OFFSET ?6",
+            true,
+        ),
+        "protocol_l7" | "protocol" => (
+            "SELECT COALESCE(t.protocol_id, 'unknown'), COALESCE(t.protocol_id, 'unknown'), NULL,
+                    SUM(upload_bytes), SUM(download_bytes), SUM(packets), SUM(flow_count),
+                    MAX(timestamp)
+             FROM traffic_scope_minute t WHERE timestamp >= ?1 AND timestamp < ?2
+               AND (?3 IS NULL OR t.scope = ?3) AND (?4 IS NULL OR t.direction = ?4)
+             GROUP BY COALESCE(t.protocol_id, 'unknown') ORDER BY SUM(upload_bytes + download_bytes) DESC
+             LIMIT ?5 OFFSET ?6",
+            true,
+        ),
+        "protocol_l4" => (
+            "SELECT CASE t.protocol WHEN 6 THEN 'tcp' WHEN 17 THEN 'udp' WHEN 1 THEN 'icmp' WHEN 58 THEN 'icmpv6' ELSE CAST(t.protocol AS TEXT) END,
+                    CASE t.protocol WHEN 6 THEN 'TCP' WHEN 17 THEN 'UDP' WHEN 1 THEN 'ICMP' WHEN 58 THEN 'ICMPv6' ELSE 'IP ' || CAST(t.protocol AS TEXT) END,
+                    NULL,
+                    SUM(upload_bytes), SUM(download_bytes), SUM(packets), SUM(flow_count),
+                    MAX(timestamp)
+             FROM traffic_scope_minute t WHERE timestamp >= ?1 AND timestamp < ?2
+               AND (?3 IS NULL OR t.scope = ?3) AND (?4 IS NULL OR t.direction = ?4)
+             GROUP BY t.protocol ORDER BY SUM(upload_bytes + download_bytes) DESC
              LIMIT ?5 OFFSET ?6",
             true,
         ),

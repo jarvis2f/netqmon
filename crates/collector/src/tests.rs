@@ -676,9 +676,9 @@ async fn traffic_scope_and_direction_filter_metrics_chart_and_breakdown_together
             .execute(
                 "INSERT INTO traffic_scope_minute(
                 timestamp, gateway_id, scope, direction, device_id, application_id,
-                category_id, domain, remote_ip, upload_bytes, download_bytes, packets, flow_count
+                category_id, domain, remote_ip, protocol, protocol_id, upload_bytes, download_bytes, packets, flow_count
              ) VALUES (?1, ?2, ?3, ?4, 1, 'internal-test', 'network', 'unknown',
-                       X'C0000214', 0, 800, 7, 1)",
+                       X'C0000214', 17, 'wireguard', 0, 800, 7, 1)",
                 rusqlite::params![
                     1_700_000_000_000_i64,
                     gateway_id,
@@ -705,7 +705,7 @@ async fn traffic_scope_and_direction_filter_metrics_chart_and_breakdown_together
     assert_eq!(internet["data"]["scope"], "internet");
     assert_eq!(internet["data"]["points"][0]["upload_bytes"], 100);
 
-    let internal_download = parse_json(router.oneshot(Request::builder()
+    let internal_download = parse_json(router.clone().oneshot(Request::builder()
         .uri("/internal/traffic?from=1699999980000&to=1700000061000&group_by=application&scope=internal&direction=download")
         .body(Body::empty()).unwrap()).await.unwrap()).await;
     assert_eq!(internal_download["data"]["direction"], "download");
@@ -718,6 +718,27 @@ async fn traffic_scope_and_direction_filter_metrics_chart_and_breakdown_together
         "internal-test"
     );
     assert_eq!(internal_download["data"]["breakdown"][0]["upload_bytes"], 0);
+
+    let internal_l7 = parse_json(router.clone().oneshot(Request::builder()
+        .uri("/internal/traffic?from=1699999980000&to=1700000061000&group_by=protocol_l7&scope=internal&direction=download")
+        .body(Body::empty()).unwrap()).await.unwrap()).await;
+    assert_eq!(internal_l7["data"]["group_by"], "protocol_l7");
+    assert_eq!(internal_l7["data"]["breakdown"][0]["id"], "wireguard");
+    assert_eq!(internal_l7["data"]["breakdown"][0]["download_bytes"], 800);
+
+    let internal_l4 = parse_json(router.clone().oneshot(Request::builder()
+        .uri("/internal/traffic?from=1699999980000&to=1700000061000&group_by=protocol_l4&scope=internal&direction=download")
+        .body(Body::empty()).unwrap()).await.unwrap()).await;
+    assert_eq!(internal_l4["data"]["group_by"], "protocol_l4");
+    assert_eq!(internal_l4["data"]["breakdown"][0]["id"], "udp");
+    assert_eq!(internal_l4["data"]["breakdown"][0]["name"], "UDP");
+    assert_eq!(internal_l4["data"]["breakdown"][0]["download_bytes"], 800);
+
+    let internal_alias = parse_json(router.oneshot(Request::builder()
+        .uri("/internal/traffic?from=1699999980000&to=1700000061000&group_by=protocol&scope=internal&direction=download")
+        .body(Body::empty()).unwrap()).await.unwrap()).await;
+    assert_eq!(internal_alias["data"]["group_by"], "protocol_l7");
+    assert_eq!(internal_alias["data"]["breakdown"][0]["id"], "wireguard");
 }
 
 #[tokio::test]
@@ -1790,7 +1811,10 @@ async fn internal_query_api_validates_pagination_ranges_and_unknown_fields() {
             "invalid_category_id",
         ),
         ("/internal/traffic?from=20&to=10", "invalid_time_range"),
-        ("/internal/traffic?group_by=protocol", "invalid_group_by"),
+        (
+            "/internal/traffic?group_by=unsupported_group",
+            "invalid_group_by",
+        ),
         ("/internal/insights?unexpected=true", "invalid_query"),
         (
             "/internal/insights?from=0&to=2678400000",

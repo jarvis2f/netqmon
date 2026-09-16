@@ -243,7 +243,7 @@
   },
   "traffic": {
     "title": "Traffic",
-    "subtitle": "Historical throughput by client, application, or category",
+    "subtitle": "Historical throughput by client, application, category, or protocol",
     "direction": "Direction",
     "both": "Download + Upload",
     "downloadOption": "Download",
@@ -253,6 +253,8 @@
     "client": "Client",
     "application": "Application",
     "category": "Category",
+    "protocol_l7": "L7 Protocol",
+    "protocol_l4": "L4 Protocol",
     "flowObservations": "Flow observations",
     "breakdownGroups": "Breakdown groups",
     "aggregatedSamples": "Aggregated samples",

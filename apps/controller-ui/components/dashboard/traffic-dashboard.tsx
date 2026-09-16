@@ -7,6 +7,7 @@ import { useTranslations } from "next-intl";
 import { AppLayout } from "@/components/app-shell/app-layout";
 import { ApplicationIcon } from "@/components/icons/application-icon";
 import { ClientDeviceIcon } from "@/components/icons/client-device-icon";
+import { ProtocolIcon } from "@/components/icons/protocol-icon";
 import { DataTable, type ColumnDef } from "@/components/data/data-table";
 import { MetricCard } from "@/components/data/metric-card";
 import {
@@ -37,7 +38,13 @@ import {
 
 type Direction = "both" | "download" | "upload";
 type TrafficScope = "internet" | "internal" | "tunnel" | "all";
-type GroupBy = "none" | "client" | "application" | "category";
+type GroupBy =
+  | "none"
+  | "client"
+  | "application"
+  | "category"
+  | "protocol_l7"
+  | "protocol_l4";
 
 interface TrafficPoint {
   timestamp: number;
@@ -229,7 +236,14 @@ export function TrafficDashboard({
       header:
         initialGroupBy === "none"
           ? t("scope")
-          : t(initialGroupBy as "client" | "application" | "category"),
+          : t(
+              initialGroupBy as
+                | "client"
+                | "application"
+                | "category"
+                | "protocol_l7"
+                | "protocol_l4",
+            ),
       cell: (row) => (
         <div className="flex min-w-0 items-center gap-2">
           {initialGroupBy === "application" && (
@@ -241,10 +255,16 @@ export function TrafficDashboard({
               size="md"
             />
           )}
+          {(initialGroupBy === "protocol_l7" ||
+            initialGroupBy === "protocol_l4") && (
+            <ProtocolIcon protocol={row.id} size="md" />
+          )}
           <div className="min-w-0">
             <div className="truncate font-medium text-foreground">
               {row.name ||
-                (initialGroupBy === "application"
+                (initialGroupBy === "application" ||
+                initialGroupBy === "protocol_l7" ||
+                initialGroupBy === "protocol_l4"
                   ? formatIdentifier(row.id)
                   : row.mac || tStatus("unknown"))}
             </div>
@@ -351,6 +371,8 @@ export function TrafficDashboard({
               <SelectItem value="client">{t("client")}</SelectItem>
               <SelectItem value="application">{t("application")}</SelectItem>
               <SelectItem value="category">{t("category")}</SelectItem>
+              <SelectItem value="protocol_l7">{t("protocol_l7")}</SelectItem>
+              <SelectItem value="protocol_l4">{t("protocol_l4")}</SelectItem>
             </SelectContent>
           </Select>
         </div>
@@ -404,7 +426,13 @@ export function TrafficDashboard({
           loading={loading}
           subtext={t("groupedBy", {
             group: t(
-              initialGroupBy as "none" | "client" | "application" | "category",
+              initialGroupBy as
+                | "none"
+                | "client"
+                | "application"
+                | "category"
+                | "protocol_l7"
+                | "protocol_l4",
             ),
           })}
         />

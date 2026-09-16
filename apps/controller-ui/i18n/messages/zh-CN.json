@@ -243,7 +243,7 @@
   },
   "traffic": {
     "title": "流量",
-    "subtitle": "按客户端、应用或类别的历史吞吐量",
+    "subtitle": "按客户端、应用、类别或协议的历史吞吐量",
     "direction": "方向",
     "both": "下行 + 上行",
     "downloadOption": "下行",
@@ -253,6 +253,8 @@
     "client": "客户端",
     "application": "应用",
     "category": "类别",
+    "protocol_l7": "L7 协议",
+    "protocol_l4": "L4 协议",
     "flowObservations": "连接流观测样本",
     "breakdownGroups": "细分分组",
     "aggregatedSamples": "汇总样本",

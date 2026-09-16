@@ -56,7 +56,9 @@ fn flow_nat_name(value: i32) -> &'static str {
 }
 
 const INITIAL_MIGRATION: &str = include_str!("../../../migrations/clickhouse/0001_initial.sql");
-const MIGRATIONS: [(u32, &str); 1] = [(1, INITIAL_MIGRATION)];
+const PROTOCOL_MIGRATION: &str =
+    include_str!("../../../migrations/clickhouse/0002_traffic_scope_protocol.sql");
+const MIGRATIONS: [(u32, &str); 2] = [(1, INITIAL_MIGRATION), (2, PROTOCOL_MIGRATION)];
 const MINUTE_MS: i64 = 60 * 1_000;
 const HOUR_MS: i64 = 60 * MINUTE_MS;
 const DAY_MS: i64 = 24 * HOUR_MS;
@@ -1534,6 +1536,8 @@ impl StorageBackend for ClickHouseStorage {
                 "category_id": attr.category_id,
                 "domain": attr.domain.as_deref().unwrap_or("unknown"),
                 "remote_ip": to_hex(&flow.remote_ip),
+                "protocol": flow.protocol,
+                "protocol_id": attr.protocol_id,
                 "upload_bytes": upload,
                 "download_bytes": download,
                 "packets": packets,

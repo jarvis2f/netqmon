@@ -12,7 +12,9 @@ use rusqlite::types::{Type, Value};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 const INITIAL_MIGRATION: &str = include_str!("../../../migrations/sqlite/0001_initial.sql");
-const MIGRATIONS: [(i64, &str); 1] = [(1, INITIAL_MIGRATION)];
+const PROTOCOL_MIGRATION: &str =
+    include_str!("../../../migrations/sqlite/0002_traffic_scope_protocol.sql");
+const MIGRATIONS: [(i64, &str); 2] = [(1, INITIAL_MIGRATION), (2, PROTOCOL_MIGRATION)];
 const MINUTE_MS: i64 = 60 * 1_000;
 const HOUR_MS: i64 = 60 * MINUTE_MS;
 const DAY_MS: i64 = 24 * HOUR_MS;
@@ -2111,7 +2113,9 @@ fn persist_minute_rollups(
         upsert_rollup(
             tx,
             "traffic_scope_minute",
-            Some("scope, direction, device_id, application_id, category_id, domain, remote_ip"),
+            Some(
+                "scope, direction, device_id, application_id, category_id, domain, remote_ip, protocol, protocol_id",
+            ),
             &[
                 timestamp.into(),
                 batch.gateway_id.clone().into(),
@@ -2126,6 +2130,8 @@ fn persist_minute_rollups(
                     .unwrap_or_else(|| "unknown".to_owned())
                     .into(),
                 flow.remote_ip.clone().into(),
+                i64::from(flow.protocol).into(),
+                attribution.protocol_id.clone().into(),
             ],
             upload,
             download,
