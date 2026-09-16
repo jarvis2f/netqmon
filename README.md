@@ -33,7 +33,7 @@ A lightweight Agent runs on the gateway and collects flow telemetry with TC eBPF
 | **Destinations** | Understand where traffic goes with domain, country/region, ASN/ISP, and geographic views. |
 | **Realtime + history** | Follow current activity and query historical ranges from the same interface. |
 | **OpenWrt-native** | TC eBPF data plane, native `procd` service, UCI configuration, diagnostics, and optional LuCI integration. |
-| **Self-hosted Controller** | Docker deployment with SQLite by default and optional ClickHouse for larger datasets. |
+| **Self-hosted Controller** | Docker deployment with a local collector database, DuckDB analytics by default, and optional ClickHouse analytics for larger datasets. |
 
 ## How it works
 
@@ -47,7 +47,7 @@ flowchart LR
 
     Agent -->|"Flow / DNS / device telemetry"| Collector["Collector"]
     Collector --> Classifier["Classifier"]
-    Collector --> Storage[("SQLite / ClickHouse")]
+    Collector --> Storage[("Collector DB / DuckDB / ClickHouse")]
     Collector --> UI["Next.js Web UI"]
     Cloud["NetQmon Cloud\nRule & update services"] -. "optional" .-> Classifier
 ```
@@ -66,7 +66,7 @@ docker compose up -d
 
 Open `http://localhost:3000` after the Controller becomes healthy.
 
-SQLite is the default storage backend. ClickHouse can be enabled when you need higher ingest volume or longer retention. See [Controller Configuration](docs/controller-configuration.md) for environment variables, ports, and storage options.
+The Controller keeps its local collector database in `/data/netqmon.db` and uses DuckDB analytics by default. Set `NETQMON_ANALYTICS_BACKEND=clickhouse` when you need external ClickHouse analytics for higher ingest volume or longer retention. See [Controller Configuration](docs/controller-configuration.md) for environment variables, ports, and storage options.
 
 ### OpenWrt Agent
 
@@ -116,7 +116,7 @@ crates/agent/                OpenWrt userspace Agent
 crates/collector/            Ingestion, DPI, realtime and query pipeline
 crates/classifier-client/    Classification client
 crates/classifier-manager/   Rule lifecycle and updates
-crates/storage/              SQLite / ClickHouse storage
+crates/storage/              Collector, DuckDB, and ClickHouse storage
 apps/controller-ui/          Next.js Controller UI
 packaging/openwrt/           OpenWrt packages and LuCI app
 deploy/docker/               Controller container build

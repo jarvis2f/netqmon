@@ -1,7 +1,7 @@
 # NetQmon Controller 配置与端口说明
 
 NetQmon Controller 是整个网络监控系统的核心服务端，通常通过 Docker 容器部署。它整合了以下三个核心进程：
-* **`netqmon-collector`**：高性能遥测数据接收引擎（支持 SQLite 与 ClickHouse 存储、nDPI 深度报文解析、GeoIP 与 MAC 厂商解析）。
+* **`netqmon-collector`**：高性能遥测数据接收与查询引擎，使用本地 Collector 数据库，并支持 DuckDB 或 ClickHouse 分析后端、nDPI 深度报文解析、GeoIP 与 MAC 厂商解析。
 * **`netqmon-classifier-manager`**：分类守护进程与组件热更新管理器。
 * **`controller-ui`**：基于 Next.js 的现代化 Web 控制台与 API 网关。
 
@@ -16,8 +16,8 @@ NetQmon Controller 是整个网络监控系统的核心服务端，通常通过 
 | **`3000`** | TCP (HTTP) | 公开 / 局域网 | **Web 控制台访问端口**。管理员通过浏览器访问此端口进入 NetQmon 管理界面。 |
 | **`8090`** | TCP (HTTP/Protobuf) | 局域网 / 路由可达 | **Agent 遥测数据上报端口**。部署在 OpenWrt 路由器上的 `netqmon-agent` 通过此端口完成初始注册并持续推送流遥测 Batch。 |
 | **`8091`** | TCP (HTTP/JSON) | 仅容器内部 (`127.0.0.1`) | **内部 Collector 查询 API**。由 `controller-ui` 的 Node.js 服务端发起反向代理调用，**禁止直接暴露给公网**。 |
-| **`8123`** | TCP (HTTP) | 可选（ClickHouse Profile） | ClickHouse HTTP 查询端口（仅在使用 ClickHouse 存储模式时启用）。 |
-| **`9000`** | TCP (Native) | 可选（ClickHouse Profile） | ClickHouse TCP 原生协议端口（仅在使用 ClickHouse 存储模式时启用）。 |
+| **`8123`** | TCP (HTTP) | 可选（ClickHouse Profile） | ClickHouse HTTP 查询端口（当 `NETQMON_ANALYTICS_BACKEND=clickhouse` 时使用）。 |
+| **`9000`** | TCP (Native) | 可选（ClickHouse Profile） | ClickHouse TCP 原生协议端口（当 `NETQMON_ANALYTICS_BACKEND=clickhouse` 时使用）。 |
 
 > [!SECURITY]
 > * **端口 `3000` 和 `8090`** 应仅在受信任的家庭/企业局域网内开放，若部署于公网 VPS，强烈建议配置反向代理（如 Nginx/Caddy）并启用 HTTPS/TLS 加密。
@@ -38,13 +38,14 @@ NetQmon Controller 是整个网络监控系统的核心服务端，通常通过 
 
 | 环境变量 | 默认值 | 作用说明 |
 | :--- | :--- | :--- |
-| `NETQMON_STORAGE_BACKEND` | `sqlite` | 数据存储后端类型，可选 `sqlite` 或 `clickhouse`。普通家庭环境推荐 `sqlite`，千万级流数据推荐 `clickhouse`。 |
-| `NETQMON_COLLECTOR_DATABASE_PATH` | `/data/netqmon.db` | SQLite 数据库文件存储路径（位于持久化卷 `/data` 中）。 |
+| `NETQMON_COLLECTOR_DATABASE_PATH` | `/data/netqmon.db` | Collector 数据库文件存储路径（位于持久化卷 `/data` 中）。 |
+| `NETQMON_ANALYTICS_BACKEND` | `duckdb` | 分析后端：本地默认使用 `duckdb`，也可设置为 `clickhouse` 连接外部 ClickHouse 服务。 |
+| `NETQMON_DUCKDB_PATH` | `/data/netqmon-analytics.duckdb` | DuckDB 分析数据库文件路径。应保存在持久化卷 `/data` 中。 |
 | `NETQMON_LICENSE_STATE_PATH` | `/data/license.json` | 持久化许可证身份与安装凭据。必须位于持久化的 `/data` 中，确保替换容器后安装实例 ID 不变。 |
-| `NETQMON_CLICKHOUSE_URL` | `http://clickhouse:8123` | ClickHouse HTTP 连接地址（当后端为 `clickhouse` 时生效）。 |
+| `NETQMON_CLICKHOUSE_URL` | `http://clickhouse:8123` | ClickHouse HTTP 连接地址（当 `NETQMON_ANALYTICS_BACKEND=clickhouse` 时使用）。 |
 | `NETQMON_CLICKHOUSE_DATABASE` | `default` | ClickHouse 数据库名称。 |
-| `NETQMON_CLICKHOUSE_USER` | `default` | ClickHouse 认证用户名（可选）。 |
-| `NETQMON_CLICKHOUSE_PASSWORD` | *(空)* | ClickHouse 认证密码（可选）。 |
+| `NETQMON_CLICKHOUSE_USER` | *(未设置)* | ClickHouse 认证用户名（可选）。 |
+| `NETQMON_CLICKHOUSE_PASSWORD` | *(未设置)* | ClickHouse 认证密码（可选）。 |
 
 ### 2.3 网络监听与服务地址
 

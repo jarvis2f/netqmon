@@ -515,15 +515,15 @@ impl ClassifierHandle {
     pub fn diagnostics(&self) -> RuleDiagnostics {
         let stats = self.rule_stats().ok();
         let classifier_version = self.classifier_version().ok();
-        let state = self
+        let availability = self
             .availability
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         RuleDiagnostics {
             classifier_version,
             stats,
-            availability: state.state.as_str().to_owned(),
-            last_error: state.last_error.clone(),
+            availability: availability.state.as_str().to_owned(),
+            last_error: availability.last_error.clone(),
         }
     }
 

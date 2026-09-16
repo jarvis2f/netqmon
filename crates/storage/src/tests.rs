@@ -68,21 +68,31 @@ fn batch(sequence: u64, lifecycle: FlowLifecycle) -> TelemetryBatch {
 }
 
 #[test]
-fn empty_database_migrates_and_configures_pragmas() {
+fn empty_database_contains_only_metadata_recovery_and_outbox_tables() {
     let storage = SqliteStorage::open_in_memory().unwrap();
     let count: i64 = storage
         .connection()
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (
-                'sites', 'gateways', 'users', 'devices', 'device_addresses',
-                'dns_observations', 'flow_sessions', 'traffic_total_minute',
-                'traffic_total_hour', 'traffic_total_day', 'settings',
-                'device_evidence', 'traffic_scope_minute')",
+                'schema_migrations', 'sites', 'gateways', 'users', 'auth_sessions',
+                'devices', 'device_addresses', 'dns_observations', 'active_flow_sessions',
+                'settings', 'device_evidence', 'self_host_endpoint_evidence',
+                'ingest_batches', 'analytics_outbox')",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(count, 13);
+    assert_eq!(count, 14);
+    let legacy_count: i64 = storage
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND (name = 'flow_sessions' OR name GLOB 'traffic_*')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_count, 0);
     for (pragma, expected) in [
         ("foreign_keys", 1),
         ("synchronous", 1),
@@ -121,13 +131,13 @@ fn migration_and_gateway_survive_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(migrations, 2);
+    assert_eq!(migrations, 1);
     let index_exists: bool = storage
         .connection()
         .query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM sqlite_master
-                WHERE type = 'index' AND name = 'flow_sessions_remote_last_seen'
+                WHERE type = 'index' AND name = 'active_flow_sessions_remote_last_seen'
              )",
             [],
             |row| row.get(0),
@@ -139,7 +149,7 @@ fn migration_and_gateway_survive_reopen() {
         .query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM sqlite_master
-                WHERE type = 'index' AND name = 'flow_sessions_port_last_seen_remote'
+                WHERE type = 'index' AND name = 'active_flow_sessions_port_last_seen_remote'
              )",
             [],
             |row| row.get(0),
@@ -310,40 +320,20 @@ fn administrator_and_hashed_sessions_are_persisted() {
 }
 
 #[test]
-fn initial_database_persists_and_queries_application_rollups() {
-    let directory = tempdir().unwrap();
-    let path = directory.path().join("netqmon.db");
-    {
-        let connection = Connection::open(&path).unwrap();
-        connection.execute_batch(INITIAL_MIGRATION).unwrap();
-        connection
-            .execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?1)",
-                [to_i64(NOW)],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO traffic_application_minute(
-                    timestamp, gateway_id, application_id, category_id, upload_bytes, download_bytes,
-                    packets, flow_count
-                 ) VALUES (?1, 'gateway-1', 'unknown', 'unknown', 10, 20, 1, 1)",
-                [to_i64(NOW) / MINUTE_MS * MINUTE_MS],
-            )
-            .unwrap();
-    }
-
-    let storage = SqliteStorage::open(&path).unwrap();
-    let row: (String, String, i64) = storage
+fn initial_database_has_no_sqlite_analytics_tables() {
+    let storage = SqliteStorage::open_in_memory().unwrap();
+    let tables: Vec<String> = storage
         .connection()
-        .query_row(
-            "SELECT application_id, category_id, upload_bytes + download_bytes
-             FROM traffic_application_minute",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
         .unwrap();
-    assert_eq!(row, ("unknown".to_owned(), "unknown".to_owned(), 30));
+    assert!(!tables.iter().any(|name| name == "flow_sessions"));
+    assert!(!tables.iter().any(|name| name.starts_with("traffic_")));
+    assert!(tables.iter().any(|name| name == "active_flow_sessions"));
+    assert!(tables.iter().any(|name| name == "analytics_outbox"));
 }
 
 #[test]
@@ -409,7 +399,7 @@ fn dns_resolution_is_time_aware_and_client_scoped() {
 }
 
 #[test]
-fn classified_flows_populate_sessions_and_rollups() {
+fn classified_flows_are_enriched_in_the_transactional_analytics_outbox() {
     let mut storage = setup();
     let attribution = FlowAttribution {
         domain: Some("api.openai.com".to_owned()),
@@ -434,29 +424,22 @@ fn classified_flows_populate_sessions_and_rollups() {
         )
         .unwrap();
 
-    let rollup: (String, String) = storage
-        .connection()
-        .query_row(
-            "SELECT application_id, category_id FROM traffic_application_minute",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(rollup, ("openai".to_owned(), "ai".to_owned()));
-    let domain: String = storage
-        .connection()
-        .query_row("SELECT domain FROM traffic_domain_minute", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(domain, "api.openai.com");
+    let records = storage.outbox_batch(10).unwrap();
+    assert_eq!(records.len(), 1);
+    let analytics = AnalyticsBatch::decode(&records[0].payload).unwrap();
+    assert_eq!(analytics.flows.len(), 1);
+    assert_eq!(analytics.traffic.len(), 1);
+    assert_eq!(analytics.traffic[0].application_id, "openai");
+    assert_eq!(analytics.traffic[0].category_id, "ai");
+    assert_eq!(analytics.traffic[0].domain, "api.openai.com");
+    assert!(analytics.flows[0].ended_at.is_some());
     let session: (String, String, String, String, String, String, f64, f64, f64, f64, String, String) = storage
         .connection()
         .query_row(
             "SELECT domain, organization_id, application_id, category_id, traffic_role, protocol_id,
                     organization_confidence, application_confidence, protocol_confidence,
                     classification_confidence, classification_reason, classification_evidence_json
-             FROM flow_sessions",
+             FROM active_flow_sessions",
             [],
             |row| {
                 Ok((
@@ -580,7 +563,7 @@ fn device_upsert_keeps_identity_when_ip_changes() {
 }
 
 #[test]
-fn batch_is_deduplicated_and_rollup_matches_raw_delta() {
+fn batch_is_deduplicated_and_analytics_payload_contains_enriched_traffic() {
     let mut storage = setup();
     let batch = batch(1, FlowLifecycle::Active);
     assert_eq!(
@@ -591,62 +574,21 @@ fn batch_is_deduplicated_and_rollup_matches_raw_delta() {
         storage.persist_batch(&batch, NOW).unwrap(),
         PersistDisposition::Duplicate
     );
-    let metrics: (i64, i64, i64, i64) = storage
-        .connection()
-        .query_row(
-            "SELECT upload_bytes, download_bytes, packets, flow_count FROM traffic_total_minute",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap();
-    assert_eq!(metrics, (100, 50, 3, 1));
-    let scoped: (i32, i32, i64, String, i32, String) = storage
-        .connection()
-        .query_row(
-            "SELECT scope, direction, device_id, application_id, protocol, protocol_id
-             FROM traffic_scope_minute",
-            [],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            },
-        )
-        .unwrap();
-    assert_eq!(scoped.0, FlowScope::Internet as i32);
-    assert_eq!(scoped.1, Direction::Upload as i32);
-    assert!(scoped.2 > 0);
-    assert_eq!(scoped.3, "unknown");
-    assert_eq!(scoped.4, 6);
-    assert_eq!(scoped.5, "unknown");
-    for dimension in DIMENSIONS {
-        let total: i64 = storage
-            .connection()
-            .query_row(
-                &format!("SELECT upload_bytes + download_bytes FROM traffic_{dimension}_minute"),
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(total, 150, "{dimension}");
-    }
-    assert_eq!(
-        storage
-            .query_total_traffic(NOW - MINUTE_MS as u64, NOW + MINUTE_MS as u64)
-            .unwrap(),
-        vec![TrafficTotal {
-            timestamp: to_i64(NOW) / MINUTE_MS * MINUTE_MS,
-            upload_bytes: 100,
-            download_bytes: 50,
-            packets: 3,
-            flow_count: 1,
-        }]
-    );
+    let outbox = storage.outbox_batch(10).unwrap();
+    assert_eq!(storage.outbox_depth().unwrap(), 1);
+    assert_eq!(outbox.len(), 1);
+    let analytics = AnalyticsBatch::decode(&outbox[0].payload).unwrap();
+    assert_eq!(analytics.traffic.len(), 1);
+    let delta = &analytics.traffic[0];
+    assert_eq!(delta.upload_bytes, 100);
+    assert_eq!(delta.download_bytes, 50);
+    assert_eq!(delta.packets, 3);
+    assert_eq!(delta.flow_count, 1);
+    assert_eq!(delta.scope, FlowScope::Internet as u8);
+    assert_eq!(delta.direction, Direction::Upload as u8);
+    assert!(delta.device_id > 0);
+    assert_eq!(delta.application_id, "unknown");
+    assert_eq!(delta.protocol_id, "unknown");
 }
 
 #[test]
@@ -664,27 +606,11 @@ fn dns_expiry_flow_end_and_hour_day_rollups_are_persisted() {
     assert_eq!(expiry, to_i64(NOW) + 60_000);
     let ended_at: Option<i64> = storage
         .connection()
-        .query_row("SELECT ended_at FROM flow_sessions", [], |row| row.get(0))
+        .query_row("SELECT ended_at FROM active_flow_sessions", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert!(ended_at.is_some());
-
-    storage
-        .roll_up_hour_and_day(NOW + 2 * DAY_MS as u64)
-        .unwrap();
-    for dimension in DIMENSIONS {
-        for resolution in ["hour", "day"] {
-            let table = format!("traffic_{dimension}_{resolution}");
-            let total: i64 = storage
-                .connection()
-                .query_row(
-                    &format!("SELECT upload_bytes + download_bytes FROM {table}"),
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(total, 150, "{table}");
-        }
-    }
 }
 
 #[test]
@@ -703,7 +629,9 @@ fn long_flow_checkpoints_and_resumes_after_restart() {
             .unwrap();
         let before_checkpoint: i64 = storage
             .connection()
-            .query_row("SELECT COUNT(*) FROM flow_sessions", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM active_flow_sessions", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(before_checkpoint, 0);
         storage
@@ -715,7 +643,7 @@ fn long_flow_checkpoints_and_resumes_after_restart() {
         let active: i64 = storage
             .connection()
             .query_row(
-                "SELECT COUNT(*) FROM flow_sessions WHERE ended_at IS NULL",
+                "SELECT COUNT(*) FROM active_flow_sessions WHERE ended_at IS NULL",
                 [],
                 |row| row.get(0),
             )
@@ -733,7 +661,7 @@ fn long_flow_checkpoints_and_resumes_after_restart() {
     let totals: (i64, i64, i64, bool) = restarted
         .connection()
         .query_row(
-            "SELECT upload_bytes, download_bytes, packets, ended_at IS NOT NULL FROM flow_sessions",
+            "SELECT upload_bytes, download_bytes, packets, ended_at IS NOT NULL FROM active_flow_sessions",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
@@ -742,22 +670,21 @@ fn long_flow_checkpoints_and_resumes_after_restart() {
 }
 
 #[test]
-fn retention_removes_expired_rows_but_keeps_day_rollups() {
+fn metadata_retention_removes_expired_dns_and_ingest_batches() {
     let mut storage = setup();
     storage
         .persist_batch(&batch(1, FlowLifecycle::Ended), NOW)
         .unwrap();
-    storage
-        .roll_up_hour_and_day(NOW + 2 * DAY_MS as u64)
-        .unwrap();
+    let outbox = storage.outbox_batch(10).unwrap();
+    assert_eq!(outbox.len(), 1);
+    storage.acknowledge_outbox(outbox[0].id).unwrap();
     storage
         .run_retention(NOW + 400 * DAY_MS as u64, RetentionPolicy::default())
         .unwrap();
     for table in [
         "dns_observations",
-        "flow_sessions",
-        "traffic_total_minute",
-        "traffic_total_hour",
+        "active_flow_sessions",
+        "analytics_outbox",
     ] {
         let count: i64 = storage
             .connection()
@@ -767,13 +694,7 @@ fn retention_removes_expired_rows_but_keeps_day_rollups() {
             .unwrap();
         assert_eq!(count, 0, "{table}");
     }
-    let day_count: i64 = storage
-        .connection()
-        .query_row("SELECT COUNT(*) FROM traffic_total_day", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(day_count, 1);
+    assert_eq!(storage.outbox_depth().unwrap(), 0);
 }
 
 #[test]
@@ -822,17 +743,13 @@ fn database_size_is_positive() {
 }
 
 #[test]
-fn active_flow_count_and_unknown_ratio() {
+fn active_flow_count_tracks_metadata_sessions() {
     let mut storage = setup();
-    // Before any flows
     assert_eq!(storage.active_flow_count().unwrap(), 0);
-    assert!((storage.unknown_ratio(0).unwrap() - 0.0).abs() < f64::EPSILON);
-
-    // Persist a batch with an active flow
     storage
         .persist_batch(&batch(1, FlowLifecycle::Active), NOW)
         .unwrap();
-    assert!(storage.active_flow_count().unwrap() >= 0); // checkpoint may or may not have written
+    assert!(storage.active_flow_count().unwrap() >= 0);
 }
 
 #[test]

@@ -1,41 +1,61 @@
 //! Counts unique stored clients and flow sessions, never sample packets or payloads.
 use crate::CollectorInner;
+use netqmon_storage::analytics::FlowQuery;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) fn diagnostics(inner: &CollectorInner, since: u64) -> Result<Value, String> {
-    let device_sql = "SELECT device_type, vendor, private_mac, identity_evidence_json FROM devices";
-    let flow_sql = format!(
-        "SELECT application_id, protocol_id, domain, classification_evidence_json, count(*) AS count FROM flow_sessions {{final}} WHERE last_seen_at >= {since} GROUP BY application_id, protocol_id, domain, classification_evidence_json"
-    );
-    let (devices, flows) = if let Some(ch) = inner.storage.clickhouse_storage() {
-        let devices = ch
-            .client()
-            .query_json(&format!("{device_sql} FINAL FORMAT JSON"))
-            .map_err(|e| e.to_string())?;
-        let flows = ch
-            .client()
-            .query_json(&format!(
-                "{} FORMAT JSON",
-                flow_sql.replace("{final}", "FINAL")
-            ))
-            .map_err(|e| e.to_string())?;
-        (
-            devices["data"].as_array().cloned().unwrap_or_default(),
-            flows["data"].as_array().cloned().unwrap_or_default(),
-        )
-    } else {
-        let connection = inner.storage.connection();
-        let mut statement = connection.prepare(device_sql).map_err(|e| e.to_string())?;
-        let devices = statement.query_map([], |r| Ok(json!({"device_type":r.get::<_,Option<String>>(0)?, "vendor":r.get::<_,Option<String>>(1)?, "private_mac":r.get::<_,i64>(2)?, "identity_evidence_json":r.get::<_,String>(3)?})))
-            .map_err(|e| e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?;
-        let mut statement = connection
-            .prepare(&flow_sql.replace("{final}", ""))
-            .map_err(|e| e.to_string())?;
-        let flows = statement.query_map([], |r| Ok(json!({"application_id":r.get::<_,Option<String>>(0)?, "protocol_id":r.get::<_,Option<String>>(1)?, "domain":r.get::<_,Option<String>>(2)?, "classification_evidence_json":r.get::<_,String>(3)?, "count":r.get::<_,i64>(4)?})))
-            .map_err(|e| e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?;
-        (devices, flows)
-    };
+    const PAGE_SIZE: u32 = 500;
+    let mut devices = Vec::new();
+    let mut offset = 0_u64;
+    loop {
+        let (page, total) = inner
+            .storage
+            .devices(PAGE_SIZE, offset)
+            .map_err(|error| error.to_string())?;
+        devices.extend(page.into_iter().map(|device| {
+            json!({
+                "device_type": device.device_type,
+                "vendor": device.vendor,
+                "private_mac": device.private_mac,
+                "identity_evidence_json": device.identity_evidence_json,
+            })
+        }));
+        offset = offset.saturating_add(PAGE_SIZE.into());
+        if offset >= total || devices.is_empty() {
+            break;
+        }
+    }
+
+    let mut flows = Vec::new();
+    offset = 0;
+    loop {
+        let page = inner
+            .storage
+            .analytics()
+            .flows(&FlowQuery {
+                from: since,
+                to: i64::MAX as u64,
+                limit: PAGE_SIZE,
+                offset,
+                ..FlowQuery::default()
+            })
+            .map_err(|error| error.to_string())?;
+        let count = page.rows.len();
+        flows.extend(page.rows.into_iter().map(|flow| {
+            json!({
+                "application_id": flow.application_id,
+                "protocol_id": flow.protocol_id,
+                "domain": flow.domain,
+                "classification_evidence_json": flow.classification_evidence_json,
+                "count": 1,
+            })
+        }));
+        offset = offset.saturating_add(count as u64);
+        if count < PAGE_SIZE as usize {
+            break;
+        }
+    }
     Ok(summarize(&devices, &flows, since))
 }
 fn known(value: &Value) -> bool {

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,12 +10,14 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use netqmon_geo::GeoProvider;
+use netqmon_storage::analytics::{
+    AnalyticsFlow, AnalyticsSummary, FlowQuery as AnalyticsFlowQuery, FlowSort, SummaryQuery,
+    TrafficBreakdownQuery, TrafficDimension, TrafficQuery as AnalyticsTrafficQuery,
+    resolution_for_range,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-
-use netqmon_geo::GeoProvider;
 
 use crate::CollectorState;
 use crate::geo_updater;
@@ -67,62 +69,6 @@ pub(crate) fn router() -> Router<CollectorState> {
         .route("/internal/settings/license/check", post(check_license))
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ActivateLicenseRequest {
-    license_key: String,
-}
-
-async fn get_license(State(state): State<CollectorState>) -> Response {
-    match state.license.status() {
-        Ok(status) => Json(SuccessEnvelope {
-            schema_version: SCHEMA_VERSION,
-            data: status,
-            pagination: None,
-        })
-        .into_response(),
-        Err(error) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "license_state_error",
-            &error,
-        ),
-    }
-}
-
-async fn activate_license(
-    State(state): State<CollectorState>,
-    Json(request): Json<ActivateLicenseRequest>,
-) -> Response {
-    if request.license_key.trim().is_empty() {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_license_key",
-            "license_key must not be empty",
-        );
-    }
-    match state.license.activate(request.license_key.trim()).await {
-        Ok(status) => Json(SuccessEnvelope {
-            schema_version: SCHEMA_VERSION,
-            data: status,
-            pagination: None,
-        })
-        .into_response(),
-        Err(error) => api_error(StatusCode::BAD_GATEWAY, "license_activation_failed", &error),
-    }
-}
-
-async fn check_license(State(state): State<CollectorState>) -> Response {
-    match state.license.check().await {
-        Ok(status) => Json(SuccessEnvelope {
-            schema_version: SCHEMA_VERSION,
-            data: status,
-            pagination: None,
-        })
-        .into_response(),
-        Err(error) => api_error(StatusCode::BAD_GATEWAY, "license_check_failed", &error),
-    }
-}
-
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PageQuery {
@@ -132,7 +78,9 @@ struct PageQuery {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ApplicationDetailQuery {
+struct TimePageQuery {
+    from: Option<u64>,
+    to: Option<u64>,
     limit: Option<u32>,
     offset: Option<u64>,
     category: Option<String>,
@@ -140,7 +88,19 @@ struct ApplicationDetailQuery {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DestinationQuery {
+struct TrafficParams {
+    from: Option<u64>,
+    to: Option<u64>,
+    group_by: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u64>,
+    scope: Option<String>,
+    direction: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DestinationParams {
     from: Option<u64>,
     to: Option<u64>,
     limit: Option<u32>,
@@ -150,10 +110,42 @@ struct DestinationQuery {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct GeoQuery {
+struct GeoParams {
     from: Option<u64>,
     to: Option<u64>,
     lang: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InsightParams {
+    from: Option<u64>,
+    to: Option<u64>,
+    limit: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlowParams {
+    limit: Option<u32>,
+    cursor: Option<String>,
+    search: Option<String>,
+    client: Option<String>,
+    application: Option<String>,
+    organization: Option<String>,
+    detected_protocol: Option<String>,
+    domain: Option<String>,
+    ip: Option<String>,
+    protocol: Option<String>,
+    port: Option<u16>,
+    direction: Option<String>,
+    scope: Option<String>,
+    path_type: Option<String>,
+    nat: Option<String>,
+    from: Option<u64>,
+    to: Option<u64>,
+    sort: Option<String>,
+    order: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -185,8 +177,12 @@ impl Page {
                 &error.body_text(),
             ))
         })?;
-        let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE);
-        let offset = query.offset.unwrap_or(0);
+        Self::from_values(query.limit, query.offset)
+    }
+
+    fn from_values(limit: Option<u32>, offset: Option<u64>) -> Result<Self, Box<Response>> {
+        let limit = limit.unwrap_or(DEFAULT_PAGE_SIZE);
+        let offset = offset.unwrap_or(0);
         if limit == 0 || limit > MAX_PAGE_SIZE {
             return Err(Box::new(api_error(
                 StatusCode::BAD_REQUEST,
@@ -205,99 +201,57 @@ impl Page {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TrafficQuery {
-    from: Option<u64>,
-    to: Option<u64>,
-    group_by: Option<String>,
-    limit: Option<u32>,
-    offset: Option<u64>,
-    scope: Option<String>,
-    direction: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InsightQuery {
-    from: Option<u64>,
-    to: Option<u64>,
-    limit: Option<u32>,
-}
-
-pub(crate) use crate::insights::InsightWindow;
-
-fn parse_insight_window(
-    query: Result<Query<InsightQuery>, QueryRejection>,
-) -> Result<InsightWindow, Box<Response>> {
-    let Query(query) = query.map_err(|error| {
-        Box::new(api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_query",
-            &error.body_text(),
-        ))
-    })?;
-    let to = query.to.unwrap_or_else(now_ms);
-    let from = query
-        .from
-        .unwrap_or_else(|| to.saturating_sub(DEFAULT_INSIGHT_WINDOW_MS));
-    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE);
-    if from >= to || to.saturating_sub(from) > MAX_INSIGHT_WINDOW_MS {
+fn parse_time_range(from: Option<u64>, to: Option<u64>) -> Result<(u64, u64), Box<Response>> {
+    let to = to.unwrap_or_else(now_ms);
+    let from = from.unwrap_or_else(|| to.saturating_sub(DAY_MS));
+    if from >= to || to > u64::try_from(i64::MAX).expect("i64::MAX is nonnegative") {
         return Err(Box::new(api_error(
             StatusCode::BAD_REQUEST,
             "invalid_time_range",
-            "insight range must be ordered and no longer than 30 days",
+            "from must be less than to and both timestamps must fit signed 64-bit milliseconds",
         )));
     }
-    if limit == 0 || limit > MAX_PAGE_SIZE {
-        return Err(Box::new(api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_pagination",
-            "limit must be between 1 and 200",
-        )));
+    Ok((from, to))
+}
+
+fn summary_query(from: u64, to: u64, page: Page) -> SummaryQuery {
+    SummaryQuery {
+        from,
+        to,
+        resolution: resolution_for_range(from, to),
+        gateway_id: None,
+        device_id: None,
+        scope: None,
+        direction: None,
+        organization_id: None,
+        application_id: None,
+        category_id: None,
+        protocol_id: None,
+        domain: None,
+        remote_ip: None,
+        limit: page.limit,
+        offset: page.offset,
     }
-    Ok(InsightWindow { from, to, limit })
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FlowQuery {
-    limit: Option<u32>,
-    cursor: Option<String>,
-    search: Option<String>,
-    client: Option<String>,
-    application: Option<String>,
-    organization: Option<String>,
-    detected_protocol: Option<String>,
-    domain: Option<String>,
-    ip: Option<String>,
-    protocol: Option<String>,
-    port: Option<u16>,
-    direction: Option<String>,
-    scope: Option<String>,
-    path_type: Option<String>,
-    nat: Option<String>,
-    from: Option<u64>,
-    to: Option<u64>,
-    sort: Option<String>,
-    order: Option<String>,
+fn traffic_query(from: u64, to: u64) -> AnalyticsTrafficQuery {
+    AnalyticsTrafficQuery {
+        from,
+        to,
+        resolution: resolution_for_range(from, to),
+        gateway_id: None,
+        scope: None,
+        direction: None,
+        device_id: None,
+        organization_id: None,
+        application_id: None,
+        category_id: None,
+        protocol_id: None,
+        domain: None,
+        remote_ip: None,
+    }
 }
 
-#[derive(Clone, Debug)]
-struct FlowCursor {
-    sort_value: i64,
-    id: String,
-}
-
-struct FlowPageOptions {
-    limit: u32,
-    sort_column: &'static str,
-    sort_name: &'static str,
-    descending: bool,
-    cursor: Option<FlowCursor>,
-}
-
-#[allow(clippy::too_many_lines)]
 async fn overview(
     State(state): State<CollectorState>,
     query: Result<Query<PageQuery>, QueryRejection>,
@@ -307,120 +261,103 @@ async fn overview(
     }
     let snapshot = state.realtime_snapshot();
     let inner = state.lock();
-    let connection = inner.storage.connection();
-    let result = (|| -> rusqlite::Result<Value> {
-        let now = now_ms();
-        let offline_after_ms = gateway_offline_after_ms();
-        let devices: i64 = scalar(connection, "SELECT COUNT(*) FROM devices", [])?;
-        let applications: i64 = scalar(
-            connection,
-            "SELECT COUNT(DISTINCT application_id) FROM traffic_application_minute",
-            [],
-        )?;
-        let historical: (i64, i64) = connection.query_row(
-            "SELECT COALESCE(SUM(upload_bytes), 0), COALESCE(SUM(download_bytes), 0)
-             FROM traffic_total_minute WHERE timestamp >= ?1",
-            [to_i64(now.saturating_sub(DAY_MS))],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let gateway = connection
-            .query_row(
-                "SELECT id, name, agent_version, kernel_version, openwrt_version, last_seen
-                 FROM gateways ORDER BY created_at LIMIT 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, i64>(5)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let gateway_status = gateway.as_ref().map_or("unenrolled", |gateway| {
-            if now.saturating_sub(to_u64(gateway.5)) <= offline_after_ms {
-                "online"
-            } else {
-                "offline"
-            }
-        });
-        let capture_warning = if gateway_status == "offline" {
-            Some("No gateway telemetry has arrived within the offline threshold".to_owned())
-        } else if let Some(health) = snapshot.gateway_health.as_ref() {
-            let mut reasons = Vec::new();
-            if health.hardware_flow_offload == "enabled" {
-                reasons.push("hardware flow offloading is enabled".to_owned());
-            }
-            if health.dropped_batches > 0 {
-                reasons.push(format!(
-                    "{} dropped telemetry batches",
-                    health.dropped_batches
-                ));
-            }
-            if health.dns_dropped_events > 0 {
-                reasons.push(format!("{} dropped DNS events", health.dns_dropped_events));
-            }
-            if health.protocol_probe_dropped_events > 0 {
-                reasons.push(format!(
-                    "{} dropped protocol probe events",
-                    health.protocol_probe_dropped_events
-                ));
-            }
-            if health.interface_counter_sanity == "degraded" {
-                reasons.push(format!(
-                    "interface counters exceeded captured flow deltas ({}B interface, {}B flows)",
-                    health.interface_delta_bytes, health.flow_delta_bytes
-                ));
-            }
-            if reasons.is_empty() {
-                None
-            } else {
-                Some(format!("Capture degraded: {}", reasons.join("; ")))
-            }
+    let now = now_ms();
+    let offline_after_ms = gateway_offline_after_ms();
+    let gateway = match inner.storage.gateway_details() {
+        Ok(gateway) => gateway,
+        Err(error) => return storage_error(error),
+    };
+    let device_count = match inner.storage.device_count() {
+        Ok(count) => count,
+        Err(error) => return storage_error(error),
+    };
+    let analytics = match inner
+        .storage
+        .analytics()
+        .overview(now.saturating_sub(DAY_MS), now)
+    {
+        Ok(analytics) => analytics,
+        Err(error) => return storage_error(error),
+    };
+    let gateway_status = gateway.as_ref().map_or("unenrolled", |record| {
+        if now.saturating_sub(record.last_seen) <= offline_after_ms {
+            "online"
         } else {
-            Some("Capture health telemetry has not been reported".to_owned())
-        };
-        let gateway = gateway.map(|gateway| {
-            let health = snapshot.gateway_health.as_ref();
-            json!({
-                "id": gateway.0,
-                "name": gateway.1,
-                "status": gateway_status,
-                "last_seen": gateway.5,
-                "agent_version": health.map_or(gateway.2.as_str(), |value| value.agent_version.as_str()),
-                "kernel_version": health.map_or(gateway.3.as_str(), |value| value.kernel_version.as_str()),
-                "openwrt_version": health.map_or(gateway.4.as_str(), |value| value.openwrt_version.as_str()),
-                "offloading_status": health.map_or("unknown", |value| value.hardware_flow_offload.as_str()),
-                "capture_interface": health.map_or("", |value| value.capture_interface.as_str()),
-                "capture_interfaces": health.map_or_else(Vec::new, |value| value.capture_interfaces.clone()),
-                "interface_counter_sanity": health.map_or("unknown", |value| value.interface_counter_sanity.as_str()),
-                "interface_delta_bytes": health.map_or(0, |value| value.interface_delta_bytes),
-                "flow_delta_bytes": health.map_or(0, |value| value.flow_delta_bytes),
-                "capture_warning": capture_warning,
-                "offline_after_ms": offline_after_ms,
-            })
-        });
-        Ok(json!({
-            "gateway_status": gateway_status,
-            "gateway": gateway,
-            "realtime": snapshot,
-            "last_24_hours": {
-                "upload_bytes": historical.0,
-                "download_bytes": historical.1,
-            },
-            "device_count": devices,
-            "application_count": applications,
-        }))
-    })();
-    result.map_or_else(storage_error, api_ok)
+            "offline"
+        }
+    });
+    let capture_warning = capture_warning(gateway_status, snapshot.gateway_health.as_ref());
+    let gateway = gateway.map(|gateway| {
+        let health = snapshot.gateway_health.as_ref();
+        json!({
+            "id": gateway.id,
+            "name": gateway.name,
+            "status": gateway_status,
+            "last_seen": gateway.last_seen,
+            "agent_version": health.map_or(gateway.agent_version.as_str(), |v| v.agent_version.as_str()),
+            "kernel_version": health.map_or(gateway.kernel_version.as_str(), |v| v.kernel_version.as_str()),
+            "openwrt_version": health.map_or(gateway.openwrt_version.as_str(), |v| v.openwrt_version.as_str()),
+            "offloading_status": health.map_or("unknown", |v| v.hardware_flow_offload.as_str()),
+            "capture_interface": health.map_or("", |v| v.capture_interface.as_str()),
+            "capture_interfaces": health.map_or_else(Vec::new, |v| v.capture_interfaces.clone()),
+            "interface_counter_sanity": health.map_or("unknown", |v| v.interface_counter_sanity.as_str()),
+            "interface_delta_bytes": health.map_or(0, |v| v.interface_delta_bytes),
+            "flow_delta_bytes": health.map_or(0, |v| v.flow_delta_bytes),
+            "capture_warning": capture_warning,
+            "offline_after_ms": offline_after_ms,
+        })
+    });
+    api_ok(json!({
+        "gateway_status": gateway_status,
+        "gateway": gateway,
+        "realtime": snapshot,
+        "last_24_hours": {"upload_bytes": analytics.upload_bytes, "download_bytes": analytics.download_bytes},
+        "device_count": device_count,
+        "application_count": analytics.application_count,
+    }))
+}
+
+fn capture_warning(
+    gateway_status: &str,
+    health: Option<&crate::realtime::GatewayHealthSnapshot>,
+) -> Option<String> {
+    if gateway_status == "offline" {
+        return Some("No gateway telemetry has arrived within the offline threshold".to_owned());
+    }
+    let Some(health) = health else {
+        return Some("Capture health telemetry has not been reported".to_owned());
+    };
+    let mut reasons = Vec::new();
+    if health.hardware_flow_offload == "enabled" {
+        reasons.push("hardware flow offloading is enabled".to_owned());
+    }
+    if health.dropped_batches > 0 {
+        reasons.push(format!(
+            "{} dropped telemetry batches",
+            health.dropped_batches
+        ));
+    }
+    if health.dns_dropped_events > 0 {
+        reasons.push(format!("{} dropped DNS events", health.dns_dropped_events));
+    }
+    if health.protocol_probe_dropped_events > 0 {
+        reasons.push(format!(
+            "{} dropped protocol probe events",
+            health.protocol_probe_dropped_events
+        ));
+    }
+    if health.interface_counter_sanity == "degraded" {
+        reasons.push(format!(
+            "interface counters exceeded captured flow deltas ({}B interface, {}B flows)",
+            health.interface_delta_bytes, health.flow_delta_bytes
+        ));
+    }
+    (!reasons.is_empty()).then(|| format!("Capture degraded: {}", reasons.join("; ")))
 }
 
 async fn traffic(
     State(state): State<CollectorState>,
-    query: Result<Query<TrafficQuery>, QueryRejection>,
+    query: Result<Query<TrafficParams>, QueryRejection>,
 ) -> Response {
     let Query(query) = match query {
         Ok(query) => query,
@@ -428,26 +365,23 @@ async fn traffic(
             return api_error(StatusCode::BAD_REQUEST, "invalid_query", &error.body_text());
         }
     };
-    let page = match Page::parse(Ok(Query(PageQuery {
-        limit: query.limit,
-        offset: query.offset,
-    }))) {
+    let page = match Page::from_values(query.limit, query.offset) {
         Ok(page) => page,
         Err(response) => return *response,
     };
-    let to = query.to.unwrap_or_else(now_ms);
-    let from = query.from.unwrap_or_else(|| to.saturating_sub(DAY_MS));
-    if from >= to || to > i64::MAX as u64 {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_time_range",
-            "from must be less than to and both timestamps must fit signed 64-bit milliseconds",
-        );
-    }
-    let group_by = query.group_by.as_deref().unwrap_or("none");
+    let (from, to) = match parse_time_range(query.from, query.to) {
+        Ok(range) => range,
+        Err(error) => return *error,
+    };
+    let group = query.group_by.as_deref().unwrap_or("none");
+    let group = if group == "protocol" {
+        "protocol_l7"
+    } else {
+        group
+    };
     if !matches!(
-        group_by,
-        "none" | "client" | "application" | "category" | "protocol_l7" | "protocol_l4" | "protocol"
+        group,
+        "none" | "client" | "application" | "category" | "protocol_l7" | "protocol_l4"
     ) {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -455,239 +389,160 @@ async fn traffic(
             "group_by must be one of none, client, application, category, protocol_l7, or protocol_l4",
         );
     }
-    let normalized_group_by = if group_by == "protocol" {
-        "protocol_l7"
-    } else {
-        group_by
-    };
-    let scope = match traffic_scope(query.scope.as_deref().unwrap_or("internet")) {
+    let scope = match parse_scope(query.scope.as_deref().unwrap_or("internet")) {
         Ok(value) => value,
         Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_scope", message),
     };
-    let direction = match traffic_direction(query.direction.as_deref().unwrap_or("both")) {
+    let direction = match parse_direction(query.direction.as_deref().unwrap_or("both")) {
         Ok(value) => value,
         Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_direction", message),
     };
-    traffic_breakdown(
-        &state,
-        from,
-        to,
-        normalized_group_by,
-        page,
-        scope,
-        direction,
-    )
+    let inner = state.lock();
+    let mut analytics_query = traffic_query(from, to);
+    analytics_query.scope = scope;
+    analytics_query.direction = direction;
+    let points = match inner.storage.analytics().traffic_series(&analytics_query) {
+        Ok(points) => points,
+        Err(error) => return storage_error(error),
+    };
+    let duration = to.saturating_sub(from);
+    let bucket_ms = duration.div_ceil(180).max(60_000).div_ceil(60_000) * 60_000;
+    let mut buckets = BTreeMap::<u64, [u64; 4]>::new();
+    for point in points {
+        let bucket = point.timestamp / bucket_ms * bucket_ms;
+        let totals = buckets.entry(bucket).or_default();
+        totals[0] = totals[0].saturating_add(point.upload_bytes);
+        totals[1] = totals[1].saturating_add(point.download_bytes);
+        totals[2] = totals[2].saturating_add(point.packets);
+        totals[3] = totals[3].saturating_add(point.flow_count);
+    }
+    let points = buckets.into_iter().map(|(timestamp, v)| json!({
+        "timestamp": timestamp, "upload_bytes": v[0], "download_bytes": v[1], "packets": v[2], "flow_count": v[3]
+    })).collect::<Vec<_>>();
+    let breakdown = match traffic_breakdown(&inner, group, page, analytics_query, &points) {
+        Ok(breakdown) => breakdown,
+        Err(error) => return *error,
+    };
+    api_ok(json!({
+        "from":from,"to":to,"bucket_ms":bucket_ms,"group_by":group,
+        "scope":scope_name(scope),"direction":direction_name(direction),"points":points,"breakdown":breakdown
+    }))
 }
 
 fn traffic_breakdown(
-    state: &CollectorState,
-    from: u64,
-    to: u64,
-    group_by: &str,
+    inner: &crate::CollectorInner,
+    group: &str,
     page: Page,
-    scope: Option<i64>,
-    direction: Option<i64>,
-) -> Response {
-    let inner = state.lock();
-    let connection = inner.storage.connection();
-    let result = (|| -> rusqlite::Result<Value> {
-        // Keep historical charts bounded while retaining the exact requested window.
-        let duration = to.saturating_sub(from);
-        let raw_bucket = duration.div_ceil(180);
-        let bucket_ms = raw_bucket.max(60_000).div_ceil(60_000) * 60_000;
-        let mut points_statement = connection.prepare(
-            "SELECT (timestamp / ?1) * ?1 AS bucket, SUM(upload_bytes),
-                    SUM(download_bytes), SUM(packets), SUM(flow_count)
-             FROM traffic_scope_minute WHERE timestamp >= ?2 AND timestamp < ?3
-               AND (?4 IS NULL OR scope = ?4) AND (?5 IS NULL OR direction = ?5)
-             GROUP BY bucket ORDER BY bucket",
-        )?;
-        let points = points_statement
-            .query_map(
-                params![
-                    to_i64(bucket_ms),
-                    to_i64(from),
-                    to_i64(to),
-                    scope,
-                    direction
-                ],
-                |row| {
-                    Ok(json!({
-                        "timestamp": row.get::<_, i64>(0)?,
-                        "upload_bytes": row.get::<_, i64>(1)?,
-                        "download_bytes": row.get::<_, i64>(2)?,
-                        "packets": row.get::<_, i64>(3)?,
-                        "flow_count": row.get::<_, i64>(4)?,
-                    }))
-                },
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        let (breakdown_sql, has_limit) = traffic_breakdown_query(group_by);
-        let mut breakdown_statement = connection.prepare(breakdown_sql)?;
-        let map_row = |row: &rusqlite::Row<'_>| {
-            let mac = row
-                .get::<_, Option<Vec<u8>>>(2)?
-                .map(|value| format_mac(&value));
-            let id = row.get::<_, String>(0)?;
-            let mut value = json!({
-                "id": id,
-                "name": row.get::<_, String>(1)?,
-                "mac": mac,
-                "upload_bytes": row.get::<_, i64>(3)?,
-                "download_bytes": row.get::<_, i64>(4)?,
-                "packets": row.get::<_, i64>(5)?,
-                "flow_count": row.get::<_, i64>(6)?,
-                "last_seen": row.get::<_, Option<i64>>(7)?,
-            });
-            if group_by == "application" {
-                if let Some(object) = value.as_object_mut() {
-                    let application_id = object
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown");
-                    let metadata = inner.classifier.application_metadata(application_id);
-                    object.insert(
-                        "name".to_owned(),
-                        json!(metadata.as_ref().map(|metadata| metadata.name.clone())),
-                    );
-                    object.insert("icon".to_owned(), icon_json(metadata));
-                }
+    analytics_query: AnalyticsTrafficQuery,
+    points: &[Value],
+) -> Result<Vec<Value>, Box<Response>> {
+    if group == "none" {
+        let totals = points.iter().fold([0_u64; 4], |mut acc, point| {
+            for (index, key) in ["upload_bytes", "download_bytes", "packets", "flow_count"]
+                .iter()
+                .enumerate()
+            {
+                acc[index] = acc[index].saturating_add(point[*key].as_u64().unwrap_or(0));
             }
-            Ok(value)
-        };
-        let breakdown = if has_limit {
-            breakdown_statement
-                .query_map(
-                    params![
-                        to_i64(from),
-                        to_i64(to),
-                        scope,
-                        direction,
-                        i64::from(page.limit),
-                        to_i64(page.offset)
-                    ],
-                    map_row,
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        } else {
-            breakdown_statement
-                .query_map(params![to_i64(from), to_i64(to), scope, direction], map_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        Ok(json!({
-            "from": from,
-            "to": to,
-            "bucket_ms": bucket_ms,
-            "group_by": group_by,
-            "scope": query_scope_name(scope),
-            "direction": query_direction_name(direction),
-            "points": points,
-            "breakdown": breakdown,
-        }))
-    })();
-    result.map_or_else(storage_error, api_ok)
-}
-
-fn traffic_breakdown_query(group_by: &str) -> (&'static str, bool) {
-    match group_by {
-        "client" => (
-            "SELECT CAST(d.id AS TEXT), COALESCE(d.display_name, d.hostname, ''), d.mac,
-                    SUM(t.upload_bytes), SUM(t.download_bytes), SUM(t.packets), SUM(t.flow_count),
-                    MAX(t.timestamp)
-             FROM traffic_scope_minute t JOIN devices d ON d.id = t.device_id
-             WHERE t.timestamp >= ?1 AND t.timestamp < ?2
-               AND (?3 IS NULL OR t.scope = ?3) AND (?4 IS NULL OR t.direction = ?4)
-             GROUP BY d.id ORDER BY SUM(t.upload_bytes + t.download_bytes) DESC
-             LIMIT ?5 OFFSET ?6",
-            true,
-        ),
-        "application" => (
-            "SELECT t.application_id, t.application_id, NULL,
-                    SUM(upload_bytes), SUM(download_bytes), SUM(packets), SUM(flow_count),
-                    MAX(timestamp)
-             FROM traffic_scope_minute t WHERE timestamp >= ?1 AND timestamp < ?2
-               AND (?3 IS NULL OR t.scope = ?3) AND (?4 IS NULL OR t.direction = ?4)
-             GROUP BY t.application_id ORDER BY SUM(upload_bytes + download_bytes) DESC
-             LIMIT ?5 OFFSET ?6",
-            true,
-        ),
-        "category" => (
-            "SELECT t.category_id, t.category_id, NULL,
-                    SUM(upload_bytes), SUM(download_bytes), SUM(packets), SUM(flow_count),
-                    MAX(timestamp)
-             FROM traffic_scope_minute t WHERE timestamp >= ?1 AND timestamp < ?2
-               AND (?3 IS NULL OR t.scope = ?3) AND (?4 IS NULL OR t.direction = ?4)
-             GROUP BY t.category_id ORDER BY SUM(upload_bytes + download_bytes) DESC
-             LIMIT ?5 OFFSET ?6",
-            true,
-        ),
-        "protocol_l7" | "protocol" => (
-            "SELECT COALESCE(t.protocol_id, 'unknown'), COALESCE(t.protocol_id, 'unknown'), NULL,
-                    SUM(upload_bytes), SUM(download_bytes), SUM(packets), SUM(flow_count),
-                    MAX(timestamp)
-             FROM traffic_scope_minute t WHERE timestamp >= ?1 AND timestamp < ?2
-               AND (?3 IS NULL OR t.scope = ?3) AND (?4 IS NULL OR t.direction = ?4)
-             GROUP BY COALESCE(t.protocol_id, 'unknown') ORDER BY SUM(upload_bytes + download_bytes) DESC
-             LIMIT ?5 OFFSET ?6",
-            true,
-        ),
-        "protocol_l4" => (
-            "SELECT CASE t.protocol WHEN 6 THEN 'tcp' WHEN 17 THEN 'udp' WHEN 1 THEN 'icmp' WHEN 58 THEN 'icmpv6' ELSE CAST(t.protocol AS TEXT) END,
-                    CASE t.protocol WHEN 6 THEN 'TCP' WHEN 17 THEN 'UDP' WHEN 1 THEN 'ICMP' WHEN 58 THEN 'ICMPv6' ELSE 'IP ' || CAST(t.protocol AS TEXT) END,
-                    NULL,
-                    SUM(upload_bytes), SUM(download_bytes), SUM(packets), SUM(flow_count),
-                    MAX(timestamp)
-             FROM traffic_scope_minute t WHERE timestamp >= ?1 AND timestamp < ?2
-               AND (?3 IS NULL OR t.scope = ?3) AND (?4 IS NULL OR t.direction = ?4)
-             GROUP BY t.protocol ORDER BY SUM(upload_bytes + download_bytes) DESC
-             LIMIT ?5 OFFSET ?6",
-            true,
-        ),
-        _ => (
-            "SELECT 'total', 'All traffic', NULL,
-                    COALESCE(SUM(upload_bytes), 0), COALESCE(SUM(download_bytes), 0),
-                    COALESCE(SUM(packets), 0), COALESCE(SUM(flow_count), 0), MAX(timestamp)
-             FROM traffic_scope_minute WHERE timestamp >= ?1 AND timestamp < ?2
-               AND (?3 IS NULL OR scope = ?3) AND (?4 IS NULL OR direction = ?4)",
-            false,
-        ),
+            acc
+        });
+        return Ok(vec![
+            json!({"id":"total","name":"All traffic","upload_bytes":totals[0],"download_bytes":totals[1],"packets":totals[2],"flow_count":totals[3],"last_seen":null}),
+        ]);
     }
+    let dimension = match group {
+        "client" => TrafficDimension::Device,
+        "application" => TrafficDimension::Application,
+        "category" => TrafficDimension::Category,
+        "protocol_l4" => TrafficDimension::TransportProtocol,
+        _ => TrafficDimension::Protocol,
+    };
+    let rows = inner
+        .storage
+        .analytics()
+        .traffic_breakdown(&TrafficBreakdownQuery {
+            traffic: analytics_query,
+            dimension,
+            limit: page.limit,
+            offset: page.offset,
+        })
+        .map_err(|error| Box::new(storage_error(error)))?;
+    Ok(rows
+        .iter()
+        .map(|row| traffic_breakdown_item(inner, group, row))
+        .collect())
 }
 
-fn traffic_scope(value: &str) -> Result<Option<i64>, &'static str> {
+fn traffic_breakdown_item(
+    inner: &crate::CollectorInner,
+    group: &str,
+    row: &netqmon_storage::analytics::TrafficBreakdown,
+) -> Value {
+    let mut item = json!({"id":row.key,"name":row.key,"upload_bytes":row.upload_bytes,"download_bytes":row.download_bytes,"packets":row.packets,"flow_count":row.flow_count,"last_seen":row.last_seen_at});
+    if group == "client" {
+        if let Ok(id) = row.key.parse::<i64>() {
+            if let Ok(Some(device)) = inner.storage.device(id) {
+                item["id"] = json!(device.id.to_string());
+                item["name"] = json!(display_name(&device));
+                item["mac"] = json!(format_mac(&device.mac));
+            }
+        }
+    } else if group == "application" {
+        let metadata = inner.classifier.application_metadata(&row.key);
+        item["name"] = json!(metadata.as_ref().map(|m| m.name.clone()));
+        item["icon"] = icon_json(metadata);
+    } else if group == "protocol_l4" {
+        let (id, name) = transport_protocol_name(&row.key);
+        item["id"] = json!(id);
+        item["name"] = json!(name);
+    }
+    item
+}
+
+fn parse_scope(value: &str) -> Result<Option<u8>, &'static str> {
     match value.to_ascii_lowercase().as_str() {
         "all" => Ok(None),
-        "internet" => Ok(Some(netqmon_protocol::v1::FlowScope::Internet as i64)),
-        "internal" => Ok(Some(netqmon_protocol::v1::FlowScope::Internal as i64)),
-        "tunnel" => Ok(Some(netqmon_protocol::v1::FlowScope::Tunnel as i64)),
+        "internet" => Ok(Some(netqmon_protocol::v1::FlowScope::Internet as u8)),
+        "internal" => Ok(Some(netqmon_protocol::v1::FlowScope::Internal as u8)),
+        "tunnel" => Ok(Some(netqmon_protocol::v1::FlowScope::Tunnel as u8)),
         _ => Err("scope must be one of internet, internal, tunnel, or all"),
     }
 }
 
-fn traffic_direction(value: &str) -> Result<Option<i64>, &'static str> {
+fn parse_direction(value: &str) -> Result<Option<u8>, &'static str> {
     match value.to_ascii_lowercase().as_str() {
         "both" => Ok(None),
-        "upload" => Ok(Some(netqmon_protocol::v1::Direction::Upload as i64)),
-        "download" => Ok(Some(netqmon_protocol::v1::Direction::Download as i64)),
+        "upload" => Ok(Some(netqmon_protocol::v1::Direction::Upload as u8)),
+        "download" => Ok(Some(netqmon_protocol::v1::Direction::Download as u8)),
         _ => Err("direction must be one of both, upload, or download"),
     }
 }
 
-fn query_scope_name(value: Option<i64>) -> &'static str {
-    match value {
-        Some(value) if value == netqmon_protocol::v1::FlowScope::Internet as i64 => "internet",
-        Some(value) if value == netqmon_protocol::v1::FlowScope::Internal as i64 => "internal",
-        Some(value) if value == netqmon_protocol::v1::FlowScope::Tunnel as i64 => "tunnel",
+fn scope_name(value: Option<u8>) -> &'static str {
+    match value.and_then(|v| netqmon_protocol::v1::FlowScope::try_from(i32::from(v)).ok()) {
+        Some(netqmon_protocol::v1::FlowScope::Internet) => "internet",
+        Some(netqmon_protocol::v1::FlowScope::Internal) => "internal",
+        Some(netqmon_protocol::v1::FlowScope::Tunnel) => "tunnel",
         _ => "all",
     }
 }
 
-fn query_direction_name(value: Option<i64>) -> &'static str {
-    match value {
-        Some(value) if value == netqmon_protocol::v1::Direction::Upload as i64 => "upload",
-        Some(value) if value == netqmon_protocol::v1::Direction::Download as i64 => "download",
+fn direction_name(value: Option<u8>) -> &'static str {
+    match value.and_then(|v| netqmon_protocol::v1::Direction::try_from(i32::from(v)).ok()) {
+        Some(netqmon_protocol::v1::Direction::Upload) => "upload",
+        Some(netqmon_protocol::v1::Direction::Download) => "download",
         _ => "both",
+    }
+}
+
+fn transport_protocol_name(value: &str) -> (String, String) {
+    let n = value.parse::<u8>().unwrap_or(0);
+    match n {
+        6 => ("tcp".to_owned(), "TCP".to_owned()),
+        17 => ("udp".to_owned(), "UDP".to_owned()),
+        1 => ("icmp".to_owned(), "ICMP".to_owned()),
+        58 => ("icmpv6".to_owned(), "ICMPv6".to_owned()),
+        other => (other.to_string(), format!("IP {other}")),
     }
 }
 
@@ -696,17 +551,50 @@ async fn clients(
     query: Result<Query<PageQuery>, QueryRejection>,
 ) -> Response {
     let page = match Page::parse(query) {
-        Ok(page) => page,
-        Err(response) => return *response,
+        Ok(v) => v,
+        Err(e) => return *e,
     };
     let inner = state.lock();
-    if let Some(clickhouse) = inner.storage.clickhouse_storage() {
-        return clickhouse
-            .query_clients(page.limit, page.offset)
-            .map_or_else(storage_error, |(items, total)| page_ok(items, page, total));
+    let (rows, total) = match inner.storage.devices(page.limit, page.offset) {
+        Ok(v) => v,
+        Err(e) => return storage_error(e),
+    };
+    let mut items = Vec::with_capacity(rows.len());
+    for device in rows {
+        let evidence = match inner
+            .storage
+            .device_evidence(&device.gateway_id, &device.mac)
+        {
+            Ok(rows) => rows,
+            Err(error) => return storage_error(error),
+        };
+        let addresses = match inner.storage.device_addresses(device.id) {
+            Ok(rows) => rows,
+            Err(error) => return storage_error(error),
+        };
+        let mut analytics = summary_query(
+            0,
+            now_ms(),
+            Page {
+                limit: 1,
+                offset: 0,
+            },
+        );
+        analytics.device_id = Some(positive_id_as_u64(device.id));
+        let traffic = inner
+            .storage
+            .analytics()
+            .client_traffic(&analytics)
+            .ok()
+            .and_then(|mut v| v.pop());
+        items.push(device_json(
+            &device,
+            traffic.as_ref(),
+            &evidence,
+            &addresses,
+        ));
     }
-    query_clients(inner.storage.connection(), page)
-        .map_or_else(storage_error, |(items, total)| page_ok(items, page, total))
+    page_ok(items, page, total)
 }
 
 async fn client_detail(
@@ -717,301 +605,164 @@ async fn client_detail(
     if let Err(response) = Page::parse(query) {
         return *response;
     }
-    let Ok(id) = id.parse::<i64>() else {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_client_id",
-            "client id must be an integer",
-        );
+    let id = match parse_positive_id(&id, "invalid_client_id") {
+        Ok(id) => id,
+        Err(response) => return *response,
     };
-    if id <= 0 {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_client_id",
-            "client id must be positive",
-        );
-    }
     let inner = state.lock();
-    if let Some(clickhouse) = inner.storage.clickhouse_storage() {
-        return match clickhouse.query_client_detail(id) {
-            Ok(Some(value)) => api_ok(value),
-            Ok(None) => api_error(StatusCode::NOT_FOUND, "not_found", "client was not found"),
-            Err(error) => storage_error(error),
-        };
-    }
-    match query_client_detail(inner.storage.connection(), id) {
-        Ok(Some(value)) => api_ok(value),
-        Ok(None) => api_error(StatusCode::NOT_FOUND, "not_found", "client was not found"),
-        Err(error) => storage_error(error),
-    }
+    let device = match inner.storage.device(id) {
+        Ok(Some(value)) => value,
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "not_found", "client was not found"),
+        Err(e) => return storage_error(e),
+    };
+    let evidence = match inner
+        .storage
+        .device_evidence(&device.gateway_id, &device.mac)
+    {
+        Ok(rows) => rows,
+        Err(error) => return storage_error(error),
+    };
+    let addresses = match inner.storage.device_addresses(id) {
+        Ok(v) => v,
+        Err(e) => return storage_error(e),
+    };
+    let mut q = summary_query(
+        0,
+        now_ms(),
+        Page {
+            limit: 200,
+            offset: 0,
+        },
+    );
+    q.device_id = Some(positive_id_as_u64(id));
+    let apps = inner
+        .storage
+        .analytics()
+        .application_summary(&q)
+        .unwrap_or_default();
+    let domains = inner
+        .storage
+        .analytics()
+        .domain_summary(&q)
+        .unwrap_or_default();
+    let destinations = inner
+        .storage
+        .analytics()
+        .destination_summary(&q)
+        .unwrap_or_default();
+    let traffic = inner
+        .storage
+        .analytics()
+        .client_traffic(&q)
+        .ok()
+        .and_then(|mut rows| rows.pop());
+    let address_rows = addresses
+        .iter()
+        .map(device_address_json)
+        .collect::<Vec<_>>();
+    let mut client = device_json(&device, traffic.as_ref(), &evidence, &addresses);
+    client["applications"] = json!(
+        apps.into_iter()
+            .map(|row| summary_item(&row, "application", &inner.classifier))
+            .collect::<Vec<_>>()
+    );
+    client["domains"] = json!(
+        domains
+            .into_iter()
+            .map(|row| summary_item(&row, "domain", &inner.classifier))
+            .collect::<Vec<_>>()
+    );
+    client["destinations"] = json!(
+        destinations
+            .into_iter()
+            .map(|row| summary_item(&row, "destination", &inner.classifier))
+            .collect::<Vec<_>>()
+    );
+    api_ok(json!({"client":client,"addresses":address_rows}))
 }
 
 async fn client_related(
     State(state): State<CollectorState>,
     Path((id, relation)): Path<(String, String)>,
-    query: Result<Query<RelatedQuery>, QueryRejection>,
+    query: Result<Query<TimePageQuery>, QueryRejection>,
 ) -> Response {
-    let Ok(id) = id.parse::<i64>() else {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_client_id",
-            "client id must be an integer",
-        );
-    };
-    if id <= 0 {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_client_id",
-            "client id must be positive",
-        );
-    }
     let Query(query) = match query {
-        Ok(query) => query,
-        Err(error) => {
-            return api_error(StatusCode::BAD_REQUEST, "invalid_query", &error.body_text());
-        }
+        Ok(v) => v,
+        Err(e) => return api_error(StatusCode::BAD_REQUEST, "invalid_query", &e.body_text()),
     };
-    let page = match Page::parse(Ok(Query(PageQuery {
-        limit: query.limit,
-        offset: query.offset,
-    }))) {
-        Ok(page) => page,
+    let id = match parse_positive_id(&id, "invalid_client_id") {
+        Ok(id) => id,
         Err(response) => return *response,
     };
-    let to = query.to.unwrap_or_else(now_ms);
-    let from = query.from.unwrap_or_else(|| to.saturating_sub(DAY_MS));
-    if from >= to {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_time_range",
-            "from must be less than to",
-        );
-    }
-    let scope = match traffic_scope(query.scope.as_deref().unwrap_or("internet")) {
-        Ok(value) => value,
-        Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_scope", message),
+    let page = match Page::from_values(query.limit, query.offset) {
+        Ok(v) => v,
+        Err(e) => return *e,
+    };
+    let (from, to) = match parse_time_range(query.from, query.to) {
+        Ok(v) => v,
+        Err(e) => return *e,
     };
     let inner = state.lock();
-    let connection = inner.storage.connection();
-    let result = match relation.as_str() {
-        "traffic" => query_client_traffic(connection, id, from, to, scope),
-        "applications" => {
-            query_client_applications(connection, &inner.classifier, id, page, from, to, scope)
+    match relation.as_str() {
+        "traffic" => {
+            let mut q = traffic_query(from, to);
+            q.device_id = Some(positive_id_as_u64(id));
+            q.scope = Some(netqmon_protocol::v1::FlowScope::Internet as u8);
+            match inner.storage.analytics().traffic_series(&q) {
+                Ok(rows) => api_ok(
+                    json!({"bucket_ms":60_000,"points":rows.into_iter().map(|r|json!({"timestamp":r.timestamp,"upload_bytes":r.upload_bytes,"download_bytes":r.download_bytes,"packets":r.packets,"flow_count":r.flow_count})).collect::<Vec<_>>()}),
+                ),
+                Err(e) => storage_error(e),
+            }
         }
-        "domains" => query_client_domains(connection, id, page, from, to, scope),
-        "destinations" => query_client_destinations(connection, id, page, from, to, scope),
-        "flows" => query_client_flows(connection, &inner.classifier, id, page, from, to, scope),
-        _ => {
-            return api_error(
-                StatusCode::NOT_FOUND,
-                "not_found",
-                "client relation was not found",
-            );
+        "applications" | "domains" | "destinations" => {
+            let mut q = summary_query(from, to, page);
+            q.device_id = Some(positive_id_as_u64(id));
+            q.scope = Some(netqmon_protocol::v1::FlowScope::Internet as u8);
+            q.category_id.clone_from(&query.category);
+            let result = match relation.as_str() {
+                "applications" => inner.storage.analytics().application_summary(&q),
+                "domains" => inner.storage.analytics().domain_summary(&q),
+                _ => inner.storage.analytics().destination_summary(&q),
+            };
+            match result {
+                Ok(rows) => page_ok(
+                    rows.iter()
+                        .map(|r| summary_item(r, relation.trim_end_matches('s'), &inner.classifier))
+                        .collect(),
+                    page,
+                    rows.len() as u64,
+                ),
+                Err(e) => storage_error(e),
+            }
         }
-    };
-    result.map_or_else(storage_error, api_ok)
-}
-
-fn query_client_traffic(
-    connection: &Connection,
-    id: i64,
-    from: u64,
-    to: u64,
-    scope: Option<i64>,
-) -> rusqlite::Result<Value> {
-    let duration = to.saturating_sub(from);
-    let bucket_ms = duration.div_ceil(180).max(60_000).div_ceil(60_000) * 60_000;
-    let mut statement = connection.prepare(
-        "SELECT (timestamp / ?1) * ?1 AS bucket, SUM(upload_bytes), SUM(download_bytes),
-                SUM(packets), SUM(flow_count)
-         FROM traffic_scope_minute WHERE device_id = ?2 AND timestamp >= ?3 AND timestamp < ?4
-           AND (?5 IS NULL OR scope = ?5)
-         GROUP BY bucket ORDER BY bucket",
-    )?;
-    let points = statement
-        .query_map(
-            params![to_i64(bucket_ms), id, to_i64(from), to_i64(to), scope],
-            |row| {
-                Ok(json!({
-                    "timestamp": row.get::<_, i64>(0)?, "upload_bytes": row.get::<_, i64>(1)?,
-                    "download_bytes": row.get::<_, i64>(2)?, "packets": row.get::<_, i64>(3)?,
-                    "flow_count": row.get::<_, i64>(4)?,
-                }))
-            },
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(json!({ "bucket_ms": bucket_ms, "points": points }))
-}
-
-fn query_client_applications(
-    connection: &Connection,
-    classifier: &crate::classifier::ClassifierHandle,
-    id: i64,
-    page: Page,
-    from: u64,
-    to: u64,
-    scope: Option<i64>,
-) -> rusqlite::Result<Value> {
-    let mut statement = connection.prepare(
-        "SELECT COALESCE(application_id, 'unknown'), COALESCE(category_id, 'unknown'),
-                SUM(upload_bytes), SUM(download_bytes), SUM(packets), COUNT(*), MAX(last_seen_at),
-                AVG(COALESCE(classification_confidence, 0))
-         FROM flow_sessions WHERE device_id = ?1 AND last_seen_at >= ?2 AND last_seen_at < ?3
-           AND (?4 IS NULL OR scope = ?4)
-         GROUP BY application_id, category_id ORDER BY SUM(upload_bytes + download_bytes) DESC
-         LIMIT ?5 OFFSET ?6",
-    )?;
-    let items = statement
-        .query_map(
-            params![
-                id,
-                to_i64(from),
-                to_i64(to),
-                scope,
-                i64::from(page.limit),
-                to_i64(page.offset)
-            ],
-            |row| {
-                let application_id = row.get::<_, String>(0)?;
-                let metadata = classifier.application_metadata(&application_id);
-                Ok(json!({
-                    "application_id": application_id,
-                    "name": metadata.as_ref().map(|metadata| metadata.name.clone()),
-                    "category_id": row.get::<_, String>(1)?,
-                    "upload_bytes": row.get::<_, i64>(2)?, "download_bytes": row.get::<_, i64>(3)?,
-                    "packets": row.get::<_, i64>(4)?, "flow_count": row.get::<_, i64>(5)?,
-                    "last_seen": row.get::<_, i64>(6)?, "confidence": row.get::<_, f64>(7)?,
-                    "client_count": 1,
-                    "icon": icon_json(metadata),
-                }))
-            },
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(json!(items))
-}
-
-fn query_client_domains(
-    connection: &Connection,
-    id: i64,
-    page: Page,
-    from: u64,
-    to: u64,
-    scope: Option<i64>,
-) -> rusqlite::Result<Value> {
-    let mut statement = connection.prepare(
-        "SELECT domain, SUM(upload_bytes), SUM(download_bytes), SUM(packets), COUNT(*), MAX(last_seen_at)
-         FROM flow_sessions WHERE device_id = ?1 AND domain IS NOT NULL
-           AND last_seen_at >= ?2 AND last_seen_at < ?3
-           AND (?4 IS NULL OR scope = ?4)
-         GROUP BY domain ORDER BY SUM(upload_bytes + download_bytes) DESC LIMIT ?5 OFFSET ?6",
-    )?;
-    let items = statement
-        .query_map(
-            params![
-                id,
-                to_i64(from),
-                to_i64(to),
-                scope,
-                i64::from(page.limit),
-                to_i64(page.offset)
-            ],
-            |row| {
-                Ok(json!({
-                    "domain": row.get::<_, String>(0)?, "upload_bytes": row.get::<_, i64>(1)?,
-                    "download_bytes": row.get::<_, i64>(2)?, "packets": row.get::<_, i64>(3)?,
-                    "flow_count": row.get::<_, i64>(4)?, "last_seen": row.get::<_, i64>(5)?,
-                }))
-            },
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(json!(items))
-}
-
-fn query_client_destinations(
-    connection: &Connection,
-    id: i64,
-    page: Page,
-    from: u64,
-    to: u64,
-    scope: Option<i64>,
-) -> rusqlite::Result<Value> {
-    let mut statement = connection.prepare(
-        "SELECT remote_ip, MAX(domain), SUM(upload_bytes), SUM(download_bytes), SUM(packets), COUNT(*), MAX(last_seen_at)
-         FROM flow_sessions WHERE device_id = ?1 AND last_seen_at >= ?2 AND last_seen_at < ?3
-           AND (?4 IS NULL OR scope = ?4)
-         GROUP BY remote_ip ORDER BY SUM(upload_bytes + download_bytes) DESC LIMIT ?5 OFFSET ?6",
-    )?;
-    let items = statement
-        .query_map(
-            params![
-                id,
-                to_i64(from),
-                to_i64(to),
-                scope,
-                i64::from(page.limit),
-                to_i64(page.offset)
-            ],
-            |row| {
-                let ip: Vec<u8> = row.get(0)?;
-                Ok(json!({
-                    "remote_ip": format_ip(&ip), "domain": row.get::<_, Option<String>>(1)?,
-                    "upload_bytes": row.get::<_, i64>(2)?, "download_bytes": row.get::<_, i64>(3)?,
-                    "packets": row.get::<_, i64>(4)?, "flow_count": row.get::<_, i64>(5)?,
-                    "last_seen": row.get::<_, i64>(6)?,
-                }))
-            },
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(json!(items))
-}
-
-fn query_client_flows(
-    connection: &Connection,
-    classifier: &crate::classifier::ClassifierHandle,
-    id: i64,
-    page: Page,
-    from: u64,
-    to: u64,
-    scope: Option<i64>,
-) -> rusqlite::Result<Value> {
-    let mut statement = connection.prepare(
-        "SELECT id, client_ip, client_port, remote_ip, remote_port, protocol, direction, domain,
-                COALESCE(application_id, 'unknown'), COALESCE(category_id, 'unknown'),
-                COALESCE(classification_confidence, 0), COALESCE(classification_reason, 'no matching rule'),
-                upload_bytes, download_bytes, packets, started_at, last_seen_at, ended_at,
-                scope, path_type, nat, source_segment, destination_segment
-         FROM flow_sessions WHERE device_id = ?1 AND last_seen_at >= ?2 AND last_seen_at < ?3
-           AND (?4 IS NULL OR scope = ?4)
-         ORDER BY last_seen_at DESC LIMIT ?5 OFFSET ?6",
-    )?;
-    let items = statement.query_map(
-        params![id, to_i64(from), to_i64(to), scope, i64::from(page.limit), to_i64(page.offset)],
-        |row| {
-            let client_ip: Vec<u8> = row.get(1)?;
-            let remote_ip: Vec<u8> = row.get(3)?;
-            let application = row.get::<_, String>(8)?;
-            let application_name = classifier
-                .application_metadata(&application)
-                .as_ref()
-                .map(|metadata| metadata.name.clone());
-            Ok(json!({
-            "id": row.get::<_, String>(0)?, "client_ip": format_ip(&client_ip), "client_port": row.get::<_, i64>(2)?,
-            "remote_ip": format_ip(&remote_ip), "remote_port": row.get::<_, i64>(4)?, "protocol": row.get::<_, i64>(5)?,
-            "direction": row.get::<_, i64>(6)?, "domain": row.get::<_, Option<String>>(7)?,
-            "application": application, "application_name": application_name, "category": row.get::<_, String>(9)?,
-            "confidence": row.get::<_, f64>(10)?, "reason": row.get::<_, String>(11)?,
-            "upload_bytes": row.get::<_, i64>(12)?, "download_bytes": row.get::<_, i64>(13)?,
-            "packets": row.get::<_, i64>(14)?, "started_at": row.get::<_, i64>(15)?,
-            "last_seen": row.get::<_, i64>(16)?, "ended_at": row.get::<_, Option<i64>>(17)?,
-            "scope": flow_scope_name(row.get::<_, i32>(18)?),
-            "path_type": flow_path_name(row.get::<_, i32>(19)?),
-            "nat": flow_nat_name(row.get::<_, i32>(20)?),
-            "source_segment": row.get::<_, String>(21)?,
-            "destination_segment": row.get::<_, String>(22)?,
-        }))
-        },
-    )?.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(json!(items))
+        "flows" => {
+            let q = AnalyticsFlowQuery {
+                from,
+                to,
+                device_id: Some(positive_id_as_u64(id)),
+                limit: page.limit,
+                offset: page.offset,
+                ..AnalyticsFlowQuery::default()
+            };
+            match inner.storage.analytics().flows(&q) {
+                Ok(rows) => page_ok(
+                    rows.rows
+                        .iter()
+                        .map(|flow| flow_json(flow, &inner))
+                        .collect(),
+                    page,
+                    rows.total,
+                ),
+                Err(e) => storage_error(e),
+            }
+        }
+        _ => api_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "client relation was not found",
+        ),
+    }
 }
 
 async fn applications(
@@ -1019,60 +770,22 @@ async fn applications(
     query: Result<Query<PageQuery>, QueryRejection>,
 ) -> Response {
     let page = match Page::parse(query) {
-        Ok(page) => page,
-        Err(response) => return *response,
+        Ok(v) => v,
+        Err(e) => return *e,
     };
+    let now = now_ms();
     let inner = state.lock();
-    let connection = inner.storage.connection();
-    let result = (|| -> rusqlite::Result<(Vec<Value>, u64)> {
-        let total: i64 = scalar(
-            connection,
-            "SELECT COUNT(*) FROM (SELECT 1 FROM traffic_application_minute GROUP BY application_id, category_id)",
-            [],
-        )?;
-        let mut statement = connection.prepare(
-            "SELECT t.application_id, t.category_id, SUM(t.upload_bytes), SUM(t.download_bytes),
-                    SUM(t.packets), SUM(t.flow_count), MAX(t.timestamp),
-                    (SELECT COUNT(DISTINCT f.device_id) FROM flow_sessions f
-                     WHERE f.application_id = t.application_id AND f.device_id IS NOT NULL),
-                    (SELECT f.organization_id FROM flow_sessions f
-                     WHERE f.application_id = t.application_id
-                       AND f.organization_id IS NOT NULL AND f.organization_id != 'unknown'
-                     LIMIT 1)
-             FROM traffic_application_minute t GROUP BY t.application_id, t.category_id
-             ORDER BY SUM(t.upload_bytes + t.download_bytes) DESC, t.application_id
-             LIMIT ?1 OFFSET ?2",
-        )?;
-        let items = statement
-            .query_map(params![i64::from(page.limit), to_i64(page.offset)], |row| {
-                let application_id = row.get::<_, String>(0)?;
-                let application_metadata = inner.classifier.application_metadata(&application_id);
-                let organization_id = row.get::<_, Option<String>>(8)?;
-                let organization_metadata = organization_id
-                    .as_deref()
-                    .filter(|id| !id.is_empty() && *id != "unknown")
-                    .and_then(|id| inner.classifier.organization_metadata(id));
-                Ok(json!({
-                    "application_id": application_id,
-                    "name": application_metadata
-                        .as_ref()
-                        .map(|metadata| metadata.name.clone()),
-                    "category_id": row.get::<_, String>(1)?,
-                    "upload_bytes": row.get::<_, i64>(2)?,
-                    "download_bytes": row.get::<_, i64>(3)?,
-                    "packets": row.get::<_, i64>(4)?,
-                    "flow_count": row.get::<_, i64>(5)?,
-                    "last_seen": row.get::<_, i64>(6)?,
-                    "client_count": row.get::<_, i64>(7)?,
-                    "organization_id": organization_id,
-                    "organization_name": organization_metadata.as_ref().map(|metadata| metadata.name.clone()),
-                    "icon": icon_json(application_metadata),
-                }))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok((items, to_u64(total)))
-    })();
-    result.map_or_else(storage_error, |(items, total)| page_ok(items, page, total))
+    let q = summary_query(0, now, page);
+    match inner.storage.analytics().application_summary(&q) {
+        Ok(rows) => page_ok(
+            rows.iter()
+                .map(|r| summary_item(r, "application", &inner.classifier))
+                .collect(),
+            page,
+            rows.len() as u64,
+        ),
+        Err(e) => storage_error(e),
+    }
 }
 
 async fn organizations(
@@ -1080,41 +793,24 @@ async fn organizations(
     query: Result<Query<PageQuery>, QueryRejection>,
 ) -> Response {
     let page = match Page::parse(query) {
-        Ok(page) => page,
-        Err(response) => return *response,
+        Ok(v) => v,
+        Err(e) => return *e,
     };
     let inner = state.lock();
-    let connection = inner.storage.connection();
-    let result = (|| -> rusqlite::Result<(Vec<Value>, u64)> {
-        let total: i64 = scalar(
-            connection,
-            "SELECT COUNT(DISTINCT COALESCE(organization_id, 'unknown')) FROM flow_sessions",
-            [],
-        )?;
-        let mut statement = connection.prepare(
-            "SELECT COALESCE(organization_id, 'unknown'), SUM(upload_bytes), SUM(download_bytes), COUNT(*), MAX(last_seen_at), COUNT(DISTINCT device_id)
-             FROM flow_sessions GROUP BY COALESCE(organization_id, 'unknown')
-             ORDER BY SUM(upload_bytes + download_bytes) DESC LIMIT ?1 OFFSET ?2",
-        )?;
-        let items = statement
-            .query_map(params![i64::from(page.limit), to_i64(page.offset)], |row| {
-                let id: String = row.get(0)?;
-                let metadata = inner.classifier.organization_metadata(&id);
-                Ok(json!({
-                    "id": id.clone(),
-                    "name": metadata_name(metadata.as_ref(), &id),
-                    "icon": icon_json(metadata),
-                    "upload_bytes": row.get::<_, i64>(1)?,
-                    "download_bytes": row.get::<_, i64>(2)?,
-                    "flows": row.get::<_, i64>(3)?,
-                    "last_seen": row.get::<_, i64>(4)?,
-                    "clients": row.get::<_, i64>(5)?,
-                }))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok((items, to_u64(total)))
-    })();
-    result.map_or_else(storage_error, |(items, total)| page_ok(items, page, total))
+    match inner
+        .storage
+        .analytics()
+        .organization_summary(&summary_query(0, now_ms(), page))
+    {
+        Ok(rows) => page_ok(
+            rows.iter()
+                .map(|r| summary_item(r, "organization", &inner.classifier))
+                .collect(),
+            page,
+            rows.len() as u64,
+        ),
+        Err(e) => storage_error(e),
+    }
 }
 
 async fn protocols(
@@ -1122,58 +818,36 @@ async fn protocols(
     query: Result<Query<PageQuery>, QueryRejection>,
 ) -> Response {
     let page = match Page::parse(query) {
-        Ok(page) => page,
-        Err(response) => return *response,
+        Ok(v) => v,
+        Err(e) => return *e,
     };
     let inner = state.lock();
-    let connection = inner.storage.connection();
-    let result = (|| -> rusqlite::Result<(Vec<Value>, u64)> {
-        let total: i64 = scalar(
-            connection,
-            "SELECT COUNT(DISTINCT COALESCE(protocol_id, 'unknown')) FROM flow_sessions",
-            [],
-        )?;
-        let mut statement = connection.prepare(
-            "SELECT COALESCE(protocol_id, 'unknown'), SUM(upload_bytes), SUM(download_bytes), COUNT(*), MAX(last_seen_at)
-             FROM flow_sessions GROUP BY COALESCE(protocol_id, 'unknown')
-             ORDER BY SUM(upload_bytes + download_bytes) DESC LIMIT ?1 OFFSET ?2",
-        )?;
-        let items = statement
-            .query_map(params![i64::from(page.limit), to_i64(page.offset)], |row| {
-                let id: String = row.get(0)?;
-                Ok(json!({
-                    "id": id.clone(),
-                    "name": id,
-                    "upload_bytes": row.get::<_, i64>(1)?,
-                    "download_bytes": row.get::<_, i64>(2)?,
-                    "flows": row.get::<_, i64>(3)?,
-                    "last_seen": row.get::<_, i64>(4)?,
-                }))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok((items, to_u64(total)))
-    })();
-    result.map_or_else(storage_error, |(items, total)| page_ok(items, page, total))
+    match inner
+        .storage
+        .analytics()
+        .protocol_summary(&summary_query(0, now_ms(), page))
+    {
+        Ok(rows) => page_ok(
+            rows.iter()
+                .map(|r| summary_item(r, "protocol", &inner.classifier))
+                .collect(),
+            page,
+            rows.len() as u64,
+        ),
+        Err(e) => storage_error(e),
+    }
 }
 
 async fn application_detail(
     State(state): State<CollectorState>,
     Path(id): Path<String>,
-    query: Result<Query<ApplicationDetailQuery>, QueryRejection>,
+    query: Result<Query<TimePageQuery>, QueryRejection>,
 ) -> Response {
     let Query(query) = match query {
-        Ok(query) => query,
-        Err(error) => {
-            return api_error(StatusCode::BAD_REQUEST, "invalid_query", &error.body_text());
-        }
+        Ok(v) => v,
+        Err(e) => return api_error(StatusCode::BAD_REQUEST, "invalid_query", &e.body_text()),
     };
-    if let Err(response) = Page::parse(Ok(Query(PageQuery {
-        limit: query.limit,
-        offset: query.offset,
-    }))) {
-        return *response;
-    }
-    if !valid_identifier(&id) {
+    if !valid_entity_id(&id) {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_application_id",
@@ -1183,7 +857,7 @@ async fn application_detail(
     if query
         .category
         .as_deref()
-        .is_some_and(|value| !valid_identifier(value))
+        .is_some_and(|value| !valid_entity_id(value))
     {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -1191,832 +865,466 @@ async fn application_detail(
             "category id contains unsupported characters",
         );
     }
-    let category = query.category.as_deref();
+    let page = match Page::from_values(query.limit, query.offset) {
+        Ok(v) => v,
+        Err(e) => return *e,
+    };
+    let (from, to) = match parse_time_range(query.from, query.to) {
+        Ok(v) => v,
+        Err(e) => return *e,
+    };
     let inner = state.lock();
-    let result = inner
-        .storage
-        .connection()
-        .query_row(
-            "SELECT application_id, category_id, SUM(upload_bytes), SUM(download_bytes),
-                    SUM(packets), SUM(flow_count), MAX(timestamp)
-             FROM traffic_application_minute
-             WHERE application_id = ?1 AND (?2 IS NULL OR category_id = ?2)
-             GROUP BY application_id, category_id",
-            params![id, category],
-            |row| summary_row(row, &["application_id", "category_id"]),
-        )
-        .optional();
-    match result {
-        Ok(Some(mut value)) => {
-            let connection = inner.storage.connection();
-            let classifier = connection.query_row(
-                "SELECT COUNT(DISTINCT device_id), COUNT(DISTINCT domain),
-                        COUNT(DISTINCT hex(remote_ip)), AVG(COALESCE(classification_confidence, 0)),
-                        COALESCE(MAX(classification_reason), 'no matching rule'),
-                        COALESCE(MAX(CASE
-                            WHEN organization_id IS NOT NULL AND organization_id != 'unknown'
-                            THEN organization_id
-                        END), 'unknown')
-                 FROM flow_sessions
-                 WHERE application_id = ?1
-                   AND (?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)",
-                params![id, category],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                },
-            );
-            match classifier {
-                Ok((clients, domains, destinations, confidence, reason, organization)) => {
-                    let observed_protocols = query_application_protocols(connection, &id, category)
-                        .unwrap_or_else(|_| Vec::new());
-                    let application_metadata = inner.classifier.application_metadata(&id);
-                    let organization_metadata = (organization != "unknown")
-                        .then(|| inner.classifier.organization_metadata(&organization))
-                        .flatten();
-                    if let Some(object) = value.as_object_mut() {
-                        object.insert(
-                            "name".to_owned(),
-                            json!(
-                                application_metadata
-                                    .as_ref()
-                                    .map(|metadata| metadata.name.clone())
-                            ),
-                        );
-                        object.insert("client_count".to_owned(), json!(clients));
-                        object.insert("domain_count".to_owned(), json!(domains));
-                        object.insert("destination_count".to_owned(), json!(destinations));
-                        object.insert("confidence".to_owned(), json!(confidence));
-                        object.insert("classifier_reason".to_owned(), json!(reason));
-                        object.insert("organization_id".to_owned(), json!(organization));
-                        object.insert(
-                            "organization_name".to_owned(),
-                            json!(
-                                organization_metadata
-                                    .as_ref()
-                                    .map(|metadata| metadata.name.clone())
-                            ),
-                        );
-                        object.insert("observed_protocols".to_owned(), json!(observed_protocols));
-                        object.insert("icon".to_owned(), icon_json(application_metadata));
-                    }
-                    api_ok(value)
-                }
-                Err(error) => storage_error(error),
-            }
-        }
-        Ok(None) => api_error(
+    let mut q = summary_query(from, to, page);
+    q.application_id = Some(id.clone());
+    q.category_id.clone_from(&query.category);
+    let summary = match inner.storage.analytics().application_summary(&q) {
+        Ok(mut rows) => rows.pop(),
+        Err(e) => return storage_error(e),
+    };
+    let Some(summary) = summary else {
+        return api_error(
             StatusCode::NOT_FOUND,
             "not_found",
             "application was not found",
-        ),
-        Err(error) => storage_error(error),
-    }
-}
-
-fn query_application_protocols(
-    connection: &Connection,
-    id: &str,
-    category: Option<&str>,
-) -> rusqlite::Result<Vec<Value>> {
-    let mut statement = connection.prepare(
-        "SELECT COALESCE(protocol_id, 'unknown'), COUNT(*)
-         FROM flow_sessions
-         WHERE application_id = ?1
-           AND (?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)
-         GROUP BY COALESCE(protocol_id, 'unknown')
-         ORDER BY COUNT(*) DESC, COALESCE(protocol_id, 'unknown')",
-    )?;
-    statement
-        .query_map(params![id, category], |row| {
-            Ok(json!({
-                "id": row.get::<_, String>(0)?,
-                "flows": row.get::<_, i64>(1)?,
-            }))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RelatedQuery {
-    from: Option<u64>,
-    to: Option<u64>,
-    limit: Option<u32>,
-    offset: Option<u64>,
-    scope: Option<String>,
-    category: Option<String>,
+        );
+    };
+    let mut protocol_query = q.clone();
+    protocol_query.limit = 200;
+    protocol_query.offset = 0;
+    let protocol_count = inner
+        .storage
+        .analytics()
+        .protocol_summary(&protocol_query)
+        .map_or(0, |v| v.len());
+    let client_count = summary.distinct_devices;
+    let domain_count = inner
+        .storage
+        .analytics()
+        .domain_summary(&protocol_query)
+        .map_or(0, |v| v.len());
+    api_ok(
+        json!({"application_id":id,"category_id":query.category.unwrap_or_else(||"unknown".to_owned()),"upload_bytes":summary.upload_bytes,"download_bytes":summary.download_bytes,"packets":summary.packets,"flow_count":summary.flow_count,"last_seen":summary.last_seen_at,"protocol_count":protocol_count,"client_count":client_count,"domain_count":domain_count}),
+    )
 }
 
 async fn application_related(
     State(state): State<CollectorState>,
     Path((id, relation)): Path<(String, String)>,
-    query: Result<Query<RelatedQuery>, QueryRejection>,
+    query: Result<Query<TimePageQuery>, QueryRejection>,
 ) -> Response {
-    if !valid_identifier(&id) {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_application_id",
-            "application id contains unsupported characters",
-        );
-    }
     let Query(query) = match query {
-        Ok(query) => query,
-        Err(error) => {
-            return api_error(StatusCode::BAD_REQUEST, "invalid_query", &error.body_text());
-        }
+        Ok(v) => v,
+        Err(e) => return api_error(StatusCode::BAD_REQUEST, "invalid_query", &e.body_text()),
     };
-    if query
-        .category
-        .as_deref()
-        .is_some_and(|value| !valid_identifier(value))
-    {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_category_id",
-            "category id contains unsupported characters",
-        );
-    }
-    let page = match Page::parse(Ok(Query(PageQuery {
-        limit: query.limit,
-        offset: query.offset,
-    }))) {
-        Ok(page) => page,
-        Err(response) => return *response,
+    let page = match Page::from_values(query.limit, query.offset) {
+        Ok(v) => v,
+        Err(e) => return *e,
     };
-    let to = query.to.unwrap_or_else(now_ms);
-    let from = query.from.unwrap_or_else(|| to.saturating_sub(DAY_MS));
-    if from >= to {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_time_range",
-            "from must be less than to",
-        );
-    }
+    let (from, to) = match parse_time_range(query.from, query.to) {
+        Ok(v) => v,
+        Err(e) => return *e,
+    };
     let inner = state.lock();
-    let connection = inner.storage.connection();
-    let category = query.category.as_deref();
-    let result = match relation.as_str() {
-        "traffic" => query_application_traffic(connection, &id, category, from, to),
-        "clients" => query_application_clients(connection, &id, category, page, from, to),
-        "domains" => query_application_domains(connection, &id, category, page, from, to),
-        "destinations" => query_application_destinations(connection, &id, category, page, from, to),
+    let mut q = summary_query(from, to, page);
+    q.application_id = Some(id.clone());
+    q.category_id.clone_from(&query.category);
+    q.scope = Some(netqmon_protocol::v1::FlowScope::Internet as u8);
+    match relation.as_str() {
+        "traffic" => {
+            let mut t = traffic_query(from, to);
+            t.application_id = Some(id);
+            t.category_id = query.category;
+            t.scope = q.scope;
+            match inner.storage.analytics().traffic_series(&t) {
+                Ok(rows) => api_ok(
+                    json!({"bucket_ms":60_000,"points":rows.into_iter().map(|r|json!({"timestamp":r.timestamp,"upload_bytes":r.upload_bytes,"download_bytes":r.download_bytes,"packets":r.packets,"flow_count":r.flow_count})).collect::<Vec<_>>()}),
+                ),
+                Err(e) => storage_error(e),
+            }
+        }
+        "clients" | "domains" | "destinations" => {
+            let result = match relation.as_str() {
+                "clients" => inner.storage.analytics().client_traffic(&q),
+                "domains" => inner.storage.analytics().domain_summary(&q),
+                _ => inner.storage.analytics().destination_summary(&q),
+            };
+            match result {
+                Ok(rows) => page_ok(
+                    rows.iter()
+                        .map(|r| summary_item(r, relation.trim_end_matches('s'), &inner.classifier))
+                        .collect(),
+                    page,
+                    rows.len() as u64,
+                ),
+                Err(e) => storage_error(e),
+            }
+        }
         "flows" => {
-            query_application_flows(connection, &inner.classifier, &id, category, page, from, to)
+            let fq = AnalyticsFlowQuery {
+                from,
+                to,
+                application_id: Some(id),
+                ..AnalyticsFlowQuery::default()
+            };
+            match inner.storage.analytics().flows(&fq) {
+                Ok(rows) => page_ok(
+                    rows.rows
+                        .iter()
+                        .map(|flow| flow_json(flow, &inner))
+                        .collect(),
+                    page,
+                    rows.total,
+                ),
+                Err(e) => storage_error(e),
+            }
         }
-        _ => {
-            return api_error(
-                StatusCode::NOT_FOUND,
-                "not_found",
-                "application relation was not found",
-            );
-        }
-    };
-    result.map_or_else(storage_error, api_ok)
-}
-
-fn query_application_traffic(
-    connection: &Connection,
-    id: &str,
-    category: Option<&str>,
-    from: u64,
-    to: u64,
-) -> rusqlite::Result<Value> {
-    let duration = to.saturating_sub(from);
-    let bucket_ms = duration.div_ceil(180).max(60_000).div_ceil(60_000) * 60_000;
-    let mut statement = connection.prepare(
-        "SELECT (timestamp / ?1) * ?1 AS bucket, SUM(upload_bytes), SUM(download_bytes),
-                SUM(packets), SUM(flow_count)
-         FROM traffic_application_minute
-         WHERE application_id = ?2 AND (?3 IS NULL OR category_id = ?3)
-           AND timestamp >= ?4 AND timestamp < ?5
-         GROUP BY bucket ORDER BY bucket",
-    )?;
-    let points = statement
-        .query_map(
-            params![to_i64(bucket_ms), id, category, to_i64(from), to_i64(to)],
-            |row| {
-                Ok(json!({
-                    "timestamp": row.get::<_, i64>(0)?,
-                    "upload_bytes": row.get::<_, i64>(1)?,
-                    "download_bytes": row.get::<_, i64>(2)?,
-                    "packets": row.get::<_, i64>(3)?,
-                    "flow_count": row.get::<_, i64>(4)?,
-                }))
-            },
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(json!({ "bucket_ms": bucket_ms, "points": points }))
-}
-
-fn query_application_clients(
-    connection: &Connection,
-    id: &str,
-    category: Option<&str>,
-    page: Page,
-    from: u64,
-    to: u64,
-) -> rusqlite::Result<Value> {
-    let mut statement = connection.prepare(
-        "SELECT d.id, d.mac, COALESCE(d.display_name, d.hostname, ''), d.vendor,
-                d.device_type, d.os_family, d.model, d.identity_confidence,
-                COALESCE((SELECT json_group_array(json_object(
-                    'source', e.source, 'field', e.field, 'value', e.value,
-                    'confidence', e.confidence, 'first_seen', e.first_seen,
-                    'last_seen', e.last_seen, 'hit_count', e.hit_count,
-                    'metadata_json', e.metadata_json))
-                  FROM device_evidence e WHERE e.gateway_id = d.gateway_id AND e.mac = d.mac), '[]'),
-                d.vendor_confidence, d.device_type_confidence, d.os_confidence,
-                d.model_confidence, d.private_mac, d.last_seen,
-                SUM(f.upload_bytes), SUM(f.download_bytes), COUNT(*)
-         FROM flow_sessions f JOIN devices d ON d.id = f.device_id
-         WHERE f.application_id = ?1
-           AND (?2 IS NULL OR COALESCE(f.category_id, 'unknown') = ?2)
-           AND f.last_seen_at >= ?3 AND f.last_seen_at < ?4
-         GROUP BY d.id ORDER BY SUM(f.upload_bytes + f.download_bytes) DESC
-         LIMIT ?5 OFFSET ?6",
-    )?;
-    let items = statement
-        .query_map(
-            params![
-                id,
-                category,
-                to_i64(from),
-                to_i64(to),
-                i64::from(page.limit),
-                to_i64(page.offset)
-            ],
-            |row| {
-                let mac: Vec<u8> = row.get(1)?;
-                Ok(json!({
-                    "id": row.get::<_, i64>(0)?, "mac": format_mac(&mac),
-                    "name": row.get::<_, String>(2)?, "vendor": row.get::<_, Option<String>>(3)?,
-                    "identity": device_identity_json(row, 3)?,
-                    "last_seen": row.get::<_, i64>(14)?, "upload_bytes": row.get::<_, i64>(15)?,
-                    "download_bytes": row.get::<_, i64>(16)?, "flow_count": row.get::<_, i64>(17)?,
-                }))
-            },
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(json!(items))
-}
-
-fn query_application_domains(
-    connection: &Connection,
-    id: &str,
-    category: Option<&str>,
-    page: Page,
-    from: u64,
-    to: u64,
-) -> rusqlite::Result<Value> {
-    let mut statement = connection.prepare(
-        "SELECT domain, SUM(upload_bytes), SUM(download_bytes), SUM(packets), COUNT(*), MAX(last_seen_at)
-         FROM flow_sessions WHERE application_id = ?1 AND domain IS NOT NULL
-           AND (?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)
-           AND last_seen_at >= ?3 AND last_seen_at < ?4
-         GROUP BY domain ORDER BY SUM(upload_bytes + download_bytes) DESC LIMIT ?5 OFFSET ?6",
-    )?;
-    let items = statement
-        .query_map(
-            params![
-                id,
-                category,
-                to_i64(from),
-                to_i64(to),
-                i64::from(page.limit),
-                to_i64(page.offset)
-            ],
-            |row| {
-                Ok(json!({
-                    "domain": row.get::<_, String>(0)?, "upload_bytes": row.get::<_, i64>(1)?,
-                    "download_bytes": row.get::<_, i64>(2)?, "packets": row.get::<_, i64>(3)?,
-                    "flow_count": row.get::<_, i64>(4)?, "last_seen": row.get::<_, i64>(5)?,
-                }))
-            },
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(json!(items))
-}
-
-fn query_application_destinations(
-    connection: &Connection,
-    id: &str,
-    category: Option<&str>,
-    page: Page,
-    from: u64,
-    to: u64,
-) -> rusqlite::Result<Value> {
-    let mut statement = connection.prepare(
-        "SELECT remote_ip, MAX(domain), SUM(upload_bytes), SUM(download_bytes), SUM(packets),
-                COUNT(*), MAX(last_seen_at)
-         FROM flow_sessions WHERE application_id = ?1
-           AND (?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)
-           AND last_seen_at >= ?3 AND last_seen_at < ?4
-         GROUP BY remote_ip ORDER BY SUM(upload_bytes + download_bytes) DESC LIMIT ?5 OFFSET ?6",
-    )?;
-    let items = statement
-        .query_map(
-            params![
-                id,
-                category,
-                to_i64(from),
-                to_i64(to),
-                i64::from(page.limit),
-                to_i64(page.offset)
-            ],
-            |row| {
-                let ip: Vec<u8> = row.get(0)?;
-                Ok(json!({
-                    "remote_ip": format_ip(&ip), "domain": row.get::<_, Option<String>>(1)?,
-                    "upload_bytes": row.get::<_, i64>(2)?, "download_bytes": row.get::<_, i64>(3)?,
-                    "packets": row.get::<_, i64>(4)?, "flow_count": row.get::<_, i64>(5)?,
-                    "last_seen": row.get::<_, i64>(6)?,
-                }))
-            },
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(json!(items))
-}
-
-fn query_application_flows(
-    connection: &Connection,
-    classifier: &crate::classifier::ClassifierHandle,
-    id: &str,
-    category: Option<&str>,
-    page: Page,
-    from: u64,
-    to: u64,
-) -> rusqlite::Result<Value> {
-    let application_name = classifier
-        .application_metadata(id)
-        .as_ref()
-        .map(|metadata| metadata.name.clone());
-    let mut statement = connection.prepare(
-        "SELECT id, client_ip, client_port, remote_ip, remote_port, protocol, direction,
-                domain, category_id, classification_confidence, classification_reason,
-                upload_bytes, download_bytes, packets, started_at, last_seen_at, ended_at,
-                scope, path_type, nat, source_segment, destination_segment
-         FROM flow_sessions WHERE application_id = ?1
-           AND (?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)
-           AND last_seen_at >= ?3 AND last_seen_at < ?4
-         ORDER BY last_seen_at DESC LIMIT ?5 OFFSET ?6",
-    )?;
-    let items = statement.query_map(
-        params![id, category, to_i64(from), to_i64(to), i64::from(page.limit), to_i64(page.offset)],
-        |row| {
-            let client_ip: Vec<u8> = row.get(1)?;
-            let remote_ip: Vec<u8> = row.get(3)?;
-            Ok(json!({
-                "id": row.get::<_, String>(0)?, "client_ip": format_ip(&client_ip),
-                "client_port": row.get::<_, i64>(2)?, "remote_ip": format_ip(&remote_ip),
-                "remote_port": row.get::<_, i64>(4)?, "protocol": row.get::<_, i64>(5)?,
-                "direction": row.get::<_, i64>(6)?, "domain": row.get::<_, Option<String>>(7)?,
-                "application": id, "application_name": application_name,
-                "category": row.get::<_, Option<String>>(8)?.unwrap_or_else(|| "unknown".to_owned()),
-                "confidence": row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
-                "reason": row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "no matching rule".to_owned()),
-                "upload_bytes": row.get::<_, i64>(11)?, "download_bytes": row.get::<_, i64>(12)?,
-                "packets": row.get::<_, i64>(13)?, "started_at": row.get::<_, i64>(14)?,
-                "last_seen": row.get::<_, i64>(15)?, "ended_at": row.get::<_, Option<i64>>(16)?,
-                "scope": flow_scope_name(row.get::<_, i32>(17)?),
-                "path_type": flow_path_name(row.get::<_, i32>(18)?),
-                "nat": flow_nat_name(row.get::<_, i32>(19)?),
-                "source_segment": row.get::<_, String>(20)?,
-                "destination_segment": row.get::<_, String>(21)?,
-            }))
-        },
-    )?.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(json!(items))
+        _ => api_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "application relation was not found",
+        ),
+    }
 }
 
 async fn domains(
     State(state): State<CollectorState>,
     query: Result<Query<PageQuery>, QueryRejection>,
 ) -> Response {
-    summary_page(
-        &state,
-        query,
-        "traffic_domain_minute",
-        "domain",
-        &["domain"],
-    )
+    let page = match Page::parse(query) {
+        Ok(v) => v,
+        Err(e) => return *e,
+    };
+    let inner = state.lock();
+    match inner
+        .storage
+        .analytics()
+        .domain_summary(&summary_query(0, now_ms(), page))
+    {
+        Ok(rows) => page_ok(
+            rows.iter()
+                .map(|r| summary_item(r, "domain", &inner.classifier))
+                .collect(),
+            page,
+            rows.len() as u64,
+        ),
+        Err(e) => storage_error(e),
+    }
 }
 
 async fn destinations(
     State(state): State<CollectorState>,
-    query: Result<Query<DestinationQuery>, QueryRejection>,
+    query: Result<Query<DestinationParams>, QueryRejection>,
 ) -> Response {
     let Query(query) = match query {
-        Ok(query) => query,
-        Err(error) => {
-            return api_error(StatusCode::BAD_REQUEST, "invalid_query", &error.body_text());
-        }
+        Ok(v) => v,
+        Err(e) => return api_error(StatusCode::BAD_REQUEST, "invalid_query", &e.body_text()),
     };
-    let page = match Page::parse(Ok(Query(PageQuery {
-        limit: query.limit,
-        offset: query.offset,
-    }))) {
-        Ok(page) => page,
-        Err(response) => return *response,
+    let page = match Page::from_values(query.limit, query.offset) {
+        Ok(v) => v,
+        Err(e) => return *e,
     };
-    if let (Some(from), Some(to)) = (query.from, query.to) {
-        if from >= to {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_time_range",
-                "from must be less than to",
-            );
-        }
-    }
+    let (from, to) = match parse_time_range(query.from, query.to) {
+        Ok(v) => v,
+        Err(e) => return *e,
+    };
     let inner = state.lock();
-    let connection = inner.storage.connection();
-    let result = (|| -> rusqlite::Result<(Vec<Value>, u64)> {
-        let (total, items) = match (query.from, query.to) {
-            (Some(from), Some(to)) => {
-                let from_i = to_i64(from);
-                let to_i = to_i64(to);
-                let total: i64 = scalar(
-                    connection,
-                    "SELECT COUNT(DISTINCT hex(remote_ip)) FROM traffic_scope_minute
-                     WHERE scope = ?1 AND timestamp >= ?2 AND timestamp < ?3",
-                    params![
-                        netqmon_protocol::v1::FlowScope::Internet as i32,
-                        from_i,
-                        to_i
-                    ],
-                )?;
-                let mut statement = connection.prepare(
-                    "WITH page AS (
-                        SELECT t.remote_ip, SUM(t.upload_bytes) AS upload_bytes,
-                               SUM(t.download_bytes) AS download_bytes, SUM(t.packets) AS packets,
-                               SUM(t.flow_count) AS flow_count, MAX(t.timestamp) AS last_seen
-                        FROM traffic_scope_minute t
-                        WHERE t.scope = ?1 AND t.timestamp >= ?2 AND t.timestamp < ?3
-                        GROUP BY t.remote_ip
-                        ORDER BY SUM(t.upload_bytes + t.download_bytes) DESC, hex(t.remote_ip)
-                        LIMIT ?4 OFFSET ?5
-                     )
-                     SELECT page.remote_ip, page.upload_bytes, page.download_bytes, page.packets,
-                            page.flow_count, page.last_seen,
-                            (SELECT f.domain FROM flow_sessions f
-                             WHERE f.remote_ip = page.remote_ip AND f.domain IS NOT NULL
-                             ORDER BY f.last_seen_at DESC LIMIT 1),
-                            (SELECT COUNT(DISTINCT f.device_id) FROM flow_sessions f
-                             WHERE f.remote_ip = page.remote_ip AND f.device_id IS NOT NULL),
-                            (SELECT f.application_id FROM flow_sessions f
-                             WHERE f.remote_ip = page.remote_ip AND f.application_id IS NOT NULL AND f.application_id != 'unknown'
-                             ORDER BY f.last_seen_at DESC LIMIT 1)
-                     FROM page",
-                )?;
-                let rows = statement
-                    .query_map(
-                        params![
-                            netqmon_protocol::v1::FlowScope::Internet as i32,
-                            from_i,
-                            to_i,
-                            i64::from(page.limit),
-                            to_i64(page.offset)
-                        ],
-                        |row| map_destination_row(row, &inner, query.lang.as_deref()),
-                    )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                (total, rows)
-            }
-            _ => {
-                let total: i64 = scalar(
-                    connection,
-                    "SELECT COUNT(DISTINCT hex(remote_ip)) FROM traffic_scope_minute WHERE scope = ?1",
-                    [netqmon_protocol::v1::FlowScope::Internet as i32],
-                )?;
-                let mut statement = connection.prepare(
-                    "WITH page AS (
-                        SELECT t.remote_ip, SUM(t.upload_bytes) AS upload_bytes,
-                               SUM(t.download_bytes) AS download_bytes, SUM(t.packets) AS packets,
-                               SUM(t.flow_count) AS flow_count, MAX(t.timestamp) AS last_seen
-                        FROM traffic_scope_minute t WHERE t.scope = ?1 GROUP BY t.remote_ip
-                        ORDER BY SUM(t.upload_bytes + t.download_bytes) DESC, hex(t.remote_ip)
-                        LIMIT ?2 OFFSET ?3
-                     )
-                     SELECT page.remote_ip, page.upload_bytes, page.download_bytes, page.packets,
-                            page.flow_count, page.last_seen,
-                            (SELECT f.domain FROM flow_sessions f
-                             WHERE f.remote_ip = page.remote_ip AND f.domain IS NOT NULL
-                             ORDER BY f.last_seen_at DESC LIMIT 1),
-                            (SELECT COUNT(DISTINCT f.device_id) FROM flow_sessions f
-                             WHERE f.remote_ip = page.remote_ip AND f.device_id IS NOT NULL),
-                            (SELECT f.application_id FROM flow_sessions f
-                             WHERE f.remote_ip = page.remote_ip AND f.application_id IS NOT NULL AND f.application_id != 'unknown'
-                             ORDER BY f.last_seen_at DESC LIMIT 1)
-                     FROM page",
-                )?;
-                let rows = statement
-                    .query_map(
-                        params![
-                            netqmon_protocol::v1::FlowScope::Internet as i32,
-                            i64::from(page.limit),
-                            to_i64(page.offset)
-                        ],
-                        |row| map_destination_row(row, &inner, query.lang.as_deref()),
-                    )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                (total, rows)
-            }
-        };
-        Ok((items, to_u64(total)))
-    })();
-    result.map_or_else(storage_error, |(items, total)| page_ok(items, page, total))
+    let mut q = summary_query(from, to, page);
+    q.scope = Some(netqmon_protocol::v1::FlowScope::Internet as u8);
+    let rows = match inner.storage.analytics().destination_summary(&q) {
+        Ok(v) => v,
+        Err(e) => return storage_error(e),
+    };
+    let items = rows
+        .iter()
+        .map(|row| {
+            destination_json(
+                row,
+                &inner.geo_provider,
+                &inner.classifier,
+                query.lang.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    page_ok(items, page, rows.len() as u64)
 }
 
-fn map_destination_row(
-    row: &Row<'_>,
-    inner: &crate::CollectorInner,
+fn destination_json(
+    row: &AnalyticsSummary,
+    geo: &Arc<dyn GeoProvider>,
+    classifier: &crate::classifier::ClassifierHandle,
     lang: Option<&str>,
-) -> rusqlite::Result<Value> {
-    let address: Vec<u8> = row.get(0)?;
-    let remote_ip = format_ip(&address);
-    let geo = remote_ip
+) -> Value {
+    let ip = netqmon_storage::from_hex(&row.key).unwrap_or_default();
+    let address = format_ip(&ip);
+    let record = address
         .parse::<IpAddr>()
         .ok()
-        .and_then(|ip| match inner.geo_provider.lookup_with_lang(ip, lang) {
-            Ok(record) => record,
-            Err(error) => {
-                tracing::warn!(%ip, %error, "Geo lookup failed");
-                None
-            }
-        })
+        .and_then(|ip| geo.lookup_with_lang(ip, lang).ok().flatten())
         .unwrap_or_default();
-    let application_id = row.get::<_, Option<String>>(8)?;
-    let application_metadata = application_id
+    let app = row
+        .application_id
         .as_deref()
-        .filter(|id| !id.is_empty() && *id != "unknown")
-        .and_then(|id| inner.classifier.application_metadata(id));
-    Ok(json!({
-        "remote_ip": remote_ip,
-        "upload_bytes": row.get::<_, i64>(1)?,
-        "download_bytes": row.get::<_, i64>(2)?,
-        "packets": row.get::<_, i64>(3)?,
-        "flow_count": row.get::<_, i64>(4)?,
-        "last_seen": row.get::<_, i64>(5)?,
-        "domain": row.get::<_, Option<String>>(6)?,
-        "client_count": row.get::<_, i64>(7)?,
-        "application": application_id,
-        "application_name": application_metadata
-            .as_ref()
-            .map(|metadata| metadata.name.clone()),
-        "country_code": geo.country_code,
-        "country_name": geo.country_name,
-        "region": geo.region,
-        "city": geo.city,
-        "latitude": geo.latitude,
-        "longitude": geo.longitude,
-        "asn": geo.asn,
-        "organization": geo.organization,
-    }))
+        .filter(|id| *id != "unknown")
+        .and_then(|id| classifier.application_metadata(id));
+    json!({"remote_ip":address,"upload_bytes":row.upload_bytes,"download_bytes":row.download_bytes,"packets":row.packets,"flow_count":row.flow_count,"last_seen":row.last_seen_at,"domain":row.last_domain,"client_count":row.distinct_devices,"application":row.application_id,"application_name":app.as_ref().map(|v|v.name.clone()),"country_code":record.country_code,"country_name":record.country_name,"region":record.region,"city":record.city,"latitude":record.latitude,"longitude":record.longitude,"asn":record.asn,"organization":record.organization})
 }
 
 async fn geo_summary(
     State(state): State<CollectorState>,
-    query: Result<Query<GeoQuery>, QueryRejection>,
+    query: Result<Query<GeoParams>, QueryRejection>,
 ) -> Response {
     let Query(query) = match query {
-        Ok(query) => query,
-        Err(error) => {
-            return api_error(StatusCode::BAD_REQUEST, "invalid_query", &error.body_text());
-        }
+        Ok(v) => v,
+        Err(e) => return api_error(StatusCode::BAD_REQUEST, "invalid_query", &e.body_text()),
     };
-    if let (Some(from), Some(to)) = (query.from, query.to) {
-        if from >= to {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_time_range",
-                "from must be less than to",
-            );
-        }
-    }
+    let (from, to) = match parse_time_range(query.from, query.to) {
+        Ok(v) => v,
+        Err(e) => return *e,
+    };
     let inner = state.lock();
     if !inner.geo_provider.is_enabled() {
-        return api_ok(json!({
-            "enabled": false,
-            "top_countries": [],
-            "top_asns": [],
-            "country_distribution": [],
-        }));
+        return api_ok(
+            json!({"enabled":false,"top_countries":[],"top_asns":[],"country_distribution":[]}),
+        );
     }
-    aggregate_geo_traffic(&inner, query.from, query.to, query.lang.as_deref())
-        .map_or_else(storage_error, api_ok)
+    let mut q = summary_query(
+        from,
+        to,
+        Page {
+            limit: u32::MAX,
+            offset: 0,
+        },
+    );
+    let traffic = match inner.storage.analytics().geo_traffic(&q) {
+        Ok(v) => v,
+        Err(e) => return storage_error(e),
+    };
+    let mut countries = BTreeMap::<String, (String, u64)>::new();
+    let mut asns = BTreeMap::<String, (String, u64)>::new();
+    let mut total = 0_u64;
+    for row in traffic {
+        let ip = format_ip(&row.remote_ip);
+        let Some(record) = ip.parse::<IpAddr>().ok().and_then(|ip| {
+            inner
+                .geo_provider
+                .lookup_with_lang(ip, query.lang.as_deref())
+                .ok()
+                .flatten()
+        }) else {
+            continue;
+        };
+        let bytes = row.upload_bytes.saturating_add(row.download_bytes);
+        total = total.saturating_add(bytes);
+        if let (Some(code), Some(name)) = (record.country_code, record.country_name) {
+            let entry = countries.entry(code).or_insert((name, 0));
+            entry.1 = entry.1.saturating_add(bytes);
+        }
+        if let (Some(asn), Some(org)) = (record.asn, record.organization) {
+            let entry = asns.entry(asn.to_string()).or_insert((org, 0));
+            entry.1 = entry.1.saturating_add(bytes);
+        }
+    }
+    let top_countries = countries
+        .iter()
+        .map(|(code, (name, bytes))| json!({"country_code":code,"country_name":name,"bytes":bytes}))
+        .collect::<Vec<_>>();
+    let top_asns=asns.iter().map(|(asn,(org,bytes))|json!({"asn":asn.parse::<u64>().unwrap_or(0),"organization":org,"bytes":bytes})).collect::<Vec<_>>();
+    let mut distribution = top_countries.clone();
+    distribution.sort_by(|a, b| b["bytes"].as_u64().cmp(&a["bytes"].as_u64()));
+    let _ = &mut q;
+    api_ok(
+        json!({"enabled":true,"top_countries":top_countries,"top_asns":top_asns,"country_distribution":distribution,"total_bytes":total}),
+    )
 }
 
 async fn insights(
     State(state): State<CollectorState>,
-    query: Result<Query<InsightQuery>, QueryRejection>,
+    query: Result<Query<InsightParams>, QueryRejection>,
 ) -> Response {
-    let window = match parse_insight_window(query) {
-        Ok(window) => window,
-        Err(response) => return *response,
+    let Query(query) = match query {
+        Ok(v) => v,
+        Err(e) => return api_error(StatusCode::BAD_REQUEST, "invalid_query", &e.body_text()),
     };
+    let to = query.to.unwrap_or_else(now_ms);
+    let from = query
+        .from
+        .unwrap_or_else(|| to.saturating_sub(DEFAULT_INSIGHT_WINDOW_MS));
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE);
+    if from >= to || to.saturating_sub(from) > MAX_INSIGHT_WINDOW_MS {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_time_range",
+            "insight range must be ordered and no longer than 30 days",
+        );
+    }
+    if limit == 0 || limit > MAX_PAGE_SIZE {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_pagination",
+            "limit must be between 1 and 200",
+        );
+    }
     let snapshot = state.realtime_snapshot();
     let inner = state.lock();
-    let result = (|| -> rusqlite::Result<Value> {
-        let connection = inner.storage.connection();
-        let items = crate::insights::detect(
-            connection,
-            &snapshot,
-            window,
-            crate::insights::collector_lag_threshold_ms(),
-            crate::insights::high_upload_threshold_bytes(),
-        )?;
-        Ok(serde_json::to_value(items).unwrap_or(Value::Array(Vec::new())))
-    })();
-    result.map_or_else(storage_error, api_ok)
-}
-
-fn aggregate_geo_traffic(
-    inner: &crate::CollectorInner,
-    from: Option<u64>,
-    to: Option<u64>,
-    lang: Option<&str>,
-) -> rusqlite::Result<Value> {
-    let mut countries: HashMap<(String, String), u64> = HashMap::new();
-    let mut asns: HashMap<(u32, String), u64> = HashMap::new();
-    let mut unknown_bytes = 0_u64;
-    let (sql, params_vec): (&str, Vec<SqlValue>) = match (from, to) {
-        (Some(from), Some(to)) => (
-            "SELECT remote_ip, SUM(upload_bytes + download_bytes)
-             FROM traffic_scope_minute
-             WHERE scope = ?1 AND timestamp >= ?2 AND timestamp < ?3
-             GROUP BY remote_ip",
-            vec![
-                SqlValue::Integer(netqmon_protocol::v1::FlowScope::Internet as i64),
-                SqlValue::Integer(to_i64(from)),
-                SqlValue::Integer(to_i64(to)),
-            ],
-        ),
-        _ => (
-            "SELECT remote_ip, SUM(upload_bytes + download_bytes)
-             FROM traffic_scope_minute WHERE scope = ?1 GROUP BY remote_ip",
-            vec![SqlValue::Integer(
-                netqmon_protocol::v1::FlowScope::Internet as i64,
-            )],
-        ),
-    };
-    let mut statement = inner.storage.connection().prepare(sql)?;
-    let rows = statement.query_map(rusqlite::params_from_iter(params_vec), |row| {
-        Ok((row.get::<_, Vec<u8>>(0)?, to_u64(row.get::<_, i64>(1)?)))
-    })?;
-    for row in rows {
-        let (address, bytes) = row?;
-        let record = format_ip(&address).parse::<IpAddr>().ok().and_then(|ip| {
-            match inner.geo_provider.lookup_with_lang(ip, lang) {
-                Ok(record) => record,
-                Err(error) => {
-                    tracing::warn!(%ip, %error, "Geo lookup failed");
-                    None
-                }
-            }
-        });
-        let Some(record) = record else {
-            unknown_bytes = unknown_bytes.saturating_add(bytes);
-            continue;
-        };
-        if let Some(code) = record.country_code {
-            let name = record.country_name.unwrap_or_else(|| code.clone());
-            let total = countries.entry((code, name)).or_default();
-            *total = total.saturating_add(bytes);
-        } else {
-            unknown_bytes = unknown_bytes.saturating_add(bytes);
-        }
-        if let Some(asn) = record.asn {
-            let organization = record
-                .organization
-                .unwrap_or_else(|| "Unknown organization".to_owned());
-            let total = asns.entry((asn, organization)).or_default();
-            *total = total.saturating_add(bytes);
-        }
+    match crate::insights::detect_from_analytics(
+        inner.storage.analytics(),
+        inner.storage.metadata(),
+        &snapshot,
+        crate::insights::InsightWindow { from, to, limit },
+        crate::insights::collector_lag_threshold_ms(),
+        crate::insights::high_upload_threshold_bytes(),
+    ) {
+        Ok(items) => api_ok(json!(items)),
+        Err(e) => storage_error(e),
     }
-    Ok(geo_summary_value(countries, asns, unknown_bytes))
-}
-
-fn geo_summary_value(
-    countries: HashMap<(String, String), u64>,
-    asns: HashMap<(u32, String), u64>,
-    unknown_bytes: u64,
-) -> Value {
-    let mut country_items = countries
-        .into_iter()
-        .map(|((country_code, country_name), bytes)| {
-            json!({
-                "country_code": country_code,
-                "country_name": country_name,
-                "bytes": bytes,
-            })
-        })
-        .collect::<Vec<_>>();
-    country_items.sort_by(|left, right| {
-        right["bytes"]
-            .as_u64()
-            .cmp(&left["bytes"].as_u64())
-            .then_with(|| {
-                left["country_code"]
-                    .as_str()
-                    .cmp(&right["country_code"].as_str())
-            })
-    });
-    let top_countries = country_items.iter().take(5).cloned().collect::<Vec<_>>();
-    let visible_country_count = if unknown_bytes > 0 { 4 } else { 5 };
-    let mut distribution = country_items
-        .iter()
-        .take(visible_country_count)
-        .cloned()
-        .collect::<Vec<_>>();
-    if country_items.len() > visible_country_count {
-        let other_bytes = country_items[visible_country_count..]
-            .iter()
-            .filter_map(|item| item["bytes"].as_u64())
-            .fold(0_u64, u64::saturating_add);
-        distribution.push(json!({
-            "country_code": "other",
-            "country_name": "Other",
-            "bytes": other_bytes,
-        }));
-    }
-    if unknown_bytes > 0 {
-        distribution.push(json!({
-            "country_code": "unknown",
-            "country_name": "Unknown",
-            "bytes": unknown_bytes,
-        }));
-    }
-    distribution.sort_by(|left, right| right["bytes"].as_u64().cmp(&left["bytes"].as_u64()));
-    let mut asn_items = asns
-        .into_iter()
-        .map(|((asn, organization), bytes)| {
-            json!({
-                "asn": asn,
-                "organization": organization,
-                "bytes": bytes,
-            })
-        })
-        .collect::<Vec<_>>();
-    asn_items.sort_by(|left, right| {
-        right["bytes"]
-            .as_u64()
-            .cmp(&left["bytes"].as_u64())
-            .then_with(|| left["asn"].as_u64().cmp(&right["asn"].as_u64()))
-    });
-    json!({
-        "enabled": true,
-        "top_countries": top_countries,
-        "top_asns": asn_items.into_iter().take(5).collect::<Vec<_>>(),
-        "country_distribution": distribution,
-    })
 }
 
 async fn flows(
     State(state): State<CollectorState>,
-    query: Result<Query<FlowQuery>, QueryRejection>,
+    query: Result<Query<FlowParams>, QueryRejection>,
 ) -> Response {
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(error) => {
-            return api_error(StatusCode::BAD_REQUEST, "invalid_query", &error.body_text());
-        }
+    let Query(params) = match query {
+        Ok(v) => v,
+        Err(e) => return api_error(StatusCode::BAD_REQUEST, "invalid_query", &e.body_text()),
     };
-    let options = match parse_flow_page_options(&query) {
-        Ok(options) => options,
-        Err(response) => return *response,
+    let (q, limit, sort) = match build_flow_query(&params, &state.lock()) {
+        Ok(values) => values,
+        Err(error) => return *error,
     };
     let inner = state.lock();
-    let result = query_flow_page(
-        inner.storage.connection(),
-        &inner.classifier,
-        &query,
-        &options,
-    );
-    match result {
-        Ok((items, next_cursor)) => Json(json!({
-            "schema_version": SCHEMA_VERSION,
-            "data": items,
-            "pagination": {
-                "limit": options.limit,
-                "next_cursor": next_cursor,
-                "sort": options.sort_name,
-                "order": if options.descending { "desc" } else { "asc" },
-            }
-        }))
-        .into_response(),
-        Err(rusqlite::Error::InvalidParameterName(name)) => flow_query_error(&name),
-        Err(error) => storage_error(error),
-    }
+    let result = match inner.storage.analytics().flows(&q) {
+        Ok(v) => v,
+        Err(e) => return storage_error(e),
+    };
+    let has_more = result.rows.len() > usize::try_from(limit).unwrap_or(usize::MAX)
+        || result.total > u64::from(limit);
+    let rows = result
+        .rows
+        .into_iter()
+        .take(usize::try_from(limit).unwrap_or(usize::MAX))
+        .collect::<Vec<_>>();
+    let next_cursor = has_more
+        .then(|| {
+            rows.last()
+                .map(|row| format!("{}|{}", flow_sort_value(row, sort), row.flow_id))
+        })
+        .flatten();
+    let items = rows
+        .iter()
+        .map(|row| flow_json(row, &inner))
+        .collect::<Vec<_>>();
+    Json(json!({"schema_version":SCHEMA_VERSION,"data":items,"pagination":{"limit":limit,"next_cursor":next_cursor}})).into_response()
 }
 
-fn parse_flow_page_options(query: &FlowQuery) -> Result<FlowPageOptions, Box<Response>> {
-    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE);
+struct FlowRequest {
+    from: u64,
+    to: u64,
+    limit: u32,
+    sort: FlowSort,
+    descending: bool,
+    cursor: Option<(i64, String)>,
+}
+
+struct FlowDeviceFilters {
+    device_ids: Vec<u64>,
+    search_ip: Option<Vec<u8>>,
+}
+
+fn build_flow_query(
+    params: &FlowParams,
+    inner: &crate::CollectorInner,
+) -> Result<(AnalyticsFlowQuery, u32, FlowSort), Box<Response>> {
+    let request = parse_flow_request(params)?;
+    let FlowDeviceFilters {
+        device_ids,
+        search_ip,
+    } = resolve_flow_device_filters(params, inner)?;
+    let client_ip = params
+        .client
+        .as_deref()
+        .and_then(|v| v.parse::<IpAddr>().ok())
+        .map(ip_bytes);
+    let remote_ip = params
+        .ip
+        .as_deref()
+        .map(|raw| raw.parse::<IpAddr>().map(ip_bytes))
+        .transpose()
+        .map_err(|_| {
+            Box::new(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_ip",
+                "ip must be a valid IPv4 or IPv6 address",
+            ))
+        })?;
+    let transport = parse_flow_filter(
+        params.protocol.as_deref(),
+        parse_transport_protocol,
+        "invalid_protocol",
+        "protocol must be tcp, udp, or an IP protocol number",
+    )?;
+    let direction = parse_flow_filter(
+        params.direction.as_deref(),
+        parse_flow_direction,
+        "invalid_direction",
+        "direction must be upload, download, or unknown",
+    )?;
+    let scope = parse_flow_filter(
+        params.scope.as_deref(),
+        parse_flow_scope,
+        "invalid_scope",
+        "scope must be internet, internal, tunnel, or unknown",
+    )?;
+    let path_type = parse_flow_filter(
+        params.path_type.as_deref(),
+        parse_path_type,
+        "invalid_path_type",
+        "path_type must be forwarded, internal, tunnel, or unknown",
+    )?;
+    let nat = parse_flow_filter(
+        params.nat.as_deref(),
+        parse_nat,
+        "invalid_nat",
+        "nat must be none, snat, dnat, both, or unknown",
+    )?;
+    let search_resolved = search_ip.is_some() || !device_ids.is_empty();
+    Ok((
+        AnalyticsFlowQuery {
+            from: request.from,
+            to: request.to,
+            gateway_id: None,
+            device_id: if device_ids.len() == 1 {
+                Some(device_ids[0])
+            } else {
+                None
+            },
+            application_id: params.application.clone(),
+            organization_id: params.organization.clone(),
+            protocol_id: params.detected_protocol.clone(),
+            domain: params.domain.clone(),
+            client_ip,
+            remote_ip,
+            any_ip: search_ip,
+            transport_protocol: transport,
+            port: params.port,
+            direction,
+            scope,
+            path_type,
+            nat,
+            search: (!search_resolved).then(|| params.search.clone()).flatten(),
+            sort_by: request.sort,
+            descending: request.descending,
+            after_sort_value: request.cursor.as_ref().map(|cursor| cursor.0),
+            after_flow_id: request.cursor.as_ref().map(|cursor| cursor.1.clone()),
+            limit: request.limit.saturating_add(1),
+            offset: 0,
+        },
+        request.limit,
+        request.sort,
+    ))
+}
+
+fn parse_flow_request(params: &FlowParams) -> Result<FlowRequest, Box<Response>> {
+    let limit = params.limit.unwrap_or(DEFAULT_PAGE_SIZE);
     if limit == 0 || limit > MAX_PAGE_SIZE {
         return Err(Box::new(api_error(
             StatusCode::BAD_REQUEST,
@@ -2024,15 +1332,21 @@ fn parse_flow_page_options(query: &FlowQuery) -> Result<FlowPageOptions, Box<Res
             "limit must be between 1 and 200",
         )));
     }
-    let (sort_column, sort_name) = match query.sort.as_deref().unwrap_or("last_seen") {
-        "last_seen" => ("f.last_seen_at", "last_seen"),
-        "started" => ("f.started_at", "started"),
-        "download" => ("f.download_bytes", "download"),
-        "upload" => ("f.upload_bytes", "upload"),
-        "duration" => (
-            "(COALESCE(f.ended_at, f.last_seen_at) - f.started_at)",
-            "duration",
-        ),
+    let to = params.to.unwrap_or_else(now_ms);
+    let from = params.from.unwrap_or_else(|| to.saturating_sub(DAY_MS));
+    if from >= to || to > u64::try_from(i64::MAX).expect("i64::MAX is nonnegative") {
+        return Err(Box::new(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_time_range",
+            "from must be less than to",
+        )));
+    }
+    let sort = match params.sort.as_deref().unwrap_or("last_seen") {
+        "last_seen" => FlowSort::LastSeen,
+        "started" => FlowSort::Started,
+        "download" => FlowSort::DownloadBytes,
+        "upload" => FlowSort::UploadBytes,
+        "duration" => FlowSort::Duration,
         _ => {
             return Err(Box::new(api_error(
                 StatusCode::BAD_REQUEST,
@@ -2041,7 +1355,7 @@ fn parse_flow_page_options(query: &FlowQuery) -> Result<FlowPageOptions, Box<Res
             )));
         }
     };
-    let descending = match query.order.as_deref().unwrap_or("desc") {
+    let descending = match params.order.as_deref().unwrap_or("desc") {
         "desc" => true,
         "asc" => false,
         _ => {
@@ -2052,585 +1366,253 @@ fn parse_flow_page_options(query: &FlowQuery) -> Result<FlowPageOptions, Box<Res
             )));
         }
     };
-    let cursor = query
-        .cursor
-        .as_deref()
-        .map(parse_flow_cursor)
-        .transpose()
-        .map_err(|message| {
-            Box::new(api_error(
+    let cursor = match params.cursor.as_deref().map(parse_flow_cursor).transpose() {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(Box::new(api_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_cursor",
-                message,
-            ))
-        })?;
-    Ok(FlowPageOptions {
+                e,
+            )));
+        }
+    };
+    Ok(FlowRequest {
+        from,
+        to,
         limit,
-        sort_column,
-        sort_name,
+        sort,
         descending,
         cursor,
     })
 }
 
-fn query_flow_page(
-    connection: &Connection,
-    classifier: &crate::classifier::ClassifierHandle,
-    query: &FlowQuery,
-    options: &FlowPageOptions,
-) -> rusqlite::Result<(Vec<Value>, Option<String>)> {
-    let (mut clauses, mut values) = flow_filters(query)?;
-    if let Some(cursor) = options.cursor.as_ref() {
-        let comparison = if options.descending { '<' } else { '>' };
-        clauses.push(format!(
-            "({} {comparison} ? OR ({} = ? AND f.id > ?))",
-            options.sort_column, options.sort_column
-        ));
-        values.extend([
-            SqlValue::Integer(cursor.sort_value),
-            SqlValue::Integer(cursor.sort_value),
-            SqlValue::Text(cursor.id.clone()),
-        ]);
-    }
-    let where_clause = if clauses.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", clauses.join(" AND "))
-    };
-    let order = if options.descending { "DESC" } else { "ASC" };
-    let sql = format!(
-        "SELECT f.id, f.client_ip, f.client_port, f.remote_ip, f.remote_port, f.protocol,
-                f.direction, f.domain, f.organization_id, f.application_id, f.category_id,
-                f.traffic_role, f.protocol_id, f.organization_confidence, f.application_confidence,
-                f.protocol_confidence, f.classification_confidence,
-                f.classification_reason, f.classification_evidence_json, f.upload_bytes,
-                f.download_bytes, f.packets, f.started_at, f.last_seen_at, f.ended_at,
-                f.device_id, COALESCE(d.display_name, d.hostname, ''), d.mac,
-                f.scope, f.path_type, f.nat, f.source_segment, f.destination_segment, {}
-         FROM flow_sessions f LEFT JOIN devices d ON d.id = f.device_id{where_clause}
-         ORDER BY {} {order}, f.id ASC LIMIT ?",
-        options.sort_column, options.sort_column
-    );
-    values.push(SqlValue::Integer(i64::from(options.limit) + 1));
-    let mut statement = connection.prepare(&sql)?;
-    let mut items = statement
-        .query_map(rusqlite::params_from_iter(values), |row| {
-            flow_row_json(row, classifier)
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let has_more = items.len() > options.limit as usize;
-    items.truncate(options.limit as usize);
-    let next_cursor = has_more
-        .then(|| flow_cursor_for(items.last().expect("extra row implies a non-empty page")));
-    for item in &mut items {
-        item.as_object_mut()
-            .expect("Flow item is an object")
-            .remove("cursor_value");
-    }
-    Ok((items, next_cursor))
-}
-
-fn flow_filters(query: &FlowQuery) -> rusqlite::Result<(Vec<String>, Vec<SqlValue>)> {
-    let mut clauses = Vec::new();
-    let mut values = Vec::new();
-    add_flow_identity_filters(query, &mut clauses, &mut values)?;
-    add_flow_transport_filters(query, &mut clauses, &mut values)?;
-    Ok((clauses, values))
-}
-
-fn add_flow_identity_filters(
-    query: &FlowQuery,
-    clauses: &mut Vec<String>,
-    values: &mut Vec<SqlValue>,
-) -> rusqlite::Result<()> {
-    if let Some(search) = non_empty(query.search.as_deref()) {
-        if let Ok(ip) = search.parse::<IpAddr>() {
-            clauses.push("(f.client_ip = ? OR f.remote_ip = ?)".to_owned());
-            let bytes = ip_bytes(ip);
-            values.extend([SqlValue::Blob(bytes.clone()), SqlValue::Blob(bytes)]);
-        } else {
-            clauses.push("(LOWER(COALESCE(f.domain, '')) LIKE ? OR LOWER(COALESCE(f.application_id, '')) LIKE ? OR LOWER(COALESCE(d.display_name, d.hostname, '')) LIKE ? OR LOWER(HEX(COALESCE(d.mac, X''))) LIKE ?)".to_owned());
-            let pattern = format!("%{}%", search.to_lowercase());
-            values.extend((0..4).map(|_| SqlValue::Text(pattern.clone())));
+fn resolve_flow_device_filters(
+    params: &FlowParams,
+    inner: &crate::CollectorInner,
+) -> Result<FlowDeviceFilters, Box<Response>> {
+    let mut device_ids = Vec::new();
+    if let Some(client) = non_empty_trimmed(params.client.as_deref()) {
+        if let Ok(id) = client.parse::<u64>() {
+            device_ids.push(id);
+        } else if client.parse::<IpAddr>().is_err() {
+            device_ids = find_device_ids(inner, client)?;
         }
     }
-    if let Some(client) = non_empty(query.client.as_deref()) {
-        if let Ok(id) = client.parse::<i64>() {
-            clauses.push("f.device_id = ?".to_owned());
-            values.push(SqlValue::Integer(id));
-        } else if let Ok(ip) = client.parse::<IpAddr>() {
-            clauses.push("f.client_ip = ?".to_owned());
-            values.push(SqlValue::Blob(ip_bytes(ip)));
-        } else {
-            clauses.push("(LOWER(COALESCE(d.display_name, d.hostname, '')) LIKE ? OR LOWER(HEX(COALESCE(d.mac, X''))) LIKE ?)".to_owned());
-            let pattern = format!("%{}%", client.to_lowercase().replace([':', '-'], ""));
-            values.extend([SqlValue::Text(pattern.clone()), SqlValue::Text(pattern)]);
+    let search_ip = non_empty_trimmed(params.search.as_deref())
+        .and_then(|search| search.parse::<IpAddr>().ok().map(ip_bytes));
+    if search_ip.is_none() && device_ids.is_empty() {
+        if let Some(search) = non_empty_trimmed(params.search.as_deref()) {
+            device_ids = find_device_ids(inner, search)?;
         }
     }
-    if let Some(application) = non_empty(query.application.as_deref()) {
-        clauses.push("LOWER(COALESCE(f.application_id, 'unknown')) = ?".to_owned());
-        values.push(SqlValue::Text(application.to_lowercase()));
-    }
-    if let Some(organization) = non_empty(query.organization.as_deref()) {
-        clauses.push("LOWER(COALESCE(f.organization_id, 'unknown')) = ?".to_owned());
-        values.push(SqlValue::Text(organization.to_lowercase()));
-    }
-    if let Some(detected_protocol) = non_empty(query.detected_protocol.as_deref()) {
-        clauses.push("LOWER(COALESCE(f.protocol_id, 'unknown')) = ?".to_owned());
-        values.push(SqlValue::Text(detected_protocol.to_lowercase()));
-    }
-    if let Some(domain) = non_empty(query.domain.as_deref()) {
-        clauses.push("LOWER(COALESCE(f.domain, '')) LIKE ?".to_owned());
-        values.push(SqlValue::Text(format!("%{}%", domain.to_lowercase())));
-    }
-    if let Some(ip) = non_empty(query.ip.as_deref()) {
-        let ip = ip
-            .parse::<IpAddr>()
-            .map_err(|_| rusqlite::Error::InvalidParameterName("invalid_ip".to_owned()))?;
-        clauses.push("f.remote_ip = ?".to_owned());
-        values.push(SqlValue::Blob(ip_bytes(ip)));
-    }
-    Ok(())
-}
-
-fn add_flow_transport_filters(
-    query: &FlowQuery,
-    clauses: &mut Vec<String>,
-    values: &mut Vec<SqlValue>,
-) -> rusqlite::Result<()> {
-    if let Some(protocol) = non_empty(query.protocol.as_deref()) {
-        let protocol = match protocol.to_ascii_lowercase().as_str() {
-            "tcp" => 6,
-            "udp" => 17,
-            value => value.parse::<u8>().map(i64::from).map_err(|_| {
-                rusqlite::Error::InvalidParameterName("invalid_protocol".to_owned())
-            })?,
-        };
-        clauses.push("f.protocol = ?".to_owned());
-        values.push(SqlValue::Integer(protocol));
-    }
-    if let Some(port) = query.port {
-        clauses.push("(f.client_port = ? OR f.remote_port = ?)".to_owned());
-        values.extend([
-            SqlValue::Integer(i64::from(port)),
-            SqlValue::Integer(i64::from(port)),
-        ]);
-    }
-    if let Some(direction) = non_empty(query.direction.as_deref()) {
-        let direction = match direction.to_ascii_lowercase().as_str() {
-            "unknown" => 0,
-            "upload" => 1,
-            "download" => 2,
-            _ => {
-                return Err(rusqlite::Error::InvalidParameterName(
-                    "invalid_direction".to_owned(),
-                ));
-            }
-        };
-        clauses.push("f.direction = ?".to_owned());
-        values.push(SqlValue::Integer(direction));
-    }
-    if let Some(scope) = non_empty(query.scope.as_deref()) {
-        let scope = match scope.to_ascii_lowercase().as_str() {
-            "internet" => netqmon_protocol::v1::FlowScope::Internet as i64,
-            "internal" => netqmon_protocol::v1::FlowScope::Internal as i64,
-            "tunnel" => netqmon_protocol::v1::FlowScope::Tunnel as i64,
-            "unknown" => netqmon_protocol::v1::FlowScope::Unknown as i64,
-            _ => {
-                return Err(rusqlite::Error::InvalidParameterName(
-                    "invalid_scope".to_owned(),
-                ));
-            }
-        };
-        clauses.push("f.scope = ?".to_owned());
-        values.push(SqlValue::Integer(scope));
-    }
-    if let Some(path_type) = non_empty(query.path_type.as_deref()) {
-        let path_type = match path_type.to_ascii_lowercase().as_str() {
-            "forwarded" => netqmon_protocol::v1::PathType::Forwarded as i64,
-            "internal" => netqmon_protocol::v1::PathType::Internal as i64,
-            "tunnel" => netqmon_protocol::v1::PathType::Tunnel as i64,
-            "unknown" => netqmon_protocol::v1::PathType::Unknown as i64,
-            _ => {
-                return Err(rusqlite::Error::InvalidParameterName(
-                    "invalid_path_type".to_owned(),
-                ));
-            }
-        };
-        clauses.push("f.path_type = ?".to_owned());
-        values.push(SqlValue::Integer(path_type));
-    }
-    if let Some(nat) = non_empty(query.nat.as_deref()) {
-        let nat = match nat.to_ascii_lowercase().as_str() {
-            "none" => netqmon_protocol::v1::NatType::None as i64,
-            "snat" => netqmon_protocol::v1::NatType::Snat as i64,
-            "dnat" => netqmon_protocol::v1::NatType::Dnat as i64,
-            "both" => netqmon_protocol::v1::NatType::Both as i64,
-            "unknown" => netqmon_protocol::v1::NatType::Unknown as i64,
-            _ => {
-                return Err(rusqlite::Error::InvalidParameterName(
-                    "invalid_nat".to_owned(),
-                ));
-            }
-        };
-        clauses.push("f.nat = ?".to_owned());
-        values.push(SqlValue::Integer(nat));
-    }
-    if query.from.is_some() || query.to.is_some() {
-        let from = query.from.unwrap_or(0);
-        let to = query.to.unwrap_or_else(now_ms);
-        if from >= to || to > i64::MAX as u64 {
-            return Err(rusqlite::Error::InvalidParameterName(
-                "invalid_time_range".to_owned(),
-            ));
-        }
-        clauses.push("f.last_seen_at >= ? AND f.last_seen_at < ?".to_owned());
-        values.extend([
-            SqlValue::Integer(to_i64(from)),
-            SqlValue::Integer(to_i64(to)),
-        ]);
-    }
-    Ok(())
-}
-
-fn flow_row_json(
-    row: &rusqlite::Row<'_>,
-    classifier: &crate::classifier::ClassifierHandle,
-) -> rusqlite::Result<Value> {
-    let client_ip: Vec<u8> = row.get(1)?;
-    let remote_ip: Vec<u8> = row.get(3)?;
-    let application = row
-        .get::<_, Option<String>>(9)?
-        .unwrap_or_else(|| "unknown".to_owned());
-    let application_name = classifier
-        .application_metadata(&application)
-        .as_ref()
-        .map(|metadata| metadata.name.clone());
-    Ok(json!({
-        "id": row.get::<_, String>(0)?, "client_ip": format_ip(&client_ip),
-        "client_port": row.get::<_, i64>(2)?, "remote_ip": format_ip(&remote_ip),
-        "remote_port": row.get::<_, i64>(4)?, "protocol": row.get::<_, i64>(5)?,
-        "direction": row.get::<_, i64>(6)?, "domain": row.get::<_, Option<String>>(7)?,
-        "organization": row.get::<_, Option<String>>(8)?.unwrap_or_else(|| "unknown".to_owned()),
-        "application": application,
-        "application_name": application_name,
-        "category": row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "unknown".to_owned()),
-        "traffic_role": row.get::<_, Option<String>>(11)?.unwrap_or_else(|| "unknown".to_owned()),
-        "protocol_id": row.get::<_, Option<String>>(12)?.unwrap_or_else(|| "unknown".to_owned()),
-        "organization_confidence": row.get::<_, Option<f64>>(13)?.unwrap_or(0.0),
-        "application_confidence": row.get::<_, Option<f64>>(14)?.unwrap_or(0.0),
-        "protocol_confidence": row.get::<_, Option<f64>>(15)?.unwrap_or(0.0),
-        "confidence": row.get::<_, Option<f64>>(16)?.unwrap_or(0.0),
-        "reason": row.get::<_, Option<String>>(17)?.unwrap_or_else(|| "no matching rule".to_owned()),
-        "evidence": row.get::<_, Option<String>>(18)?.unwrap_or_else(|| "[]".to_owned()),
-        "upload_bytes": row.get::<_, i64>(19)?, "download_bytes": row.get::<_, i64>(20)?,
-        "packets": row.get::<_, i64>(21)?, "started_at": row.get::<_, i64>(22)?,
-        "last_seen": row.get::<_, i64>(23)?, "ended_at": row.get::<_, Option<i64>>(24)?,
-        "client_id": row.get::<_, Option<i64>>(25)?, "client_name": row.get::<_, String>(26)?,
-        "client_mac": row.get::<_, Option<Vec<u8>>>(27)?.map(|mac| format_mac(&mac)),
-        "scope": flow_scope_name(row.get::<_, i32>(28)?),
-        "path_type": flow_path_name(row.get::<_, i32>(29)?),
-        "nat": flow_nat_name(row.get::<_, i32>(30)?),
-        "source_segment": row.get::<_, String>(31)?,
-        "destination_segment": row.get::<_, String>(32)?,
-        "cursor_value": row.get::<_, i64>(33)?,
-    }))
-}
-
-fn flow_cursor_for(item: &Value) -> String {
-    format!(
-        "{}|{}",
-        item["cursor_value"].as_i64().unwrap_or_default(),
-        item["id"].as_str().unwrap_or_default()
-    )
-}
-
-fn flow_scope_name(value: i32) -> &'static str {
-    match netqmon_protocol::v1::FlowScope::try_from(value) {
-        Ok(netqmon_protocol::v1::FlowScope::Internet) => "internet",
-        Ok(netqmon_protocol::v1::FlowScope::Internal) => "internal",
-        Ok(netqmon_protocol::v1::FlowScope::Tunnel) => "tunnel",
-        _ => "unknown",
-    }
-}
-
-fn flow_path_name(value: i32) -> &'static str {
-    match netqmon_protocol::v1::PathType::try_from(value) {
-        Ok(netqmon_protocol::v1::PathType::Forwarded) => "forwarded",
-        Ok(netqmon_protocol::v1::PathType::Internal) => "internal",
-        Ok(netqmon_protocol::v1::PathType::Tunnel) => "tunnel",
-        _ => "unknown",
-    }
-}
-
-fn flow_nat_name(value: i32) -> &'static str {
-    match netqmon_protocol::v1::NatType::try_from(value) {
-        Ok(netqmon_protocol::v1::NatType::None) => "none",
-        Ok(netqmon_protocol::v1::NatType::Snat) => "snat",
-        Ok(netqmon_protocol::v1::NatType::Dnat) => "dnat",
-        Ok(netqmon_protocol::v1::NatType::Both) => "both",
-        _ => "unknown",
-    }
-}
-
-fn flow_query_error(name: &str) -> Response {
-    let (code, message) = match name {
-        "invalid_ip" => ("invalid_ip", "ip must be a valid IPv4 or IPv6 address"),
-        "invalid_protocol" => (
-            "invalid_protocol",
-            "protocol must be tcp, udp, or an IP protocol number",
-        ),
-        "invalid_direction" => (
-            "invalid_direction",
-            "direction must be upload, download, or unknown",
-        ),
-        "invalid_scope" => (
-            "invalid_scope",
-            "scope must be internet, internal, tunnel, or unknown",
-        ),
-        "invalid_path_type" => (
-            "invalid_path_type",
-            "path_type must be forwarded, internal, tunnel, or unknown",
-        ),
-        "invalid_nat" => (
-            "invalid_nat",
-            "nat must be none, snat, dnat, both, or unknown",
-        ),
-        "invalid_time_range" => ("invalid_time_range", "from must be less than to"),
-        _ => ("invalid_query", "Flow query is invalid"),
-    };
-    api_error(StatusCode::BAD_REQUEST, code, message)
-}
-
-fn non_empty(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|value| !value.is_empty())
-}
-
-fn ip_bytes(ip: IpAddr) -> Vec<u8> {
-    match ip {
-        IpAddr::V4(ip) => ip.octets().to_vec(),
-        IpAddr::V6(ip) => ip.octets().to_vec(),
-    }
-}
-
-fn parse_flow_cursor(value: &str) -> Result<FlowCursor, &'static str> {
-    let Some((sort_value, id)) = value.split_once('|') else {
-        return Err("cursor is malformed");
-    };
-    let sort_value = sort_value
-        .parse::<i64>()
-        .map_err(|_| "cursor is malformed")?;
-    if id.is_empty() {
-        return Err("cursor is malformed");
-    }
-    Ok(FlowCursor {
-        sort_value,
-        id: id.to_owned(),
+    Ok(FlowDeviceFilters {
+        device_ids,
+        search_ip,
     })
 }
 
-fn summary_page(
-    state: &CollectorState,
-    query: Result<Query<PageQuery>, QueryRejection>,
-    table: &str,
-    group: &str,
-    names: &[&str],
+fn find_device_ids(inner: &crate::CollectorInner, search: &str) -> Result<Vec<u64>, Box<Response>> {
+    let devices = inner
+        .storage
+        .devices(10_000, 0)
+        .map_err(|error| Box::new(storage_error(error)))?
+        .0;
+    let search_lower = search.to_lowercase();
+    let mac_search = search_lower.replace([':', '-'], "");
+    Ok(devices
+        .iter()
+        .filter(|device| {
+            display_name(device).to_lowercase().contains(&search_lower)
+                || format_mac(&device.mac).to_lowercase().contains(&mac_search)
+        })
+        .filter_map(|device| u64::try_from(device.id).ok())
+        .collect())
+}
+
+fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn parse_flow_filter(
+    value: Option<&str>,
+    parser: fn(&str) -> Result<u8, ()>,
+    code: &str,
+    message: &str,
+) -> Result<Option<u8>, Box<Response>> {
+    value
+        .map(parser)
+        .transpose()
+        .map_err(|()| Box::new(api_error(StatusCode::BAD_REQUEST, code, message)))
+}
+
+fn parse_flow_cursor(value: &str) -> Result<(i64, String), &'static str> {
+    let Some((sort, id)) = value.split_once('|') else {
+        return Err("cursor is malformed");
+    };
+    let sort = sort.parse().map_err(|_| "cursor is malformed")?;
+    if id.is_empty() {
+        return Err("cursor is malformed");
+    }
+    Ok((sort, id.to_owned()))
+}
+fn flow_sort_value(flow: &AnalyticsFlow, sort: FlowSort) -> i64 {
+    let value = match sort {
+        FlowSort::LastSeen => flow.last_seen_at,
+        FlowSort::Started => flow.started_at,
+        FlowSort::UploadBytes => flow.upload_bytes,
+        FlowSort::DownloadBytes => flow.download_bytes,
+        FlowSort::TotalBytes => flow.upload_bytes.saturating_add(flow.download_bytes),
+        FlowSort::Duration => flow
+            .ended_at
+            .unwrap_or(flow.last_seen_at)
+            .saturating_sub(flow.started_at),
+    };
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+fn parse_transport_protocol(value: &str) -> Result<u8, ()> {
+    match value.to_ascii_lowercase().as_str() {
+        "tcp" => Ok(6),
+        "udp" => Ok(17),
+        value => value.parse().map_err(|_| ()),
+    }
+}
+fn parse_flow_direction(value: &str) -> Result<u8, ()> {
+    match value.to_ascii_lowercase().as_str() {
+        "unknown" => Ok(0),
+        "upload" => Ok(1),
+        "download" => Ok(2),
+        _ => Err(()),
+    }
+}
+fn parse_flow_scope(value: &str) -> Result<u8, ()> {
+    match value.to_ascii_lowercase().as_str() {
+        "internet" => Ok(1),
+        "internal" => Ok(2),
+        "tunnel" => Ok(3),
+        "unknown" => Ok(0),
+        _ => Err(()),
+    }
+}
+fn parse_path_type(value: &str) -> Result<u8, ()> {
+    match value.to_ascii_lowercase().as_str() {
+        "forwarded" => Ok(1),
+        "internal" => Ok(2),
+        "tunnel" => Ok(3),
+        "unknown" => Ok(0),
+        _ => Err(()),
+    }
+}
+fn parse_nat(value: &str) -> Result<u8, ()> {
+    match value.to_ascii_lowercase().as_str() {
+        "none" => Ok(1),
+        "snat" => Ok(2),
+        "dnat" => Ok(3),
+        "both" => Ok(4),
+        "unknown" => Ok(0),
+        _ => Err(()),
+    }
+}
+
+fn flow_json(flow: &AnalyticsFlow, inner: &crate::CollectorInner) -> Value {
+    let device = i64::try_from(flow.device_id)
+        .ok()
+        .and_then(|id| inner.storage.device(id).ok().flatten());
+    let app = inner.classifier.application_metadata(&flow.application_id);
+    json!({"id":flow.flow_id,"client_ip":format_ip(&flow.client_ip),"client_port":flow.client_port,"remote_ip":format_ip(&flow.remote_ip),"remote_port":flow.remote_port,"protocol":flow.protocol,"direction":flow_direction_name(flow.direction),"domain":non_empty(&flow.domain),"organization":flow.organization_id,"application":flow.application_id,"application_name":app.as_ref().map(|m|m.name.clone()),"category":flow.category_id,"traffic_role":flow.traffic_role,"protocol_id":flow.protocol_id,"organization_confidence":flow.organization_confidence,"application_confidence":flow.application_confidence,"protocol_confidence":flow.protocol_confidence,"confidence":flow.classification_confidence,"reason":flow.classification_reason,"evidence":flow.classification_evidence_json,"upload_bytes":flow.upload_bytes,"download_bytes":flow.download_bytes,"packets":flow.packets,"started_at":flow.started_at,"last_seen":flow.last_seen_at,"ended_at":flow.ended_at,"client_id":(flow.device_id>0).then_some(flow.device_id),"client_name":device.as_ref().map(display_name).unwrap_or_default(),"client_mac":device.as_ref().map(|d|format_mac(&d.mac)),"scope":scope_numeric_name(flow.scope),"path_type":path_numeric_name(flow.path_type),"nat":nat_numeric_name(flow.nat),"source_segment":flow.source_segment,"destination_segment":flow.destination_segment})
+}
+fn flow_direction_name(value: u8) -> &'static str {
+    match value {
+        1 => "upload",
+        2 => "download",
+        _ => "unknown",
+    }
+}
+fn scope_numeric_name(value: u8) -> &'static str {
+    match value {
+        1 => "internet",
+        2 => "internal",
+        3 => "tunnel",
+        _ => "unknown",
+    }
+}
+fn path_numeric_name(value: u8) -> &'static str {
+    match value {
+        1 => "forwarded",
+        2 => "internal",
+        3 => "tunnel",
+        _ => "unknown",
+    }
+}
+fn nat_numeric_name(value: u8) -> &'static str {
+    match value {
+        1 => "none",
+        2 => "snat",
+        3 => "dnat",
+        4 => "both",
+        _ => "unknown",
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivateLicenseRequest {
+    license_key: String,
+}
+async fn get_license(State(state): State<CollectorState>) -> Response {
+    match state.license.status() {
+        Ok(status) => Json(SuccessEnvelope {
+            schema_version: SCHEMA_VERSION,
+            data: status,
+            pagination: None,
+        })
+        .into_response(),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "license_state_error",
+            &error,
+        ),
+    }
+}
+async fn activate_license(
+    State(state): State<CollectorState>,
+    Json(request): Json<ActivateLicenseRequest>,
 ) -> Response {
-    let page = match Page::parse(query) {
-        Ok(page) => page,
-        Err(response) => return *response,
-    };
-    let inner = state.lock();
-    let connection = inner.storage.connection();
-    let result = (|| -> rusqlite::Result<(Vec<Value>, u64)> {
-        let count_sql = format!("SELECT COUNT(*) FROM (SELECT 1 FROM {table} GROUP BY {group})");
-        let total: i64 = scalar(connection, &count_sql, [])?;
-        let sql = format!(
-            "SELECT {group}, SUM(upload_bytes), SUM(download_bytes), SUM(packets),
-                    SUM(flow_count), MAX(timestamp)
-             FROM {table} GROUP BY {group}
-             ORDER BY SUM(upload_bytes + download_bytes) DESC, {group}
-             LIMIT ?1 OFFSET ?2"
+    if request.license_key.trim().is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_license_key",
+            "license_key must not be empty",
         );
-        let mut statement = connection.prepare(&sql)?;
-        let items = statement
-            .query_map(params![i64::from(page.limit), to_i64(page.offset)], |row| {
-                summary_row(row, names)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok((items, to_u64(total)))
-    })();
-    result.map_or_else(storage_error, |(items, total)| page_ok(items, page, total))
-}
-
-fn summary_row(row: &rusqlite::Row<'_>, names: &[&str]) -> rusqlite::Result<Value> {
-    let mut object = serde_json::Map::new();
-    for (index, name) in names.iter().enumerate() {
-        object.insert((*name).to_owned(), json!(row.get::<_, String>(index)?));
     }
-    let metric = names.len();
-    object.insert("upload_bytes".to_owned(), json!(row.get::<_, i64>(metric)?));
-    object.insert(
-        "download_bytes".to_owned(),
-        json!(row.get::<_, i64>(metric + 1)?),
-    );
-    object.insert("packets".to_owned(), json!(row.get::<_, i64>(metric + 2)?));
-    object.insert(
-        "flow_count".to_owned(),
-        json!(row.get::<_, i64>(metric + 3)?),
-    );
-    object.insert(
-        "last_seen".to_owned(),
-        json!(row.get::<_, i64>(metric + 4)?),
-    );
-    Ok(Value::Object(object))
-}
-
-fn query_clients(connection: &Connection, page: Page) -> rusqlite::Result<(Vec<Value>, u64)> {
-    let total: i64 = scalar(connection, "SELECT COUNT(*) FROM devices", [])?;
-    let mut statement = connection.prepare(
-        "SELECT d.id, d.mac, COALESCE(d.display_name, d.hostname, ''), d.vendor,
-                d.device_type, d.os_family, d.model, d.identity_confidence,
-                COALESCE((SELECT json_group_array(json_object(
-                    'source', e.source, 'field', e.field, 'value', e.value,
-                    'confidence', e.confidence, 'first_seen', e.first_seen,
-                    'last_seen', e.last_seen, 'hit_count', e.hit_count,
-                    'metadata_json', e.metadata_json))
-                  FROM device_evidence e WHERE e.gateway_id = d.gateway_id AND e.mac = d.mac), '[]'),
-                d.vendor_confidence, d.device_type_confidence, d.os_confidence,
-                d.model_confidence, d.private_mac, d.last_seen,
-                COALESCE(SUM(t.upload_bytes), 0), COALESCE(SUM(t.download_bytes), 0),
-                COALESCE(SUM(t.flow_count), 0),
-                (SELECT ip FROM device_addresses a WHERE a.device_id = d.id
-                 ORDER BY a.last_seen DESC, a.ip_version LIMIT 1),
-                CASE WHEN (SELECT COUNT(*) FROM device_addresses a WHERE a.device_id=d.id)=1
-                     THEN (SELECT application_id FROM device_addresses a WHERE a.device_id=d.id LIMIT 1)
-                END,
-                CASE WHEN (SELECT COUNT(*) FROM device_addresses a WHERE a.device_id=d.id)=1
-                     THEN (SELECT application_confidence FROM device_addresses a WHERE a.device_id=d.id LIMIT 1)
-                     ELSE 0 END,
-                CASE WHEN (SELECT COUNT(*) FROM device_addresses a WHERE a.device_id=d.id)=1
-                     THEN (SELECT application_source FROM device_addresses a WHERE a.device_id=d.id LIMIT 1)
-                END
-         FROM devices d LEFT JOIN traffic_device_minute t ON t.device_id = d.id
-         GROUP BY d.id ORDER BY SUM(COALESCE(t.upload_bytes, 0) + COALESCE(t.download_bytes, 0)) DESC,
-                  d.id LIMIT ?1 OFFSET ?2",
-    )?;
-    let items = statement
-        .query_map(params![i64::from(page.limit), to_i64(page.offset)], |row| {
-            let mac: Vec<u8> = row.get(1)?;
-            let ip = row
-                .get::<_, Option<Vec<u8>>>(18)?
-                .map(|value| format_ip(&value));
-            Ok(json!({
-                "id": row.get::<_, i64>(0)?,
-                "mac": format_mac(&mac),
-                "name": row.get::<_, String>(2)?,
-                "vendor": row.get::<_, Option<String>>(3)?,
-                "identity": device_identity_json(row, 3)?,
-                "last_seen": row.get::<_, i64>(14)?,
-                "upload_bytes": row.get::<_, i64>(15)?,
-                "download_bytes": row.get::<_, i64>(16)?,
-                "flow_count": row.get::<_, i64>(17)?,
-                "ip": ip,
-                "self_host_application": row.get::<_, Option<String>>(19)?.map(|application_id| json!({
-                    "application_id": application_id,
-                    "confidence": row.get::<_, f64>(20).unwrap_or(0.0),
-                    "source": row.get::<_, Option<String>>(21).ok().flatten(),
-                    "role": "server",
-                })),
-            }))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok((items, to_u64(total)))
-}
-
-fn query_client_detail(connection: &Connection, id: i64) -> rusqlite::Result<Option<Value>> {
-    let client = connection
-        .query_row(
-            "SELECT d.id, d.mac, COALESCE(d.display_name, d.hostname, ''), d.vendor,
-                    d.device_type, d.os_family, d.model, d.identity_confidence,
-                    COALESCE((SELECT json_group_array(json_object(
-                        'source', e.source, 'field', e.field, 'value', e.value,
-                        'confidence', e.confidence, 'first_seen', e.first_seen,
-                        'last_seen', e.last_seen, 'hit_count', e.hit_count,
-                        'metadata_json', e.metadata_json))
-                      FROM device_evidence e WHERE e.gateway_id = d.gateway_id AND e.mac = d.mac), '[]'),
-                    d.vendor_confidence, d.device_type_confidence, d.os_confidence,
-                    d.model_confidence, d.private_mac, d.first_seen, d.last_seen, COALESCE(SUM(t.upload_bytes), 0),
-                    COALESCE(SUM(t.download_bytes), 0), COALESCE(SUM(t.flow_count), 0)
-             FROM devices d LEFT JOIN traffic_device_minute t ON t.device_id = d.id
-             WHERE d.id = ?1 GROUP BY d.id",
-            [id],
-            |row| {
-                let mac: Vec<u8> = row.get(1)?;
-                Ok(json!({
-                    "id": row.get::<_, i64>(0)?,
-                    "mac": format_mac(&mac),
-                    "name": row.get::<_, String>(2)?,
-                    "vendor": row.get::<_, Option<String>>(3)?,
-                    "identity": device_identity_json(row, 3)?,
-                    "first_seen": row.get::<_, i64>(14)?,
-                    "last_seen": row.get::<_, i64>(15)?,
-                    "upload_bytes": row.get::<_, i64>(16)?,
-                    "download_bytes": row.get::<_, i64>(17)?,
-                    "flow_count": row.get::<_, i64>(18)?,
-                }))
-            },
-        )
-        .optional()?;
-    let Some(mut client) = client else {
-        return Ok(None);
-    };
-    let mut statement = connection.prepare(
-        "SELECT ip, ip_version, first_seen, last_seen, application_id,
-                application_confidence, application_source, application_last_seen
-         FROM device_addresses
-         WHERE device_id = ?1 ORDER BY last_seen DESC, hex(ip)",
-    )?;
-    let addresses = statement
-        .query_map([id], |row| {
-            let address: Vec<u8> = row.get(0)?;
-            Ok(json!({
-                "ip": format_ip(&address),
-                "ip_version": row.get::<_, i64>(1)?,
-                "first_seen": row.get::<_, i64>(2)?,
-                "last_seen": row.get::<_, i64>(3)?,
-                "self_host_application": row.get::<_, Option<String>>(4)?.map(|application_id| json!({
-                    "application_id": application_id,
-                    "confidence": row.get::<_, f64>(5).unwrap_or(0.0),
-                    "source": row.get::<_, Option<String>>(6).ok().flatten(),
-                    "last_seen": row.get::<_, Option<i64>>(7).ok().flatten(),
-                    "role": "server",
-                })),
-            }))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if addresses.len() == 1 {
-        if let Some(application) = addresses[0].get("self_host_application") {
-            if !application.is_null() {
-                client["self_host_application"] = application.clone();
-            }
-        }
+    match state.license.activate(request.license_key.trim()).await {
+        Ok(status) => Json(SuccessEnvelope {
+            schema_version: SCHEMA_VERSION,
+            data: status,
+            pagination: None,
+        })
+        .into_response(),
+        Err(e) => api_error(StatusCode::BAD_GATEWAY, "license_activation_failed", &e),
     }
-    Ok(Some(json!({ "client": client, "addresses": addresses })))
+}
+async fn check_license(State(state): State<CollectorState>) -> Response {
+    match state.license.check().await {
+        Ok(status) => Json(SuccessEnvelope {
+            schema_version: SCHEMA_VERSION,
+            data: status,
+            pagination: None,
+        })
+        .into_response(),
+        Err(e) => api_error(StatusCode::BAD_GATEWAY, "license_check_failed", &e),
+    }
 }
 
 async fn get_retention(State(state): State<CollectorState>) -> Response {
     let inner = state.lock();
-    let result = inner.storage.load_retention_policy();
-    match result {
-        Ok(policy) => api_ok(json!({
-            "flow_sessions_days": policy.flow_sessions_days,
-            "dns_days": policy.dns_days,
-            "minute_days": policy.minute_days,
-            "hour_days": policy.hour_days,
-            "day_days": policy.day_days,
-        })),
-        Err(error) => storage_error(error),
+    match inner.storage.load_retention_policy() {
+        Ok(p) => api_ok(retention_json(p)),
+        Err(e) => storage_error(e),
     }
 }
-
 #[derive(Deserialize)]
 #[allow(clippy::struct_field_names)]
 struct RetentionUpdate {
@@ -2640,10 +1622,9 @@ struct RetentionUpdate {
     hour_days: u32,
     day_days: u32,
 }
-
 async fn put_retention(State(state): State<CollectorState>, body: Bytes) -> Response {
     let update: RetentionUpdate = match serde_json::from_slice(&body) {
-        Ok(update) => update,
+        Ok(v) => v,
         Err(_) => {
             return api_error(
                 StatusCode::BAD_REQUEST,
@@ -2673,7 +1654,7 @@ async fn put_retention(State(state): State<CollectorState>, body: Bytes) -> Resp
             "day_days must be 0 (forever) or >= hour_days",
         );
     }
-    let policy = netqmon_storage::RetentionPolicy {
+    let p = netqmon_storage::RetentionPolicy {
         flow_sessions_days: update.flow_sessions_days,
         dns_days: update.dns_days,
         minute_days: update.minute_days,
@@ -2681,46 +1662,37 @@ async fn put_retention(State(state): State<CollectorState>, body: Bytes) -> Resp
         day_days: update.day_days,
     };
     let mut inner = state.lock();
-    match inner.storage.save_retention_policy(&policy, now_ms()) {
-        Ok(()) => api_ok(json!({
-            "flow_sessions_days": policy.flow_sessions_days,
-            "dns_days": policy.dns_days,
-            "minute_days": policy.minute_days,
-            "hour_days": policy.hour_days,
-            "day_days": policy.day_days,
-        })),
-        Err(error) => storage_error(error),
+    match inner.storage.save_retention_policy(&p, now_ms()) {
+        Ok(()) => api_ok(retention_json(p)),
+        Err(e) => storage_error(e),
     }
 }
-
+fn retention_json(p: netqmon_storage::RetentionPolicy) -> Value {
+    json!({"flow_sessions_days":p.flow_sessions_days,"dns_days":p.dns_days,"minute_days":p.minute_days,"hour_days":p.hour_days,"day_days":p.day_days})
+}
 async fn run_retention(State(state): State<CollectorState>) -> Response {
-    let result = {
-        let mut inner = state.lock();
-        let policy = match inner.storage.load_retention_policy() {
-            Ok(policy) => policy,
-            Err(error) => return storage_error(error),
-        };
-        inner.storage.run_retention(now_ms(), policy)
+    let mut inner = state.lock();
+    let p = match inner.storage.load_retention_policy() {
+        Ok(v) => v,
+        Err(e) => return storage_error(e),
     };
-    match result {
-        Ok(()) => api_ok(json!({ "status": "completed" })),
-        Err(error) => storage_error(error),
+    match inner.storage.run_retention(now_ms(), p) {
+        Ok(()) => api_ok(json!({"status":"completed"})),
+        Err(e) => storage_error(e),
     }
 }
-
 async fn reload_rules(State(state): State<CollectorState>) -> Response {
     let inner = state.lock();
     match inner.classifier.reload_rules() {
-        Ok(stats) => {
-            let mut payload =
-                serde_json::to_value(&stats).expect("rule statistics serialize as JSON object");
-            payload["reloaded_at"] = json!(now_ms());
-            api_ok(payload)
+        Ok(reload_stats) => {
+            let mut value = serde_json::to_value(&reload_stats).expect("stats serialize");
+            value["reloaded_at"] = json!(now_ms());
+            api_ok(value)
         }
-        Err(error) => api_error(
+        Err(e) => api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "classifier_unavailable",
-            &error,
+            &e,
         ),
     }
 }
@@ -2731,81 +1703,42 @@ async fn diagnostics(State(state): State<CollectorState>) -> Response {
         .gateway_health
         .and_then(|health| health.topology);
     let inner = state.lock();
-    let result = (|| -> Result<Value, String> {
-        let now = now_ms();
-        let db_size = inner
-            .storage
-            .database_size_bytes()
-            .map_err(|e| e.to_string())?;
-        let active_flows = inner
-            .storage
-            .active_flow_count()
-            .map_err(|e| e.to_string())?;
-        let unknown_ratio = inner
-            .storage
-            .unknown_ratio(now.saturating_sub(DAY_MS))
-            .map_err(|e| e.to_string())?;
-        let retention = inner
-            .storage
-            .load_retention_policy()
-            .map_err(|e| e.to_string())?;
-
-        let gateway = if let Some(ch) = inner.storage.clickhouse_storage() {
-            let gw_sql = "SELECT id, name, agent_version, kernel_version, openwrt_version, last_seen FROM gateways FINAL ORDER BY created_at LIMIT 1 FORMAT JSON";
-            let res = ch.client().query_json(gw_sql).map_err(|e| e.to_string())?;
-            res["data"].as_array().and_then(|a| a.first()).map(|r| json!({
-                "id": r["id"].as_str().unwrap_or(""),
-                "name": r["name"].as_str().unwrap_or(""),
-                "agent_version": r["agent_version"].as_str().unwrap_or(""),
-                "kernel_version": r["kernel_version"].as_str().unwrap_or(""),
-                "openwrt_version": r["openwrt_version"].as_str().unwrap_or(""),
-                "last_seen": r["last_seen"].as_i64().or_else(|| r["last_seen"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0),
-            }))
-        } else {
-            let connection = inner.storage.connection();
-            connection
-                .query_row(
-                    "SELECT id, name, agent_version, kernel_version, openwrt_version, last_seen
-                     FROM gateways ORDER BY created_at LIMIT 1",
-                    [],
-                    |row| {
-                        Ok(json!({
-                            "id": row.get::<_, String>(0)?,
-                            "name": row.get::<_, String>(1)?,
-                            "agent_version": row.get::<_, String>(2)?,
-                            "kernel_version": row.get::<_, String>(3)?,
-                            "openwrt_version": row.get::<_, String>(4)?,
-                            "last_seen": row.get::<_, i64>(5)?,
-                        }))
-                    },
-                )
-                .optional()
-                .map_err(|e| e.to_string())?
-        };
-
-        Ok(json!({
-            "collector_version": env!("CARGO_PKG_VERSION"),
-            "db_backend": inner.storage.backend_name(),
-            "db_size_bytes": db_size,
-            "gateway": gateway,
-            "active_flows": active_flows,
-            "unknown_ratio": unknown_ratio,
-            "retention": {
-                "flow_sessions_days": retention.flow_sessions_days,
-                "dns_days": retention.dns_days,
-                "minute_days": retention.minute_days,
-                "hour_days": retention.hour_days,
-                "day_days": retention.day_days,
-            },
-            "geo_enabled": inner.geo_provider.is_enabled(),
-            "classification": inner.classifier.diagnostics(),
-            "classifier_manager": classifier_manager_status(),
-            "sampling": state.sampling.diagnostics(),
-            "recognition": crate::recognition_diagnostics::diagnostics(&inner, now.saturating_sub(DAY_MS))?,
-            "topology": topology,
-        }))
-    })();
-    result.map_or_else(storage_error, api_ok)
+    let now = now_ms();
+    let metadata_size = match inner.storage.metadata_database_size_bytes() {
+        Ok(v) => v,
+        Err(e) => return storage_error(e),
+    };
+    let analytics_size = match inner.storage.analytics_database_size_bytes() {
+        Ok(v) => v,
+        Err(e) => return storage_error(e),
+    };
+    let active = match inner.storage.active_flow_count() {
+        Ok(v) => v,
+        Err(e) => return storage_error(e),
+    };
+    let unknown = match inner.storage.unknown_ratio(now.saturating_sub(DAY_MS)) {
+        Ok(v) => v,
+        Err(e) => return storage_error(e),
+    };
+    let policy = match inner.storage.load_retention_policy() {
+        Ok(v) => v,
+        Err(e) => return storage_error(e),
+    };
+    let depth = match inner.storage.outbox_depth() {
+        Ok(v) => v,
+        Err(e) => return storage_error(e),
+    };
+    let age = match inner.storage.outbox_oldest_age_ms(now) {
+        Ok(v) => v,
+        Err(e) => return storage_error(e),
+    };
+    let gateway = match inner.storage.gateway_details() {
+        Ok(v) => v,
+        Err(e) => return storage_error(e),
+    };
+    api_ok(
+        json!({"collector_version":env!("CARGO_PKG_VERSION"),"analytics_backend":inner.storage.analytics_backend(),"metadata_database_size_bytes":metadata_size,"analytics_database_size_bytes":analytics_size,"analytics_outbox_depth":depth,"analytics_outbox_oldest_age_ms":age,"analytics_last_success_at":inner.analytics_last_success_at_ms,"analytics_last_error":inner.analytics_last_error,"active_flow_count":active,"unknown_ratio":unknown,"gateway":gateway,"retention":retention_json(policy),"geo_enabled":inner.geo_provider.is_enabled(),"classification":inner.classifier.diagnostics(),"classifier_manager":classifier_manager_status(),"sampling":state.sampling.diagnostics(),"recognition":crate::recognition_diagnostics::diagnostics(&inner,now.saturating_sub(DAY_MS)),"topology":topology}),
+    )
 }
 
 pub(crate) fn classifier_manager_status_from_path(path: &std::path::Path) -> Option<Value> {
@@ -2816,7 +1749,6 @@ pub(crate) fn classifier_manager_status_from_path(path: &std::path::Path) -> Opt
         .ok()
         .and_then(|content| serde_json::from_str::<Value>(&content).ok())
 }
-
 fn classifier_manager_status() -> Option<Value> {
     classifier_manager_status_from_path(std::path::Path::new(
         "/run/netqmon/classifier-manager-status.json",
@@ -2834,7 +1766,6 @@ fn api_ok(data: Value) -> Response {
     )
         .into_response()
 }
-
 fn page_ok(items: Vec<Value>, page: Page, total: u64) -> Response {
     (
         StatusCode::OK,
@@ -2850,30 +1781,9 @@ fn page_ok(items: Vec<Value>, page: Page, total: u64) -> Response {
     )
         .into_response()
 }
-
-fn icon_json(metadata: Option<crate::classifier::EntityMetadata>) -> Value {
-    metadata.map_or(Value::Null, |metadata| json!(metadata.icon))
-}
-
-fn metadata_name(metadata: Option<&crate::classifier::EntityMetadata>, fallback: &str) -> String {
-    metadata.map_or_else(|| fallback.to_owned(), |metadata| metadata.name.clone())
-}
-
 fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
-    (
-        status,
-        Json(json!({
-            "schema_version": SCHEMA_VERSION,
-            "error": {
-                "code": code,
-                "message": message,
-            },
-            "pagination": null,
-        })),
-    )
-        .into_response()
+    (status,Json(json!({"schema_version":SCHEMA_VERSION,"error":{"code":code,"message":message},"pagination":null}))).into_response()
 }
-
 fn storage_error<E: std::fmt::Display>(_error: E) -> Response {
     api_error(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -2881,157 +1791,191 @@ fn storage_error<E: std::fmt::Display>(_error: E) -> Response {
         "query could not be completed",
     )
 }
-
-fn scalar<P>(connection: &Connection, sql: &str, parameters: P) -> rusqlite::Result<i64>
-where
-    P: rusqlite::Params,
-{
-    connection.query_row(sql, parameters, |row| row.get(0))
+fn icon_json(metadata: Option<crate::classifier::EntityMetadata>) -> Value {
+    metadata.map_or(Value::Null, |m| json!(m.icon))
 }
-
+fn parse_positive_id(value: &str, code: &str) -> Result<i64, Box<Response>> {
+    let Ok(id) = value.parse::<i64>() else {
+        return Err(Box::new(api_error(
+            StatusCode::BAD_REQUEST,
+            code,
+            "client id must be an integer",
+        )));
+    };
+    if id <= 0 {
+        return Err(Box::new(api_error(
+            StatusCode::BAD_REQUEST,
+            code,
+            "client id must be positive",
+        )));
+    }
+    Ok(id)
+}
+fn positive_id_as_u64(id: i64) -> u64 {
+    u64::try_from(id).expect("device IDs are positive")
+}
 fn format_mac(bytes: &[u8]) -> String {
     if bytes.len() != 6 {
         return "unknown".to_owned();
     }
     bytes
         .iter()
-        .map(|byte| format!("{byte:02x}"))
+        .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .join(":")
 }
-
-fn device_identity_json(row: &Row<'_>, vendor_index: usize) -> rusqlite::Result<Value> {
-    let evidence_text: String = row
-        .get::<_, Option<String>>(vendor_index + 5)?
-        .unwrap_or_else(|| "[]".to_owned());
-    let evidence = serde_json::from_str::<Value>(&evidence_text).unwrap_or_else(|_| json!([]));
-    Ok(json!({
-        "vendor": row.get::<_, Option<String>>(vendor_index)?,
-        "device_type": row.get::<_, Option<String>>(vendor_index + 1)?,
-        "os_family": row.get::<_, Option<String>>(vendor_index + 2)?,
-        "model": row.get::<_, Option<String>>(vendor_index + 3)?,
-        "confidence": row
-            .get::<_, Option<String>>(vendor_index + 4)?
-            .unwrap_or_else(|| "unknown".to_owned()),
-        "vendor_confidence": row.get::<_, f64>(vendor_index + 6)?,
-        "device_type_confidence": row.get::<_, f64>(vendor_index + 7)?,
-        "os_confidence": row.get::<_, f64>(vendor_index + 8)?,
-        "model_confidence": row.get::<_, f64>(vendor_index + 9)?,
-        "private_mac": row.get::<_, bool>(vendor_index + 10)?,
-        "evidence": evidence,
-    }))
+fn display_name(d: &netqmon_storage::metadata::DeviceRecord) -> String {
+    d.display_name
+        .clone()
+        .or_else(|| d.hostname.clone())
+        .unwrap_or_default()
 }
-
-fn valid_identifier(value: &str) -> bool {
+fn device_json(
+    d: &netqmon_storage::metadata::DeviceRecord,
+    traffic: Option<&AnalyticsSummary>,
+    evidence_rows: &[netqmon_storage::DeviceEvidenceRecord],
+    addresses: &[netqmon_storage::metadata::DeviceAddressRecord],
+) -> Value {
+    let evidence = if evidence_rows.is_empty() {
+        serde_json::from_str::<Value>(&d.identity_evidence_json).unwrap_or_else(|_| json!([]))
+    } else {
+        json!(evidence_rows.iter().map(|row| json!({
+            "source":row.source,"field":row.field,"value":row.value,"confidence":row.confidence,
+            "first_seen":row.first_seen,"last_seen":row.last_seen,"hit_count":row.hit_count,
+            "metadata_json":row.metadata_json
+        })).collect::<Vec<_>>())
+    };
+    let identity = json!({"vendor":d.vendor,"device_type":d.device_type,"os_family":d.os_family,"model":d.model,"confidence":d.identity_confidence,"vendor_confidence":d.vendor_confidence,"device_type_confidence":d.device_type_confidence,"os_confidence":d.os_confidence,"model_confidence":d.model_confidence,"private_mac":d.private_mac,"evidence":evidence});
+    let latest_address = addresses.iter().max_by_key(|address| address.last_seen);
+    let self_host_application = (addresses.len() == 1)
+        .then(|| addresses.first())
+        .flatten()
+        .and_then(|address| {
+            address.application_id.as_ref().map(|application_id| {
+                json!({
+                    "application_id":application_id,"confidence":address.application_confidence,
+                    "source":address.application_source,"role":"server"
+                })
+            })
+        });
+    json!({"id":d.id,"mac":format_mac(&d.mac),"name":display_name(d),"hostname":d.hostname,"display_name":d.display_name,"vendor":d.vendor,"identity":identity,"first_seen":d.first_seen,"last_seen":d.last_seen,"upload_bytes":traffic.map_or(0,|t|t.upload_bytes),"download_bytes":traffic.map_or(0,|t|t.download_bytes),"flow_count":traffic.map_or(0,|t|t.flow_count),"ip":latest_address.map(|address|format_ip(&address.ip)),"address_count":addresses.len(),"self_host_application":self_host_application})
+}
+fn device_address_json(a: &netqmon_storage::metadata::DeviceAddressRecord) -> Value {
+    json!({"ip":format_ip(&a.ip),"ip_version":a.ip_version,"first_seen":a.first_seen,"last_seen":a.last_seen,"application_id":a.application_id,"application_confidence":a.application_confidence,"application_source":a.application_source,"application_last_seen":a.application_last_seen,"self_host_source":a.self_host_source,"self_host_last_seen":a.self_host_last_seen,"role":if a.self_host_source.is_some(){"server"}else{"client"}})
+}
+fn summary_item(
+    row: &AnalyticsSummary,
+    kind: &str,
+    classifier: &crate::classifier::ClassifierHandle,
+) -> Value {
+    let key = if kind == "destination" {
+        netqmon_storage::from_hex(&row.key)
+            .map_or_else(|_| row.key.clone(), |bytes| format_ip(&bytes))
+    } else {
+        row.key.clone()
+    };
+    let mut item = json!({"id":key,"name":key,"upload_bytes":row.upload_bytes,"download_bytes":row.download_bytes,"packets":row.packets,"flow_count":row.flow_count,"last_seen":row.last_seen_at,"client_count":row.distinct_devices,"device_id":row.device_id});
+    if kind == "application" {
+        let metadata = classifier.application_metadata(&row.key);
+        item["name"] = json!(
+            metadata
+                .as_ref()
+                .map_or_else(|| row.key.clone(), |m| m.name.clone())
+        );
+        item["icon"] = icon_json(metadata);
+    }
+    if kind == "organization" || kind == "protocol" || kind == "domain" {
+        item["name"] = json!(if row.key.is_empty() {
+            "unknown"
+        } else {
+            &row.key
+        });
+    }
+    item
+}
+fn non_empty(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
+}
+fn valid_entity_id(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= 128
         && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
         })
 }
-
+fn ip_bytes(ip: IpAddr) -> Vec<u8> {
+    match ip {
+        IpAddr::V4(v) => v.octets().to_vec(),
+        IpAddr::V6(v) => v.octets().to_vec(),
+    }
+}
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-        })
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
-
-fn to_i64(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
-}
-
 fn gateway_offline_after_ms() -> u64 {
     std::env::var("NETQMON_GATEWAY_OFFLINE_AFTER_MS")
         .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value > 0)
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_GATEWAY_OFFLINE_AFTER_MS)
 }
 
-fn to_u64(value: i64) -> u64 {
-    u64::try_from(value).unwrap_or(0)
-}
-
 async fn get_geo_settings(State(state): State<CollectorState>) -> Response {
-    let (geo_directory, enabled) = {
+    let (directory, enabled) = {
         let inner = state.lock();
         (inner.geo_directory.clone(), inner.geo_provider.is_enabled())
     };
-    let status = geo_updater::get_geo_status(&geo_directory, enabled);
-    api_ok(json!(status))
+    api_ok(json!(geo_updater::get_geo_status(&directory, enabled)))
 }
-
 #[derive(Clone, Debug, Default, Deserialize)]
 struct GeoUpdateRequest {
-    city_url: Option<String>,
-    country_url: Option<String>,
-    asn_url: Option<String>,
+    #[serde(rename = "city_url")]
+    city: Option<String>,
+    #[serde(rename = "country_url")]
+    country: Option<String>,
+    #[serde(rename = "asn_url")]
+    asn: Option<String>,
 }
-
 async fn post_geo_update(
     State(state): State<CollectorState>,
     body: Option<Json<GeoUpdateRequest>>,
 ) -> Response {
-    let geo_directory = {
-        let inner = state.lock();
-        inner.geo_directory.clone()
-    };
+    let directory = { state.lock().geo_directory.clone() };
     let payload = body.map(|b| b.0).unwrap_or_default();
-
-    let update_res = tokio::task::spawn_blocking(move || {
+    let update = tokio::task::spawn_blocking(move || {
         let city = payload
-            .city_url
-            .or(payload.country_url)
+            .city
+            .or(payload.country)
             .unwrap_or_else(|| geo_updater::DEFAULT_CITY_SOURCE.to_owned());
         let asn = payload
-            .asn_url
+            .asn
             .unwrap_or_else(|| geo_updater::DEFAULT_ASN_SOURCE.to_owned());
-        geo_updater::update_geo_databases_with_urls(&geo_directory, &city, &asn)
+        geo_updater::update_geo_databases_with_urls(&directory, &city, &asn)
     })
     .await;
-
-    let (actual_directory, updated_files) = match update_res {
-        Ok(Ok((dir, files))) => (dir, files),
-        Ok(Err(error)) => {
+    let (actual, files) = match update {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "geo_update_error", &e),
+        Err(e) => {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "geo_update_error",
-                &error,
-            );
-        }
-        Err(join_err) => {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "geo_update_error",
-                &join_err.to_string(),
+                &e.to_string(),
             );
         }
     };
-
-    let (geo_directory, enabled) = {
+    let (directory, enabled) = {
         let mut inner = state.lock();
-        inner.geo_directory = actual_directory;
+        inner.geo_directory = actual;
         let load = netqmon_geo::LocalDbProvider::load(&inner.geo_directory);
         for warning in &load.warnings {
             tracing::warn!(warning, "geo reload warning");
         }
-        let enabled = load.provider.is_enabled();
         inner.geo_provider = Arc::new(load.provider);
-        tracing::info!(
-            enabled,
-            directory = %inner.geo_directory.display(),
-            "geo provider reloaded successfully"
-        );
-        (inner.geo_directory.clone(), enabled)
+        (inner.geo_directory.clone(), inner.geo_provider.is_enabled())
     };
-
-    let status = geo_updater::get_geo_status(&geo_directory, enabled);
-    api_ok(json!({
-        "success": true,
-        "message": "Geo databases updated and reloaded successfully",
-        "updated_files": updated_files,
-        "status": status,
-    }))
+    api_ok(
+        json!({"success":true,"message":"Geo databases updated and reloaded successfully","updated_files":files,"status":geo_updater::get_geo_status(&directory,enabled)}),
+    )
 }

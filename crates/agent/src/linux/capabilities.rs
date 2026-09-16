@@ -304,8 +304,7 @@ pub(super) fn probe_tcx_backend(config: &AgentConfig) -> libbpf_rs::Result<()> {
         )?);
     }
     for link in &mut links {
-        link.detach()
-            .map_err(|_| libbpf_rs::Error::from_raw_os_error(nix::libc::EIO))?;
+        link.detach();
     }
     Ok(())
 }

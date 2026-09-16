@@ -7,19 +7,17 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::analytics::{AnalyticsBatch, AnalyticsFlow, TrafficDelta};
+use crate::metadata::{DeviceAddressRecord, DeviceRecord, GatewayDetails};
 use netqmon_protocol::v1::{FlowDelta, FlowLifecycle, TelemetryBatch};
-use rusqlite::types::{Type, Value};
+use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 const INITIAL_MIGRATION: &str = include_str!("../../../migrations/sqlite/0001_initial.sql");
-const PROTOCOL_MIGRATION: &str =
-    include_str!("../../../migrations/sqlite/0002_traffic_scope_protocol.sql");
-const MIGRATIONS: [(i64, &str); 2] = [(1, INITIAL_MIGRATION), (2, PROTOCOL_MIGRATION)];
+const MIGRATIONS: [(i64, &str); 1] = [(1, INITIAL_MIGRATION)];
 const MINUTE_MS: i64 = 60 * 1_000;
-const HOUR_MS: i64 = 60 * MINUTE_MS;
-const DAY_MS: i64 = 24 * HOUR_MS;
+const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
 const FLOW_CHECKPOINT_MS: i64 = 5 * MINUTE_MS;
-const DIMENSIONS: [&str; 5] = ["total", "device", "application", "domain", "destination"];
 
 /// Default database location for the single-container deployment.
 pub const DEFAULT_DATABASE_PATH: &str = "/data/netqmon.db";
@@ -43,15 +41,6 @@ pub struct SessionRecord {
     pub user_id: String,
     pub username: String,
     pub expires_at: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TrafficTotal {
-    pub timestamp: i64,
-    pub upload_bytes: i64,
-    pub download_bytes: i64,
-    pub packets: i64,
-    pub flow_count: i64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -157,26 +146,35 @@ impl Default for RetentionPolicy {
     }
 }
 
+pub mod analytics;
 pub mod clickhouse;
-pub use clickhouse::{ClickHouseClient, ClickHouseConfig, ClickHouseStorage, from_hex, to_hex};
+pub mod metadata;
+pub mod storage;
+pub use clickhouse::{ClickHouseClient, ClickHouseConfig, from_hex, to_hex};
+pub use metadata::{MetadataStore, SqliteMetadataStore};
+pub use storage::{AnalyticsBackend, Storage};
 
 /// Unified storage error covering SQLite and `ClickHouse` operations.
 #[derive(Debug)]
 pub enum StorageError {
-    Sqlite(rusqlite::Error),
+    MetadataSqlite(rusqlite::Error),
+    DuckDb(String),
     ClickHouse(String),
     Connection(String),
     Serialization(String),
+    InvalidData(String),
     Other(String),
 }
 
 impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Sqlite(err) => write!(f, "sqlite error: {err}"),
+            Self::MetadataSqlite(err) => write!(f, "sqlite metadata error: {err}"),
+            Self::DuckDb(err) => write!(f, "duckdb error: {err}"),
             Self::ClickHouse(err) => write!(f, "clickhouse error: {err}"),
             Self::Connection(err) => write!(f, "storage connection error: {err}"),
             Self::Serialization(err) => write!(f, "storage serialization error: {err}"),
+            Self::InvalidData(err) => write!(f, "invalid storage data: {err}"),
             Self::Other(err) => write!(f, "storage error: {err}"),
         }
     }
@@ -185,7 +183,7 @@ impl std::fmt::Display for StorageError {
 impl std::error::Error for StorageError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Sqlite(err) => Some(err),
+            Self::MetadataSqlite(err) => Some(err),
             _ => None,
         }
     }
@@ -193,194 +191,11 @@ impl std::error::Error for StorageError {
 
 impl From<rusqlite::Error> for StorageError {
     fn from(err: rusqlite::Error) -> Self {
-        Self::Sqlite(err)
+        Self::MetadataSqlite(err)
     }
 }
 
 pub type StorageResult<T> = Result<T, StorageError>;
-
-pub trait StorageBackend {
-    /// Loads the enrolled Gateway, if present.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when backend cannot execute or decode the query.
-    fn gateway(&self) -> StorageResult<Option<GatewayRecord>>;
-    /// Creates the v1 Gateway if none is enrolled.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when backend cannot execute the insert.
-    fn save_gateway(
-        &mut self,
-        gateway_id: &str,
-        name: &str,
-        agent_version: &str,
-        agent_token_hash: &[u8],
-        now_ms: u64,
-    ) -> StorageResult<bool>;
-    /// Replaces credentials for a stale Gateway without changing its identity.
-    ///
-    /// The replacement must be conditional on `last_seen` being at or before
-    /// `stale_before_ms`, so concurrent enrollment attempts cannot both rotate
-    /// the same Gateway.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the backend cannot execute the conditional update.
-    fn replace_stale_gateway(
-        &mut self,
-        gateway_id: &str,
-        name: &str,
-        agent_version: &str,
-        agent_token_hash: &[u8],
-        stale_before_ms: u64,
-        now_ms: u64,
-    ) -> StorageResult<bool>;
-    /// Returns whether the administrator account exists.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if lookup fails.
-    fn admin_exists(&self) -> StorageResult<bool>;
-    /// Creates the first administrator.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if creation fails.
-    fn create_admin(
-        &mut self,
-        id: &str,
-        username: &str,
-        password_hash: &str,
-        now_ms: u64,
-    ) -> StorageResult<bool>;
-    /// Looks up user by username.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if query fails.
-    fn user_by_username(&self, username: &str) -> StorageResult<Option<UserRecord>>;
-    /// Creates an authentication session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if session cannot be saved.
-    fn create_session(
-        &mut self,
-        user_id: &str,
-        token_hash: &[u8],
-        now_ms: u64,
-        expires_at: u64,
-    ) -> StorageResult<()>;
-    /// Loads an active session by token hash.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if lookup fails.
-    fn session(&self, token_hash: &[u8], now_ms: u64) -> StorageResult<Option<SessionRecord>>;
-    /// Deletes a session by token hash.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if deletion fails.
-    fn delete_session(&mut self, token_hash: &[u8]) -> StorageResult<bool>;
-    /// Persists one idempotent telemetry batch.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the batch cannot be persisted.
-    fn persist_batch(
-        &mut self,
-        batch: &TelemetryBatch,
-        received_at_ms: u64,
-    ) -> StorageResult<PersistDisposition>;
-    /// Persists a classified batch.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if batch cannot be persisted.
-    fn persist_classified_batch(
-        &mut self,
-        batch: &TelemetryBatch,
-        attributions: &[FlowAttribution],
-        device_identities: &[DeviceIdentityUpdate],
-        received_at_ms: u64,
-    ) -> StorageResult<PersistDisposition>;
-    /// Loads all accumulated identity evidence for one Gateway-scoped device.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the evidence cannot be queried or decoded.
-    fn device_evidence(
-        &self,
-        gateway_id: &str,
-        mac: &[u8],
-    ) -> StorageResult<Vec<DeviceEvidenceRecord>>;
-    /// Resolves the most recent client-scoped DNS answer valid at a timestamp.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when backend cannot execute or decode the query.
-    fn resolve_domain(
-        &self,
-        gateway_id: &str,
-        client_ip: &[u8],
-        answer_ip: &[u8],
-        at_ms: u64,
-    ) -> StorageResult<Option<String>>;
-    /// Queries minute totals in the half-open time range.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when backend cannot execute or decode the query.
-    fn query_total_traffic(&self, from_ms: u64, to_ms: u64) -> StorageResult<Vec<TrafficTotal>>;
-    /// Aggregates complete minute buckets into hour and day tables.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the aggregation cannot be executed.
-    fn roll_up_hour_and_day(&mut self, now_ms: u64) -> StorageResult<()>;
-    /// Applies the configured retention policy.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the retention execution fails.
-    fn run_retention(&mut self, now_ms: u64, policy: RetentionPolicy) -> StorageResult<()>;
-    /// Loads the persisted retention policy.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if policy cannot be read.
-    fn load_retention_policy(&self) -> StorageResult<RetentionPolicy>;
-    /// Saves the retention policy.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if policy cannot be saved.
-    fn save_retention_policy(&mut self, policy: &RetentionPolicy, now_ms: u64)
-    -> StorageResult<()>;
-    /// Counts currently active flows.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if count fails.
-    fn active_flow_count(&self) -> StorageResult<i64>;
-    /// Calculates the ratio of unknown traffic since timestamp.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if calculation fails.
-    fn unknown_ratio(&self, since_ms: u64) -> StorageResult<f64>;
-    /// Returns database size in bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if size cannot be determined.
-    fn database_size_bytes(&self) -> StorageResult<i64>;
-    /// Returns backend name identifier.
-    fn backend_name(&self) -> &'static str;
-}
 
 /// The single SQLite writer owned by the Collector.
 #[derive(Debug)]
@@ -419,6 +234,11 @@ impl SqliteStorage {
             connection,
             active_flows,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.connection
     }
 
     /// Loads the single enrolled Gateway.
@@ -701,18 +521,136 @@ impl SqliteStorage {
         persist_devices(&transaction, batch, device_identities)?;
         persist_self_host_endpoint_evidence(&transaction, batch, attributions)?;
         persist_dns(&transaction, batch)?;
-        persist_minute_rollups(&transaction, batch, attributions)?;
         let mut staged_active_flows = self.active_flows.clone();
-        update_active_flows(
+        let flow_versions = update_active_flows(
             &transaction,
             &mut staged_active_flows,
             batch,
             attributions,
             received_at,
         )?;
+        let analytics_batch = build_analytics_batch(
+            &transaction,
+            batch,
+            attributions,
+            flow_versions,
+            received_at_ms,
+        )?;
+        let payload = analytics_batch.encode().map_err(|error| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error)))
+        })?;
+        transaction.execute(
+            "INSERT INTO analytics_outbox(gateway_id, boot_id, sequence, payload, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                batch.gateway_id,
+                batch.boot_id,
+                to_i64(batch.sequence),
+                payload,
+                received_at,
+            ],
+        )?;
         transaction.commit()?;
         self.active_flows = staged_active_flows;
         Ok(PersistDisposition::Accepted)
+    }
+
+    /// Stores a late classification update and appends a new analytics flow
+    /// version without repeating the packet counters or traffic contribution.
+    ///
+    /// # Errors
+    /// Returns an error if SQLite cannot update the flow or append its outbox event.
+    pub fn append_reclassification(
+        &mut self,
+        gateway_id: &str,
+        flow: &FlowDelta,
+        attribution: &FlowAttribution,
+        now_ms: u64,
+    ) -> rusqlite::Result<bool> {
+        self.append_reclassification_with_latest(gateway_id, flow, attribution, now_ms, None)
+    }
+
+    /// Stores a late classification update using the latest analytics version
+    /// when the ended flow has already left SQLite recovery state.
+    ///
+    /// # Errors
+    /// Returns an error if SQLite cannot append the reclassification outbox event.
+    pub fn append_reclassification_with_latest(
+        &mut self,
+        gateway_id: &str,
+        flow: &FlowDelta,
+        attribution: &FlowAttribution,
+        now_ms: u64,
+        latest: Option<&AnalyticsFlow>,
+    ) -> rusqlite::Result<bool> {
+        // FlowSampleKey intentionally contains only the network tuple and
+        // timestamps. It does not carry the collector's upload/download
+        // direction, so resolve the persisted identity from that tuple first.
+        let cached_key = self
+            .active_flows
+            .iter()
+            .find(|(candidate, current)| sample_matches(candidate, current, gateway_id, flow))
+            .map(|(candidate, _)| candidate.clone());
+        let cached = cached_key
+            .as_ref()
+            .and_then(|candidate| self.active_flows.get(candidate))
+            .cloned();
+        let key = cached_key.unwrap_or_else(|| FlowKey::from_batch(gateway_id, flow));
+        let mut staged_active = cached.clone();
+        if let Some(current) = &mut staged_active {
+            apply_late_protocol(&mut current.attribution, attribution);
+        }
+
+        let now = to_i64(now_ms);
+        let transaction = self.connection.transaction()?;
+        let analytics_flow = if let Some(current) = &staged_active {
+            write_flow_session(&transaction, &key, current, false, now)?;
+            analytics_flow_from_current(&transaction, &key, current, false, now)?
+        } else if let Some(latest) = latest {
+            let mut updated = latest.clone();
+            apply_late_protocol_to_analytics_flow(&mut updated, attribution, now_ms);
+            updated
+        } else {
+            let Some(analytics_flow) = update_persisted_reclassification(
+                &transaction,
+                gateway_id,
+                &key,
+                flow,
+                attribution,
+            )?
+            else {
+                transaction.rollback()?;
+                return Ok(false);
+            };
+            analytics_flow
+        };
+
+        let sequence: i64 = transaction.query_row(
+            "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'analytics_outbox'), 0) + 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let batch = AnalyticsBatch {
+            gateway_id: gateway_id.to_owned(),
+            boot_id: "late-dpi".to_owned(),
+            sequence: u64::try_from(sequence).unwrap_or(1),
+            received_at: now_ms,
+            flows: vec![analytics_flow],
+            traffic: Vec::new(),
+        };
+        let payload = batch.encode().map_err(|error| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error)))
+        })?;
+        transaction.execute(
+            "INSERT INTO analytics_outbox(gateway_id, boot_id, sequence, payload, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![gateway_id, batch.boot_id, sequence, payload, now],
+        )?;
+        transaction.commit()?;
+        if let Some(current) = staged_active {
+            self.active_flows.insert(key, current);
+        }
+        Ok(true)
     }
 
     /// Loads the accumulated identity evidence for one device.
@@ -775,21 +713,6 @@ impl SqliteStorage {
             .optional()
     }
 
-    /// Aggregates complete minute buckets into hour and day tables.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the aggregation transaction cannot be committed.
-    pub fn roll_up_hour_and_day(&mut self, now_ms: u64) -> rusqlite::Result<()> {
-        let now = to_i64(now_ms);
-        let transaction = self.connection.transaction()?;
-        for dimension in DIMENSIONS {
-            aggregate(&transaction, dimension, "minute", "hour", HOUR_MS, now)?;
-            aggregate(&transaction, dimension, "hour", "day", DAY_MS, now)?;
-        }
-        transaction.commit()
-    }
-
     /// Deletes data older than its retention window and expired DNS answers.
     ///
     /// # Errors
@@ -798,13 +721,6 @@ impl SqliteStorage {
     pub fn run_retention(&mut self, now_ms: u64, policy: RetentionPolicy) -> rusqlite::Result<()> {
         let now = to_i64(now_ms);
         let transaction = self.connection.transaction()?;
-        delete_older_than(
-            &transaction,
-            "flow_sessions",
-            "last_seen_at",
-            now,
-            policy.flow_sessions_days,
-        )?;
         if policy.dns_days == 0 {
             transaction.execute("DELETE FROM dns_observations WHERE expires_at < ?1", [now])?;
         } else {
@@ -821,34 +737,14 @@ impl SqliteStorage {
             now,
             policy.minute_days,
         )?;
-        for dimension in DIMENSIONS {
-            delete_older_than(
-                &transaction,
-                &format!("traffic_{dimension}_minute"),
-                "timestamp",
-                now,
-                policy.minute_days,
-            )?;
-            delete_older_than(
-                &transaction,
-                &format!("traffic_{dimension}_hour"),
-                "timestamp",
-                now,
-                policy.hour_days,
-            )?;
-            delete_older_than(
-                &transaction,
-                &format!("traffic_{dimension}_day"),
-                "timestamp",
-                now,
-                policy.day_days,
+        if policy.flow_sessions_days > 0 {
+            let cutoff = now.saturating_sub(i64::from(policy.flow_sessions_days) * DAY_MS);
+            transaction.execute(
+                "DELETE FROM active_flow_sessions WHERE ended_at IS NOT NULL AND last_seen_at < ?1",
+                [cutoff],
             )?;
         }
         transaction.commit()
-    }
-
-    pub fn connection(&self) -> &Connection {
-        &self.connection
     }
 
     /// Loads the persisted retention policy or returns the default.
@@ -896,30 +792,10 @@ impl SqliteStorage {
     /// Returns an error when SQLite cannot execute the query.
     pub fn active_flow_count(&self) -> rusqlite::Result<i64> {
         self.connection.query_row(
-            "SELECT COUNT(*) FROM flow_sessions WHERE ended_at IS NULL",
+            "SELECT COUNT(*) FROM active_flow_sessions WHERE ended_at IS NULL",
             [],
             |row| row.get(0),
         )
-    }
-
-    /// Returns the ratio of unknown-classified flows to total recent flows.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when SQLite cannot execute the query.
-    #[allow(clippy::cast_precision_loss)]
-    pub fn unknown_ratio(&self, since_ms: u64) -> rusqlite::Result<f64> {
-        let result: (i64, i64) = self.connection.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN application_id = 'unknown' THEN 1 ELSE 0 END), 0)
-             FROM flow_sessions WHERE last_seen_at >= ?1",
-            [to_i64(since_ms)],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if result.0 == 0 {
-            Ok(0.0)
-        } else {
-            Ok(result.1 as f64 / result.0 as f64)
-        }
     }
 
     /// Returns the database file size in bytes.
@@ -941,38 +817,212 @@ impl SqliteStorage {
         Ok(page_count * page_size)
     }
 
-    /// Queries minute totals in the half-open time range.
+    /// Loads committed analytics batches in insertion order.
     ///
     /// # Errors
-    ///
-    /// Returns an error when SQLite cannot execute or decode the query.
-    pub fn query_total_traffic(
-        &self,
-        from_ms: u64,
-        to_ms: u64,
-    ) -> rusqlite::Result<Vec<TrafficTotal>> {
-        let mut statement = self.connection.prepare(
-            "SELECT timestamp, upload_bytes, download_bytes, packets, flow_count
-             FROM traffic_total_minute WHERE timestamp >= ?1 AND timestamp < ?2
-             ORDER BY timestamp",
-        )?;
+    /// Returns an error if SQLite cannot read the outbox.
+    pub fn outbox_batch(&self, limit: u32) -> rusqlite::Result<Vec<crate::metadata::OutboxRecord>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, payload FROM analytics_outbox ORDER BY id LIMIT ?1")?;
         statement
-            .query_map(params![to_i64(from_ms), to_i64(to_ms)], |row| {
-                Ok(TrafficTotal {
-                    timestamp: row.get(0)?,
-                    upload_bytes: row.get(1)?,
-                    download_bytes: row.get(2)?,
-                    packets: row.get(3)?,
-                    flow_count: row.get(4)?,
+            .query_map([limit], |row| {
+                Ok(crate::metadata::OutboxRecord {
+                    id: row.get(0)?,
+                    payload: row.get(1)?,
                 })
             })?
             .collect()
     }
+
+    /// Acknowledges one analytics batch after it has been applied.
+    ///
+    /// # Errors
+    /// Returns an error if SQLite cannot delete the outbox record.
+    pub fn acknowledge_outbox(&mut self, id: i64) -> StorageResult<()> {
+        self.acknowledge_outbox_with_completed_flows(id, &[])
+    }
+
+    /// Acknowledges a batch and removes confirmed ended flow checkpoints atomically.
+    ///
+    /// Newer checkpoints are retained so an older outbox row cannot erase newer
+    /// recovery state.
+    ///
+    /// # Errors
+    /// Returns an error if SQLite cannot acknowledge the batch and clean up flows.
+    pub fn acknowledge_outbox_with_completed_flows(
+        &mut self,
+        id: i64,
+        completed_flows: &[crate::metadata::CompletedFlowCheckpoint],
+    ) -> StorageResult<()> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM analytics_outbox WHERE id = ?1", [id])?;
+        let mut removed_flow_ids = Vec::new();
+        for flow in completed_flows {
+            let latest: Option<AnalyticsFlow> = transaction
+                .query_row(
+                    "SELECT id, gateway_id, COALESCE(device_id, 0), ip_version, protocol,
+                            client_ip, client_port, remote_ip, remote_port, direction,
+                            COALESCE(domain, ''), COALESCE(organization_id, 'unknown'),
+                            COALESCE(application_id, 'unknown'), COALESCE(category_id, 'unknown'),
+                            COALESCE(traffic_role, 'unknown'), COALESCE(protocol_id, 'unknown'),
+                            COALESCE(organization_confidence, 0), COALESCE(application_confidence, 0),
+                            COALESCE(protocol_confidence, 0), COALESCE(classification_confidence, 0),
+                            COALESCE(classification_reason, ''), classification_evidence_json,
+                            upload_bytes, download_bytes, packets, started_at, last_seen_at, ended_at,
+                            checkpointed_at, scope, path_type, nat, source_segment, destination_segment
+                     FROM active_flow_sessions WHERE gateway_id = ?1 AND id = ?2",
+                    params![flow.flow.gateway_id, flow.flow.flow_id],
+                    analytics_flow_from_row,
+                )
+                .optional()?;
+            if latest.as_ref() == Some(&flow.flow) {
+                let deleted = transaction.execute(
+                    "DELETE FROM active_flow_sessions
+                     WHERE id = ?1 AND gateway_id = ?2 AND ended_at IS NOT NULL",
+                    params![flow.flow.flow_id, flow.flow.gateway_id],
+                )?;
+                if deleted > 0 {
+                    removed_flow_ids
+                        .push((flow.flow.gateway_id.clone(), flow.flow.flow_id.clone()));
+                }
+            }
+        }
+        transaction.commit()?;
+        self.active_flows.retain(|key, _| {
+            !removed_flow_ids
+                .iter()
+                .any(|(gateway_id, flow_id)| key.gateway_id == *gateway_id && key.id() == *flow_id)
+        });
+        Ok(())
+    }
+
+    /// Returns the number of pending analytics batches.
+    ///
+    /// # Errors
+    /// Returns an error if SQLite cannot count the outbox rows.
+    pub fn outbox_depth(&self) -> rusqlite::Result<u64> {
+        self.connection
+            .query_row("SELECT COUNT(*) FROM analytics_outbox", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|count| u64::try_from(count).unwrap_or(0))
+    }
+
+    /// Returns the age in milliseconds of the oldest pending analytics batch.
+    ///
+    /// # Errors
+    /// Returns an error if SQLite cannot read the oldest outbox timestamp.
+    pub fn outbox_oldest_age_ms(&self, now_ms: u64) -> rusqlite::Result<u64> {
+        let created_at: Option<i64> = self.connection.query_row(
+            "SELECT MIN(created_at) FROM analytics_outbox",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(created_at.map_or(0, |created_at| {
+            now_ms.saturating_sub(u64::try_from(created_at).unwrap_or(0))
+        }))
+    }
 }
 
-impl StorageBackend for SqliteStorage {
+fn update_persisted_reclassification(
+    transaction: &rusqlite::Transaction<'_>,
+    gateway_id: &str,
+    key: &FlowKey,
+    flow: &FlowDelta,
+    attribution: &FlowAttribution,
+) -> rusqlite::Result<Option<AnalyticsFlow>> {
+    let matched_id: Option<String> = transaction
+        .query_row(
+            "SELECT id FROM active_flow_sessions
+             WHERE gateway_id = ?1 AND ip_version = ?2 AND protocol = ?3
+               AND client_ip = ?4 AND client_port = ?5
+               AND remote_ip = ?6 AND remote_port = ?7
+               AND started_at <= ?8 AND last_seen_at >= ?9
+             ORDER BY checkpointed_at DESC
+             LIMIT 1",
+            params![
+                gateway_id,
+                key.ip_version,
+                key.protocol,
+                key.client_ip,
+                key.client_port,
+                key.remote_ip,
+                key.remote_port,
+                to_i64(flow.last_seen_unix_ms.saturating_add(1)),
+                to_i64(flow.first_seen_unix_ms.saturating_sub(1)),
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(matched_id) = matched_id else {
+        return Ok(None);
+    };
+    let changed = transaction.execute(
+        "UPDATE active_flow_sessions SET
+            protocol_id = CASE WHEN ?2 <> 'unknown' AND ?2 <> '' THEN ?2 ELSE protocol_id END,
+            protocol_confidence = CASE WHEN ?2 <> 'unknown' AND ?2 <> '' THEN ?3 ELSE protocol_confidence END,
+            category_id = CASE WHEN ?4 <> 'unknown' AND ?4 <> '' THEN ?4 ELSE category_id END,
+            traffic_role = CASE WHEN ?5 <> 'unknown' AND ?5 <> '' THEN ?5 ELSE traffic_role END,
+            classification_confidence = MAX(COALESCE(classification_confidence, 0), ?6),
+            classification_reason = ?7,
+            classification_evidence_json = ?8
+         WHERE id = ?1 AND gateway_id = ?9",
+        params![
+            matched_id,
+            attribution.protocol_id,
+            attribution.protocol_confidence,
+            attribution.category_id,
+            attribution.traffic_role,
+            attribution.confidence,
+            attribution.reason,
+            attribution.evidence_json,
+            gateway_id,
+        ],
+    )?;
+    debug_assert_eq!(changed, 1);
+    let mut statement = transaction.prepare(
+        "SELECT id, gateway_id, COALESCE(device_id, 0), ip_version, protocol,
+                client_ip, client_port, remote_ip, remote_port, direction,
+                COALESCE(domain, ''), COALESCE(organization_id, 'unknown'),
+                COALESCE(application_id, 'unknown'), COALESCE(category_id, 'unknown'),
+                COALESCE(traffic_role, 'unknown'), COALESCE(protocol_id, 'unknown'),
+                COALESCE(organization_confidence, 0), COALESCE(application_confidence, 0),
+                COALESCE(protocol_confidence, 0), COALESCE(classification_confidence, 0),
+                COALESCE(classification_reason, ''), classification_evidence_json,
+                upload_bytes, download_bytes, packets, started_at, last_seen_at, ended_at,
+                checkpointed_at, scope, path_type, nat, source_segment, destination_segment
+         FROM active_flow_sessions WHERE id = ?1 AND gateway_id = ?2",
+    )?;
+    let flow = statement.query_row(params![matched_id, gateway_id], analytics_flow_from_row)?;
+    Ok(Some(flow))
+}
+
+impl crate::metadata::MetadataStore for SqliteStorage {
     fn gateway(&self) -> StorageResult<Option<GatewayRecord>> {
-        Self::gateway(self).map_err(Into::into)
+        SqliteStorage::gateway(self).map_err(Into::into)
+    }
+
+    fn gateway_details(&self) -> StorageResult<Option<GatewayDetails>> {
+        self.connection
+            .query_row(
+                "SELECT id, name, agent_version, arch, kernel_version, openwrt_version, last_seen
+                 FROM gateways ORDER BY created_at LIMIT 1",
+                [],
+                |row| {
+                    Ok(GatewayDetails {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        agent_version: row.get(2)?,
+                        arch: row.get(3)?,
+                        kernel_version: row.get(4)?,
+                        openwrt_version: row.get(5)?,
+                        last_seen: u64::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     fn save_gateway(
@@ -983,7 +1033,7 @@ impl StorageBackend for SqliteStorage {
         agent_token_hash: &[u8],
         now_ms: u64,
     ) -> StorageResult<bool> {
-        Self::save_gateway(
+        SqliteStorage::save_gateway(
             self,
             gateway_id,
             name,
@@ -1003,7 +1053,7 @@ impl StorageBackend for SqliteStorage {
         stale_before_ms: u64,
         now_ms: u64,
     ) -> StorageResult<bool> {
-        Self::replace_stale_gateway(
+        SqliteStorage::replace_stale_gateway(
             self,
             gateway_id,
             name,
@@ -1016,7 +1066,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn admin_exists(&self) -> StorageResult<bool> {
-        Self::admin_exists(self).map_err(Into::into)
+        SqliteStorage::admin_exists(self).map_err(Into::into)
     }
 
     fn create_admin(
@@ -1026,11 +1076,11 @@ impl StorageBackend for SqliteStorage {
         password_hash: &str,
         now_ms: u64,
     ) -> StorageResult<bool> {
-        Self::create_admin(self, id, username, password_hash, now_ms).map_err(Into::into)
+        SqliteStorage::create_admin(self, id, username, password_hash, now_ms).map_err(Into::into)
     }
 
     fn user_by_username(&self, username: &str) -> StorageResult<Option<UserRecord>> {
-        Self::user_by_username(self, username).map_err(Into::into)
+        SqliteStorage::user_by_username(self, username).map_err(Into::into)
     }
 
     fn create_session(
@@ -1040,23 +1090,16 @@ impl StorageBackend for SqliteStorage {
         now_ms: u64,
         expires_at: u64,
     ) -> StorageResult<()> {
-        Self::create_session(self, user_id, token_hash, now_ms, expires_at).map_err(Into::into)
+        SqliteStorage::create_session(self, user_id, token_hash, now_ms, expires_at)
+            .map_err(Into::into)
     }
 
     fn session(&self, token_hash: &[u8], now_ms: u64) -> StorageResult<Option<SessionRecord>> {
-        Self::session(self, token_hash, now_ms).map_err(Into::into)
+        SqliteStorage::session(self, token_hash, now_ms).map_err(Into::into)
     }
 
     fn delete_session(&mut self, token_hash: &[u8]) -> StorageResult<bool> {
-        Self::delete_session(self, token_hash).map_err(Into::into)
-    }
-
-    fn persist_batch(
-        &mut self,
-        batch: &TelemetryBatch,
-        received_at_ms: u64,
-    ) -> StorageResult<PersistDisposition> {
-        Self::persist_batch(self, batch, received_at_ms).map_err(Into::into)
+        SqliteStorage::delete_session(self, token_hash).map_err(Into::into)
     }
 
     fn persist_classified_batch(
@@ -1066,481 +1109,44 @@ impl StorageBackend for SqliteStorage {
         device_identities: &[DeviceIdentityUpdate],
         received_at_ms: u64,
     ) -> StorageResult<PersistDisposition> {
-        Self::persist_classified_batch(self, batch, attributions, device_identities, received_at_ms)
-            .map_err(Into::into)
-    }
-
-    fn device_evidence(
-        &self,
-        gateway_id: &str,
-        mac: &[u8],
-    ) -> StorageResult<Vec<DeviceEvidenceRecord>> {
-        Self::device_evidence(self, gateway_id, mac).map_err(Into::into)
-    }
-
-    fn resolve_domain(
-        &self,
-        gateway_id: &str,
-        client_ip: &[u8],
-        answer_ip: &[u8],
-        at_ms: u64,
-    ) -> StorageResult<Option<String>> {
-        Self::resolve_domain(self, gateway_id, client_ip, answer_ip, at_ms).map_err(Into::into)
-    }
-
-    fn query_total_traffic(&self, from_ms: u64, to_ms: u64) -> StorageResult<Vec<TrafficTotal>> {
-        Self::query_total_traffic(self, from_ms, to_ms).map_err(Into::into)
-    }
-
-    fn roll_up_hour_and_day(&mut self, now_ms: u64) -> StorageResult<()> {
-        Self::roll_up_hour_and_day(self, now_ms).map_err(Into::into)
-    }
-
-    fn run_retention(&mut self, now_ms: u64, policy: RetentionPolicy) -> StorageResult<()> {
-        Self::run_retention(self, now_ms, policy).map_err(Into::into)
-    }
-
-    fn load_retention_policy(&self) -> StorageResult<RetentionPolicy> {
-        Self::load_retention_policy(self).map_err(Into::into)
-    }
-
-    fn save_retention_policy(
-        &mut self,
-        policy: &RetentionPolicy,
-        now_ms: u64,
-    ) -> StorageResult<()> {
-        Self::save_retention_policy(self, policy, now_ms).map_err(Into::into)
-    }
-
-    fn active_flow_count(&self) -> StorageResult<i64> {
-        Self::active_flow_count(self).map_err(Into::into)
-    }
-
-    fn unknown_ratio(&self, since_ms: u64) -> StorageResult<f64> {
-        Self::unknown_ratio(self, since_ms).map_err(Into::into)
-    }
-
-    fn database_size_bytes(&self) -> StorageResult<i64> {
-        Self::database_size_bytes(self).map_err(Into::into)
-    }
-
-    fn backend_name(&self) -> &'static str {
-        "sqlite"
-    }
-}
-
-/// Unified storage wrapper switching between SQLite and `ClickHouse` backends.
-#[derive(Debug)]
-pub enum Storage {
-    Sqlite(SqliteStorage),
-    ClickHouse(ClickHouseStorage),
-}
-
-#[allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
-impl Storage {
-    /// Applies late DPI metadata without inserting telemetry or changing counters.
-    ///
-    /// # Errors
-    /// Returns backend errors while updating existing sessions.
-    pub fn reclassify_flow(
-        &mut self,
-        gateway: &str,
-        flow: &FlowDelta,
-        attribution: &FlowAttribution,
-    ) -> StorageResult<()> {
-        match self {
-            Self::ClickHouse(storage) => storage.reclassify_flow(gateway, flow, attribution),
-            Self::Sqlite(storage) => {
-                for (key, current) in &mut storage.active_flows {
-                    if sample_matches(key, current, gateway, flow)
-                        && attribution.protocol_confidence
-                            >= current.attribution.protocol_confidence
-                    {
-                        apply_late_protocol(&mut current.attribution, attribution);
-                    }
-                }
-                storage.connection.execute(
-                    "UPDATE flow_sessions SET protocol_id=?1,protocol_confidence=?2,category_id=CASE WHEN ?3='unknown' THEN category_id ELSE ?3 END,traffic_role=CASE WHEN ?4='unknown' THEN traffic_role ELSE ?4 END,
-                        classification_confidence=MAX(classification_confidence,?5),classification_reason=?6,classification_evidence_json=?7
-                     WHERE gateway_id=?8 AND ip_version=?9 AND protocol=?10 AND client_ip=?11 AND client_port=?12
-                        AND remote_ip=?13 AND remote_port=?14 AND started_at<=?15 AND last_seen_at>=?16
-                        AND protocol_confidence<=?2",
-                    params![attribution.protocol_id,attribution.protocol_confidence,attribution.category_id,attribution.traffic_role,
-                        attribution.confidence,attribution.reason,attribution.evidence_json,gateway,flow.ip_version,flow.protocol,
-                        flow.client_ip,flow.client_port,flow.remote_ip,flow.remote_port,to_i64(flow.last_seen_unix_ms.saturating_add(1)),to_i64(flow.first_seen_unix_ms.saturating_sub(1))],
-                )?;
-                Ok(())
-            }
-        }
-    }
-
-    #[must_use]
-    pub fn sqlite(storage: SqliteStorage) -> Self {
-        Self::Sqlite(storage)
-    }
-
-    #[must_use]
-    pub fn clickhouse(storage: ClickHouseStorage) -> Self {
-        Self::ClickHouse(storage)
-    }
-
-    #[must_use]
-    pub fn sqlite_connection(&self) -> Option<&Connection> {
-        match self {
-            Self::Sqlite(s) => Some(s.connection()),
-            Self::ClickHouse(_) => None,
-        }
-    }
-
-    #[must_use]
-    pub fn clickhouse_storage(&self) -> Option<&ClickHouseStorage> {
-        match self {
-            Self::Sqlite(_) => None,
-            Self::ClickHouse(c) => Some(c),
-        }
-    }
-
-    pub fn clickhouse_storage_mut(&mut self) -> Option<&mut ClickHouseStorage> {
-        match self {
-            Self::Sqlite(_) => None,
-            Self::ClickHouse(c) => Some(c),
-        }
-    }
-
-    #[must_use]
-    pub fn connection(&self) -> &Connection {
-        match self {
-            Self::Sqlite(s) => s.connection(),
-            Self::ClickHouse(_) => panic!("connection() called on ClickHouse storage backend"),
-        }
-    }
-
-    pub fn gateway(&self) -> StorageResult<Option<GatewayRecord>> {
-        StorageBackend::gateway(self)
-    }
-
-    pub fn save_gateway(
-        &mut self,
-        gateway_id: &str,
-        name: &str,
-        agent_version: &str,
-        agent_token_hash: &[u8],
-        now_ms: u64,
-    ) -> StorageResult<bool> {
-        StorageBackend::save_gateway(
-            self,
-            gateway_id,
-            name,
-            agent_version,
-            agent_token_hash,
-            now_ms,
-        )
-    }
-
-    pub fn replace_stale_gateway(
-        &mut self,
-        gateway_id: &str,
-        name: &str,
-        agent_version: &str,
-        agent_token_hash: &[u8],
-        stale_before_ms: u64,
-        now_ms: u64,
-    ) -> StorageResult<bool> {
-        StorageBackend::replace_stale_gateway(
-            self,
-            gateway_id,
-            name,
-            agent_version,
-            agent_token_hash,
-            stale_before_ms,
-            now_ms,
-        )
-    }
-
-    pub fn admin_exists(&self) -> StorageResult<bool> {
-        StorageBackend::admin_exists(self)
-    }
-
-    pub fn create_admin(
-        &mut self,
-        id: &str,
-        username: &str,
-        password_hash: &str,
-        now_ms: u64,
-    ) -> StorageResult<bool> {
-        StorageBackend::create_admin(self, id, username, password_hash, now_ms)
-    }
-
-    pub fn user_by_username(&self, username: &str) -> StorageResult<Option<UserRecord>> {
-        StorageBackend::user_by_username(self, username)
-    }
-
-    pub fn create_session(
-        &mut self,
-        user_id: &str,
-        token_hash: &[u8],
-        now_ms: u64,
-        expires_at: u64,
-    ) -> StorageResult<()> {
-        StorageBackend::create_session(self, user_id, token_hash, now_ms, expires_at)
-    }
-
-    pub fn session(&self, token_hash: &[u8], now_ms: u64) -> StorageResult<Option<SessionRecord>> {
-        StorageBackend::session(self, token_hash, now_ms)
-    }
-
-    pub fn delete_session(&mut self, token_hash: &[u8]) -> StorageResult<bool> {
-        StorageBackend::delete_session(self, token_hash)
-    }
-
-    pub fn persist_batch(
-        &mut self,
-        batch: &TelemetryBatch,
-        received_at_ms: u64,
-    ) -> StorageResult<PersistDisposition> {
-        StorageBackend::persist_batch(self, batch, received_at_ms)
-    }
-
-    pub fn persist_classified_batch(
-        &mut self,
-        batch: &TelemetryBatch,
-        attributions: &[FlowAttribution],
-        device_identities: &[DeviceIdentityUpdate],
-        received_at_ms: u64,
-    ) -> StorageResult<PersistDisposition> {
-        StorageBackend::persist_classified_batch(
+        SqliteStorage::persist_classified_batch(
             self,
             batch,
             attributions,
             device_identities,
             received_at_ms,
         )
+        .map_err(Into::into)
     }
 
-    pub fn device_evidence(
-        &self,
-        gateway_id: &str,
-        mac: &[u8],
-    ) -> StorageResult<Vec<DeviceEvidenceRecord>> {
-        StorageBackend::device_evidence(self, gateway_id, mac)
-    }
-
-    pub fn resolve_domain(
-        &self,
-        gateway_id: &str,
-        client_ip: &[u8],
-        answer_ip: &[u8],
-        at_ms: u64,
-    ) -> StorageResult<Option<String>> {
-        StorageBackend::resolve_domain(self, gateway_id, client_ip, answer_ip, at_ms)
-    }
-
-    pub fn query_total_traffic(
-        &self,
-        from_ms: u64,
-        to_ms: u64,
-    ) -> StorageResult<Vec<TrafficTotal>> {
-        StorageBackend::query_total_traffic(self, from_ms, to_ms)
-    }
-
-    pub fn roll_up_hour_and_day(&mut self, now_ms: u64) -> StorageResult<()> {
-        StorageBackend::roll_up_hour_and_day(self, now_ms)
-    }
-
-    pub fn run_retention(&mut self, now_ms: u64, policy: RetentionPolicy) -> StorageResult<()> {
-        StorageBackend::run_retention(self, now_ms, policy)
-    }
-
-    pub fn load_retention_policy(&self) -> StorageResult<RetentionPolicy> {
-        StorageBackend::load_retention_policy(self)
-    }
-
-    pub fn save_retention_policy(
-        &mut self,
-        policy: &RetentionPolicy,
-        now_ms: u64,
-    ) -> StorageResult<()> {
-        StorageBackend::save_retention_policy(self, policy, now_ms)
-    }
-
-    pub fn active_flow_count(&self) -> StorageResult<i64> {
-        StorageBackend::active_flow_count(self)
-    }
-
-    pub fn unknown_ratio(&self, since_ms: u64) -> StorageResult<f64> {
-        StorageBackend::unknown_ratio(self, since_ms)
-    }
-
-    pub fn database_size_bytes(&self) -> StorageResult<i64> {
-        StorageBackend::database_size_bytes(self)
-    }
-
-    pub fn backend_name(&self) -> &'static str {
-        StorageBackend::backend_name(self)
-    }
-}
-
-impl StorageBackend for Storage {
-    fn gateway(&self) -> StorageResult<Option<GatewayRecord>> {
-        match self {
-            Self::Sqlite(s) => StorageBackend::gateway(s),
-            Self::ClickHouse(c) => StorageBackend::gateway(c),
-        }
-    }
-
-    fn save_gateway(
+    fn append_reclassification(
         &mut self,
         gateway_id: &str,
-        name: &str,
-        agent_version: &str,
-        agent_token_hash: &[u8],
+        flow: &FlowDelta,
+        attribution: &FlowAttribution,
         now_ms: u64,
     ) -> StorageResult<bool> {
-        match self {
-            Self::Sqlite(s) => StorageBackend::save_gateway(
-                s,
-                gateway_id,
-                name,
-                agent_version,
-                agent_token_hash,
-                now_ms,
-            ),
-            Self::ClickHouse(c) => StorageBackend::save_gateway(
-                c,
-                gateway_id,
-                name,
-                agent_version,
-                agent_token_hash,
-                now_ms,
-            ),
-        }
+        SqliteStorage::append_reclassification(self, gateway_id, flow, attribution, now_ms)
+            .map_err(Into::into)
     }
 
-    fn replace_stale_gateway(
+    fn append_reclassification_with_latest(
         &mut self,
         gateway_id: &str,
-        name: &str,
-        agent_version: &str,
-        agent_token_hash: &[u8],
-        stale_before_ms: u64,
+        flow: &FlowDelta,
+        attribution: &FlowAttribution,
         now_ms: u64,
+        latest: Option<&AnalyticsFlow>,
     ) -> StorageResult<bool> {
-        match self {
-            Self::Sqlite(s) => StorageBackend::replace_stale_gateway(
-                s,
-                gateway_id,
-                name,
-                agent_version,
-                agent_token_hash,
-                stale_before_ms,
-                now_ms,
-            ),
-            Self::ClickHouse(c) => StorageBackend::replace_stale_gateway(
-                c,
-                gateway_id,
-                name,
-                agent_version,
-                agent_token_hash,
-                stale_before_ms,
-                now_ms,
-            ),
-        }
-    }
-
-    fn admin_exists(&self) -> StorageResult<bool> {
-        match self {
-            Self::Sqlite(s) => StorageBackend::admin_exists(s),
-            Self::ClickHouse(c) => StorageBackend::admin_exists(c),
-        }
-    }
-
-    fn create_admin(
-        &mut self,
-        id: &str,
-        username: &str,
-        password_hash: &str,
-        now_ms: u64,
-    ) -> StorageResult<bool> {
-        match self {
-            Self::Sqlite(s) => StorageBackend::create_admin(s, id, username, password_hash, now_ms),
-            Self::ClickHouse(c) => {
-                StorageBackend::create_admin(c, id, username, password_hash, now_ms)
-            }
-        }
-    }
-
-    fn user_by_username(&self, username: &str) -> StorageResult<Option<UserRecord>> {
-        match self {
-            Self::Sqlite(s) => StorageBackend::user_by_username(s, username),
-            Self::ClickHouse(c) => StorageBackend::user_by_username(c, username),
-        }
-    }
-
-    fn create_session(
-        &mut self,
-        user_id: &str,
-        token_hash: &[u8],
-        now_ms: u64,
-        expires_at: u64,
-    ) -> StorageResult<()> {
-        match self {
-            Self::Sqlite(s) => {
-                StorageBackend::create_session(s, user_id, token_hash, now_ms, expires_at)
-            }
-            Self::ClickHouse(c) => {
-                StorageBackend::create_session(c, user_id, token_hash, now_ms, expires_at)
-            }
-        }
-    }
-
-    fn session(&self, token_hash: &[u8], now_ms: u64) -> StorageResult<Option<SessionRecord>> {
-        match self {
-            Self::Sqlite(s) => StorageBackend::session(s, token_hash, now_ms),
-            Self::ClickHouse(c) => StorageBackend::session(c, token_hash, now_ms),
-        }
-    }
-
-    fn delete_session(&mut self, token_hash: &[u8]) -> StorageResult<bool> {
-        match self {
-            Self::Sqlite(s) => StorageBackend::delete_session(s, token_hash),
-            Self::ClickHouse(c) => StorageBackend::delete_session(c, token_hash),
-        }
-    }
-
-    fn persist_batch(
-        &mut self,
-        batch: &TelemetryBatch,
-        received_at_ms: u64,
-    ) -> StorageResult<PersistDisposition> {
-        match self {
-            Self::Sqlite(s) => StorageBackend::persist_batch(s, batch, received_at_ms),
-            Self::ClickHouse(c) => StorageBackend::persist_batch(c, batch, received_at_ms),
-        }
-    }
-
-    fn persist_classified_batch(
-        &mut self,
-        batch: &TelemetryBatch,
-        attributions: &[FlowAttribution],
-        device_identities: &[DeviceIdentityUpdate],
-        received_at_ms: u64,
-    ) -> StorageResult<PersistDisposition> {
-        match self {
-            Self::Sqlite(s) => StorageBackend::persist_classified_batch(
-                s,
-                batch,
-                attributions,
-                device_identities,
-                received_at_ms,
-            ),
-            Self::ClickHouse(c) => StorageBackend::persist_classified_batch(
-                c,
-                batch,
-                attributions,
-                device_identities,
-                received_at_ms,
-            ),
-        }
+        SqliteStorage::append_reclassification_with_latest(
+            self,
+            gateway_id,
+            flow,
+            attribution,
+            now_ms,
+            latest,
+        )
+        .map_err(Into::into)
     }
 
     fn device_evidence(
@@ -1548,10 +1154,86 @@ impl StorageBackend for Storage {
         gateway_id: &str,
         mac: &[u8],
     ) -> StorageResult<Vec<DeviceEvidenceRecord>> {
-        match self {
-            Self::Sqlite(s) => StorageBackend::device_evidence(s, gateway_id, mac),
-            Self::ClickHouse(c) => StorageBackend::device_evidence(c, gateway_id, mac),
-        }
+        SqliteStorage::device_evidence(self, gateway_id, mac).map_err(Into::into)
+    }
+
+    fn devices(&self, limit: u32, offset: u64) -> StorageResult<(Vec<DeviceRecord>, u64)> {
+        let total = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM devices", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, gateway_id, mac, hostname, display_name, vendor, device_type, os_family,
+                    model, identity_confidence, identity_evidence_json, vendor_confidence,
+                    device_type_confidence, os_confidence, model_confidence, private_mac,
+                    first_seen, last_seen
+             FROM devices ORDER BY COALESCE(display_name, hostname, ''), id LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = statement.query_map(params![limit, to_i64(offset)], read_device_record)?;
+        let devices = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((devices, u64::try_from(total).unwrap_or(0)))
+    }
+
+    fn device(&self, id: i64) -> StorageResult<Option<DeviceRecord>> {
+        self.connection
+            .query_row(
+                "SELECT id, gateway_id, mac, hostname, display_name, vendor, device_type, os_family,
+                        model, identity_confidence, identity_evidence_json, vendor_confidence,
+                        device_type_confidence, os_confidence, model_confidence, private_mac,
+                        first_seen, last_seen
+                 FROM devices WHERE id = ?1",
+                [id],
+                read_device_record,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn device_addresses(&self, id: i64) -> StorageResult<Vec<DeviceAddressRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT a.ip, a.ip_version, a.first_seen, a.last_seen, a.application_id,
+                    a.application_confidence, a.application_source, a.application_last_seen,
+                    (SELECT e.source FROM self_host_endpoint_evidence e
+                     WHERE e.gateway_id = d.gateway_id AND e.ip = a.ip
+                       AND e.expires_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+                     ORDER BY e.confidence DESC, e.last_seen DESC LIMIT 1),
+                    (SELECT e.last_seen FROM self_host_endpoint_evidence e
+                     WHERE e.gateway_id = d.gateway_id AND e.ip = a.ip
+                       AND e.expires_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+                     ORDER BY e.confidence DESC, e.last_seen DESC LIMIT 1)
+             FROM device_addresses a JOIN devices d ON d.id = a.device_id
+             WHERE a.device_id = ?1 ORDER BY a.last_seen DESC, a.ip",
+        )?;
+        let rows = statement.query_map([id], |row| {
+            Ok(DeviceAddressRecord {
+                ip: row.get(0)?,
+                ip_version: row.get(1)?,
+                first_seen: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+                last_seen: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                application_id: row.get(4)?,
+                application_confidence: row.get(5)?,
+                application_source: row.get(6)?,
+                application_last_seen: row
+                    .get::<_, Option<i64>>(7)?
+                    .and_then(|value| u64::try_from(value).ok()),
+                self_host_source: row.get(8)?,
+                self_host_last_seen: row
+                    .get::<_, Option<i64>>(9)?
+                    .and_then(|value| u64::try_from(value).ok()),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    fn device_count(&self) -> StorageResult<u64> {
+        self.connection
+            .query_row("SELECT COUNT(*) FROM devices", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|value| u64::try_from(value).unwrap_or(0))
+            .map_err(Into::into)
     }
 
     fn resolve_domain(
@@ -1561,42 +1243,12 @@ impl StorageBackend for Storage {
         answer_ip: &[u8],
         at_ms: u64,
     ) -> StorageResult<Option<String>> {
-        match self {
-            Self::Sqlite(s) => {
-                StorageBackend::resolve_domain(s, gateway_id, client_ip, answer_ip, at_ms)
-            }
-            Self::ClickHouse(c) => {
-                StorageBackend::resolve_domain(c, gateway_id, client_ip, answer_ip, at_ms)
-            }
-        }
-    }
-
-    fn query_total_traffic(&self, from_ms: u64, to_ms: u64) -> StorageResult<Vec<TrafficTotal>> {
-        match self {
-            Self::Sqlite(s) => StorageBackend::query_total_traffic(s, from_ms, to_ms),
-            Self::ClickHouse(c) => StorageBackend::query_total_traffic(c, from_ms, to_ms),
-        }
-    }
-
-    fn roll_up_hour_and_day(&mut self, now_ms: u64) -> StorageResult<()> {
-        match self {
-            Self::Sqlite(s) => StorageBackend::roll_up_hour_and_day(s, now_ms),
-            Self::ClickHouse(c) => StorageBackend::roll_up_hour_and_day(c, now_ms),
-        }
-    }
-
-    fn run_retention(&mut self, now_ms: u64, policy: RetentionPolicy) -> StorageResult<()> {
-        match self {
-            Self::Sqlite(s) => StorageBackend::run_retention(s, now_ms, policy),
-            Self::ClickHouse(c) => StorageBackend::run_retention(c, now_ms, policy),
-        }
+        SqliteStorage::resolve_domain(self, gateway_id, client_ip, answer_ip, at_ms)
+            .map_err(Into::into)
     }
 
     fn load_retention_policy(&self) -> StorageResult<RetentionPolicy> {
-        match self {
-            Self::Sqlite(s) => StorageBackend::load_retention_policy(s),
-            Self::ClickHouse(c) => StorageBackend::load_retention_policy(c),
-        }
+        SqliteStorage::load_retention_policy(self).map_err(Into::into)
     }
 
     fn save_retention_policy(
@@ -1604,42 +1256,89 @@ impl StorageBackend for Storage {
         policy: &RetentionPolicy,
         now_ms: u64,
     ) -> StorageResult<()> {
-        match self {
-            Self::Sqlite(s) => StorageBackend::save_retention_policy(s, policy, now_ms),
-            Self::ClickHouse(c) => StorageBackend::save_retention_policy(c, policy, now_ms),
-        }
+        SqliteStorage::save_retention_policy(self, policy, now_ms).map_err(Into::into)
     }
 
     fn active_flow_count(&self) -> StorageResult<i64> {
-        match self {
-            Self::Sqlite(s) => StorageBackend::active_flow_count(s),
-            Self::ClickHouse(c) => StorageBackend::active_flow_count(c),
-        }
+        SqliteStorage::active_flow_count(self).map_err(Into::into)
     }
 
-    fn unknown_ratio(&self, since_ms: u64) -> StorageResult<f64> {
-        match self {
-            Self::Sqlite(s) => StorageBackend::unknown_ratio(s, since_ms),
-            Self::ClickHouse(c) => StorageBackend::unknown_ratio(c, since_ms),
-        }
+    fn run_metadata_retention(
+        &mut self,
+        now_ms: u64,
+        policy: RetentionPolicy,
+    ) -> StorageResult<()> {
+        SqliteStorage::run_retention(self, now_ms, policy).map_err(Into::into)
     }
 
-    fn database_size_bytes(&self) -> StorageResult<i64> {
-        match self {
-            Self::Sqlite(s) => StorageBackend::database_size_bytes(s),
-            Self::ClickHouse(c) => StorageBackend::database_size_bytes(c),
-        }
+    fn outbox_batch(&self, limit: u32) -> StorageResult<Vec<crate::metadata::OutboxRecord>> {
+        SqliteStorage::outbox_batch(self, limit).map_err(Into::into)
     }
 
-    fn backend_name(&self) -> &'static str {
-        match self {
-            Self::Sqlite(s) => StorageBackend::backend_name(s),
-            Self::ClickHouse(c) => StorageBackend::backend_name(c),
-        }
+    fn acknowledge_outbox(&mut self, id: i64) -> StorageResult<()> {
+        SqliteStorage::acknowledge_outbox(self, id)
+    }
+
+    fn acknowledge_outbox_with_completed_flows(
+        &mut self,
+        id: i64,
+        completed_flows: &[crate::metadata::CompletedFlowCheckpoint],
+    ) -> StorageResult<()> {
+        SqliteStorage::acknowledge_outbox_with_completed_flows(self, id, completed_flows)
+    }
+
+    fn outbox_depth(&self) -> StorageResult<u64> {
+        SqliteStorage::outbox_depth(self).map_err(Into::into)
+    }
+
+    fn outbox_oldest_age_ms(&self, now_ms: u64) -> StorageResult<u64> {
+        SqliteStorage::outbox_oldest_age_ms(self, now_ms).map_err(Into::into)
+    }
+
+    fn metadata_database_size_bytes(&self) -> StorageResult<u64> {
+        SqliteStorage::database_size_bytes(self)
+            .map(|size| u64::try_from(size).unwrap_or(0))
+            .map_err(Into::into)
     }
 }
 
+fn read_device_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRecord> {
+    Ok(DeviceRecord {
+        id: row.get(0)?,
+        gateway_id: row.get(1)?,
+        mac: row.get(2)?,
+        hostname: row.get(3)?,
+        display_name: row.get(4)?,
+        vendor: row.get(5)?,
+        device_type: row.get(6)?,
+        os_family: row.get(7)?,
+        model: row.get(8)?,
+        identity_confidence: row.get(9)?,
+        identity_evidence_json: row.get(10)?,
+        vendor_confidence: row.get(11)?,
+        device_type_confidence: row.get(12)?,
+        os_confidence: row.get(13)?,
+        model_confidence: row.get(14)?,
+        private_mac: row.get(15)?,
+        first_seen: u64::try_from(row.get::<_, i64>(16)?).unwrap_or(0),
+        last_seen: u64::try_from(row.get::<_, i64>(17)?).unwrap_or(0),
+    })
+}
+
 fn migrate(connection: &Connection) -> rusqlite::Result<()> {
+    let had_migrations = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    let has_v2_metadata = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'active_flow_sessions')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if had_migrations && !has_v2_metadata {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
             version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL
@@ -1675,7 +1374,7 @@ fn load_active_flows(connection: &Connection) -> rusqlite::Result<HashMap<FlowKe
                 application_confidence, protocol_confidence, classification_confidence,
                 classification_reason, classification_evidence_json, scope, path_type, nat,
                 source_segment, destination_segment
-         FROM flow_sessions WHERE ended_at IS NULL",
+         FROM active_flow_sessions WHERE ended_at IS NULL",
     )?;
     statement
         .query_map([], |row| {
@@ -2028,162 +1727,15 @@ fn persist_dns(tx: &Transaction<'_>, batch: &TelemetryBatch) -> rusqlite::Result
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
-fn persist_minute_rollups(
-    tx: &Transaction<'_>,
-    batch: &TelemetryBatch,
-    attributions: &[FlowAttribution],
-) -> rusqlite::Result<()> {
-    let timestamp = to_i64(batch.sent_at) / MINUTE_MS * MINUTE_MS;
-    let unknown = FlowAttribution::default();
-    for (index, flow) in batch.flows.iter().enumerate() {
-        let attribution = attributions.get(index).unwrap_or(&unknown);
-        let upload = to_i64(flow.upload_bytes);
-        let download = to_i64(flow.download_bytes);
-        let packets = to_i64(flow.packets);
-        upsert_rollup(
-            tx,
-            "traffic_total_minute",
-            None,
-            &[timestamp.into(), batch.gateway_id.clone().into()],
-            upload,
-            download,
-            packets,
-        )?;
-        if let Some(device_id) = device_id_for_flow(tx, &batch.gateway_id, flow)? {
-            upsert_rollup(
-                tx,
-                "traffic_device_minute",
-                Some("device_id"),
-                &[
-                    timestamp.into(),
-                    batch.gateway_id.clone().into(),
-                    device_id.into(),
-                ],
-                upload,
-                download,
-                packets,
-            )?;
-        }
-        upsert_rollup(
-            tx,
-            "traffic_application_minute",
-            Some("application_id, category_id"),
-            &[
-                timestamp.into(),
-                batch.gateway_id.clone().into(),
-                attribution.application_id.clone().into(),
-                attribution.category_id.clone().into(),
-            ],
-            upload,
-            download,
-            packets,
-        )?;
-        upsert_rollup(
-            tx,
-            "traffic_domain_minute",
-            Some("domain"),
-            &[
-                timestamp.into(),
-                batch.gateway_id.clone().into(),
-                attribution
-                    .domain
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_owned())
-                    .into(),
-            ],
-            upload,
-            download,
-            packets,
-        )?;
-        upsert_rollup(
-            tx,
-            "traffic_destination_minute",
-            Some("remote_ip"),
-            &[
-                timestamp.into(),
-                batch.gateway_id.clone().into(),
-                flow.remote_ip.clone().into(),
-            ],
-            upload,
-            download,
-            packets,
-        )?;
-        let device_id = device_id_for_flow(tx, &batch.gateway_id, flow)?.unwrap_or(0);
-        upsert_rollup(
-            tx,
-            "traffic_scope_minute",
-            Some(
-                "scope, direction, device_id, application_id, category_id, domain, remote_ip, protocol, protocol_id",
-            ),
-            &[
-                timestamp.into(),
-                batch.gateway_id.clone().into(),
-                i64::from(flow.scope).into(),
-                i64::from(flow.direction).into(),
-                device_id.into(),
-                attribution.application_id.clone().into(),
-                attribution.category_id.clone().into(),
-                attribution
-                    .domain
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_owned())
-                    .into(),
-                flow.remote_ip.clone().into(),
-                i64::from(flow.protocol).into(),
-                attribution.protocol_id.clone().into(),
-            ],
-            upload,
-            download,
-            packets,
-        )?;
-    }
-    Ok(())
-}
-
-fn upsert_rollup(
-    tx: &Transaction<'_>,
-    table: &str,
-    dimension: Option<&str>,
-    keys: &[Value],
-    upload: i64,
-    download: i64,
-    packets: i64,
-) -> rusqlite::Result<()> {
-    let columns = dimension.map_or_else(
-        || "timestamp, gateway_id".to_owned(),
-        |dimension| format!("timestamp, gateway_id, {dimension}"),
-    );
-    let placeholders = (1..=keys.len())
-        .map(|index| format!("?{index}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let metric_offset = keys.len() + 1;
-    let sql = format!(
-        "INSERT INTO {table}({columns}, upload_bytes, download_bytes, packets, flow_count)
-         VALUES ({placeholders}, ?{metric_offset}, ?{}, ?{}, 1)
-         ON CONFLICT({columns}) DO UPDATE SET
-           upload_bytes = upload_bytes + excluded.upload_bytes,
-           download_bytes = download_bytes + excluded.download_bytes,
-           packets = packets + excluded.packets,
-           flow_count = flow_count + 1",
-        metric_offset + 1,
-        metric_offset + 2,
-    );
-    let mut values = keys.to_vec();
-    values.extend([upload.into(), download.into(), packets.into()]);
-    tx.execute(&sql, rusqlite::params_from_iter(values))?;
-    Ok(())
-}
-
 fn update_active_flows(
     tx: &Transaction<'_>,
     active: &mut HashMap<FlowKey, ActiveFlow>,
     batch: &TelemetryBatch,
     attributions: &[FlowAttribution],
     received_at: i64,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<Vec<AnalyticsFlow>> {
     let unknown = FlowAttribution::default();
+    let mut versions = Vec::new();
     for (index, flow) in batch.flows.iter().enumerate() {
         let attribution = attributions.get(index).unwrap_or(&unknown);
         let key = FlowKey::from_batch(&batch.gateway_id, flow);
@@ -2197,6 +1749,13 @@ fn update_active_flows(
                 received_at.saturating_sub(current.checkpointed_at) >= FLOW_CHECKPOINT_MS;
             if ended || checkpoint {
                 write_flow_session(tx, &key, current, ended, received_at)?;
+                versions.push(analytics_flow_from_current(
+                    tx,
+                    &key,
+                    current,
+                    ended,
+                    received_at,
+                )?);
                 current.checkpointed_at = received_at;
             }
         }
@@ -2204,7 +1763,153 @@ fn update_active_flows(
             active.remove(&key);
         }
     }
-    Ok(())
+    Ok(versions)
+}
+
+fn analytics_flow_from_current(
+    tx: &Transaction<'_>,
+    key: &FlowKey,
+    flow: &ActiveFlow,
+    ended: bool,
+    checkpointed_at: i64,
+) -> rusqlite::Result<AnalyticsFlow> {
+    let device_id = device_id_for_mac(tx, &key.gateway_id, &flow.client_mac)?
+        .and_then(|id| u64::try_from(id).ok())
+        .unwrap_or(0);
+    Ok(AnalyticsFlow {
+        flow_id: key.id(),
+        gateway_id: key.gateway_id.clone(),
+        device_id,
+        ip_version: u8::try_from(key.ip_version).unwrap_or(0),
+        protocol: u8::try_from(key.protocol).unwrap_or(0),
+        client_ip: key.client_ip.clone(),
+        client_port: u16::try_from(key.client_port).unwrap_or(0),
+        remote_ip: key.remote_ip.clone(),
+        remote_port: u16::try_from(key.remote_port).unwrap_or(0),
+        direction: u8::try_from(key.direction).unwrap_or(0),
+        domain: flow.attribution.domain.clone().unwrap_or_default(),
+        organization_id: normalized_id(&flow.attribution.organization_id),
+        application_id: normalized_id(&flow.attribution.application_id),
+        category_id: normalized_id(&flow.attribution.category_id),
+        traffic_role: normalized_id(&flow.attribution.traffic_role),
+        protocol_id: normalized_id(&flow.attribution.protocol_id),
+        organization_confidence: flow.attribution.organization_confidence,
+        application_confidence: flow.attribution.application_confidence,
+        protocol_confidence: flow.attribution.protocol_confidence,
+        classification_confidence: flow.attribution.confidence,
+        classification_reason: flow.attribution.reason.clone(),
+        classification_evidence_json: flow.attribution.evidence_json.clone(),
+        upload_bytes: u64::try_from(flow.upload_bytes).unwrap_or(0),
+        download_bytes: u64::try_from(flow.download_bytes).unwrap_or(0),
+        packets: u64::try_from(flow.packets).unwrap_or(0),
+        started_at: u64::try_from(flow.started_at).unwrap_or(0),
+        last_seen_at: u64::try_from(flow.last_seen_at).unwrap_or(0),
+        ended_at: ended.then(|| u64::try_from(flow.last_seen_at).unwrap_or(0)),
+        checkpointed_at: u64::try_from(checkpointed_at).unwrap_or(0),
+        scope: u8::try_from(flow.scope).unwrap_or(0),
+        path_type: u8::try_from(flow.path_type).unwrap_or(0),
+        nat: u8::try_from(flow.nat).unwrap_or(0),
+        source_segment: flow.source_segment.clone(),
+        destination_segment: flow.destination_segment.clone(),
+    })
+}
+
+fn analytics_flow_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AnalyticsFlow> {
+    let ended_at: Option<i64> = row.get(27)?;
+    Ok(AnalyticsFlow {
+        flow_id: row.get(0)?,
+        gateway_id: row.get(1)?,
+        device_id: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+        ip_version: u8::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+        protocol: u8::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+        client_ip: row.get(5)?,
+        client_port: u16::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
+        remote_ip: row.get(7)?,
+        remote_port: u16::try_from(row.get::<_, i64>(8)?).unwrap_or(0),
+        direction: u8::try_from(row.get::<_, i64>(9)?).unwrap_or(0),
+        domain: row.get(10)?,
+        organization_id: row.get(11)?,
+        application_id: row.get(12)?,
+        category_id: row.get(13)?,
+        traffic_role: row.get(14)?,
+        protocol_id: row.get(15)?,
+        organization_confidence: row.get(16)?,
+        application_confidence: row.get(17)?,
+        protocol_confidence: row.get(18)?,
+        classification_confidence: row.get(19)?,
+        classification_reason: row.get(20)?,
+        classification_evidence_json: row.get(21)?,
+        upload_bytes: u64::try_from(row.get::<_, i64>(22)?).unwrap_or(0),
+        download_bytes: u64::try_from(row.get::<_, i64>(23)?).unwrap_or(0),
+        packets: u64::try_from(row.get::<_, i64>(24)?).unwrap_or(0),
+        started_at: u64::try_from(row.get::<_, i64>(25)?).unwrap_or(0),
+        last_seen_at: u64::try_from(row.get::<_, i64>(26)?).unwrap_or(0),
+        ended_at: ended_at.map(|value| u64::try_from(value).unwrap_or(0)),
+        checkpointed_at: u64::try_from(row.get::<_, i64>(28)?).unwrap_or(0),
+        scope: u8::try_from(row.get::<_, i64>(29)?).unwrap_or(0),
+        path_type: u8::try_from(row.get::<_, i64>(30)?).unwrap_or(0),
+        nat: u8::try_from(row.get::<_, i64>(31)?).unwrap_or(0),
+        source_segment: row.get(32)?,
+        destination_segment: row.get(33)?,
+    })
+}
+
+fn build_analytics_batch(
+    tx: &Transaction<'_>,
+    batch: &TelemetryBatch,
+    attributions: &[FlowAttribution],
+    flows: Vec<AnalyticsFlow>,
+    received_at: u64,
+) -> rusqlite::Result<AnalyticsBatch> {
+    let unknown = FlowAttribution::default();
+    let mut traffic = Vec::with_capacity(batch.flows.len());
+    for (index, flow) in batch.flows.iter().enumerate() {
+        let attribution = attributions.get(index).unwrap_or(&unknown);
+        let device_id = device_id_for_flow(tx, &batch.gateway_id, flow)?
+            .and_then(|id| u64::try_from(id).ok())
+            .unwrap_or(0);
+        let timestamp = if flow.last_seen_unix_ms == 0 {
+            received_at
+        } else {
+            flow.last_seen_unix_ms
+        };
+        traffic.push(TrafficDelta {
+            timestamp,
+            gateway_id: batch.gateway_id.clone(),
+            scope: u8::try_from(flow.scope).unwrap_or(0),
+            direction: u8::try_from(flow.direction).unwrap_or(0),
+            transport_protocol: u8::try_from(flow.protocol).unwrap_or(0),
+            path_type: u8::try_from(flow.path_type).unwrap_or(0),
+            nat: u8::try_from(flow.nat).unwrap_or(0),
+            device_id,
+            organization_id: normalized_id(&attribution.organization_id),
+            application_id: normalized_id(&attribution.application_id),
+            category_id: normalized_id(&attribution.category_id),
+            protocol_id: normalized_id(&attribution.protocol_id),
+            domain: attribution.domain.clone().unwrap_or_default(),
+            remote_ip: flow.remote_ip.clone(),
+            upload_bytes: flow.upload_bytes,
+            download_bytes: flow.download_bytes,
+            packets: flow.packets,
+            flow_count: 1,
+        });
+    }
+    Ok(AnalyticsBatch {
+        gateway_id: batch.gateway_id.clone(),
+        boot_id: batch.boot_id.clone(),
+        sequence: batch.sequence,
+        received_at,
+        flows,
+        traffic,
+    })
+}
+
+fn normalized_id(value: &str) -> String {
+    if value.is_empty() {
+        "unknown".to_owned()
+    } else {
+        value.to_owned()
+    }
 }
 
 fn write_flow_session(
@@ -2216,7 +1921,7 @@ fn write_flow_session(
 ) -> rusqlite::Result<()> {
     let device_id = device_id_for_mac(tx, &key.gateway_id, &flow.client_mac)?;
     tx.execute(
-        "INSERT INTO flow_sessions(
+        "INSERT INTO active_flow_sessions(
             id, gateway_id, device_id, ip_version, protocol, client_ip, client_port,
             remote_ip, remote_port, direction, upload_bytes, download_bytes, packets,
             started_at, last_seen_at, ended_at, checkpointed_at, domain, organization_id,
@@ -2228,7 +1933,7 @@ fn write_flow_session(
                    ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
                    ?30, ?31, ?32, ?33, ?34)
          ON CONFLICT(id) DO UPDATE SET
-            device_id = COALESCE(excluded.device_id, flow_sessions.device_id),
+            device_id = COALESCE(excluded.device_id, active_flow_sessions.device_id),
             upload_bytes = excluded.upload_bytes, download_bytes = excluded.download_bytes,
             packets = excluded.packets, last_seen_at = excluded.last_seen_at,
             ended_at = excluded.ended_at, checkpointed_at = excluded.checkpointed_at,
@@ -2306,40 +2011,6 @@ fn device_id_for_mac(
         |row| row.get(0),
     )
     .optional()
-}
-
-fn dimension_columns(dimension: &str) -> &'static str {
-    match dimension {
-        "total" => "gateway_id",
-        "device" => "gateway_id, device_id",
-        "application" => "gateway_id, application_id, category_id",
-        "domain" => "gateway_id, domain",
-        "destination" => "gateway_id, remote_ip",
-        _ => unreachable!(),
-    }
-}
-
-fn aggregate(
-    tx: &Transaction<'_>,
-    dimension: &str,
-    source: &str,
-    target: &str,
-    bucket_ms: i64,
-    now: i64,
-) -> rusqlite::Result<()> {
-    let columns = dimension_columns(dimension);
-    let source_table = format!("traffic_{dimension}_{source}");
-    let target_table = format!("traffic_{dimension}_{target}");
-    let sql = format!(
-        "INSERT OR REPLACE INTO {target_table}(
-            timestamp, {columns}, upload_bytes, download_bytes, packets, flow_count
-         ) SELECT (timestamp / ?1) * ?1, {columns}, SUM(upload_bytes),
-                  SUM(download_bytes), SUM(packets), SUM(flow_count)
-           FROM {source_table} WHERE timestamp < ?2
-           GROUP BY (timestamp / ?1), {columns}"
-    );
-    tx.execute(&sql, params![bucket_ms, now / bucket_ms * bucket_ms])?;
-    Ok(())
 }
 
 fn delete_older_than(
@@ -2512,4 +2183,24 @@ fn apply_late_protocol(current: &mut FlowAttribution, incoming: &FlowAttribution
     current.confidence = current.confidence.max(incoming.confidence);
     current.reason.clone_from(&incoming.reason);
     current.evidence_json.clone_from(&incoming.evidence_json);
+}
+
+fn apply_late_protocol_to_analytics_flow(
+    flow: &mut AnalyticsFlow,
+    attribution: &FlowAttribution,
+    now_ms: u64,
+) {
+    flow.protocol_id.clone_from(&attribution.protocol_id);
+    flow.protocol_confidence = attribution.protocol_confidence;
+    if attribution.category_id != "unknown" {
+        flow.category_id.clone_from(&attribution.category_id);
+    }
+    if attribution.traffic_role != "unknown" {
+        flow.traffic_role.clone_from(&attribution.traffic_role);
+    }
+    flow.classification_confidence = flow.classification_confidence.max(attribution.confidence);
+    flow.classification_reason.clone_from(&attribution.reason);
+    flow.classification_evidence_json
+        .clone_from(&attribution.evidence_json);
+    flow.checkpointed_at = now_ms.max(flow.checkpointed_at.saturating_add(1));
 }

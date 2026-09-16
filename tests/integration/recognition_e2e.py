@@ -143,10 +143,16 @@ def main():
 
         metadata=[json.loads(row[0]) for row in con.execute("SELECT metadata_json FROM device_evidence WHERE source='mdns' AND field='observation'")]
         assert any(int(m['attributes']['captured_length'])>576 and m['attributes']['truncated']=='false' for m in metadata)
-        tls=con.execute("SELECT protocol_id,application_id,category_id,domain FROM flow_sessions WHERE remote_port=18443").fetchall()
-        assert any(row[:3]==('tls','youtube','streaming') and row[3]=='www.youtube.com' for row in tls),tls
-        http=con.execute("SELECT protocol_id,application_id,category_id,domain FROM flow_sessions WHERE remote_port=18080").fetchall()
-        assert any(row[:3]==('http','youtube','streaming') for row in http),http
+        def flows_for_port(port):
+            with urllib.request.urlopen(
+                f'http://127.0.0.1:18091/internal/flows?from=0&to=9223372036854775807&limit=100&port={port}',
+                timeout=3,
+            ) as response:
+                return json.load(response)['data']
+        tls=flows_for_port(18443)
+        assert any(row['protocol_id']=='tls' and row['application']=='youtube' and row['category']=='streaming' and row['domain']=='www.youtube.com' for row in tls),tls
+        http=flows_for_port(18080)
+        assert any(row['protocol_id']=='http' and row['application']=='youtube' and row['category']=='streaming' for row in http),http
         assert con.execute('SELECT count(*) FROM dns_observations').fetchone()[0]==0
         assert diagnostics['sampling']['packet_count']>0
         assert diagnostics['recognition']['device']['evidence_source_coverage']['mdns']>0

@@ -101,12 +101,12 @@ fn partitions_total_throughput_by_scope() {
     internal.download_bytes = 60;
     internal.remote_ip = vec![192, 0, 2, 20];
     scoped.flows.push(internal);
-    engine_update_assertions(scoped);
+    engine_update_assertions(&scoped);
 }
 
-fn engine_update_assertions(batch: TelemetryBatch) {
+fn engine_update_assertions(batch: &TelemetryBatch) {
     let mut engine = RealtimeEngine::default();
-    engine.update(&batch, &[attribution(), attribution()], 2_000);
+    engine.update(batch, &[attribution(), attribution()], 2_000);
     let snapshot = engine.snapshot();
     assert_eq!(snapshot.total.upload_bytes_per_second, 140);
     assert_eq!(snapshot.internet.upload_bytes_per_second, 100);

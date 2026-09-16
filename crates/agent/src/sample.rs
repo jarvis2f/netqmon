@@ -7,6 +7,7 @@ use crate::{
 };
 use netqmon_protocol::v1::{Direction as WireDirection, FlowSample, FlowSampleKey, SamplePacket};
 
+#[cfg(test)]
 pub const SAMPLE_EVENT_SIZE: usize = 4168;
 const SAMPLE_EVENT_HEADER_SIZE: usize = 72;
 

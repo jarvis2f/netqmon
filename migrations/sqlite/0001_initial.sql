@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS gateways (
   last_seen INTEGER NOT NULL,
   created_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS gateways_site_id ON gateways(site_id);
 
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
@@ -59,6 +60,7 @@ CREATE TABLE IF NOT EXISTS devices (
   last_seen INTEGER NOT NULL,
   UNIQUE(gateway_id, mac)
 );
+CREATE INDEX IF NOT EXISTS devices_gateway_last_seen ON devices(gateway_id, last_seen DESC);
 
 CREATE TABLE IF NOT EXISTS device_addresses (
   device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
@@ -104,7 +106,35 @@ CREATE TABLE IF NOT EXISTS dns_observations (
 CREATE INDEX IF NOT EXISTS dns_observations_expires_at ON dns_observations(expires_at);
 CREATE INDEX IF NOT EXISTS dns_observations_lookup ON dns_observations(gateway_id, client_ip, answer_ip, observed_at);
 
-CREATE TABLE IF NOT EXISTS flow_sessions (
+CREATE TABLE IF NOT EXISTS self_host_endpoint_evidence (
+  gateway_id TEXT NOT NULL REFERENCES gateways(id) ON DELETE CASCADE,
+  ip BLOB NOT NULL,
+  protocol INTEGER NOT NULL,
+  port INTEGER NOT NULL,
+  application_id TEXT NOT NULL,
+  confidence REAL NOT NULL,
+  source TEXT NOT NULL,
+  last_seen INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  PRIMARY KEY(gateway_id, ip, protocol, port, application_id)
+);
+CREATE INDEX IF NOT EXISTS self_host_endpoint_evidence_expiry ON self_host_endpoint_evidence(gateway_id, ip, expires_at);
+
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ingest_batches (
+  gateway_id TEXT NOT NULL REFERENCES gateways(id) ON DELETE CASCADE,
+  boot_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  received_at INTEGER NOT NULL,
+  PRIMARY KEY(gateway_id, boot_id, sequence)
+);
+
+CREATE TABLE IF NOT EXISTS active_flow_sessions (
   id TEXT PRIMARY KEY,
   gateway_id TEXT NOT NULL REFERENCES gateways(id) ON DELETE CASCADE,
   device_id INTEGER REFERENCES devices(id) ON DELETE SET NULL,
@@ -140,232 +170,30 @@ CREATE TABLE IF NOT EXISTS flow_sessions (
   source_segment TEXT NOT NULL DEFAULT '',
   destination_segment TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS flow_sessions_last_seen_at ON flow_sessions(last_seen_at);
-CREATE INDEX IF NOT EXISTS flow_sessions_organization_last_seen ON flow_sessions(organization_id, last_seen_at);
-CREATE INDEX IF NOT EXISTS flow_sessions_protocol_last_seen ON flow_sessions(protocol_id, last_seen_at);
-CREATE INDEX IF NOT EXISTS flow_sessions_remote_last_seen ON flow_sessions(remote_ip, last_seen_at);
-CREATE INDEX IF NOT EXISTS flow_sessions_application_last_seen ON flow_sessions(application_id, last_seen_at);
-CREATE INDEX IF NOT EXISTS flow_sessions_device_last_seen ON flow_sessions(device_id, last_seen_at);
-CREATE INDEX IF NOT EXISTS flow_sessions_port_last_seen_remote ON flow_sessions(remote_port, last_seen_at, remote_ip);
-CREATE INDEX IF NOT EXISTS flow_sessions_role_category_client_last_seen ON flow_sessions(traffic_role, category_id, client_ip, last_seen_at);
-CREATE INDEX IF NOT EXISTS flow_sessions_client_protocol_last_seen ON flow_sessions(client_ip, protocol_id, last_seen_at);
-CREATE INDEX IF NOT EXISTS flow_sessions_client_remote_protocol_last_seen ON flow_sessions(client_ip, remote_ip, protocol_id, last_seen_at);
-CREATE INDEX IF NOT EXISTS flow_sessions_client_remote_proto_last_seen ON flow_sessions(client_ip, remote_ip, protocol, last_seen_at);
-CREATE INDEX IF NOT EXISTS flow_sessions_scope_last_seen ON flow_sessions(scope, last_seen_at);
-CREATE INDEX IF NOT EXISTS flow_sessions_scope_path_nat ON flow_sessions(scope, path_type, nat);
+CREATE INDEX IF NOT EXISTS active_flow_sessions_last_seen_at ON active_flow_sessions(last_seen_at);
+CREATE INDEX IF NOT EXISTS active_flow_sessions_organization_last_seen ON active_flow_sessions(organization_id, last_seen_at);
+CREATE INDEX IF NOT EXISTS active_flow_sessions_protocol_last_seen ON active_flow_sessions(protocol_id, last_seen_at);
+CREATE INDEX IF NOT EXISTS active_flow_sessions_remote_last_seen ON active_flow_sessions(remote_ip, last_seen_at);
+CREATE INDEX IF NOT EXISTS active_flow_sessions_application_last_seen ON active_flow_sessions(application_id, last_seen_at);
+CREATE INDEX IF NOT EXISTS active_flow_sessions_device_last_seen ON active_flow_sessions(device_id, last_seen_at);
+CREATE INDEX IF NOT EXISTS active_flow_sessions_port_last_seen_remote ON active_flow_sessions(remote_port, last_seen_at, remote_ip);
+CREATE INDEX IF NOT EXISTS active_flow_sessions_role_category_client_last_seen ON active_flow_sessions(traffic_role, category_id, client_ip, last_seen_at);
+CREATE INDEX IF NOT EXISTS active_flow_sessions_client_protocol_last_seen ON active_flow_sessions(client_ip, protocol_id, last_seen_at);
+CREATE INDEX IF NOT EXISTS active_flow_sessions_client_remote_protocol_last_seen ON active_flow_sessions(client_ip, remote_ip, protocol_id, last_seen_at);
+CREATE INDEX IF NOT EXISTS active_flow_sessions_client_remote_proto_last_seen ON active_flow_sessions(client_ip, remote_ip, protocol, last_seen_at);
+CREATE INDEX IF NOT EXISTS active_flow_sessions_scope_last_seen ON active_flow_sessions(scope, last_seen_at);
+CREATE INDEX IF NOT EXISTS active_flow_sessions_scope_path_nat ON active_flow_sessions(scope, path_type, nat);
 
-CREATE TABLE IF NOT EXISTS ingest_batches (
+CREATE TABLE IF NOT EXISTS analytics_outbox (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   gateway_id TEXT NOT NULL REFERENCES gateways(id) ON DELETE CASCADE,
   boot_id TEXT NOT NULL,
   sequence INTEGER NOT NULL,
-  received_at INTEGER NOT NULL,
-  PRIMARY KEY(gateway_id, boot_id, sequence)
+  payload BLOB NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE(gateway_id, boot_id, sequence)
 );
-
-CREATE TABLE IF NOT EXISTS settings (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS self_host_endpoint_evidence (
-  gateway_id TEXT NOT NULL REFERENCES gateways(id) ON DELETE CASCADE,
-  ip BLOB NOT NULL,
-  protocol INTEGER NOT NULL,
-  port INTEGER NOT NULL,
-  application_id TEXT NOT NULL,
-  confidence REAL NOT NULL,
-  source TEXT NOT NULL,
-  last_seen INTEGER NOT NULL,
-  expires_at INTEGER NOT NULL,
-  PRIMARY KEY(gateway_id, ip, protocol, port, application_id)
-);
-CREATE INDEX IF NOT EXISTS self_host_endpoint_evidence_expiry ON self_host_endpoint_evidence(gateway_id, ip, expires_at);
-
-CREATE TABLE IF NOT EXISTS traffic_total_minute (
-  timestamp INTEGER NOT NULL,
-  gateway_id TEXT NOT NULL,
-  upload_bytes INTEGER NOT NULL,
-  download_bytes INTEGER NOT NULL,
-  packets INTEGER NOT NULL,
-  flow_count INTEGER NOT NULL,
-  PRIMARY KEY(timestamp, gateway_id)
-);
-
-CREATE TABLE IF NOT EXISTS traffic_device_minute (
-  timestamp INTEGER NOT NULL,
-  gateway_id TEXT NOT NULL,
-  device_id INTEGER NOT NULL,
-  upload_bytes INTEGER NOT NULL,
-  download_bytes INTEGER NOT NULL,
-  packets INTEGER NOT NULL,
-  flow_count INTEGER NOT NULL,
-  PRIMARY KEY(timestamp, gateway_id, device_id)
-);
-
-CREATE TABLE IF NOT EXISTS traffic_application_minute (
-  timestamp INTEGER NOT NULL,
-  gateway_id TEXT NOT NULL,
-  application_id TEXT NOT NULL,
-  category_id TEXT NOT NULL,
-  upload_bytes INTEGER NOT NULL,
-  download_bytes INTEGER NOT NULL,
-  packets INTEGER NOT NULL,
-  flow_count INTEGER NOT NULL,
-  PRIMARY KEY(timestamp, gateway_id, application_id, category_id)
-);
-
-CREATE TABLE IF NOT EXISTS traffic_domain_minute (
-  timestamp INTEGER NOT NULL,
-  gateway_id TEXT NOT NULL,
-  domain TEXT NOT NULL,
-  upload_bytes INTEGER NOT NULL,
-  download_bytes INTEGER NOT NULL,
-  packets INTEGER NOT NULL,
-  flow_count INTEGER NOT NULL,
-  PRIMARY KEY(timestamp, gateway_id, domain)
-);
-
-CREATE TABLE IF NOT EXISTS traffic_destination_minute (
-  timestamp INTEGER NOT NULL,
-  gateway_id TEXT NOT NULL,
-  remote_ip BLOB NOT NULL,
-  upload_bytes INTEGER NOT NULL,
-  download_bytes INTEGER NOT NULL,
-  packets INTEGER NOT NULL,
-  flow_count INTEGER NOT NULL,
-  PRIMARY KEY(timestamp, gateway_id, remote_ip)
-);
-
-CREATE TABLE IF NOT EXISTS traffic_scope_minute (
-  timestamp INTEGER NOT NULL,
-  gateway_id TEXT NOT NULL,
-  scope INTEGER NOT NULL,
-  direction INTEGER NOT NULL,
-  device_id INTEGER NOT NULL,
-  application_id TEXT NOT NULL,
-  category_id TEXT NOT NULL,
-  domain TEXT NOT NULL,
-  remote_ip BLOB NOT NULL,
-  upload_bytes INTEGER NOT NULL,
-  download_bytes INTEGER NOT NULL,
-  packets INTEGER NOT NULL,
-  flow_count INTEGER NOT NULL,
-  PRIMARY KEY(timestamp, gateway_id, scope, direction, device_id,
-              application_id, category_id, domain, remote_ip)
-);
-CREATE INDEX IF NOT EXISTS traffic_scope_minute_query ON traffic_scope_minute(scope, direction, timestamp);
-CREATE INDEX IF NOT EXISTS traffic_scope_minute_device ON traffic_scope_minute(device_id, scope, timestamp);
-
-CREATE TABLE IF NOT EXISTS traffic_total_hour (
-  timestamp INTEGER NOT NULL,
-  gateway_id TEXT NOT NULL,
-  upload_bytes INTEGER NOT NULL,
-  download_bytes INTEGER NOT NULL,
-  packets INTEGER NOT NULL,
-  flow_count INTEGER NOT NULL,
-  PRIMARY KEY(timestamp, gateway_id)
-);
-
-CREATE TABLE IF NOT EXISTS traffic_device_hour (
-  timestamp INTEGER NOT NULL,
-  gateway_id TEXT NOT NULL,
-  device_id INTEGER NOT NULL,
-  upload_bytes INTEGER NOT NULL,
-  download_bytes INTEGER NOT NULL,
-  packets INTEGER NOT NULL,
-  flow_count INTEGER NOT NULL,
-  PRIMARY KEY(timestamp, gateway_id, device_id)
-);
-
-CREATE TABLE IF NOT EXISTS traffic_application_hour (
-  timestamp INTEGER NOT NULL,
-  gateway_id TEXT NOT NULL,
-  application_id TEXT NOT NULL,
-  category_id TEXT NOT NULL,
-  upload_bytes INTEGER NOT NULL,
-  download_bytes INTEGER NOT NULL,
-  packets INTEGER NOT NULL,
-  flow_count INTEGER NOT NULL,
-  PRIMARY KEY(timestamp, gateway_id, application_id, category_id)
-);
-
-CREATE TABLE IF NOT EXISTS traffic_domain_hour (
-  timestamp INTEGER NOT NULL,
-  gateway_id TEXT NOT NULL,
-  domain TEXT NOT NULL,
-  upload_bytes INTEGER NOT NULL,
-  download_bytes INTEGER NOT NULL,
-  packets INTEGER NOT NULL,
-  flow_count INTEGER NOT NULL,
-  PRIMARY KEY(timestamp, gateway_id, domain)
-);
-
-CREATE TABLE IF NOT EXISTS traffic_destination_hour (
-  timestamp INTEGER NOT NULL,
-  gateway_id TEXT NOT NULL,
-  remote_ip BLOB NOT NULL,
-  upload_bytes INTEGER NOT NULL,
-  download_bytes INTEGER NOT NULL,
-  packets INTEGER NOT NULL,
-  flow_count INTEGER NOT NULL,
-  PRIMARY KEY(timestamp, gateway_id, remote_ip)
-);
-
-CREATE TABLE IF NOT EXISTS traffic_total_day (
-  timestamp INTEGER NOT NULL,
-  gateway_id TEXT NOT NULL,
-  upload_bytes INTEGER NOT NULL,
-  download_bytes INTEGER NOT NULL,
-  packets INTEGER NOT NULL,
-  flow_count INTEGER NOT NULL,
-  PRIMARY KEY(timestamp, gateway_id)
-);
-
-CREATE TABLE IF NOT EXISTS traffic_device_day (
-  timestamp INTEGER NOT NULL,
-  gateway_id TEXT NOT NULL,
-  device_id INTEGER NOT NULL,
-  upload_bytes INTEGER NOT NULL,
-  download_bytes INTEGER NOT NULL,
-  packets INTEGER NOT NULL,
-  flow_count INTEGER NOT NULL,
-  PRIMARY KEY(timestamp, gateway_id, device_id)
-);
-
-CREATE TABLE IF NOT EXISTS traffic_application_day (
-  timestamp INTEGER NOT NULL,
-  gateway_id TEXT NOT NULL,
-  application_id TEXT NOT NULL,
-  category_id TEXT NOT NULL,
-  upload_bytes INTEGER NOT NULL,
-  download_bytes INTEGER NOT NULL,
-  packets INTEGER NOT NULL,
-  flow_count INTEGER NOT NULL,
-  PRIMARY KEY(timestamp, gateway_id, application_id, category_id)
-);
-
-CREATE TABLE IF NOT EXISTS traffic_domain_day (
-  timestamp INTEGER NOT NULL,
-  gateway_id TEXT NOT NULL,
-  domain TEXT NOT NULL,
-  upload_bytes INTEGER NOT NULL,
-  download_bytes INTEGER NOT NULL,
-  packets INTEGER NOT NULL,
-  flow_count INTEGER NOT NULL,
-  PRIMARY KEY(timestamp, gateway_id, domain)
-);
-
-CREATE TABLE IF NOT EXISTS traffic_destination_day (
-  timestamp INTEGER NOT NULL,
-  gateway_id TEXT NOT NULL,
-  remote_ip BLOB NOT NULL,
-  upload_bytes INTEGER NOT NULL,
-  download_bytes INTEGER NOT NULL,
-  packets INTEGER NOT NULL,
-  flow_count INTEGER NOT NULL,
-  PRIMARY KEY(timestamp, gateway_id, remote_ip)
-);
+CREATE INDEX IF NOT EXISTS analytics_outbox_created_at ON analytics_outbox(created_at);
 
 INSERT OR IGNORE INTO sites(id, name, created_at)
 VALUES ('default', 'default', CAST(unixepoch('subsec') * 1000 AS INTEGER));

@@ -7,7 +7,9 @@ use netqmon_protocol::v1::{ProbeRequest, ProbeResult};
 pub(super) fn execute(request: &ProbeRequest) -> ProbeResult {
     let observed_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis() as u64);
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        });
     let (outcome, status) = match request.target.as_ref() {
         Some(Target::Favicon(target)) => {
             let (result, status) = crate::favicon_probe::execute(target);

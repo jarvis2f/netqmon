@@ -11,6 +11,7 @@ temporary_directory=$(mktemp -d)
 log_file=${temporary_directory}/collector.log
 mock_log_file=${temporary_directory}/mock-classifierd.log
 database_path=${temporary_directory}/netqmon.db
+analytics_path=${temporary_directory}/netqmon-analytics.duckdb
 classifier_socket=${temporary_directory}/classifierd.sock
 collector_pid=
 mock_classifier_pid=
@@ -46,6 +47,7 @@ NETQMON_COLLECTOR_PUBLIC_ADDR=${public_address} \
 NETQMON_COLLECTOR_INTERNAL_ADDR=${internal_address} \
 NETQMON_COLLECTOR_ENROLLMENT_TOKEN=${enrollment_token} \
 NETQMON_COLLECTOR_DATABASE_PATH=${database_path} \
+NETQMON_DUCKDB_PATH=${analytics_path} \
 NETQMON_CLASSIFIER_SOCKET=${classifier_socket} \
 NETQMON_LICENSE_STATE_PATH=${temporary_directory}/license.json \
   "${collector}" >"${log_file}" 2>&1 &
@@ -79,23 +81,55 @@ fi
 python3 - "${internal_address}" <<'PY'
 import json
 import sys
+import time
+from urllib.parse import urlencode
 import urllib.request
 
 base = f"http://{sys.argv[1]}"
+now = int(time.time() * 1000)
+traffic_path = "/internal/traffic?" + urlencode({
+    "from": now - 86_400_000,
+    "to": now + 60_000,
+    "limit": 10,
+    "offset": 0,
+    "scope": "all",
+})
 paths = [
     "/internal/overview?limit=10&offset=0",
-    "/internal/traffic?from=0&to=9223372036854775807&limit=10&offset=0",
+    traffic_path,
     "/internal/clients?limit=10&offset=0",
     "/internal/applications?limit=10&offset=0",
     "/internal/domains?limit=10&offset=0",
     "/internal/destinations?limit=10&offset=0",
     "/internal/flows?limit=10",
 ]
+responses = {}
 for path in paths:
     with urllib.request.urlopen(base + path, timeout=2) as response:
         payload = json.load(response)
         assert payload["schema_version"] == 1, (path, payload)
         assert "data" in payload, (path, payload)
+        responses[path] = payload["data"]
+
+for _ in range(50):
+    with urllib.request.urlopen(base + traffic_path, timeout=2) as response:
+        responses[traffic_path] = json.load(response)["data"]
+    traffic_bytes = sum(
+        point["upload_bytes"] + point["download_bytes"]
+        for point in responses[traffic_path]["points"]
+    )
+    if traffic_bytes == 65700:
+        break
+    time.sleep(0.1)
+assert traffic_bytes == 65700, traffic_bytes
+flow_path = "/internal/flows?from=0&to=9223372036854775807&limit=10"
+for _ in range(50):
+    with urllib.request.urlopen(base + flow_path, timeout=2) as response:
+        responses[flow_path] = json.load(response)["data"]
+    if responses[flow_path]:
+        break
+    time.sleep(0.1)
+assert responses[flow_path], "analytics flow query returned no rows"
 
 with urllib.request.urlopen(base + "/internal/realtime/stream", timeout=2) as response:
     assert response.readline().decode().strip() == "event: snapshot"
@@ -112,25 +146,25 @@ import sys
 
 connection = sqlite3.connect(sys.argv[1])
 gateway_count = connection.execute("SELECT COUNT(*) FROM gateways").fetchone()[0]
-traffic_bytes = connection.execute(
-    "SELECT SUM(upload_bytes + download_bytes) FROM traffic_total_minute"
-).fetchone()[0]
 assert gateway_count == 1, gateway_count
-assert traffic_bytes == 65700, traffic_bytes
+assert not connection.execute(
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND (name='flow_sessions' OR name GLOB 'traffic_*')"
+).fetchone(), "analytics tables leaked into SQLite metadata"
 PY
 
 NETQMON_COLLECTOR_PUBLIC_ADDR=${public_address} \
 NETQMON_COLLECTOR_INTERNAL_ADDR=${internal_address} \
 NETQMON_COLLECTOR_ENROLLMENT_TOKEN=${enrollment_token} \
 NETQMON_COLLECTOR_DATABASE_PATH=${database_path} \
+NETQMON_DUCKDB_PATH=${analytics_path} \
 NETQMON_CLASSIFIER_SOCKET=${classifier_socket} \
   "${collector}" >>"${log_file}" 2>&1 &
 collector_pid=$!
 
 for _ in $(seq 1 50); do
-  if curl --fail --silent "http://${public_address}/health" >/dev/null; then
-    echo "Collector restart preserved Gateway and synthetic traffic bytes"
-    exit 0
+  if curl --fail --silent "http://${public_address}/health" >/dev/null && \
+     curl --fail --silent "http://${internal_address}/internal/health" >/dev/null; then
+    break
   fi
   if ! kill -0 "${collector_pid}" 2>/dev/null; then
     cat "${log_file}"
@@ -139,5 +173,24 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 
-cat "${log_file}"
-exit 1
+python3 - "${internal_address}" <<'PY'
+import json
+import sys
+import time
+from urllib.parse import urlencode
+import urllib.request
+
+now = int(time.time() * 1000)
+query = urlencode({"from": now - 86_400_000, "to": now + 60_000, "limit": 10, "offset": 0, "scope": "all"})
+url = f"http://{sys.argv[1]}/internal/traffic?{query}"
+for _ in range(50):
+    with urllib.request.urlopen(url, timeout=3) as response:
+        payload = json.load(response)
+    traffic_bytes = sum(point["upload_bytes"] + point["download_bytes"] for point in payload["data"]["points"])
+    if traffic_bytes == 65700:
+        break
+    time.sleep(0.1)
+assert payload["schema_version"] == 1, payload
+assert traffic_bytes == 65700, traffic_bytes
+print("Collector restart preserved Gateway metadata and DuckDB analytics traffic")
+PY

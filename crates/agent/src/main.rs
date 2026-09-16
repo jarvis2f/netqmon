@@ -43,7 +43,7 @@ mod topology;
 mod transport;
 
 #[cfg(target_os = "linux")]
-#[allow(dead_code, unused_imports, unsafe_code)]
+#[allow(clippy::all, clippy::pedantic, dead_code, unused_imports, unsafe_code)]
 mod bpf {
     include!(concat!(env!("OUT_DIR"), "/flow.skel.rs"));
 
@@ -72,7 +72,7 @@ mod bpf {
                 program.as_fd().as_raw_fd(),
                 ifindex,
                 attach_type,
-                &options,
+                &raw const options,
             )
         };
         if fd < 0 {
@@ -103,7 +103,7 @@ fn main() {
                     std::process::exit(2);
                 }
             };
-            if let Err(error) = linux::run(config) {
+            if let Err(error) = linux::run(&config) {
                 eprintln!("{error}");
                 std::process::exit(1);
             }

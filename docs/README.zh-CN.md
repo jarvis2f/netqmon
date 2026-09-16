@@ -33,7 +33,7 @@ NetQmon 是一个面向 OpenWrt 的自托管网络可观测平台。它希望解
 | **目的地** | 从域名、国家/地区、ASN/ISP 和地理视图理解流量去向。 |
 | **实时与历史** | 在同一个界面观察当前网络活动，并查询不同时间范围的历史数据。 |
 | **OpenWrt 原生体验** | TC eBPF 数据面、`procd` 服务、UCI 配置、诊断命令，以及可选的 LuCI 管理界面。 |
-| **自托管 Controller** | 通过 Docker 部署；默认使用 SQLite，也可以选择 ClickHouse 承载更大规模的数据。 |
+| **自托管 Controller** | 通过 Docker 部署；使用本地 Collector 数据库，默认使用 DuckDB 分析，也可选择 ClickHouse 分析后端承载更大规模的数据。 |
 
 ## 工作方式
 
@@ -47,7 +47,7 @@ flowchart LR
 
     Agent -->|"Flow / DNS / 设备遥测"| Collector["Collector"]
     Collector --> Classifier["Classifier"]
-    Collector --> Storage[("SQLite / ClickHouse")]
+    Collector --> Storage[("Collector DB / DuckDB / ClickHouse")]
     Collector --> UI["Next.js Web UI"]
     Cloud["NetQmon Cloud\n规则与更新服务"] -. "可选" .-> Classifier
 ```
@@ -66,7 +66,7 @@ docker compose up -d
 
 Controller 健康检查通过后，访问 `http://localhost:3000`。
 
-默认使用 SQLite 作为存储后端。在需要更高写入吞吐或更长数据保留期时，可以启用 ClickHouse。详细环境变量、端口与存储配置见 [Controller 配置与端口说明](controller-configuration.zh-CN.md)。
+Controller 将本地 Collector 数据库保存于 `/data/netqmon.db`，并默认使用 DuckDB 分析。需要更高写入吞吐或更长数据保留期时，可设置 `NETQMON_ANALYTICS_BACKEND=clickhouse` 使用外部 ClickHouse 分析后端。详细环境变量、端口与存储配置见 [Controller 配置与端口说明](controller-configuration.zh-CN.md)。
 
 ### OpenWrt Agent
 
@@ -116,7 +116,7 @@ crates/agent/                OpenWrt userspace Agent
 crates/collector/            数据接收、DPI、实时与查询管线
 crates/classifier-client/    分类客户端
 crates/classifier-manager/   规则生命周期与更新
-crates/storage/              SQLite / ClickHouse 存储
+crates/storage/              Collector、DuckDB 与 ClickHouse 存储
 apps/controller-ui/          Next.js Controller UI
 packaging/openwrt/           OpenWrt 软件包与 LuCI 应用
 deploy/docker/               Controller 容器构建

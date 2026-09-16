@@ -1,7 +1,7 @@
 # NetQmon Controller Configuration & Port Reference
 
 The NetQmon Controller is the central server component of the NetQmon observability stack, packaged and deployed as a multi-process Docker container. It coordinates three core services:
-* **`netqmon-collector`**: High-performance telemetry ingestion and query engine (supporting SQLite and ClickHouse backends, bounded nDPI deep packet analysis, GeoIP, and MAC OUI vendor resolution).
+* **`netqmon-collector`**: High-performance telemetry ingestion and query engine with a local collector database, selectable DuckDB or ClickHouse analytics, bounded nDPI deep packet analysis, GeoIP, and MAC OUI vendor resolution.
 * **`netqmon-classifier-manager`**: Classification daemon supervisor and signed component update coordinator.
 * **`controller-ui`**: Modern Next.js web console and authenticated API gateway.
 
@@ -16,8 +16,8 @@ In a standard deployment (such as via `docker-compose.yml`), the Controller cont
 | **`3000`** | TCP (HTTP) | Public / LAN | **Web Console Port**. Network administrators access this port in a web browser to view the NetQmon dashboard. |
 | **`8090`** | TCP (HTTP/Protobuf) | LAN / Routable | **Agent Telemetry Ingestion Port**. OpenWrt routers running `netqmon-agent` connect to this port for initial gateway enrollment and ongoing telemetry batch streaming. |
 | **`8091`** | TCP (HTTP/JSON) | Container Internal (`127.0.0.1`) | **Internal Collector Query API**. Used solely by `controller-ui` server-side proxy handlers. **Must not be exposed directly to untrusted networks**. |
-| **`8123`** | TCP (HTTP) | Optional (ClickHouse Profile) | ClickHouse HTTP query port (only utilized when running with the ClickHouse storage backend). |
-| **`9000`** | TCP (Native) | Optional (ClickHouse Profile) | ClickHouse native TCP port (only utilized when running with the ClickHouse storage backend). |
+| **`8123`** | TCP (HTTP) | Optional (ClickHouse Profile) | ClickHouse HTTP query port, used when `NETQMON_ANALYTICS_BACKEND=clickhouse`. |
+| **`9000`** | TCP (Native) | Optional (ClickHouse Profile) | ClickHouse native TCP port, used when `NETQMON_ANALYTICS_BACKEND=clickhouse`. |
 
 > [!SECURITY]
 > * **Ports `3000` and `8090`** should be restricted to trusted local network segments. When deploying on a public VPS, put them behind a reverse proxy (e.g. Caddy, Traefik, or Nginx) with TLS/HTTPS enabled.
@@ -38,13 +38,14 @@ In a standard deployment (such as via `docker-compose.yml`), the Controller cont
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `NETQMON_STORAGE_BACKEND` | `sqlite` | Storage backend type: `sqlite` or `clickhouse`. SQLite is recommended for typical home/homelab networks; ClickHouse is recommended for multi-gigabit workloads with high flow retention requirements. |
-| `NETQMON_COLLECTOR_DATABASE_PATH` | `/data/netqmon.db` | Filesystem path for the SQLite database (located inside the persistent `/data` volume). |
+| `NETQMON_COLLECTOR_DATABASE_PATH` | `/data/netqmon.db` | Filesystem path for the collector database, located inside the persistent `/data` volume. |
+| `NETQMON_ANALYTICS_BACKEND` | `duckdb` | Analytics backend: `duckdb` for the local default or `clickhouse` for an external ClickHouse service. |
+| `NETQMON_DUCKDB_PATH` | `/data/netqmon-analytics.duckdb` | Filesystem path for the DuckDB analytics database. Keep it on the persistent `/data` volume. |
 | `NETQMON_LICENSE_STATE_PATH` | `/data/license.json` | Persistent license identity and installation credential state. Keep this path on the persistent `/data` volume so the installation ID survives container replacement. |
-| `NETQMON_CLICKHOUSE_URL` | `http://clickhouse:8123` | ClickHouse HTTP endpoint URL (applicable when `NETQMON_STORAGE_BACKEND=clickhouse`). |
+| `NETQMON_CLICKHOUSE_URL` | `http://clickhouse:8123` | ClickHouse HTTP endpoint URL, used when `NETQMON_ANALYTICS_BACKEND=clickhouse`. |
 | `NETQMON_CLICKHOUSE_DATABASE` | `default` | ClickHouse database name. |
-| `NETQMON_CLICKHOUSE_USER` | `default` | ClickHouse authentication username (optional). |
-| `NETQMON_CLICKHOUSE_PASSWORD` | *(empty)* | ClickHouse authentication password (optional). |
+| `NETQMON_CLICKHOUSE_USER` | *(unset)* | ClickHouse authentication username (optional). |
+| `NETQMON_CLICKHOUSE_PASSWORD` | *(unset)* | ClickHouse authentication password (optional). |
 
 ### 2.3 Network Listeners & Service Bindings
 

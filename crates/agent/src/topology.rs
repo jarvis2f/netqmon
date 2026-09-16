@@ -217,7 +217,6 @@ impl TopologySnapshot {
             .map(|route| route.interface.as_str())
             .collect::<Vec<_>>();
         let forwarding = self.ipv4_forwarding || self.ipv6_forwarding;
-        let capture_is_default = default_interfaces.contains(&capture_interface);
         let gateway_on_capture_subnet = self.routes.iter().any(|route| {
             route.interface == capture_interface
                 && route.gateway.is_some_and(|gateway| {
@@ -234,10 +233,7 @@ impl TopologySnapshot {
             .interfaces
             .iter()
             .any(|interface| interface.name == capture_interface && interface.is_bridge);
-        self.mode = if forwarding
-            && (capture_is_default || gateway_on_capture_subnet)
-            && gateway_on_capture_subnet
-        {
+        self.mode = if forwarding && gateway_on_capture_subnet {
             TopologyMode::OneArmRouter
         } else if forwarding && !default_interfaces.is_empty() {
             TopologyMode::Router

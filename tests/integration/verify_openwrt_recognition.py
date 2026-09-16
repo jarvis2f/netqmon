@@ -22,9 +22,11 @@ dhcp6 = [json.loads(r[0])['attributes'] for r in connection.execute(
 assert any({'duid', 'vendor_specific', 'client_fqdn'} <= a.keys() for a in dhcp6), dhcp6
 flows = {}
 for protocol, port in [('tls', 18443), ('http', 18080)]:
-    rows = connection.execute('SELECT protocol_id,application_id,category_id,domain '
-                              'FROM flow_sessions WHERE remote_port=?', (port,)).fetchall()
-    assert any(r == (protocol, 'youtube', 'streaming', 'www.youtube.com') for r in rows), rows
+    with urllib.request.urlopen(
+            f'http://127.0.0.1:28091/internal/flows?from=0&to=9223372036854775807&limit=100&port={port}') as response:
+        rows = json.load(response)['data']
+    assert any(r['protocol_id'] == protocol and r['application'] == 'youtube'
+               and r['category'] == 'streaming' and r['domain'] == 'www.youtube.com' for r in rows), rows
     flows[protocol] = rows
 assert connection.execute("SELECT count(*) FROM devices WHERE device_type='printer'").fetchone()[0] > 0
 with urllib.request.urlopen('http://127.0.0.1:28091/internal/settings/diagnostics') as response:

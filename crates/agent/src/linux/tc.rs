@@ -39,7 +39,10 @@ impl AttachLinks {
 
     pub(super) fn detach(&mut self) -> Result<()> {
         match self {
-            Self::Tcx(links) => links.detach(),
+            Self::Tcx(links) => {
+                links.detach();
+                Ok(())
+            }
             Self::Netlink(hooks) => hooks.detach(),
         }
     }
@@ -89,10 +92,9 @@ impl TcxLinks {
         Ok(Self { ingress, egress })
     }
 
-    pub(super) fn detach(&mut self) -> Result<()> {
+    pub(super) fn detach(&mut self) {
         self.egress.take();
         self.ingress.take();
-        Ok(())
     }
 }
 
@@ -223,9 +225,8 @@ impl Drop for NetlinkHooks {
 pub(super) fn requested_backend(value: AttachBackend, tcx_supported: bool) -> ActiveBackend {
     match value {
         AttachBackend::Tcx => ActiveBackend::Tcx,
-        AttachBackend::Netlink => ActiveBackend::Netlink,
         AttachBackend::Auto if tcx_supported => ActiveBackend::Tcx,
-        AttachBackend::Auto => ActiveBackend::Netlink,
+        AttachBackend::Netlink | AttachBackend::Auto => ActiveBackend::Netlink,
     }
 }
 

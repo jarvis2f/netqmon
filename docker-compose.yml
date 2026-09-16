@@ -6,8 +6,9 @@ services:
       dockerfile: deploy/docker/Dockerfile.controller
     image: ${NETQMON_CONTROLLER_IMAGE:-ghcr.io/jarvis2f/netqmon:latest}
     environment:
-      - NETQMON_STORAGE_BACKEND=${NETQMON_STORAGE_BACKEND:-sqlite}
       - NETQMON_COLLECTOR_DATABASE_PATH=/data/netqmon.db
+      - NETQMON_ANALYTICS_BACKEND=${NETQMON_ANALYTICS_BACKEND:-duckdb}
+      - NETQMON_DUCKDB_PATH=/data/netqmon-analytics.duckdb
       - NETQMON_COLLECTOR_MAC_DATASET_PATH=/data/mac-prefixes.json
       - NETQMON_COLLECTOR_ENROLLMENT_TOKEN=${NETQMON_COLLECTOR_ENROLLMENT_TOKEN:-netqmon-dev-enrollment-token}
       - NETQMON_COLLECTOR_PUBLIC_ADDR=0.0.0.0:8090

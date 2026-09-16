@@ -106,9 +106,8 @@ pub(crate) struct LicenseCoordinator {
 
 impl LicenseCoordinator {
     pub(crate) fn from_env(classifier: ClassifierHandle) -> Self {
-        let identity_path = env::var_os("NETQMON_LICENSE_STATE_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
+        let identity_path = env::var_os("NETQMON_LICENSE_STATE_PATH").map_or_else(
+            || {
                 if cfg!(test) {
                     std::env::temp_dir()
                         .join(format!("netqmon-test-license-{}.json", Uuid::new_v4()))
@@ -126,7 +125,9 @@ impl LicenseCoordinator {
                         default_path
                     }
                 }
-            });
+            },
+            PathBuf::from,
+        );
         Self::new(
             classifier,
             env::var("NETQMON_CLOUD_API_URL")

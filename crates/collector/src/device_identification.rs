@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -916,10 +917,11 @@ fn fetch_http(url: &str) -> Result<String, String> {
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let mut digest = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        write!(digest, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    digest
 }
 
 fn iso_time(time: SystemTime) -> String {

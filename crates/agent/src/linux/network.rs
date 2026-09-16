@@ -34,10 +34,8 @@ pub(super) fn discover(config: &AgentConfig) -> Result<TopologyContext, String> 
         .filter_map(|route| route.gateway)
         .collect::<Vec<_>>();
     let firewall = fs::read_to_string("/etc/config/firewall").ok();
-    let (flow_offloading, flow_offloading_hw) = firewall
-        .as_deref()
-        .map(parse_offloading)
-        .unwrap_or((None, None));
+    let (flow_offloading, flow_offloading_hw) =
+        firewall.as_deref().map_or((None, None), parse_offloading);
     let nat = firewall.as_deref().map_or(NatStatus::Unknown, |contents| {
         if contains_enabled_option(contents, "masq") {
             NatStatus::Masquerade
@@ -373,7 +371,7 @@ fn prefix_length(netmask: IpAddr) -> Option<u8> {
         IpAddr::V4(address) => (u128::from(u32::from(address)), 32),
         IpAddr::V6(address) => (u128::from(address), 128),
     };
-    let prefix = mask.count_ones() as u8;
+    let prefix = u8::try_from(mask.count_ones()).ok()?;
     let expected = if prefix == 0 {
         0
     } else if prefix == 128 {

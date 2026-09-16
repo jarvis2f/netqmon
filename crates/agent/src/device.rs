@@ -111,6 +111,7 @@ impl DeviceObservationCache {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn resolve(&self, ip: IpAddr) -> Option<MacAddress> {
         self.ip_owners.get(&ip).copied()
     }

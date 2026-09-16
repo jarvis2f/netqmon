@@ -21,11 +21,10 @@ use crate::transport::TransportStats;
 pub const DEFAULT_SOCKET_PATH: &str = "/var/run/netqmon-agent.sock";
 
 fn rate_ppm(numerator: u64, denominator: u64) -> u64 {
-    if denominator == 0 {
-        0
-    } else {
-        numerator.saturating_mul(1_000_000) / denominator
-    }
+    numerator
+        .saturating_mul(1_000_000)
+        .checked_div(denominator)
+        .unwrap_or_default()
 }
 
 #[must_use]
@@ -406,6 +405,7 @@ impl DiagnosticsHub {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
     }

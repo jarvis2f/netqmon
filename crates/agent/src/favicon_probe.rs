@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn extracts_link_icons_without_accepting_inline_data() {
-        let html = br#"<link href='/a.png' rel='shortcut icon'><link rel=icon href=data:image/png,abc><link REL=ICON HREF=/b.ico>"#;
+        let html = br"<link href='/a.png' rel='shortcut icon'><link rel=icon href=data:image/png,abc><link REL=ICON HREF=/b.ico>";
         assert_eq!(icon_hrefs(html), vec!["/a.png", "/b.ico"]);
     }
 }

@@ -215,8 +215,8 @@ jobs:
       - name: Build
         run: pnpm build
 
-  clickhouse-dpi:
-    name: ClickHouse late DPI
+  clickhouse-analytics:
+    name: ClickHouse analytics contract
     runs-on: ubuntu-latest
     services:
       clickhouse:
@@ -233,7 +233,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: Verify late classification on real ClickHouse
+      - name: Verify idempotent analytics and late classification on real ClickHouse
         env:
           NETQMON_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
-        run: cargo test -p netqmon-storage --test late_dpi_clickhouse -- --ignored
+        run: cargo test -p netqmon-storage --no-default-features --features analytics-clickhouse --test clickhouse_analytics_contract -- --ignored

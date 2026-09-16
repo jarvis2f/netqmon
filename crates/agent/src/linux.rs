@@ -154,7 +154,11 @@ impl fmt::Display for AgentError {
 
 impl Error for AgentError {}
 
-pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
+// This function owns the long-lived BPF runtime loop and its coordinated
+// state; keeping its poll, telemetry, and shutdown transitions together makes
+// the lifecycle ordering explicit.
+#[allow(clippy::too_many_lines)]
+pub(super) fn run(config: &AgentConfig) -> Result<(), AgentError> {
     let interface = config.interface.clone();
     let log_level = config.log_level;
     let configured_interfaces = config
@@ -162,7 +166,7 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
         .iter()
         .map(|name| resolve_interface(name).map(|ifindex| (name.clone(), ifindex)))
         .collect::<Result<Vec<_>, _>>()?;
-    let network = network::discover(&config).map_err(AgentError::Runtime)?;
+    let network = network::discover(config).map_err(AgentError::Runtime)?;
     probe_map_creation()?;
     let shutdown = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGINT, Arc::clone(&shutdown))
@@ -172,9 +176,9 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
     let session_boot_id = session_boot_id();
     let controller_endpoints = transport::controller_endpoints(&config.controller_url);
     let telemetry_queue =
-        TelemetryQueue::spawn(&config, Arc::clone(&shutdown), session_boot_id.clone());
+        TelemetryQueue::spawn(config, Arc::clone(&shutdown), session_boot_id.clone());
     let sample_queue = Arc::new(SampleQueue::spawn(
-        &config,
+        config,
         Arc::clone(&shutdown),
         session_boot_id,
     ));
@@ -187,7 +191,7 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
     let tcx_supported = if config.attach_backend == crate::config::AttachBackend::Netlink {
         false
     } else {
-        capabilities::probe_tcx_backend(&config).is_ok()
+        capabilities::probe_tcx_backend(config).is_ok()
     };
     let selected_backend = tc::requested_backend(config.attach_backend, tcx_supported);
     let capture_is_bridge = network
@@ -207,12 +211,12 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
     let mut open_object = MaybeUninit::uninit();
     let mut open_skeleton = builder
         .open(&mut open_object)
-        .map_err(|error| classify_bpf_error(BpfStage::Open, error))?;
+        .map_err(|error| classify_bpf_error(BpfStage::Open, &error))?;
     open_skeleton
         .maps
         .flow_map
         .set_max_entries(config.max_flows)
-        .map_err(|err| classify_map_error("flow_map", err))?;
+        .map_err(|error| classify_map_error("flow_map", &error))?;
     open_skeleton
         .maps
         .sample_budgets
@@ -221,7 +225,7 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
         } else {
             1
         })
-        .map_err(|err| classify_map_error("sample_budgets", err))?;
+        .map_err(|error| classify_map_error("sample_budgets", &error))?;
     open_skeleton.progs.netqmon_attach_probe.set_autoload(false);
     if let Some(rodata) = open_skeleton.maps.rodata_data.as_deref_mut() {
         rodata.sample_enabled = u8::from(config.sample_enabled);
@@ -234,7 +238,7 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
     }
     let skeleton = open_skeleton
         .load()
-        .map_err(|error| classify_bpf_error(BpfStage::Load, error))?;
+        .map_err(|error| classify_bpf_error(BpfStage::Load, &error))?;
     for target_ifindex in &observed_ingress_ifindices {
         let key = u32::try_from(*target_ifindex)
             .map_err(|_| AgentError::Runtime("interface index overflow".to_owned()))?
@@ -285,12 +289,12 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                     log_level,
                     format_args!("TCX attach failed ({error}); falling back to netlink TC"),
                 );
-                attach_netlink().map_err(|error| classify_tc_error(&interface, error))?
+                attach_netlink().map_err(|error| classify_tc_error(&interface, &error))?
             }
-            Err(error) => return Err(classify_tc_error(&interface, error)),
+            Err(error) => return Err(classify_tc_error(&interface, &error)),
         },
         tc::ActiveBackend::Netlink => {
-            attach_netlink().map_err(|error| classify_tc_error(&interface, error))?
+            attach_netlink().map_err(|error| classify_tc_error(&interface, &error))?
         }
     };
     let active_backend = hooks
@@ -529,11 +533,7 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
         if now >= next_conntrack_refresh {
             let refresh_started = Instant::now();
             let refreshed = Arc::new(ConntrackContext::discover());
-            conntrack_stats.record_refresh(
-                true,
-                refreshed.len(),
-                refresh_started.elapsed().as_micros() as u64,
-            );
+            conntrack_stats.record_refresh(true, refreshed.len(), elapsed_micros(refresh_started));
             if let Ok(mut current) = conntrack.write() {
                 *current = refreshed;
                 conntrack_refreshed_this_iteration = true;
@@ -562,8 +562,7 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                 let (dedup_entries, http_dedup_entries) = processor.dedup_entries();
                 let device_count = devices
                     .lock()
-                    .map(|devices| devices.snapshot().len() as u64)
-                    .unwrap_or(0);
+                    .map_or(0, |devices| devices.snapshot().len() as u64);
                 diagnostics_hub.update_device_discovery(
                     device_count,
                     dedup_entries as u64,
@@ -607,7 +606,7 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                 }
                 log_device_snapshot(&devices, log_level);
             }
-            last_neighbor_refresh_duration_us = refresh_started.elapsed().as_micros() as u64;
+            last_neighbor_refresh_duration_us = elapsed_micros(refresh_started);
             diagnostics_hub.update_refresh_durations(
                 last_neighbor_refresh_duration_us,
                 last_dhcp_lease_refresh_duration_us,
@@ -619,7 +618,7 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
             if let Ok(mut devices) = devices.lock() {
                 refresh_dhcp_leases(&mut devices, log_level);
             }
-            last_dhcp_lease_refresh_duration_us = refresh_started.elapsed().as_micros() as u64;
+            last_dhcp_lease_refresh_duration_us = elapsed_micros(refresh_started);
             diagnostics_hub.update_refresh_durations(
                 last_neighbor_refresh_duration_us,
                 last_dhcp_lease_refresh_duration_us,
@@ -750,7 +749,7 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                             }
                         }
                     }
-                    last_poll_duration_us = poll_start.elapsed().as_micros() as u64;
+                    last_poll_duration_us = elapsed_micros(poll_start);
                     diagnostics_hub.update_poll(
                         retained_entries,
                         last_poll_duration_us,
@@ -1084,10 +1083,10 @@ impl AsymmetryDetector {
     fn observe(&mut self, direction: crate::normalization::Direction, packets: u64) {
         match direction {
             crate::normalization::Direction::Upload => {
-                self.original_packets = self.original_packets.saturating_add(packets)
+                self.original_packets = self.original_packets.saturating_add(packets);
             }
             crate::normalization::Direction::Download => {
-                self.reply_packets = self.reply_packets.saturating_add(packets)
+                self.reply_packets = self.reply_packets.saturating_add(packets);
             }
             crate::normalization::Direction::Internal
             | crate::normalization::Direction::Unknown => {}
@@ -1125,14 +1124,16 @@ fn boot_epoch_ms() -> u64 {
 
 fn monotonic_ns() -> u64 {
     // Same clock as bpf_ktime_get_ns; NTP adjustments must not reset active budgets.
-    nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)
-        .map(|time| {
-            u64::try_from(time.tv_sec())
-                .unwrap_or(0)
-                .saturating_mul(1_000_000_000)
-                + u64::try_from(time.tv_nsec()).unwrap_or(0)
-        })
-        .unwrap_or(0)
+    nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC).map_or(0, |time| {
+        u64::try_from(time.tv_sec())
+            .unwrap_or(0)
+            .saturating_mul(1_000_000_000)
+            + u64::try_from(time.tv_nsec()).unwrap_or(0)
+    })
+}
+
+fn elapsed_micros(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 fn read_trimmed(path: &str) -> String {
@@ -1272,11 +1273,7 @@ fn process_pending_sample_events(
         let resolved = deferred.iter().any(|bytes| {
             sample_event_key(bytes).is_some_and(|key| refreshed.resolve(&key).is_some())
         });
-        stats.record_refresh(
-            resolved,
-            refreshed.len(),
-            refresh_started.elapsed().as_micros() as u64,
-        );
+        stats.record_refresh(resolved, refreshed.len(), elapsed_micros(refresh_started));
         if let Ok(mut current) = conntrack.write() {
             *current = Arc::clone(&refreshed);
         }
@@ -1328,9 +1325,7 @@ fn sample_event_captured_length(bytes: &[u8]) -> u64 {
     bytes
         .get(64..68)
         .and_then(|value| value.try_into().ok())
-        .map(u32::from_ne_bytes)
-        .map(u64::from)
-        .unwrap_or(0)
+        .map_or(0, |value: [u8; 4]| u64::from(u32::from_ne_bytes(value)))
 }
 
 fn print_lifecycle_event(
@@ -1416,11 +1411,7 @@ fn normalize_with_current_conntrack(
     let refresh_started = Instant::now();
     let refreshed = Arc::new(ConntrackContext::discover());
     let (flow, resolved) = normalize_with_resolution(key, network, &refreshed)?;
-    stats.record_refresh(
-        resolved,
-        refreshed.len(),
-        refresh_started.elapsed().as_micros() as u64,
-    );
+    stats.record_refresh(resolved, refreshed.len(), elapsed_micros(refresh_started));
     *current = Arc::clone(&refreshed);
     if let Ok(mut shared) = conntrack.write() {
         *shared = refreshed;
@@ -1556,7 +1547,7 @@ fn next_map_key<M: MapCore + ?Sized>(
     key_size: usize,
 ) -> Result<Option<Vec<u8>>, libbpf_rs::Error> {
     let mut next = vec![0_u8; key_size];
-    let previous_ptr = previous.map_or(std::ptr::null(), |key| key.as_ptr());
+    let previous_ptr = previous.map_or(std::ptr::null(), <[u8]>::as_ptr);
     // SAFETY: all pointers reference buffers valid for the duration of the
     // syscall, and the map fd is borrowed from the live MapCore object.
     let ret = unsafe {
@@ -1578,7 +1569,9 @@ fn next_map_key<M: MapCore + ?Sized>(
     }
 }
 
-#[allow(unsafe_code)]
+// Keep the batched syscall and compatibility fallback together so both paths
+// update the same snapshot and idle-flow accounting.
+#[allow(clippy::too_many_lines, unsafe_code)]
 fn read_flow_map<M>(
     map: &M,
     now_ns: u64,
@@ -1599,6 +1592,12 @@ where
         key_size
     };
     let value_size = map.value_size() as usize;
+    if key_size == 0 || value_size == 0 {
+        return Err(libbpf_rs::Error::from(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "flow map key and value sizes must be non-zero",
+        )));
+    }
     let mut batch_keys = vec![0_u8; batch_key_size * BATCH_SIZE as usize];
     let mut batch_values = vec![0_u8; value_size * BATCH_SIZE as usize];
     let mut batch_next = vec![0_u8; batch_key_size];
@@ -1608,7 +1607,6 @@ where
         sz: size_of::<libbpf_rs::libbpf_sys::bpf_map_batch_opts>() as _,
         elem_flags: MapFlags::ANY.bits(),
         flags: MapFlags::ANY.bits(),
-        ..Default::default()
     };
     let mut snapshot = Vec::with_capacity(BATCH_SIZE as usize);
     let mut keys_scanned = 0_u64;
@@ -1629,8 +1627,8 @@ where
                 batch_next.as_mut_ptr().cast(),
                 batch_keys.as_mut_ptr().cast(),
                 batch_values.as_mut_ptr().cast(),
-                &mut count,
-                &batch_options,
+                &raw mut count,
+                &raw const batch_options,
             )
         };
         let batch_error = if ret != 0 {
@@ -1660,8 +1658,10 @@ where
                 &batch_keys[key_start..key_start + key_size],
                 &batch_values[value_start..value_start + value_size],
                 now_ns,
-                tcp_idle_timeout_seconds,
-                udp_idle_timeout_seconds,
+                FlowIdleTimeouts {
+                    tcp_seconds: tcp_idle_timeout_seconds,
+                    udp_seconds: udp_idle_timeout_seconds,
+                },
                 &mut snapshot,
                 &mut retained_entries,
             );
@@ -1685,8 +1685,10 @@ where
                     &key,
                     &value,
                     now_ns,
-                    tcp_idle_timeout_seconds,
-                    udp_idle_timeout_seconds,
+                    FlowIdleTimeouts {
+                        tcp_seconds: tcp_idle_timeout_seconds,
+                        udp_seconds: udp_idle_timeout_seconds,
+                    },
                     &mut snapshot,
                     &mut retained_entries,
                 );
@@ -1700,13 +1702,18 @@ where
     })
 }
 
+#[derive(Clone, Copy)]
+struct FlowIdleTimeouts {
+    tcp_seconds: u64,
+    udp_seconds: u64,
+}
+
 fn process_flow_entry<M: MapCore + ?Sized>(
     map: &M,
     raw_key: &[u8],
     raw_value: &[u8],
     now_ns: u64,
-    tcp_idle_timeout_seconds: u64,
-    udp_idle_timeout_seconds: u64,
+    idle_timeouts: FlowIdleTimeouts,
     snapshot: &mut Vec<(FlowKey, FlowCounters)>,
     retained_entries: &mut u64,
 ) {
@@ -1720,8 +1727,8 @@ fn process_flow_entry<M: MapCore + ?Sized>(
         &key,
         &counters,
         now_ns,
-        tcp_idle_timeout_seconds,
-        udp_idle_timeout_seconds,
+        idle_timeouts.tcp_seconds,
+        idle_timeouts.udp_seconds,
     ) {
         // Fetch the latest counters atomically with deletion so packets
         // observed between the first lookup and cleanup are still emitted.
@@ -1913,6 +1920,9 @@ fn resolve_interface(interface: &str) -> Result<i32, AgentError> {
     })
 }
 
+// These primitive map key/value widths are fixed by the BPF ABI and always fit
+// in the u32 dimensions required by bpf_map_create.
+#[allow(clippy::cast_possible_truncation)]
 fn probe_map_creation() -> Result<(), AgentError> {
     let opts = libbpf_rs::libbpf_sys::bpf_map_create_opts {
         sz: size_of::<libbpf_rs::libbpf_sys::bpf_map_create_opts>() as _,
@@ -1929,7 +1939,7 @@ fn probe_map_creation() -> Result<(), AgentError> {
         &opts,
     )
     .map(drop)
-    .map_err(|err| classify_map_error("Hash", err))?;
+    .map_err(|error| classify_map_error("Hash", &error))?;
 
     // 2. Probe LRU Hash map support (flow_map)
     MapHandle::create(
@@ -1941,7 +1951,7 @@ fn probe_map_creation() -> Result<(), AgentError> {
         &opts,
     )
     .map(drop)
-    .map_err(|err| classify_map_error("LRU hash", err))?;
+    .map_err(|error| classify_map_error("LRU hash", &error))?;
 
     // 3. Probe Array map support (dns_drop_count, sample_counters)
     MapHandle::create(
@@ -1953,17 +1963,17 @@ fn probe_map_creation() -> Result<(), AgentError> {
         &opts,
     )
     .map(drop)
-    .map_err(|err| classify_map_error("Array", err))?;
+    .map_err(|error| classify_map_error("Array", &error))?;
 
     // 4. Probe Ringbuf support (required for DNS/DHCP/Discovery/Sample events, Linux >= 5.8)
     MapHandle::create(MapType::RingBuf, Some("nqm_rb_prb"), 0, 0, 4096, &opts)
         .map(drop)
-        .map_err(|err| classify_map_error("Ringbuf (requires Linux >= 5.8)", err))?;
+        .map_err(|error| classify_map_error("Ringbuf (requires Linux >= 5.8)", &error))?;
 
     Ok(())
 }
 
-fn classify_map_error(map_name: &str, error: libbpf_rs::Error) -> AgentError {
+fn classify_map_error(map_name: &str, error: &libbpf_rs::Error) -> AgentError {
     let detail = format!("could not create {map_name} map ({error})");
     match error.kind() {
         ErrorKind::PermissionDenied => AgentError::PermissionDenied(detail),
@@ -1978,7 +1988,7 @@ enum BpfStage {
     Load,
 }
 
-fn classify_bpf_error(stage: BpfStage, error: libbpf_rs::Error) -> AgentError {
+fn classify_bpf_error(stage: BpfStage, error: &libbpf_rs::Error) -> AgentError {
     let detail = match stage {
         BpfStage::Open => format!("could not open embedded object ({error})"),
         BpfStage::Load => format!("could not load classifier ({error})"),
@@ -1990,13 +2000,21 @@ fn classify_bpf_error(stage: BpfStage, error: libbpf_rs::Error) -> AgentError {
     }
 }
 
-fn classify_tc_error(interface: &str, error: libbpf_rs::Error) -> AgentError {
+fn classify_tc_error(interface: &str, error: &libbpf_rs::Error) -> AgentError {
     let detail = format!("could not attach to {interface:?} ({error})");
     if error.kind() == ErrorKind::PermissionDenied {
         AgentError::PermissionDenied(detail)
     } else {
         AgentError::TcUnavailable(detail)
     }
+}
+
+fn read_indexed_counter<M: MapCore>(map: &M, index: u32) -> u64 {
+    map.lookup(&index.to_ne_bytes(), MapFlags::ANY)
+        .ok()
+        .flatten()
+        .and_then(|bytes| bytes.as_slice().try_into().ok().map(u64::from_ne_bytes))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -2042,28 +2060,28 @@ mod tests {
 
     #[test]
     fn classifies_libbpf_failures_by_startup_stage() {
-        let permission = classify_bpf_error(BpfStage::Load, LibbpfError::from_raw_os_error(EPERM));
+        let permission = classify_bpf_error(BpfStage::Load, &LibbpfError::from_raw_os_error(EPERM));
         assert!(matches!(permission, AgentError::PermissionDenied(_)));
 
         let unavailable =
-            classify_bpf_error(BpfStage::Open, LibbpfError::from_raw_os_error(ENOSYS));
+            classify_bpf_error(BpfStage::Open, &LibbpfError::from_raw_os_error(ENOSYS));
         assert!(matches!(unavailable, AgentError::BpfUnavailable(_)));
 
-        let map = classify_map_error("LRU hash", LibbpfError::from_raw_os_error(EINVAL));
+        let map = classify_map_error("LRU hash", &LibbpfError::from_raw_os_error(EINVAL));
         assert!(matches!(map, AgentError::MapCreationFailed(_)));
 
-        let tc = classify_tc_error("eth0", LibbpfError::from_raw_os_error(ENOSYS));
+        let tc = classify_tc_error("eth0", &LibbpfError::from_raw_os_error(ENOSYS));
         assert!(matches!(tc, AgentError::TcUnavailable(_)));
     }
 
     #[test]
     fn parses_openwrt_firewall_hfo_option() {
         assert!(firewall_hw_flow_offload_enabled(
-            r#"
+            r"
 config defaults
     option flow_offloading '1'
     option flow_offloading_hw '1'
-"#
+"
         ));
         assert!(firewall_hw_flow_offload_enabled(
             r#"
@@ -2072,11 +2090,11 @@ config defaults
 "#
         ));
         assert!(!firewall_hw_flow_offload_enabled(
-            r#"
+            r"
 config defaults
     # option flow_offloading_hw '1'
     option flow_offloading_hw '0'
-"#
+"
         ));
     }
 
@@ -2178,12 +2196,4 @@ config defaults
             Some(SAMPLE_EVENT_HEADER_SIZE + 100)
         );
     }
-}
-
-fn read_indexed_counter<M: MapCore>(map: &M, index: u32) -> u64 {
-    map.lookup(&index.to_ne_bytes(), MapFlags::ANY)
-        .ok()
-        .flatten()
-        .and_then(|bytes| bytes.as_slice().try_into().ok().map(u64::from_ne_bytes))
-        .unwrap_or(0)
 }

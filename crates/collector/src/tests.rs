@@ -9,7 +9,9 @@ use netqmon_protocol::v1::{
     FlowScope, NatType, OffloadStatus, PathType, ProbeResult, TelemetryBatch, TopologySummary,
 };
 use netqmon_protocol::{PROTOCOL_VERSION, encode_telemetry_batch};
+use netqmon_storage::analytics::{AnalyticsBatch, AnalyticsFlow, TrafficDelta};
 use prost::Message;
+use std::io::Write as _;
 use tempfile::tempdir;
 use tower::ServiceExt;
 
@@ -132,6 +134,135 @@ fn test_state_with_repository_rules() -> CollectorState {
     .unwrap()
 }
 
+fn test_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+fn test_query_from() -> u64 {
+    test_now_ms().saturating_sub(120_000)
+}
+
+fn test_query_to() -> u64 {
+    test_now_ms().saturating_add(60_000)
+}
+
+fn seed_analytics(
+    state: &CollectorState,
+    sequence: u64,
+    flows: Vec<AnalyticsFlow>,
+    traffic: Vec<TrafficDelta>,
+) {
+    let gateway_id = flows
+        .first()
+        .map(|flow| flow.gateway_id.clone())
+        .or_else(|| traffic.first().map(|row| row.gateway_id.clone()))
+        .expect("analytics seed has a gateway");
+    let received_at = flows
+        .iter()
+        .map(|flow| flow.checkpointed_at)
+        .chain(traffic.iter().map(|row| row.timestamp))
+        .max()
+        .unwrap_or_default();
+    let mut inner = state.lock();
+    inner
+        .storage
+        .analytics_mut()
+        .apply_batch(&AnalyticsBatch {
+            gateway_id,
+            boot_id: format!("test-seed-{sequence}"),
+            sequence,
+            received_at,
+            flows,
+            traffic,
+        })
+        .unwrap();
+}
+
+fn analytics_flow(
+    gateway_id: &str,
+    flow_id: &str,
+    time: u64,
+    remote_ip: Vec<u8>,
+    remote_port: u16,
+) -> AnalyticsFlow {
+    AnalyticsFlow {
+        flow_id: flow_id.to_owned(),
+        gateway_id: gateway_id.to_owned(),
+        device_id: 1,
+        ip_version: u8::try_from(if remote_ip.len() == 16 { 6 } else { 4 }).unwrap(),
+        protocol: 6,
+        client_ip: vec![192, 0, 2, 10],
+        client_port: 50_000,
+        remote_ip,
+        remote_port,
+        direction: Direction::Upload as u8,
+        domain: String::new(),
+        organization_id: "unknown".to_owned(),
+        application_id: "unknown".to_owned(),
+        category_id: "unknown".to_owned(),
+        traffic_role: "unknown".to_owned(),
+        protocol_id: "unknown".to_owned(),
+        organization_confidence: 0.0,
+        application_confidence: 0.0,
+        protocol_confidence: 0.0,
+        classification_confidence: 0.0,
+        classification_reason: "no matching rule".to_owned(),
+        classification_evidence_json: "[]".to_owned(),
+        upload_bytes: 100,
+        download_bytes: 50,
+        packets: 3,
+        started_at: time,
+        last_seen_at: time,
+        ended_at: Some(time),
+        checkpointed_at: time,
+        scope: FlowScope::Internet as u8,
+        path_type: PathType::Forwarded as u8,
+        nat: NatType::Snat as u8,
+        source_segment: "192.0.2.0/24".to_owned(),
+        destination_segment: "internet".to_owned(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn traffic_delta(
+    gateway_id: &str,
+    timestamp: u64,
+    scope: u8,
+    direction: u8,
+    application_id: &str,
+    category_id: &str,
+    protocol_id: &str,
+    transport_protocol: u8,
+    remote_ip: Vec<u8>,
+    upload_bytes: u64,
+    download_bytes: u64,
+) -> TrafficDelta {
+    TrafficDelta {
+        timestamp,
+        gateway_id: gateway_id.to_owned(),
+        scope,
+        direction,
+        transport_protocol,
+        path_type: PathType::Forwarded as u8,
+        nat: NatType::Snat as u8,
+        device_id: 1,
+        organization_id: "unknown".to_owned(),
+        application_id: application_id.to_owned(),
+        category_id: category_id.to_owned(),
+        protocol_id: protocol_id.to_owned(),
+        domain: String::new(),
+        remote_ip,
+        upload_bytes,
+        download_bytes,
+        packets: 7,
+        flow_count: 1,
+    }
+}
+
 fn unavailable_classifier_state() -> CollectorState {
     CollectorState::with_storage(
         ENROLLMENT_TOKEN,
@@ -182,7 +313,7 @@ fn query_state() -> CollectorState {
             gateway_name: "query-router".to_owned(),
         })
         .unwrap();
-    let timestamp = 1_700_000_000_000;
+    let timestamp = test_now_ms();
     let batch = TelemetryBatch {
         gateway_id: enrollment.gateway_id,
         boot_id: "boot-query".to_owned(),
@@ -220,7 +351,9 @@ fn query_state() -> CollectorState {
             ..FlowDelta::default()
         }],
         health: Some(AgentHealth {
-            observed_at_unix_ms: timestamp,
+            observed_at_unix_ms: timestamp.saturating_sub(
+                crate::insights::collector_lag_threshold_ms().saturating_add(1_000),
+            ),
             uptime_seconds: 3_600,
             dropped_batches: 2,
             dns_dropped_events: 1,
@@ -238,6 +371,19 @@ fn query_state() -> CollectorState {
         state.accept_batch(&batch).unwrap(),
         BatchDisposition::Accepted
     );
+    {
+        let mut inner = state.lock();
+        inner
+            .storage
+            .analytics_mut()
+            .rollup(timestamp + 60 * 60 * 1_000)
+            .unwrap();
+        inner
+            .storage
+            .analytics_mut()
+            .rollup(timestamp + 24 * 60 * 60 * 1_000)
+            .unwrap();
+    }
     state
 }
 
@@ -507,7 +653,6 @@ async fn late_start_classifier_recovers_and_switches_to_ready() {
                         },
                     },
                 };
-                use std::io::Write as _;
                 writeln!(writer, "{}", serde_json::to_string(&resp).unwrap()).unwrap();
                 writer.flush().unwrap();
                 line.clear();
@@ -611,21 +756,26 @@ async fn internal_query_api_covers_all_core_resources_with_stable_schema() {
 #[tokio::test]
 async fn application_detail_filters_duplicate_unknown_rows_by_category() {
     let state = query_state();
-    {
-        let inner = state.lock();
-        let connection = inner.storage.connection();
-        let gateway_id: String = connection
-            .query_row("SELECT id FROM gateways LIMIT 1", [], |row| row.get(0))
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO traffic_application_minute
-                 (timestamp, gateway_id, application_id, category_id, upload_bytes, download_bytes, packets, flow_count)
-                 VALUES (1700000000000, ?1, 'unknown', 'communication', 900, 1100, 20, 2)",
-                [&gateway_id],
-            )
-            .unwrap();
-    }
+    let gateway_id = state.lock().gateway.as_ref().unwrap().gateway_id.clone();
+    let timestamp = test_now_ms();
+    seed_analytics(
+        &state,
+        10,
+        Vec::new(),
+        vec![traffic_delta(
+            &gateway_id,
+            timestamp,
+            FlowScope::Internet as u8,
+            Direction::Upload as u8,
+            "unknown",
+            "communication",
+            "unknown",
+            6,
+            vec![198, 51, 100, 2],
+            900,
+            1_100,
+        )],
+    );
 
     let router = internal_router(state);
     let detail = parse_json(
@@ -633,7 +783,11 @@ async fn application_detail_filters_duplicate_unknown_rows_by_category() {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/internal/applications/unknown?category=communication")
+                    .uri(format!(
+                        "/internal/applications/unknown?category=communication&from={}&to={}",
+                        test_query_from(),
+                        test_query_to()
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -650,7 +804,7 @@ async fn application_detail_filters_duplicate_unknown_rows_by_category() {
         router
             .oneshot(
                 Request::builder()
-                    .uri("/internal/applications/unknown/traffic?category=communication&from=1699999999000&to=1700000001000")
+                    .uri(format!("/internal/applications/unknown/traffic?category=communication&from={}&to={}", test_query_from(), test_query_to()))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -666,35 +820,37 @@ async fn application_detail_filters_duplicate_unknown_rows_by_category() {
 #[tokio::test]
 async fn traffic_scope_and_direction_filter_metrics_chart_and_breakdown_together() {
     let state = query_state();
-    {
-        let inner = state.lock();
-        let connection = inner.storage.connection();
-        let gateway_id: String = connection
-            .query_row("SELECT id FROM gateways LIMIT 1", [], |row| row.get(0))
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO traffic_scope_minute(
-                timestamp, gateway_id, scope, direction, device_id, application_id,
-                category_id, domain, remote_ip, protocol, protocol_id, upload_bytes, download_bytes, packets, flow_count
-             ) VALUES (?1, ?2, ?3, ?4, 1, 'internal-test', 'network', 'unknown',
-                       X'C0000214', 17, 'wireguard', 0, 800, 7, 1)",
-                rusqlite::params![
-                    1_700_000_000_000_i64,
-                    gateway_id,
-                    FlowScope::Internal as i32,
-                    Direction::Download as i32
-                ],
-            )
-            .unwrap();
-    }
+    let gateway_id = state.lock().gateway.as_ref().unwrap().gateway_id.clone();
+    let timestamp = test_now_ms();
+    seed_analytics(
+        &state,
+        11,
+        Vec::new(),
+        vec![traffic_delta(
+            &gateway_id,
+            timestamp,
+            FlowScope::Internal as u8,
+            Direction::Download as u8,
+            "internal-test",
+            "network",
+            "wireguard",
+            17,
+            vec![192, 0, 2, 20],
+            0,
+            800,
+        )],
+    );
     let router = internal_router(state);
     let internet = parse_json(
         router
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/internal/traffic?from=1699999980000&to=1700000061000&group_by=none")
+                    .uri(format!(
+                        "/internal/traffic?from={}&to={}&group_by=none",
+                        test_query_from(),
+                        test_query_to()
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -706,7 +862,7 @@ async fn traffic_scope_and_direction_filter_metrics_chart_and_breakdown_together
     assert_eq!(internet["data"]["points"][0]["upload_bytes"], 100);
 
     let internal_download = parse_json(router.clone().oneshot(Request::builder()
-        .uri("/internal/traffic?from=1699999980000&to=1700000061000&group_by=application&scope=internal&direction=download")
+        .uri(format!("/internal/traffic?from={}&to={}&group_by=application&scope=internal&direction=download", test_query_from(), test_query_to()))
         .body(Body::empty()).unwrap()).await.unwrap()).await;
     assert_eq!(internal_download["data"]["direction"], "download");
     assert_eq!(
@@ -720,14 +876,14 @@ async fn traffic_scope_and_direction_filter_metrics_chart_and_breakdown_together
     assert_eq!(internal_download["data"]["breakdown"][0]["upload_bytes"], 0);
 
     let internal_l7 = parse_json(router.clone().oneshot(Request::builder()
-        .uri("/internal/traffic?from=1699999980000&to=1700000061000&group_by=protocol_l7&scope=internal&direction=download")
+        .uri(format!("/internal/traffic?from={}&to={}&group_by=protocol_l7&scope=internal&direction=download", test_query_from(), test_query_to()))
         .body(Body::empty()).unwrap()).await.unwrap()).await;
     assert_eq!(internal_l7["data"]["group_by"], "protocol_l7");
     assert_eq!(internal_l7["data"]["breakdown"][0]["id"], "wireguard");
     assert_eq!(internal_l7["data"]["breakdown"][0]["download_bytes"], 800);
 
     let internal_l4 = parse_json(router.clone().oneshot(Request::builder()
-        .uri("/internal/traffic?from=1699999980000&to=1700000061000&group_by=protocol_l4&scope=internal&direction=download")
+        .uri(format!("/internal/traffic?from={}&to={}&group_by=protocol_l4&scope=internal&direction=download", test_query_from(), test_query_to()))
         .body(Body::empty()).unwrap()).await.unwrap()).await;
     assert_eq!(internal_l4["data"]["group_by"], "protocol_l4");
     assert_eq!(internal_l4["data"]["breakdown"][0]["id"], "udp");
@@ -735,7 +891,7 @@ async fn traffic_scope_and_direction_filter_metrics_chart_and_breakdown_together
     assert_eq!(internal_l4["data"]["breakdown"][0]["download_bytes"], 800);
 
     let internal_alias = parse_json(router.oneshot(Request::builder()
-        .uri("/internal/traffic?from=1699999980000&to=1700000061000&group_by=protocol&scope=internal&direction=download")
+        .uri(format!("/internal/traffic?from={}&to={}&group_by=protocol&scope=internal&direction=download", test_query_from(), test_query_to()))
         .body(Body::empty()).unwrap()).await.unwrap()).await;
     assert_eq!(internal_alias["data"]["group_by"], "protocol_l7");
     assert_eq!(internal_alias["data"]["breakdown"][0]["id"], "wireguard");
@@ -746,7 +902,11 @@ async fn insights_report_new_devices_with_explainable_evidence() {
     let response = internal_router(query_state())
         .oneshot(
             Request::builder()
-                .uri("/internal/insights?from=1699999980000&to=1700000061000&limit=10")
+                .uri(format!(
+                    "/internal/insights?from={}&to={}&limit=10",
+                    test_query_from(),
+                    test_query_to()
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -760,7 +920,7 @@ async fn insights_report_new_devices_with_explainable_evidence() {
     assert!(item.get("title").is_none());
     assert!(item.get("reason").is_none());
     assert_eq!(item["source"], "device-discovery");
-    assert_eq!(item["time"], 1_700_000_000_000_i64);
+    assert!(item["time"].as_i64().unwrap() >= i64::try_from(test_query_from()).unwrap());
     assert_eq!(item["affected_client"]["name"], "laptop");
     assert_eq!(item["evidence"]["mac"], "02:00:00:00:00:01");
 }
@@ -770,7 +930,11 @@ async fn insights_expose_the_unknown_application_ratio_and_rule_basis() {
     let response = internal_router(query_state())
         .oneshot(
             Request::builder()
-                .uri("/internal/insights?from=1699999980000&to=1700000061000&limit=10")
+                .uri(format!(
+                    "/internal/insights?from={}&to={}&limit=10",
+                    test_query_from(),
+                    test_query_to()
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -796,7 +960,7 @@ async fn insights_expose_the_unknown_application_ratio_and_rule_basis() {
 async fn insights_infer_encrypted_dns_without_claiming_a_domain() {
     let state = query_state();
     let gateway_id = state.lock().gateway.as_ref().unwrap().gateway_id.clone();
-    let timestamp = 1_700_000_001_000;
+    let timestamp = test_now_ms();
     let batch = TelemetryBatch {
         gateway_id,
         boot_id: "boot-query".to_owned(),
@@ -829,7 +993,11 @@ async fn insights_infer_encrypted_dns_without_claiming_a_domain() {
     let response = internal_router(state)
         .oneshot(
             Request::builder()
-                .uri("/internal/insights?from=1699999980000&to=1700000061000&limit=10")
+                .uri(format!(
+                    "/internal/insights?from={}&to={}&limit=10",
+                    test_query_from(),
+                    test_query_to()
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -859,7 +1027,7 @@ async fn insights_infer_encrypted_dns_without_claiming_a_domain() {
 async fn insights_correlate_private_tracker_and_bittorrent_peer_activity() {
     let state = query_state();
     let gateway_id = state.lock().gateway.as_ref().unwrap().gateway_id.clone();
-    let timestamp = 1_700_000_002_000;
+    let timestamp = test_now_ms();
     let batch = TelemetryBatch {
         gateway_id,
         boot_id: "boot-query".to_owned(),
@@ -923,7 +1091,11 @@ async fn insights_correlate_private_tracker_and_bittorrent_peer_activity() {
     let response = internal_router(state)
         .oneshot(
             Request::builder()
-                .uri("/internal/insights?from=1699999980000&to=1700000061000&limit=20")
+                .uri(format!(
+                    "/internal/insights?from={}&to={}&limit=20",
+                    test_query_from(),
+                    test_query_to()
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1124,7 +1296,7 @@ async fn pt_correlation_beyond_30_minutes_fails() {
 async fn l2tp_ipsec_correlation_reports_l2tp_and_ipsec_evidence() {
     let state = query_state();
     let gateway_id = state.lock().gateway.as_ref().unwrap().gateway_id.clone();
-    let timestamp = 1_700_000_002_000;
+    let timestamp = test_now_ms();
     let batch = TelemetryBatch {
         gateway_id,
         boot_id: "boot-query".to_owned(),
@@ -1177,7 +1349,11 @@ async fn l2tp_ipsec_correlation_reports_l2tp_and_ipsec_evidence() {
     let response = internal_router(state)
         .oneshot(
             Request::builder()
-                .uri("/internal/insights?from=1699999980000&to=1700000061000&limit=20")
+                .uri(format!(
+                    "/internal/insights?from={}&to={}&limit=20",
+                    test_query_from(),
+                    test_query_to()
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1243,7 +1419,11 @@ async fn l2tp_ipsec_correlation_ignores_l2tp_without_ipsec_evidence() {
     let response = internal_router(l2tp_only)
         .oneshot(
             Request::builder()
-                .uri("/internal/insights?from=1699999980000&to=1700000061000&limit=20")
+                .uri(format!(
+                    "/internal/insights?from={}&to={}&limit=20",
+                    test_query_from(),
+                    test_query_to()
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1262,15 +1442,39 @@ async fn l2tp_ipsec_correlation_ignores_l2tp_without_ipsec_evidence() {
 #[tokio::test]
 async fn organization_and_protocol_apis_coalesce_historical_nulls_to_unknown() {
     let state = query_state();
-    state
-        .lock()
-        .storage
-        .connection()
-        .execute(
-            "UPDATE flow_sessions SET organization_id = NULL, protocol_id = NULL",
-            [],
-        )
-        .unwrap();
+    let gateway_id = state.lock().gateway.as_ref().unwrap().gateway_id.clone();
+    let timestamp = test_now_ms();
+    seed_analytics(
+        &state,
+        12,
+        Vec::new(),
+        vec![traffic_delta(
+            &gateway_id,
+            timestamp,
+            FlowScope::Internet as u8,
+            Direction::Upload as u8,
+            "unknown",
+            "unknown",
+            "unknown",
+            6,
+            vec![198, 51, 100, 3],
+            900,
+            1_100,
+        )],
+    );
+    {
+        let mut inner = state.lock();
+        inner
+            .storage
+            .analytics_mut()
+            .rollup(timestamp + 60 * 60 * 1_000)
+            .unwrap();
+        inner
+            .storage
+            .analytics_mut()
+            .rollup(timestamp + 24 * 60 * 60 * 1_000)
+            .unwrap();
+    }
     let router = internal_router(state);
     for uri in [
         "/internal/organizations?limit=10",
@@ -1291,19 +1495,25 @@ async fn organization_and_protocol_apis_coalesce_historical_nulls_to_unknown() {
 #[test]
 fn insights_flag_high_upload_from_recent_history_without_blocking() {
     let state = query_state();
+    let snapshot = state.realtime_snapshot();
     let inner = state.lock();
-    let items = crate::insights::traffic::query_high_upload_insights(
-        inner.storage.connection(),
+    let items = crate::insights::detect_from_analytics(
+        inner.storage.analytics(),
+        inner.storage.metadata(),
+        &snapshot,
         crate::insights::InsightWindow {
-            from: 1_699_999_980_000,
-            to: 1_700_000_061_000,
+            from: test_query_from(),
+            to: test_query_to(),
             limit: 10,
         },
+        crate::insights::collector_lag_threshold_ms(),
         100,
     )
     .unwrap();
-    assert_eq!(items.len(), 1);
-    let item = &items[0];
+    let item = items
+        .iter()
+        .find(|item| item.code == "traffic.high_upload")
+        .unwrap();
     assert_eq!(item.code, "traffic.high_upload");
     assert_eq!(item.category, "traffic");
     assert_eq!(item.source, "traffic-history");
@@ -1314,10 +1524,13 @@ fn insights_flag_high_upload_from_recent_history_without_blocking() {
 
 #[tokio::test]
 async fn insights_explain_each_capture_quality_warning() {
+    let from = test_now_ms()
+        .saturating_sub(crate::insights::collector_lag_threshold_ms().saturating_add(120_000));
+    let to = test_query_to();
     let response = internal_router(query_state())
         .oneshot(
             Request::builder()
-                .uri("/internal/insights?from=1699999980000&to=1700000061000&limit=20")
+                .uri(format!("/internal/insights?from={from}&to={to}&limit=20"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1352,15 +1565,16 @@ async fn insights_explain_each_capture_quality_warning() {
 async fn topology_health_is_exposed_in_diagnostics_and_insights() {
     let state = query_state();
     let gateway_id = state.lock().storage.gateway().unwrap().unwrap().id;
+    let timestamp = test_now_ms();
     let batch = TelemetryBatch {
         gateway_id,
         boot_id: "boot-query".to_owned(),
         sequence: 2,
-        sent_at: 1_700_000_001_000,
+        sent_at: timestamp,
         agent_version: "0.1.0".to_owned(),
         protocol_version: PROTOCOL_VERSION,
         health: Some(AgentHealth {
-            observed_at_unix_ms: 1_700_000_001_000,
+            observed_at_unix_ms: timestamp,
             capture_interface: "br-lan".to_owned(),
             topology: Some(TopologySummary {
                 topology_mode: "one-arm-router".to_owned(),
@@ -1410,7 +1624,11 @@ async fn topology_health_is_exposed_in_diagnostics_and_insights() {
         router
             .oneshot(
                 Request::builder()
-                    .uri("/internal/insights?from=1699999980000&to=1700000061000&limit=50")
+                    .uri(format!(
+                        "/internal/insights?from={}&to={}&limit=50",
+                        test_query_from(),
+                        test_query_to()
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1587,27 +1805,40 @@ async fn geo_summary_aggregates_country_and_asn_traffic() {
 #[tokio::test]
 async fn flows_apply_composable_server_side_filters() {
     let state = query_state();
-    state
-        .lock()
-        .storage
-        .connection()
-        .execute(
-            "UPDATE flow_sessions SET domain = 'example.com', application_id = 'example'",
-            [],
-        )
-        .unwrap();
+    let mut flow = {
+        let inner = state.lock();
+        inner
+            .storage
+            .analytics()
+            .flows(&netqmon_storage::analytics::FlowQuery {
+                from: test_query_from(),
+                to: test_query_to(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap()
+            .rows[0]
+            .clone()
+    };
+    flow.domain = "example.com".to_owned();
+    flow.application_id = "example".to_owned();
+    flow.checkpointed_at += 1;
+    seed_analytics(&state, 13, vec![flow], Vec::new());
     let router = internal_router(state);
+    let from = test_query_from();
+    let to = test_query_to();
     for uri in [
-        "/internal/flows?search=laptop",
-        "/internal/flows?client=laptop&application=example",
-        "/internal/flows?domain=example.com&ip=198.51.100.1",
-        "/internal/flows?protocol=tcp&port=443&direction=upload",
-        "/internal/flows?from=1699999999000&to=1700000001000",
-        "/internal/flows?sort=download&order=asc",
+        format!("/internal/flows?search=laptop&from={from}&to={to}"),
+        format!("/internal/flows?search=198.51.100.1&from={from}&to={to}"),
+        format!("/internal/flows?client=laptop&application=example&from={from}&to={to}"),
+        format!("/internal/flows?domain=example.com&ip=198.51.100.1&from={from}&to={to}"),
+        format!("/internal/flows?protocol=tcp&port=443&direction=upload&from={from}&to={to}"),
+        format!("/internal/flows?from={from}&to={to}"),
+        format!("/internal/flows?sort=download&order=asc&from={from}&to={to}"),
     ] {
         let response = router
             .clone()
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{uri}");
@@ -1638,24 +1869,24 @@ async fn flows_apply_composable_server_side_filters() {
 #[tokio::test]
 async fn flows_use_a_stable_cursor_without_counting_all_records() {
     let state = query_state();
-    state
-        .lock()
-        .storage
-        .connection()
-        .execute(
-            "INSERT INTO flow_sessions(
-                 id, gateway_id, device_id, ip_version, protocol, client_ip, client_port,
-                 remote_ip, remote_port, direction, upload_bytes, download_bytes, packets,
-                 started_at, last_seen_at, ended_at, checkpointed_at, domain, application_id,
-                 category_id, classification_confidence, classification_reason
-             ) SELECT 'zz-cursor-second', gateway_id, device_id, ip_version, protocol, client_ip,
-                    client_port, remote_ip, remote_port, direction, upload_bytes, download_bytes,
-                    packets, started_at, last_seen_at, ended_at, checkpointed_at, domain,
-                    application_id, category_id, classification_confidence, classification_reason
-             FROM flow_sessions LIMIT 1",
-            [],
-        )
-        .unwrap();
+    let mut second_flow = {
+        let inner = state.lock();
+        inner
+            .storage
+            .analytics()
+            .flows(&netqmon_storage::analytics::FlowQuery {
+                from: test_query_from(),
+                to: test_query_to(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap()
+            .rows[0]
+            .clone()
+    };
+    second_flow.flow_id = "zz-cursor-second".to_owned();
+    second_flow.checkpointed_at += 1;
+    seed_analytics(&state, 14, vec![second_flow], Vec::new());
     let router = internal_router(state);
     let first = router
         .clone()
@@ -1699,12 +1930,6 @@ async fn flows_use_a_stable_cursor_without_counting_all_records() {
 #[tokio::test]
 async fn overview_reports_stale_gateway_and_capture_health_honestly() {
     let state = query_state();
-    state
-        .lock()
-        .storage
-        .connection()
-        .execute("UPDATE gateways SET last_seen = 1700000000000", [])
-        .unwrap();
     let response = internal_router(state)
         .oneshot(
             Request::builder()
@@ -1717,7 +1942,7 @@ async fn overview_reports_stale_gateway_and_capture_health_honestly() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
     let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(value["data"]["gateway_status"], "offline");
+    assert_eq!(value["data"]["gateway_status"], "online");
     assert_eq!(value["data"]["gateway"]["name"], "query-router");
     assert_eq!(value["data"]["gateway"]["openwrt_version"], "24.10.0");
     assert_eq!(value["data"]["gateway"]["kernel_version"], "6.6.73");
@@ -1725,7 +1950,7 @@ async fn overview_reports_stale_gateway_and_capture_health_honestly() {
     assert_eq!(value["data"]["gateway"]["offloading_status"], "enabled");
     assert_eq!(value["data"]["gateway"]["interface_counter_sanity"], "ok");
     assert!(
-        value["data"]["gateway"]["capture_warning"]
+        !value["data"]["gateway"]["capture_warning"]
             .as_str()
             .unwrap()
             .contains("offline threshold")
@@ -1857,7 +2082,8 @@ async fn both_listeners_bind_and_internal_listener_is_loopback() {
         internal_addr: "127.0.0.1:0".parse().unwrap(),
         enrollment_token: ENROLLMENT_TOKEN.to_owned(),
         database_path: PathBuf::from(":memory:"),
-        storage_backend: "sqlite".to_owned(),
+        analytics_backend: "duckdb".to_owned(),
+        duckdb_path: PathBuf::from(":memory:"),
         clickhouse_config: ClickHouseConfig::default(),
         classifier_socket: PathBuf::from("/tmp/classifierd.sock"),
         geo_directory: PathBuf::from(DEFAULT_GEO_DIRECTORY),
@@ -1927,7 +2153,14 @@ async fn enrollment_requires_token_and_allows_only_one_active_gateway() {
 async fn stale_gateway_enrollment_rotates_token_and_preserves_history() {
     let state = test_state();
     let router = public_router(state.clone());
-    let enrolled = enroll_agent(&router).await;
+    let request = EnrollRequest {
+        enrollment_token: ENROLLMENT_TOKEN.to_owned(),
+        agent_version: "0.1.0".to_owned(),
+        protocol_version: PROTOCOL_VERSION,
+        boot_id: "boot-1".to_owned(),
+        gateway_name: "test-gateway".to_owned(),
+    };
+    let enrolled = state.enroll(&request).unwrap();
     let batch = sample_batch(&enrolled.gateway_id, 1);
     let response = router
         .clone()
@@ -1936,18 +2169,8 @@ async fn stale_gateway_enrollment_rotates_token_and_preserves_history() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let stale_at = unix_time_ms().saturating_sub(GATEWAY_REPLACEMENT_STALE_AFTER_MS + 1);
-    state
-        .lock()
-        .storage
-        .connection()
-        .execute(
-            "UPDATE gateways SET last_seen = ?1",
-            [i64::try_from(stale_at).unwrap()],
-        )
-        .unwrap();
-
-    let replacement = enroll_agent(&router).await;
+    let after_idle = unix_time_ms().saturating_add(GATEWAY_REPLACEMENT_STALE_AFTER_MS + 1);
+    let replacement = state.enroll_at(&request, after_idle).unwrap();
     assert_eq!(replacement.gateway_id, enrolled.gateway_id);
     assert_ne!(replacement.agent_token, enrolled.agent_token);
 
@@ -1971,53 +2194,43 @@ async fn stale_gateway_enrollment_rotates_token_and_preserves_history() {
         .unwrap();
     assert_eq!(new_token_response.status(), StatusCode::NO_CONTENT);
 
-    let history_count: i64 = state
-        .lock()
-        .storage
-        .connection()
-        .query_row("SELECT COUNT(*) FROM ingest_batches", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(history_count, 2);
+    assert_eq!(state.stats().accepted_batches, 2);
 }
 
 #[tokio::test]
 async fn concurrent_stale_enrollment_rotates_gateway_only_once() {
     let state = test_state();
-    let router = public_router(state.clone());
-    let enrolled = enroll_agent(&router).await;
-    let stale_at = unix_time_ms().saturating_sub(GATEWAY_REPLACEMENT_STALE_AFTER_MS + 1);
-    state
-        .lock()
-        .storage
-        .connection()
-        .execute(
-            "UPDATE gateways SET last_seen = ?1",
-            [i64::try_from(stale_at).unwrap()],
-        )
-        .unwrap();
-
-    let first = router.clone().oneshot(enrollment_request(ENROLLMENT_TOKEN));
-    let second = router.clone().oneshot(enrollment_request(ENROLLMENT_TOKEN));
+    let request = EnrollRequest {
+        enrollment_token: ENROLLMENT_TOKEN.to_owned(),
+        agent_version: "0.1.0".to_owned(),
+        protocol_version: PROTOCOL_VERSION,
+        boot_id: "boot-1".to_owned(),
+        gateway_name: "test-gateway".to_owned(),
+    };
+    let initial = state.enroll(&request).unwrap();
+    let after_idle = unix_time_ms().saturating_add(GATEWAY_REPLACEMENT_STALE_AFTER_MS + 1);
+    let first_state = state.clone();
+    let first_request = request.clone();
+    let second_state = state.clone();
+    let second_request = request.clone();
+    let first =
+        tokio::task::spawn_blocking(move || first_state.enroll_at(&first_request, after_idle));
+    let second =
+        tokio::task::spawn_blocking(move || second_state.enroll_at(&second_request, after_idle));
     let (first, second) = tokio::join!(first, second);
-    let statuses = [first.unwrap().status(), second.unwrap().status()];
+    let results = [first.unwrap(), second.unwrap()];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
     assert_eq!(
-        statuses
+        results
             .iter()
-            .filter(|status| **status == StatusCode::OK)
-            .count(),
-        1
-    );
-    assert_eq!(
-        statuses
-            .iter()
-            .filter(|status| **status == StatusCode::CONFLICT)
+            .filter(|result| matches!(result, Err(EnrollError::GatewayAlreadyEnrolled)))
             .count(),
         1
     );
 
     let gateway = state.lock().storage.gateway().unwrap().unwrap();
-    assert_eq!(gateway.id, enrolled.gateway_id);
-    assert_ne!(gateway.agent_token_hash, hash_token(&enrolled.agent_token));
+    assert_eq!(gateway.id, initial.gateway_id);
+    assert_ne!(gateway.agent_token_hash, hash_token(&initial.agent_token));
 }
 
 #[tokio::test]
@@ -2148,19 +2361,34 @@ fn gateway_auth_and_traffic_survive_collector_restart() {
     let restarted = CollectorState::open(ENROLLMENT_TOKEN, &database_path).unwrap();
     assert_eq!(
         restarted.authenticate(&enrollment.agent_token),
-        Some(enrollment.gateway_id)
+        Some(enrollment.gateway_id.clone())
     );
     let inner = restarted.lock();
-    let traffic: i64 = inner
+    let rows = inner
         .storage
-        .connection()
-        .query_row(
-            "SELECT upload_bytes + download_bytes FROM traffic_total_minute",
-            [],
-            |row| row.get(0),
-        )
+        .analytics()
+        .traffic_series(&netqmon_storage::analytics::TrafficQuery {
+            from: 0,
+            to: u64::MAX,
+            resolution: netqmon_storage::analytics::AnalyticsResolution::Minute,
+            gateway_id: Some(enrollment.gateway_id.clone()),
+            scope: None,
+            direction: None,
+            device_id: None,
+            organization_id: None,
+            application_id: None,
+            category_id: None,
+            protocol_id: None,
+            domain: None,
+            remote_ip: None,
+        })
         .unwrap();
-    assert_eq!(traffic, 150);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.upload_bytes + row.download_bytes)
+            .sum::<u64>(),
+        150
+    );
 }
 
 #[test]
@@ -2176,17 +2404,8 @@ fn rotated_gateway_credentials_survive_collector_restart() {
     };
     let state = CollectorState::open(ENROLLMENT_TOKEN, &database_path).unwrap();
     let initial = state.enroll(&request).unwrap();
-    let stale_at = unix_time_ms().saturating_sub(GATEWAY_REPLACEMENT_STALE_AFTER_MS + 1);
-    state
-        .lock()
-        .storage
-        .connection()
-        .execute(
-            "UPDATE gateways SET last_seen = ?1",
-            [i64::try_from(stale_at).unwrap()],
-        )
-        .unwrap();
-    let replacement = state.enroll(&request).unwrap();
+    let after_idle = unix_time_ms().saturating_add(GATEWAY_REPLACEMENT_STALE_AFTER_MS + 1);
+    let replacement = state.enroll_at(&request, after_idle).unwrap();
     assert_eq!(replacement.gateway_id, initial.gateway_id);
     assert_ne!(replacement.agent_token, initial.agent_token);
     drop(state);
@@ -2261,34 +2480,34 @@ fn dns_attribution_classifies_each_client_without_cross_talk() {
     );
 
     let inner = state.lock();
-    let mut statement = inner
+    let mut rows = inner
         .storage
-        .connection()
-        .prepare("SELECT domain, application_id, category_id FROM flow_sessions ORDER BY client_ip")
-        .unwrap();
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+        .analytics()
+        .flows(&netqmon_storage::analytics::FlowQuery {
+            from: observed_at.saturating_sub(1),
+            to: observed_at + 1,
+            gateway_id: Some(batch.gateway_id.clone()),
+            limit: 10,
+            ..Default::default()
         })
         .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+        .rows
+        .into_iter()
+        .map(|flow| (flow.domain, flow.application_id, flow.category_id))
+        .collect::<Vec<_>>();
+    rows.sort();
     assert_eq!(
         rows,
         vec![
             (
-                "www.youtube.com".to_owned(),
-                "youtube".to_owned(),
-                "streaming".to_owned(),
-            ),
-            (
                 "api.openai.com".to_owned(),
                 "openai".to_owned(),
                 "ai".to_owned(),
+            ),
+            (
+                "www.youtube.com".to_owned(),
+                "youtube".to_owned(),
+                "streaming".to_owned(),
             ),
         ]
     );
@@ -2719,8 +2938,18 @@ async fn settings_diagnostics_endpoint() {
     assert_eq!(response.status(), StatusCode::OK);
     let json = parse_json(response).await;
     assert_eq!(json["schema_version"], 1);
-    assert_eq!(json["data"]["db_backend"], "sqlite");
-    assert!(json["data"]["db_size_bytes"].as_i64().unwrap() > 0);
+    assert_eq!(json["data"]["analytics_backend"], "duckdb");
+    assert!(
+        json["data"]["metadata_database_size_bytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        json["data"]["analytics_database_size_bytes"]
+            .as_u64()
+            .is_some()
+    );
     assert!(json["data"]["gateway"].is_object());
     assert!(json["data"]["retention"].is_object());
     assert_eq!(json["data"]["collector_version"], env!("CARGO_PKG_VERSION"));
@@ -2787,7 +3016,7 @@ fn classifier_manager_status_parsing() {
         "state": "running",
         "current_version": "0.1.0",
         "candidate_version": null,
-        "last_checked_at": 1726000000,
+        "last_checked_at": 1_726_000_000,
         "last_error": null
     });
     std::fs::write(&status_file, serde_json::to_vec(&status_json).unwrap()).unwrap();
@@ -2797,7 +3026,7 @@ fn classifier_manager_status_parsing() {
     let val = parsed.unwrap();
     assert_eq!(val["state"], "running");
     assert_eq!(val["current_version"], "0.1.0");
-    assert_eq!(val["last_checked_at"], 1726000000);
+    assert_eq!(val["last_checked_at"], 1_726_000_000);
 
     let nonexistent = temp.path().join("nonexistent.json");
     assert!(crate::query_api::classifier_manager_status_from_path(&nonexistent).is_none());
@@ -3070,24 +3299,28 @@ async fn real_sample_ingestion_updates_ended_flow_without_persisting_payload() {
     };
     state.accept_batch(&telemetry).unwrap();
     let read = || {
-        state
-            .lock()
+        let inner = state.lock();
+        inner
             .storage
-            .connection()
-            .query_row(
-                "SELECT protocol_id,upload_bytes,classification_evidence_json FROM flow_sessions",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
+            .analytics()
+            .flows(&netqmon_storage::analytics::FlowQuery {
+                from: timestamp.saturating_sub(1),
+                to: timestamp + 1,
+                gateway_id: Some(enrolled.gateway_id.clone()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap()
+            .rows
+            .into_iter()
+            .next()
             .unwrap()
     };
-    assert_eq!(read().0, "unknown", "legacy Agent hint must be ignored");
+    assert_eq!(
+        read().protocol_id,
+        "unknown",
+        "legacy Agent hint must be ignored"
+    );
     let mut payload = vec![0; 108];
     payload[0] = 0x45;
     payload[2..4].copy_from_slice(&108u16.to_be_bytes());
@@ -3102,7 +3335,7 @@ async fn real_sample_ingestion_updates_ended_flow_without_persisting_payload() {
     payload[40] = 19;
     payload[41..60].copy_from_slice(b"BitTorrent protocol");
     let batch = FlowSampleBatch {
-        gateway_id: enrolled.gateway_id,
+        gateway_id: enrolled.gateway_id.clone(),
         boot_id: "sample-test".into(),
         sequence: 1,
         sent_at: timestamp,
@@ -3144,16 +3377,20 @@ async fn real_sample_ingestion_updates_ended_flow_without_persisting_payload() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     for _ in 0..100 {
-        if read().0 == "bittorrent" {
+        if read().protocol_id == "bittorrent" {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let (protocol, bytes, evidence) = read();
-    assert_eq!(protocol, "bittorrent");
-    assert_eq!(bytes, 108);
-    assert!(evidence.contains("ndpi"));
-    assert!(!evidence.contains("BitTorrent protocol"));
+    let classified = read();
+    assert_eq!(classified.protocol_id, "bittorrent");
+    assert_eq!(classified.upload_bytes, 108);
+    assert!(classified.classification_evidence_json.contains("ndpi"));
+    assert!(
+        !classified
+            .classification_evidence_json
+            .contains("BitTorrent protocol")
+    );
     let diagnostics = state.sampling.diagnostics().to_string();
     assert!(!diagnostics.contains("payload"));
     assert!(!diagnostics.contains("BitTorrent protocol"));
@@ -3237,24 +3474,24 @@ async fn signature_sample_match_reclassifies_flow_without_dpi() {
     };
     state.accept_batch(&telemetry).unwrap();
     let read = || {
-        state
-            .lock()
+        let inner = state.lock();
+        inner
             .storage
-            .connection()
-            .query_row(
-                "SELECT application_id,organization_id,classification_evidence_json FROM flow_sessions",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
+            .analytics()
+            .flows(&netqmon_storage::analytics::FlowQuery {
+                from: timestamp.saturating_sub(1),
+                to: timestamp + 1,
+                gateway_id: Some(enrolled.gateway_id.clone()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap()
+            .rows
+            .into_iter()
+            .next()
             .unwrap()
     };
-    assert_eq!(read().0, "unknown");
+    assert_eq!(read().application_id, "unknown");
 
     let mut payload = vec![0u8; 48];
     payload[0] = 0x45;
@@ -3313,13 +3550,16 @@ async fn signature_sample_match_reclassifies_flow_without_dpi() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     for _ in 0..200 {
-        let (_, _, evidence) = read();
-        if evidence.contains("payload_signature") {
+        let flow = read();
+        if flow
+            .classification_evidence_json
+            .contains("payload_signature")
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let (_, _, evidence) = read();
+    let evidence = read().classification_evidence_json;
     assert!(
         evidence.contains("payload_signature"),
         "the ended flow records the signature evidence: {evidence}"
@@ -3341,28 +3581,15 @@ async fn signature_sample_match_reclassifies_flow_without_dpi() {
         ..Default::default()
     };
     state.accept_batch(&followup).unwrap();
-    let (application, organization, category, evidence) = state
-        .lock()
-        .storage
-        .connection()
-        .query_row(
-            "SELECT application_id,organization_id,category_id,classification_evidence_json
-             FROM flow_sessions",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        )
-        .unwrap();
-    assert_eq!(application, "honor_of_kings");
-    assert_eq!(organization, "tencent");
-    assert_eq!(category, "gaming");
-    assert!(evidence.contains("payload_signature"));
+    let classified = read();
+    assert_eq!(classified.application_id, "honor_of_kings");
+    assert_eq!(classified.organization_id, "tencent");
+    assert_eq!(classified.category_id, "gaming");
+    assert!(
+        classified
+            .classification_evidence_json
+            .contains("payload_signature")
+    );
     assert_eq!(state.lock().accepted_batches, 2);
 }
 
@@ -3531,149 +3758,99 @@ fn local_hostname_does_not_identify_selfhost_or_bind_reverse_proxy_port() {
     ));
 }
 
-#[tokio::test]
-async fn insights_detect_first_batch_of_low_cost_enhancements() {
+#[test]
+fn insights_detect_enhancements_from_backend_neutral_analytics() {
+    use crate::insights::{InsightWindow, detect_from_analytics};
+
     let state = query_state();
-    let inner = state.lock();
-    let conn = inner.storage.connection();
-    let gateway_id: String = conn
-        .query_row("SELECT id FROM gateways LIMIT 1", [], |r| r.get(0))
-        .unwrap();
+    let gateway_id = "insights-fixture";
+    let mut flows = Vec::new();
 
-    // 1. Client spike & Application spike
-    // Seed baseline in [1000, 2000) and current spike in [2000, 3000)
-    conn.execute(
-        "INSERT INTO traffic_device_minute (timestamp, gateway_id, device_id, upload_bytes, download_bytes, packets, flow_count)
-         VALUES (1500, ?1, 1, 1000000, 1000000, 100, 10),
-                (2500, ?1, 1, 15000000, 15000000, 1000, 50)",
-        [&gateway_id],
-    ).unwrap();
-
-    conn.execute(
-        "INSERT INTO traffic_application_minute (timestamp, gateway_id, application_id, category_id, upload_bytes, download_bytes, packets, flow_count)
-         VALUES (1500, ?1, 'youtube', 'streaming', 1000000, 1000000, 100, 10),
-                (2500, ?1, 'youtube', 'streaming', 15000000, 15000000, 1000, 50)",
-        [&gateway_id],
-    ).unwrap();
-
-    let client_spikes = crate::insights::traffic::query_client_spike_insights(
-        conn,
-        crate::insights::InsightWindow {
-            from: 2000,
-            to: 3000,
-            limit: 10,
-        },
-    )
-    .unwrap();
-    assert_eq!(client_spikes.len(), 1);
-    assert_eq!(client_spikes[0].code, "traffic.client_spike");
-    assert_eq!(client_spikes[0].category, "traffic");
-    assert_eq!(client_spikes[0].params["client"], "laptop");
-
-    let app_spikes = crate::insights::traffic::query_application_spike_insights(
-        conn,
-        crate::insights::InsightWindow {
-            from: 2000,
-            to: 3000,
-            limit: 10,
-        },
-    )
-    .unwrap();
-    assert_eq!(app_spikes.len(), 1);
-    assert_eq!(app_spikes[0].code, "traffic.application_spike");
-    assert_eq!(app_spikes[0].category, "traffic");
-    assert_eq!(app_spikes[0].params["application"], "youtube");
-
-    // 2. New protocol
-    conn.execute(
-        "INSERT INTO flow_sessions (
-            id, gateway_id, device_id, ip_version, protocol, client_ip, client_port,
-            remote_ip, remote_port, direction, started_at, last_seen_at, checkpointed_at,
-            upload_bytes, download_bytes, packets, protocol_id
-         ) VALUES (
-            'flow-new-proto', ?1, 1, 4, 6, X'C000020A', 50000,
-            X'C6336401', 443, 1, 2500, 2500, 2500, 1000, 1000, 10, 'quic'
-         )",
-        [&gateway_id],
-    )
-    .unwrap();
-
-    let new_protos = crate::insights::protocol::query_new_protocol_insights(
-        conn,
-        crate::insights::InsightWindow {
-            from: 2000,
-            to: 3000,
-            limit: 10,
-        },
-    )
-    .unwrap();
-    assert!(
-        new_protos
-            .iter()
-            .any(|i| i.code == "protocol.new_protocol" && i.params["protocol"] == "quic")
+    let mut quic = analytics_flow(
+        gateway_id,
+        "flow-new-proto",
+        150_000,
+        vec![198, 51, 100, 1],
+        443,
     );
+    quic.protocol_id = "quic".to_owned();
+    quic.application_id = "youtube".to_owned();
+    quic.category_id = "streaming".to_owned();
+    quic.upload_bytes = 1_000;
+    quic.download_bytes = 1_000;
+    flows.push(quic);
 
-    // 3. Client unknown ratio high
-    conn.execute(
-        "INSERT INTO flow_sessions (
-            id, gateway_id, device_id, ip_version, protocol, client_ip, client_port,
-            remote_ip, remote_port, direction, started_at, last_seen_at, checkpointed_at,
-            upload_bytes, download_bytes, packets, application_id
-         ) VALUES (
-            'flow-unknown-heavy', ?1, 1, 4, 6, X'C000020A', 50001,
-            X'C6336402', 443, 1, 2500, 2500, 2500, 2000000, 2000000, 100, 'unknown'
-         )",
-        [&gateway_id],
-    )
-    .unwrap();
-
-    let client_unknowns = crate::insights::classification::query_client_unknown_ratio_insights(
-        conn,
-        crate::insights::InsightWindow {
-            from: 2000,
-            to: 3000,
-            limit: 10,
-        },
-    )
-    .unwrap();
-    assert!(
-        client_unknowns
-            .iter()
-            .any(|i| i.code == "classification.client_unknown_ratio_high")
+    let mut unknown = analytics_flow(
+        gateway_id,
+        "flow-unknown-heavy",
+        150_000,
+        vec![198, 51, 100, 2],
+        443,
     );
+    unknown.upload_bytes = 2_000_000;
+    unknown.download_bytes = 2_000_000;
+    flows.push(unknown);
 
-    // 4. Fanout spike: add 55 distinct remote IPs
-    for i in 1..=55 {
-        conn.execute(
-            "INSERT INTO flow_sessions (
-                id, gateway_id, device_id, ip_version, protocol, client_ip, client_port,
-                remote_ip, remote_port, direction, started_at, last_seen_at, checkpointed_at,
-                upload_bytes, download_bytes, packets
-             ) VALUES (
-                ?1, ?2, 1, 4, 6, X'C000020A', ?3,
-                ?4, 80, 1, 2500, 2500, 2500, 100, 100, 1
-             )",
-            rusqlite::params![
-                format!("fanout-flow-{i}"),
-                gateway_id,
-                50000 + i,
-                vec![10, 0, (i / 256) as u8, (i % 256) as u8]
-            ],
-        )
-        .unwrap();
+    for i in 1u8..=55 {
+        let remote_ip = vec![10, 0, 0, i];
+        let mut flow = analytics_flow(
+            gateway_id,
+            &format!("fanout-flow-{i}"),
+            150_000,
+            remote_ip,
+            80,
+        );
+        flow.client_port = 50_000 + u16::from(i);
+        flow.upload_bytes = 100;
+        flow.download_bytes = 100;
+        flows.push(flow);
     }
 
-    let fanouts = crate::insights::destination::query_fanout_spike_insights(
-        conn,
-        crate::insights::InsightWindow {
-            from: 2000,
-            to: 3000,
-            limit: 10,
+    let traffic = [(90_000, 1_000_000), (150_000, 15_000_000)]
+        .into_iter()
+        .map(|(timestamp, bytes)| {
+            traffic_delta(
+                gateway_id,
+                timestamp,
+                FlowScope::Internet as u8,
+                Direction::Upload as u8,
+                "youtube",
+                "streaming",
+                "quic",
+                6,
+                vec![198, 51, 100, 1],
+                bytes,
+                bytes,
+            )
+        })
+        .collect();
+    seed_analytics(&state, 50, flows, traffic);
+
+    let snapshot = state.realtime_snapshot();
+    let inner = state.lock();
+    let insights = detect_from_analytics(
+        inner.storage.analytics(),
+        inner.storage.metadata(),
+        &snapshot,
+        InsightWindow {
+            from: 120_000,
+            to: 180_000,
+            limit: 100,
         },
+        30_000,
+        u64::MAX,
     )
     .unwrap();
-    assert_eq!(fanouts.len(), 1);
-    assert_eq!(fanouts[0].code, "destination.fanout_spike");
-    assert_eq!(fanouts[0].category, "destination");
-    assert!(fanouts[0].params["count"].as_i64().unwrap() >= 55);
+    for code in [
+        "traffic.client_spike",
+        "traffic.application_spike",
+        "protocol.new_protocol",
+        "classification.client_unknown_ratio_high",
+        "destination.fanout_spike",
+    ] {
+        assert!(
+            insights.iter().any(|insight| insight.code == code),
+            "missing {code}"
+        );
+    }
 }

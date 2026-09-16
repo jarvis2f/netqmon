@@ -188,6 +188,17 @@ pub(crate) struct RealtimeEngine {
     sender: broadcast::Sender<RealtimeEvent>,
 }
 
+struct FlowDeltaSummary {
+    total: Throughput,
+    internet: Throughput,
+    internal: Throughput,
+    tunnel: Throughput,
+    unknown: Throughput,
+    clients: HashMap<String, Throughput>,
+    client_scopes: HashMap<String, ScopedThroughput>,
+    applications: HashMap<String, Throughput>,
+}
+
 impl Default for RealtimeEngine {
     fn default() -> Self {
         let (sender, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
@@ -225,14 +236,13 @@ impl RealtimeEngine {
         attributions: &[FlowAttribution],
         observed_at: u64,
     ) {
-        let (total, internet, internal, tunnel, unknown, clients, client_scopes, applications) =
-            self.apply_flow_deltas(batch, attributions, observed_at);
+        let flow_summary = self.apply_flow_deltas(batch, attributions, observed_at);
 
         let mut history = VecDeque::from(std::mem::take(&mut self.snapshot.history));
         history.push_back(ThroughputPoint {
             timestamp: observed_at,
-            upload_bytes_per_second: internet.upload_bytes_per_second,
-            download_bytes_per_second: internet.download_bytes_per_second,
+            upload_bytes_per_second: flow_summary.internet.upload_bytes_per_second,
+            download_bytes_per_second: flow_summary.internet.download_bytes_per_second,
         });
         while history.len() > MAX_HISTORY_POINTS {
             history.pop_front();
@@ -244,7 +254,26 @@ impl RealtimeEngine {
                 .cmp(&left.last_seen)
                 .then_with(|| left.id.cmp(&right.id))
         });
-        let gateway_health = batch.health.as_ref().map_or_else(
+        self.snapshot = RealtimeSnapshot {
+            generated_at: observed_at,
+            total: flow_summary.total,
+            internet: flow_summary.internet,
+            internal: flow_summary.internal,
+            tunnel: flow_summary.tunnel,
+            unknown: flow_summary.unknown,
+            clients: flow_summary.clients,
+            client_scopes: flow_summary.client_scopes,
+            applications: flow_summary.applications,
+            active_flows,
+            history: history.into(),
+            gateway_health: self.gateway_health_snapshot(batch),
+        };
+
+        self.publish_batch_events(batch, attributions, observed_at);
+    }
+
+    fn gateway_health_snapshot(&self, batch: &TelemetryBatch) -> Option<GatewayHealthSnapshot> {
+        batch.health.as_ref().map_or_else(
             || self.snapshot.gateway_health.clone(),
             |health| {
                 Some(GatewayHealthSnapshot {
@@ -257,14 +286,7 @@ impl RealtimeEngine {
                     agent_version: batch.agent_version.clone(),
                     kernel_version: health.kernel_version.clone(),
                     openwrt_version: health.openwrt_version.clone(),
-                    hardware_flow_offload: match OffloadStatus::try_from(
-                        health.hardware_flow_offload,
-                    ) {
-                        Ok(OffloadStatus::Enabled) => "enabled",
-                        Ok(OffloadStatus::Disabled) => "disabled",
-                        _ => "unknown",
-                    }
-                    .to_owned(),
+                    hardware_flow_offload: offload_name(health.hardware_flow_offload).to_owned(),
                     capture_interface: health.capture_interface.clone(),
                     capture_interfaces: if health.capture_interfaces.is_empty() {
                         vec![health.capture_interface.clone()]
@@ -314,23 +336,7 @@ impl RealtimeEngine {
                         }),
                 })
             },
-        );
-        self.snapshot = RealtimeSnapshot {
-            generated_at: observed_at,
-            total,
-            internet,
-            internal,
-            tunnel,
-            unknown,
-            clients,
-            client_scopes,
-            applications,
-            active_flows,
-            history: history.into(),
-            gateway_health,
-        };
-
-        self.publish_batch_events(batch, attributions, observed_at);
+        )
     }
 
     fn apply_flow_deltas(
@@ -338,16 +344,7 @@ impl RealtimeEngine {
         batch: &TelemetryBatch,
         attributions: &[FlowAttribution],
         observed_at: u64,
-    ) -> (
-        Throughput,
-        Throughput,
-        Throughput,
-        Throughput,
-        Throughput,
-        HashMap<String, Throughput>,
-        HashMap<String, ScopedThroughput>,
-        HashMap<String, Throughput>,
-    ) {
+    ) -> FlowDeltaSummary {
         let interval_ms = self
             .last_update_at
             .and_then(|previous| observed_at.checked_sub(previous))
@@ -379,14 +376,14 @@ impl RealtimeEngine {
                 upload_rate,
                 download_rate,
             );
-            let client_ip = format_ip(&flow.client_ip);
-            let client_id = client_id(flow);
+            let client_address = format_ip(&flow.client_ip);
+            let client_key = client_id(flow);
             add_rate(
-                clients.entry(client_id.clone()).or_default(),
+                clients.entry(client_key.clone()).or_default(),
                 upload_rate,
                 download_rate,
             );
-            let scoped = client_scopes.entry(client_id).or_default();
+            let scoped = client_scopes.entry(client_key).or_default();
             add_rate(
                 match wire_scope {
                     Some(WireFlowScope::Internet) => &mut scoped.internet,
@@ -404,19 +401,19 @@ impl RealtimeEngine {
                 upload_rate,
                 download_rate,
             );
-            self.update_active_flow(flow, attribution, client_ip);
+            self.update_active_flow(flow, attribution, client_address);
         }
         self.evict_oldest_flows();
-        (
+        FlowDeltaSummary {
             total,
             internet,
             internal,
             tunnel,
-            unknown_scope,
+            unknown: unknown_scope,
             clients,
             client_scopes,
             applications,
-        )
+        }
     }
 
     fn update_active_flow(

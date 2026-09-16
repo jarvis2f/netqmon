@@ -28,11 +28,14 @@ pub(super) fn discover_all() -> Result<Vec<NeighborEntry>, NeighborDiscoveryErro
 }
 
 fn discover_matching(ifindex: Option<u32>) -> Result<Vec<NeighborEntry>, NeighborDiscoveryError> {
-    let mut socket = Socket::new(NETLINK_ROUTE).map_err(NeighborDiscoveryError::io)?;
-    socket.bind_auto().map_err(NeighborDiscoveryError::io)?;
+    let mut socket =
+        Socket::new(NETLINK_ROUTE).map_err(|error| NeighborDiscoveryError::io(&error))?;
+    socket
+        .bind_auto()
+        .map_err(|error| NeighborDiscoveryError::io(&error))?;
     socket
         .connect(&SocketAddr::new(0, 0))
-        .map_err(NeighborDiscoveryError::io)?;
+        .map_err(|error| NeighborDiscoveryError::io(&error))?;
 
     let mut header = NetlinkHeader::default();
     header.flags = NLM_F_DUMP | NLM_F_REQUEST;
@@ -46,13 +49,15 @@ fn discover_matching(ifindex: Option<u32>) -> Result<Vec<NeighborEntry>, Neighbo
     request.finalize();
     let mut bytes = vec![0; request.header.length as usize];
     request.serialize(&mut bytes);
-    socket.send(&bytes, 0).map_err(NeighborDiscoveryError::io)?;
+    socket
+        .send(&bytes, 0)
+        .map_err(|error| NeighborDiscoveryError::io(&error))?;
 
     let mut entries = Vec::new();
     'responses: loop {
         let (datagram, _) = socket
             .recv_from_full()
-            .map_err(NeighborDiscoveryError::io)?;
+            .map_err(|error| NeighborDiscoveryError::io(&error))?;
         let mut offset = 0;
         while offset < datagram.len() {
             let message: NetlinkMessage<RouteNetlinkMessage> =
@@ -128,7 +133,7 @@ fn align_netlink(length: usize) -> usize {
 pub(super) struct NeighborDiscoveryError(String);
 
 impl NeighborDiscoveryError {
-    fn io(error: std::io::Error) -> Self {
+    fn io(error: &std::io::Error) -> Self {
         Self(error.to_string())
     }
 }

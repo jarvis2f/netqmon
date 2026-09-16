@@ -45,9 +45,11 @@ use netqmon_protocol::v1::{
 use netqmon_protocol::{
     ContentEncoding, DecodeError, PROTOCOL_VERSION, decode_telemetry_batch, validate_batch_metadata,
 };
+#[cfg(test)]
+use netqmon_storage::SqliteStorage;
 use netqmon_storage::{
-    ClickHouseConfig, ClickHouseStorage, DEFAULT_DATABASE_PATH, FlowAttribution,
-    PersistDisposition, SqliteStorage, Storage, StorageError,
+    AnalyticsBackend, ClickHouseConfig, DEFAULT_DATABASE_PATH, DeviceIdentityUpdate,
+    FlowAttribution, PersistDisposition, SqliteMetadataStore, Storage, StorageError,
 };
 use prost::Message;
 use serde_json::json;
@@ -96,51 +98,9 @@ pub async fn run_from_env() -> Result<(), Box<dyn Error>> {
     if dpi_enabled && !dpi::native_available() {
         return Err(ConfigError("DPI enabled but nDPI 4.14 is unavailable; install libndpi and rebuild or set NETQMON_DPI_ENABLED=false".into()).into());
     }
-    let classifier =
-        ClassifierHandle::connect(config.classifier_socket.clone()).map_err(ConfigError)?;
-    tracing::info!(
-        socket = %config.classifier_socket.display(),
-        "classifier IPC configured; Collector will accept traffic while it reconnects"
-    );
-    let geo_load = LocalDbProvider::load(&config.geo_directory);
-    for warning in &geo_load.warnings {
-        tracing::warn!(warning, "optional Geo database skipped");
-    }
-    tracing::info!(
-        enabled = geo_load.provider.is_enabled(),
-        directory = %config.geo_directory.display(),
-        "Geo enrichment configured"
-    );
+    let (state, classifier) = build_collector_state(&config)?;
 
-    let storage = if config.storage_backend == "clickhouse" {
-        tracing::info!(
-            url = %config.clickhouse_config.url,
-            database = %config.clickhouse_config.database,
-            "connecting to ClickHouse backend"
-        );
-        let ch = ClickHouseStorage::open(config.clickhouse_config.clone())
-            .map_err(|err| ConfigError(format!("failed to connect to ClickHouse: {err}")))?;
-        Storage::clickhouse(ch)
-    } else {
-        if let Some(parent) = config.database_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let sqlite = SqliteStorage::open(&config.database_path)
-            .map_err(|err| ConfigError(format!("failed to open SQLite: {err}")))?;
-        Storage::sqlite(sqlite)
-    };
-
-    let state = CollectorState::with_geo_provider(
-        &config.enrollment_token,
-        storage,
-        classifier.clone(),
-        Arc::new(geo_load.provider),
-        config.geo_directory.clone(),
-        DeviceIdentifier::load(&config.mac_dataset_path),
-        config.icon_cache_config,
-    )
-    .map_err(|err| ConfigError(format!("failed to initialize collector state: {err}")))?;
-    state.license.ensure_identity().map_err(ConfigError)?;
+    let (analytics_shutdown, analytics_writer) = spawn_analytics_writer(state.clone());
 
     let (public_listener, internal_listener) = bind_listeners(&config).await?;
 
@@ -158,10 +118,114 @@ pub async fn run_from_env() -> Result<(), Box<dyn Error>> {
     tracing::info!(address = %config.public_addr, "public ingestion listener started");
     tracing::info!(address = %config.internal_addr, "internal listener started");
 
-    let public = axum::serve(public_listener, public_router(state.clone()));
-    let internal = axum::serve(internal_listener, internal_router(state));
-    tokio::try_join!(public, internal)?;
+    let result = tokio::select! {
+        result = async {
+            tokio::try_join!(
+                axum::serve(public_listener, public_router(state.clone())),
+                axum::serve(internal_listener, internal_router(state)),
+            ).map(|_| ())
+        } => result,
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            Ok(())
+        }
+    };
+    let _ = analytics_shutdown.send(true);
+    let _ = analytics_writer.await;
+    result?;
     Ok(())
+}
+
+fn build_collector_state(
+    config: &CollectorConfig,
+) -> Result<(CollectorState, ClassifierHandle), Box<dyn Error>> {
+    let classifier =
+        ClassifierHandle::connect(config.classifier_socket.clone()).map_err(ConfigError)?;
+    tracing::info!(
+        socket = %config.classifier_socket.display(),
+        "classifier IPC configured; Collector will accept traffic while it reconnects"
+    );
+    let geo_load = LocalDbProvider::load(&config.geo_directory);
+    for warning in &geo_load.warnings {
+        tracing::warn!(warning, "optional Geo database skipped");
+    }
+    tracing::info!(
+        enabled = geo_load.provider.is_enabled(),
+        directory = %config.geo_directory.display(),
+        "Geo enrichment configured"
+    );
+
+    if let Some(parent) = config.database_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let metadata = SqliteMetadataStore::open(&config.database_path)
+        .map_err(|err| ConfigError(format!("failed to open SQLite metadata store: {err}")))?;
+    let analytics = open_analytics_store(config)?;
+    let storage = Storage::from_stores(metadata, analytics);
+
+    let state = CollectorState::with_geo_provider(
+        &config.enrollment_token,
+        storage,
+        classifier.clone(),
+        Arc::new(geo_load.provider),
+        config.geo_directory.clone(),
+        DeviceIdentifier::load(&config.mac_dataset_path),
+        config.icon_cache_config,
+    )
+    .map_err(|err| ConfigError(format!("failed to initialize collector state: {err}")))?;
+    state.license.ensure_identity().map_err(ConfigError)?;
+
+    Ok((state, classifier))
+}
+
+fn open_analytics_store(config: &CollectorConfig) -> Result<AnalyticsBackend, Box<dyn Error>> {
+    match config.analytics_backend.as_str() {
+        "duckdb" => {
+            #[cfg(feature = "analytics-duckdb")]
+            {
+                if let Some(parent) = config.duckdb_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                Ok(
+                    AnalyticsBackend::open_duckdb(&config.duckdb_path).map_err(|err| {
+                        ConfigError(format!("failed to open DuckDB analytics store: {err}"))
+                    })?,
+                )
+            }
+            #[cfg(not(feature = "analytics-duckdb"))]
+            {
+                Err(ConfigError(
+                    "NETQMON_ANALYTICS_BACKEND=duckdb requires the analytics-duckdb feature"
+                        .to_owned(),
+                )
+                .into())
+            }
+        }
+        "clickhouse" => {
+            #[cfg(feature = "analytics-clickhouse")]
+            {
+                tracing::info!(
+                    url = %config.clickhouse_config.url,
+                    database = %config.clickhouse_config.database,
+                    "connecting to ClickHouse analytics store"
+                );
+                Ok(
+                    AnalyticsBackend::open_clickhouse(config.clickhouse_config.clone()).map_err(
+                        |err| {
+                            ConfigError(format!(
+                                "failed to connect to ClickHouse analytics store: {err}"
+                            ))
+                        },
+                    )?,
+                )
+            }
+            #[cfg(not(feature = "analytics-clickhouse"))]
+            {
+                return Err(ConfigError("NETQMON_ANALYTICS_BACKEND=clickhouse requires the analytics-clickhouse feature".to_owned()).into());
+            }
+        }
+        _ => unreachable!("CollectorConfig validates analytics backend"),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -170,7 +234,10 @@ struct CollectorConfig {
     internal_addr: SocketAddr,
     enrollment_token: String,
     database_path: PathBuf,
-    storage_backend: String,
+    analytics_backend: String,
+    #[allow(dead_code)]
+    duckdb_path: PathBuf,
+    #[allow(dead_code)]
     clickhouse_config: ClickHouseConfig,
     classifier_socket: PathBuf,
     geo_directory: PathBuf,
@@ -198,9 +265,18 @@ impl CollectorConfig {
         }
         let database_path = env::var_os("NETQMON_COLLECTOR_DATABASE_PATH")
             .map_or_else(|| PathBuf::from(DEFAULT_DATABASE_PATH), PathBuf::from);
-        let storage_backend = env::var("NETQMON_STORAGE_BACKEND")
-            .unwrap_or_else(|_| "sqlite".to_owned())
+        let analytics_backend = env::var("NETQMON_ANALYTICS_BACKEND")
+            .unwrap_or_else(|_| "duckdb".to_owned())
             .to_ascii_lowercase();
+        if !matches!(analytics_backend.as_str(), "duckdb" | "clickhouse") {
+            return Err(ConfigError(
+                "NETQMON_ANALYTICS_BACKEND must be duckdb or clickhouse".to_owned(),
+            ));
+        }
+        let duckdb_path = env::var_os("NETQMON_DUCKDB_PATH").map_or_else(
+            || PathBuf::from("/data/netqmon-analytics.duckdb"),
+            PathBuf::from,
+        );
         let clickhouse_url = env::var("NETQMON_CLICKHOUSE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8123".to_owned());
         let clickhouse_database =
@@ -228,7 +304,8 @@ impl CollectorConfig {
             internal_addr,
             enrollment_token,
             database_path,
-            storage_backend,
+            analytics_backend,
+            duckdb_path,
             clickhouse_config,
             classifier_socket,
             geo_directory,
@@ -298,12 +375,10 @@ struct CollectorState {
 
 impl CollectorState {
     #[cfg(test)]
-    fn open(enrollment_token: &str, database_path: &Path) -> Result<Self, rusqlite::Error> {
-        Self::with_storage(
-            enrollment_token,
-            SqliteStorage::open(database_path)?,
-            ClassifierHandle::test_default(),
-        )
+    fn open(enrollment_token: &str, database_path: &Path) -> Result<Self, StorageError> {
+        let analytics_path = database_path.with_file_name("netqmon-analytics.duckdb");
+        let storage = Storage::open(database_path, analytics_path)?;
+        Self::with_storage_backend(enrollment_token, storage, ClassifierHandle::test_default())
     }
 
     #[cfg(test)]
@@ -321,20 +396,36 @@ impl CollectorState {
         enrollment_token: &str,
         storage: SqliteStorage,
         classifier: ClassifierHandle,
-    ) -> Result<Self, rusqlite::Error> {
+    ) -> Result<Self, StorageError> {
         Self::with_geo_provider(
             enrollment_token,
-            Storage::sqlite(storage),
+            Storage::from_stores(
+                SqliteMetadataStore::from_storage(storage),
+                AnalyticsBackend::open_duckdb_in_memory().expect("in-memory DuckDB must open"),
+            ),
             classifier,
             Arc::new(DisabledGeoProvider),
             PathBuf::from(DEFAULT_GEO_DIRECTORY),
             DeviceIdentifier::load(Path::new("/missing/netqmon-test-mac-prefixes.json")),
             IconCacheConfig::default(),
         )
-        .map_err(|e| match e {
-            StorageError::Sqlite(err) => err,
-            _ => rusqlite::Error::InvalidQuery,
-        })
+    }
+
+    #[cfg(test)]
+    fn with_storage_backend(
+        enrollment_token: &str,
+        storage: Storage,
+        classifier: ClassifierHandle,
+    ) -> Result<Self, StorageError> {
+        Self::with_geo_provider(
+            enrollment_token,
+            storage,
+            classifier,
+            Arc::new(DisabledGeoProvider),
+            PathBuf::from(DEFAULT_GEO_DIRECTORY),
+            DeviceIdentifier::load(Path::new("/missing/netqmon-test-mac-prefixes.json")),
+            IconCacheConfig::default(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -369,6 +460,8 @@ impl CollectorState {
             accepted_batches: 0,
             dedupe_hits: 0,
             traffic_bytes: 0,
+            analytics_last_success_at_ms: None,
+            analytics_last_error: None,
         }));
         let weak = Arc::downgrade(&inner);
         let sampling = Arc::new(dpi::SamplingService::new(
@@ -406,8 +499,11 @@ impl CollectorState {
     }
 
     fn enroll(&self, request: &EnrollRequest) -> Result<Enrollment, EnrollError> {
+        self.enroll_at(request, unix_time_ms())
+    }
+
+    fn enroll_at(&self, request: &EnrollRequest, now_ms: u64) -> Result<Enrollment, EnrollError> {
         let mut inner = self.lock();
-        let now_ms = unix_time_ms();
         if let Some(record) = inner.storage.gateway().map_err(|_| EnrollError::Storage)? {
             let stale_before_ms = now_ms.saturating_sub(GATEWAY_REPLACEMENT_STALE_AFTER_MS);
             if record.last_seen_ms <= stale_before_ms {
@@ -497,6 +593,33 @@ impl CollectorState {
 
     fn accept_batch(&self, batch: &TelemetryBatch) -> Result<BatchDisposition, StorageError> {
         let mut inner = self.lock();
+        let attributions = self.classify_accepted_batch(&mut inner, batch)?;
+        let (effective_batch, device_identities) =
+            Self::identify_batch_devices(&inner, batch, &attributions)?;
+
+        match inner.storage.persist_classified_batch(
+            &effective_batch,
+            &attributions,
+            &device_identities,
+            unix_time_ms(),
+        )? {
+            PersistDisposition::Duplicate => {
+                inner.dedupe_hits = inner.dedupe_hits.saturating_add(1);
+                Ok(BatchDisposition::Duplicate)
+            }
+            PersistDisposition::Accepted => {
+                #[cfg(test)]
+                inner.storage.process_outbox(ANALYTICS_OUTBOX_BATCH_SIZE)?;
+                Ok(self.finish_accepted_batch(&mut inner, batch, &attributions))
+            }
+        }
+    }
+
+    fn classify_accepted_batch(
+        &self,
+        inner: &mut CollectorInner,
+        batch: &TelemetryBatch,
+    ) -> Result<Vec<FlowAttribution>, StorageError> {
         let mut favicon_endpoints = std::mem::take(&mut inner.favicon_endpoints);
         favicon_endpoints.observe_results(&inner.classifier, batch);
         let dpi_results = self.sampling.lookup_batch(batch);
@@ -514,9 +637,16 @@ impl CollectorState {
         // telemetry batch must not discard previously learned endpoint identities
         // or outstanding request correlation.
         inner.favicon_endpoints = favicon_endpoints;
-        let attributions = classified?;
+        classified
+    }
+
+    fn identify_batch_devices(
+        inner: &CollectorInner,
+        batch: &TelemetryBatch,
+        attributions: &[FlowAttribution],
+    ) -> Result<(TelemetryBatch, Vec<DeviceIdentityUpdate>), StorageError> {
         let mut supplemental_evidence =
-            DeviceIdentifier::destination_evidence(&inner.classifier, batch, &attributions);
+            DeviceIdentifier::destination_evidence(&inner.classifier, batch, attributions);
         for (mac, evidence) in DeviceIdentifier::discovery_evidence(
             &inner.classifier,
             &batch.device_discovery_observations,
@@ -583,38 +713,33 @@ impl CollectorState {
             &historical_evidence,
             &supplemental_evidence,
         );
-        match inner.storage.persist_classified_batch(
-            &effective_batch,
-            &attributions,
-            &device_identities,
-            unix_time_ms(),
-        )? {
-            PersistDisposition::Duplicate => {
-                inner.dedupe_hits = inner.dedupe_hits.saturating_add(1);
-                Ok(BatchDisposition::Duplicate)
-            }
-            PersistDisposition::Accepted => {
-                self.sampling.observe_telemetry(batch);
-                let observed_at = if batch.sent_at == 0 {
-                    unix_time_ms()
-                } else {
-                    batch.sent_at
-                };
-                inner.realtime.update(batch, &attributions, observed_at);
-                inner.accepted_batches = inner.accepted_batches.saturating_add(1);
-                inner.traffic_bytes =
-                    batch.flows.iter().fold(inner.traffic_bytes, |total, flow| {
-                        total
-                            .saturating_add(flow.upload_bytes)
-                            .saturating_add(flow.download_bytes)
-                    });
-                let requests = inner
-                    .favicon_endpoints
-                    .schedule(batch, &attributions, observed_at);
-                inner.pending_probe_requests.extend(requests);
-                Ok(BatchDisposition::Accepted)
-            }
-        }
+        Ok((effective_batch, device_identities))
+    }
+
+    fn finish_accepted_batch(
+        &self,
+        inner: &mut CollectorInner,
+        batch: &TelemetryBatch,
+        attributions: &[FlowAttribution],
+    ) -> BatchDisposition {
+        self.sampling.observe_telemetry(batch);
+        let observed_at = if batch.sent_at == 0 {
+            unix_time_ms()
+        } else {
+            batch.sent_at
+        };
+        inner.realtime.update(batch, attributions, observed_at);
+        inner.accepted_batches = inner.accepted_batches.saturating_add(1);
+        inner.traffic_bytes = batch.flows.iter().fold(inner.traffic_bytes, |total, flow| {
+            total
+                .saturating_add(flow.upload_bytes)
+                .saturating_add(flow.download_bytes)
+        });
+        let requests = inner
+            .favicon_endpoints
+            .schedule(batch, attributions, observed_at);
+        inner.pending_probe_requests.extend(requests);
+        BatchDisposition::Accepted
     }
 
     fn take_probe_requests(&self) -> Vec<ProbeRequest> {
@@ -698,6 +823,8 @@ struct CollectorInner {
     accepted_batches: u64,
     dedupe_hits: u64,
     traffic_bytes: u64,
+    analytics_last_success_at_ms: Option<u64>,
+    analytics_last_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -1240,7 +1367,7 @@ fn classify_batch(
                         .application_id
                         .clone_from(&identity.application_id);
                     attribution.category_id.clone_from(&identity.traffic_class);
-                    attribution.traffic_role = "server".to_owned();
+                    "server".clone_into(&mut attribution.traffic_role);
                     attribution.organization_confidence = 1.0;
                     attribution.application_confidence = 1.0;
                     attribution.confidence = 1.0;
@@ -1588,6 +1715,88 @@ fn spawn_maintenance(state: CollectorState, interval: Duration, retention: bool)
     });
 }
 
+const ANALYTICS_OUTBOX_BATCH_SIZE: u32 = 64;
+const ANALYTICS_RETRY_MIN: Duration = Duration::from_millis(250);
+const ANALYTICS_RETRY_MAX: Duration = Duration::from_secs(30);
+const ANALYTICS_SHUTDOWN_ATTEMPTS: u8 = 5;
+
+fn spawn_analytics_writer(
+    state: CollectorState,
+) -> (
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut backoff = ANALYTICS_RETRY_MIN;
+        let mut shutdown_failures = 0_u8;
+        loop {
+            let should_shutdown = *shutdown_rx.borrow();
+            let worker_state = state.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                worker_state
+                    .lock()
+                    .storage
+                    .process_outbox(ANALYTICS_OUTBOX_BATCH_SIZE)
+            })
+            .await;
+
+            match result {
+                Ok(Ok(processed)) => {
+                    {
+                        let mut inner = state.lock();
+                        inner.analytics_last_success_at_ms = Some(unix_time_ms());
+                        inner.analytics_last_error = None;
+                    }
+                    backoff = ANALYTICS_RETRY_MIN;
+                    shutdown_failures = 0;
+                    if processed > 0 {
+                        continue;
+                    }
+                    if should_shutdown {
+                        break;
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "analytics outbox write failed; keeping rows for retry");
+                    state.lock().analytics_last_error = Some(error.to_string());
+                    if should_shutdown {
+                        shutdown_failures = shutdown_failures.saturating_add(1);
+                        if shutdown_failures >= ANALYTICS_SHUTDOWN_ATTEMPTS {
+                            tracing::error!(
+                                "analytics outbox shutdown flush stopped after bounded retries"
+                            );
+                            break;
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "analytics outbox worker task failed");
+                    state.lock().analytics_last_error = Some(error.to_string());
+                    if should_shutdown {
+                        shutdown_failures = shutdown_failures.saturating_add(1);
+                        if shutdown_failures >= ANALYTICS_SHUTDOWN_ATTEMPTS {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let delay = backoff;
+            backoff = backoff.saturating_mul(2).min(ANALYTICS_RETRY_MAX);
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {},
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    (shutdown, task)
+}
+
 /// Keeps a late-starting or restarted dynamically managed classifier visible
 /// without placing a health check on the ingestion path. The handle itself
 /// enforces the 1–30 second retry circuit; this task merely makes a probe when
@@ -1754,5 +1963,8 @@ fn apply_sample_result(
     let attributions = classified?;
     inner
         .storage
-        .reclassify_flow(&cached.gateway, &batch.flows[0], &attributions[0])
+        .reclassify_flow(&cached.gateway, &batch.flows[0], &attributions[0])?;
+    #[cfg(test)]
+    inner.storage.process_outbox(ANALYTICS_OUTBOX_BATCH_SIZE)?;
+    Ok(())
 }

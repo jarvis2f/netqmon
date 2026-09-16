@@ -14,6 +14,7 @@ temporary_directory=$(mktemp -d)
 log_file=${temporary_directory}/collector.log
 mock_log_file=${temporary_directory}/mock-classifierd.log
 database_path=${temporary_directory}/netqmon.db
+analytics_path=${temporary_directory}/netqmon-analytics.duckdb
 classifier_socket=${temporary_directory}/classifierd.sock
 collector_pid=
 mock_classifier_pid=
@@ -42,6 +43,7 @@ start_collector() {
   NETQMON_COLLECTOR_INTERNAL_ADDR=${internal_address} \
   NETQMON_COLLECTOR_ENROLLMENT_TOKEN=${enrollment_token} \
   NETQMON_COLLECTOR_DATABASE_PATH=${database_path} \
+  NETQMON_DUCKDB_PATH=${analytics_path} \
   NETQMON_CLASSIFIER_SOCKET=${classifier_socket} \
   NETQMON_LICENSE_STATE_PATH=${temporary_directory}/license.json \
     "${collector}" >>"${log_file}" 2>&1 &
@@ -99,6 +101,7 @@ wait_for_collector
 python3 - "${internal_address}" <<'PY'
 import json
 import sys
+import time
 import urllib.request
 
 base = f"http://{sys.argv[1]}"
@@ -110,11 +113,24 @@ def get(path):
     return payload["data"]
 
 overview = get("/internal/overview?limit=10&offset=0")
-traffic = get("/internal/traffic?from=0&to=9223372036854775807&limit=10&offset=0")
+now = int(time.time() * 1000)
+traffic_path = f"/internal/traffic?from={now - 86400000}&to={now + 60000}&limit=10&offset=0&scope=all"
+traffic = get(traffic_path)
+for _ in range(50):
+    traffic_bytes = sum(point["upload_bytes"] + point["download_bytes"] for point in traffic["points"])
+    if traffic_bytes == 132900:
+        break
+    time.sleep(0.1)
+    traffic = get(traffic_path)
 clients = get("/internal/clients?limit=10&offset=0")
 applications = get("/internal/applications?limit=20&offset=0")
 domains = get("/internal/domains?limit=20&offset=0")
-flows = get("/internal/flows?limit=50")
+flows = get("/internal/flows?from=0&to=9223372036854775807&limit=50")
+for _ in range(50):
+    if flows:
+        break
+    time.sleep(0.1)
+    flows = get("/internal/flows?from=0&to=9223372036854775807&limit=50")
 
 text = json.dumps(
     {
@@ -142,6 +158,10 @@ for expected in [
 
 assert "2001:db8:22::10" in text or "20010db8002200000000000000000010" in text, text
 assert "2001:db8:22::443" in text or "20010db8002200000000000000000443" in text, text
+traffic_bytes = sum(point["upload_bytes"] + point["download_bytes"] for point in traffic["points"])
+assert traffic_bytes == 132900, f"traffic_bytes={traffic_bytes}"
+assert len(flows) == 4, f"flow_count={len(flows)}"
+assert sum(":" in flow["client_ip"] or ":" in flow["remote_ip"] for flow in flows) == 1, flows
 PY
 
 python3 - "${database_path}" <<'PY'
@@ -152,38 +172,19 @@ connection = sqlite3.connect(sys.argv[1])
 gateway_count = connection.execute("SELECT COUNT(*) FROM gateways").fetchone()[0]
 device_count = connection.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
 dns_count = connection.execute("SELECT COUNT(*) FROM dns_observations").fetchone()[0]
-flow_count = connection.execute("SELECT COUNT(*) FROM flow_sessions").fetchone()[0]
-traffic_bytes = connection.execute(
-    "SELECT SUM(upload_bytes + download_bytes) FROM traffic_total_minute"
-).fetchone()[0]
-applications = {
-    row[0] for row in connection.execute(
-        "SELECT DISTINCT application_id FROM flow_sessions WHERE application_id IS NOT NULL"
-    )
-}
-protocols = {
-    row[0] for row in connection.execute(
-        "SELECT DISTINCT protocol_id FROM flow_sessions WHERE protocol_id IS NOT NULL"
-    )
-}
 domains = {
     row[0] for row in connection.execute(
         "SELECT DISTINCT domain FROM dns_observations WHERE domain IS NOT NULL"
     )
 }
-ipv6_flows = connection.execute(
-    "SELECT COUNT(*) FROM flow_sessions WHERE ip_version = 6"
-).fetchone()[0]
 
 assert gateway_count == 1, f"gateway_count={gateway_count}"
 assert device_count >= 2, f"device_count={device_count}"
 assert dns_count >= 12, f"dns_count={dns_count}"
-assert flow_count == 4, f"flow_count={flow_count}"
-assert traffic_bytes == 132900, f"traffic_bytes={traffic_bytes}"
-assert {"youtube", "github"}.issubset(applications), f"applications={sorted(applications)}"
-assert "bittorrent" in protocols, f"protocols={sorted(protocols)}"
 assert {"www.youtube.com", "github.com", "claude.ai"}.issubset(domains), f"domains={sorted(domains)}"
-assert ipv6_flows == 1, f"ipv6_flows={ipv6_flows}"
+assert not connection.execute(
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND (name='flow_sessions' OR name GLOB 'traffic_*')"
+).fetchone(), "analytics tables leaked into SQLite metadata"
 PY
 
 stop_collector
@@ -196,12 +197,25 @@ import sys
 
 connection = sqlite3.connect(sys.argv[1])
 gateway_count = connection.execute("SELECT COUNT(*) FROM gateways").fetchone()[0]
-flow_count = connection.execute("SELECT COUNT(*) FROM flow_sessions").fetchone()[0]
-traffic_bytes = connection.execute(
-    "SELECT SUM(upload_bytes + download_bytes) FROM traffic_total_minute"
-).fetchone()[0]
 assert gateway_count == 1, f"gateway_count={gateway_count}"
-assert flow_count == 4, f"flow_count={flow_count}"
+PY
+
+python3 - "${internal_address}" <<'PY'
+import json
+import sys
+import time
+import urllib.request
+
+now = int(time.time() * 1000)
+url = f"http://{sys.argv[1]}/internal/traffic?from={now - 86400000}&to={now + 60000}&limit=10&offset=0&scope=all"
+for _ in range(50):
+    with urllib.request.urlopen(url, timeout=3) as response:
+        payload = json.load(response)
+    traffic_bytes = sum(point["upload_bytes"] + point["download_bytes"] for point in payload["data"]["points"])
+    if traffic_bytes == 132900:
+        break
+    time.sleep(0.1)
+assert payload["schema_version"] == 1, payload
 assert traffic_bytes == 132900, f"traffic_bytes={traffic_bytes}"
 PY
 

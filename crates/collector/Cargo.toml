@@ -15,10 +15,9 @@ getrandom = "0.3.4"
 netqmon-classifier-client = { path = "../classifier-client" }
 netqmon-geo = { path = "../geo" }
 netqmon-protocol = { path = "../protocol" }
-netqmon-storage = { path = "../storage" }
+netqmon-storage = { path = "../storage", default-features = false }
 prost = "0.14.4"
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-rusqlite = "0.40.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "serde"] }
@@ -38,6 +37,11 @@ tower = { version = "0.5.2", features = ["util"] }
 
 [lints]
 workspace = true
+
+[features]
+default = ["analytics-duckdb"]
+analytics-duckdb = ["netqmon-storage/analytics-duckdb"]
+analytics-clickhouse = ["netqmon-storage/analytics-clickhouse"]
 
 [build-dependencies]
 cc = "1"
