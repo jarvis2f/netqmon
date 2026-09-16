@@ -534,3 +534,25 @@ jobs:
         with:
           files: ${{ runner.temp }}/openwrt-release-assets/*
           prerelease: ${{ contains(github.ref_name, '-') }}
+
+      - name: Backfill stable manifest for existing update clients
+        if: github.ref_name == 'v0.1.0-beta.7'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          stable_assets="${{ runner.temp }}/stable-release-assets"
+          mkdir -p "$stable_assets"
+          gh release download v0.1.0-beta.4 \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.ipk' \
+            --dir "$stable_assets"
+          python3 scripts/release/generate_openwrt_manifest.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --release "stable:v0.1.0-beta.4:$stable_assets" \
+            --output "$stable_assets/openwrt-agent-manifest.json"
+          gh release upload v0.1.0-beta.4 \
+            "$stable_assets/openwrt-agent-manifest.json" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
