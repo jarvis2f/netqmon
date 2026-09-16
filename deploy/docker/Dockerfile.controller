@@ -66,6 +66,17 @@ COPY apps/controller-ui ./apps/controller-ui
 
 RUN pnpm --filter @netqmon/controller-ui build
 
+# Next's standalone trace includes both glibc and musl sharp optional packages.
+# The runtime image is Alpine, so retain only the musl variants before the
+# standalone tree is copied into the final image. Cleaning the builder output
+# keeps the unused glibc libvips payload out of the image layer itself.
+RUN for package in /usr/src/netqmon/apps/controller-ui/.next/standalone/node_modules/.pnpm/@img+sharp-linux-* /usr/src/netqmon/apps/controller-ui/.next/standalone/node_modules/.pnpm/@img+sharp-libvips-linux-*; do \
+      case "${package}" in \
+        *linuxmusl-*) ;; \
+        *) rm -rf "${package}" ;; \
+      esac; \
+    done
+
 FROM node:22-alpine
 
 LABEL org.opencontainers.image.source=https://github.com/jarvis2f/netqmon
@@ -83,15 +94,6 @@ COPY --from=collector-builder /netqmon-collector /usr/local/bin/netqmon-collecto
 COPY --from=collector-builder /netqmon-classifier-manager /usr/local/bin/netqmon-classifier-manager
 COPY --from=collector-builder /usr/src/netqmon/migrations /app/migrations
 COPY --from=ui-builder /usr/src/netqmon/apps/controller-ui/.next/standalone /app
-# Next's standalone trace includes both glibc and musl sharp optional packages.
-# The runtime image is Alpine, so retain only the musl variants and avoid
-# shipping the unused glibc libvips payload in every architecture image.
-RUN for package in /app/node_modules/.pnpm/@img+sharp-linux-* /app/node_modules/.pnpm/@img+sharp-libvips-linux-*; do \
-      case "${package}" in \
-        *linuxmusl-*) ;; \
-        *) rm -rf "${package}" ;; \
-      esac; \
-    done
 COPY --from=ui-builder /usr/src/netqmon/apps/controller-ui/.next/static /app/apps/controller-ui/.next/static
 COPY --from=ui-builder /usr/src/netqmon/apps/controller-ui/public /app/apps/controller-ui/public
 COPY deploy/docker/controller-entrypoint.sh /usr/local/bin/netqmon-controller-entrypoint
