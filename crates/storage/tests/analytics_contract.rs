@@ -204,6 +204,10 @@ fn sqlite_metadata_commits_classified_batches_to_the_outbox() {
     assert_eq!(storage.process_outbox(10).unwrap(), 0);
 
     let late = FlowAttribution {
+        organization_id: "example-owner".to_owned(),
+        application_id: "example-app".to_owned(),
+        organization_confidence: 0.9,
+        application_confidence: 0.95,
         protocol_id: "tls".to_owned(),
         protocol_confidence: 1.0,
         confidence: 1.0,
@@ -227,5 +231,7 @@ fn sqlite_metadata_commits_classified_batches_to_the_outbox() {
         })
         .unwrap();
     assert_eq!(latest.total, 1);
+    assert_eq!(latest.rows[0].organization_id, "example-owner");
+    assert_eq!(latest.rows[0].application_id, "example-app");
     assert_eq!(latest.rows[0].protocol_id, "tls");
 }

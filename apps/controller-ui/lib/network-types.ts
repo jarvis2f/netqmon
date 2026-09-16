@@ -221,8 +221,17 @@ export interface RetentionPolicy {
 
 export interface DiagnosticsInfo {
   collector_version: string;
-  db_backend: string;
-  db_size_bytes: number;
+  analytics_backend?: string;
+  metadata_database_size_bytes?: number;
+  analytics_database_size_bytes?: number;
+  analytics_outbox_depth?: number;
+  analytics_outbox_oldest_age_ms?: number;
+  analytics_last_success_at?: number | null;
+  analytics_last_error?: string | null;
+  active_flow_count?: number;
+  // Legacy collector fields retained while mixed-version installs are upgraded.
+  db_backend?: string;
+  db_size_bytes?: number;
   gateway: {
     id: string;
     name: string;
@@ -231,7 +240,7 @@ export interface DiagnosticsInfo {
     openwrt_version: string;
     last_seen: number;
   } | null;
-  active_flows: number;
+  active_flows?: number;
   unknown_ratio: number;
   retention: RetentionPolicy;
   geo_enabled: boolean;

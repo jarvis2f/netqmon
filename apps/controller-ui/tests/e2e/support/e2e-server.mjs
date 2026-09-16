@@ -8,12 +8,17 @@ const collectorPort = Number(process.env.NETQMON_E2E_COLLECTOR_PORT ?? "8099");
 const appRoot = new URL("../../..", import.meta.url);
 const standaloneRoot = new URL(".next/standalone/apps/controller-ui/", appRoot);
 const standaloneStatic = new URL(".next/static/", standaloneRoot);
+const standalonePublic = new URL("public/", standaloneRoot);
 
 if (!existsSync(standaloneStatic)) {
   mkdirSync(new URL(".next/", standaloneRoot), { recursive: true });
   cpSync(new URL(".next/static/", appRoot), standaloneStatic, {
     recursive: true,
   });
+}
+
+if (!existsSync(standalonePublic)) {
+  cpSync(new URL("public/", appRoot), standalonePublic, { recursive: true });
 }
 
 const collector = createMockCollectorServer();

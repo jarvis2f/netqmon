@@ -24,6 +24,16 @@ test("redirects unauthenticated users to login", async ({ page }) => {
   await expect(page).toHaveURL(/\/login\?next=%2Fflows$/);
 });
 
+test("serves the web app manifest to signed-out clients", async ({
+  request,
+}) => {
+  const response = await request.get("/site.webmanifest");
+  expect(response.ok()).toBeTruthy();
+  expect(response.headers()["content-type"]).toMatch(/json/);
+  const manifest = await response.json();
+  expect(manifest.short_name).toBe("netqmon");
+});
+
 test("handles stale or invalid session cookie without infinite redirect loop", async ({
   page,
   context,

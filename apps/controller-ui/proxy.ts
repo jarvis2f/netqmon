@@ -7,6 +7,7 @@ const PUBLIC_PATHS = new Set([
   "/api/auth/status",
   "/api/auth/setup",
   "/api/auth/login",
+  "/site.webmanifest",
 ]);
 
 export async function proxy(request: NextRequest) {

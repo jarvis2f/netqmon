@@ -529,6 +529,7 @@ impl SqliteStorage {
             attributions,
             received_at,
         )?;
+        let flow_versions = deduplicate_flow_versions(flow_versions);
         let analytics_batch = build_analytics_batch(
             &transaction,
             batch,
@@ -598,7 +599,7 @@ impl SqliteStorage {
         let key = cached_key.unwrap_or_else(|| FlowKey::from_batch(gateway_id, flow));
         let mut staged_active = cached.clone();
         if let Some(current) = &mut staged_active {
-            apply_late_protocol(&mut current.attribution, attribution);
+            apply_late_classification(&mut current.attribution, attribution);
         }
 
         let now = to_i64(now_ms);
@@ -608,7 +609,7 @@ impl SqliteStorage {
             analytics_flow_from_current(&transaction, &key, current, false, now)?
         } else if let Some(latest) = latest {
             let mut updated = latest.clone();
-            apply_late_protocol_to_analytics_flow(&mut updated, attribution, now_ms);
+            apply_late_classification_to_analytics_flow(&mut updated, attribution, now_ms);
             updated
         } else {
             let Some(analytics_flow) = update_persisted_reclassification(
@@ -960,16 +961,32 @@ fn update_persisted_reclassification(
     };
     let changed = transaction.execute(
         "UPDATE active_flow_sessions SET
-            protocol_id = CASE WHEN ?2 <> 'unknown' AND ?2 <> '' THEN ?2 ELSE protocol_id END,
-            protocol_confidence = CASE WHEN ?2 <> 'unknown' AND ?2 <> '' THEN ?3 ELSE protocol_confidence END,
-            category_id = CASE WHEN ?4 <> 'unknown' AND ?4 <> '' THEN ?4 ELSE category_id END,
-            traffic_role = CASE WHEN ?5 <> 'unknown' AND ?5 <> '' THEN ?5 ELSE traffic_role END,
-            classification_confidence = MAX(COALESCE(classification_confidence, 0), ?6),
-            classification_reason = ?7,
-            classification_evidence_json = ?8
-         WHERE id = ?1 AND gateway_id = ?9",
+            organization_id = CASE
+                WHEN organization_id = 'unknown' AND ?2 NOT IN ('', 'unknown') THEN ?2
+                ELSE organization_id END,
+            organization_confidence = CASE
+                WHEN organization_id = 'unknown' AND ?2 NOT IN ('', 'unknown') THEN ?3
+                ELSE organization_confidence END,
+            application_id = CASE
+                WHEN application_id = 'unknown' AND ?4 NOT IN ('', 'unknown') THEN ?4
+                ELSE application_id END,
+            application_confidence = CASE
+                WHEN application_id = 'unknown' AND ?4 NOT IN ('', 'unknown') THEN ?5
+                ELSE application_confidence END,
+            protocol_id = CASE WHEN ?6 <> 'unknown' AND ?6 <> '' THEN ?6 ELSE protocol_id END,
+            protocol_confidence = CASE WHEN ?6 <> 'unknown' AND ?6 <> '' THEN ?7 ELSE protocol_confidence END,
+            category_id = CASE WHEN ?8 <> 'unknown' AND ?8 <> '' THEN ?8 ELSE category_id END,
+            traffic_role = CASE WHEN ?9 <> 'unknown' AND ?9 <> '' THEN ?9 ELSE traffic_role END,
+            classification_confidence = MAX(COALESCE(classification_confidence, 0), ?10),
+            classification_reason = ?11,
+            classification_evidence_json = ?12
+         WHERE id = ?1 AND gateway_id = ?13",
         params![
             matched_id,
+            attribution.organization_id,
+            attribution.organization_confidence,
+            attribution.application_id,
+            attribution.application_confidence,
             attribution.protocol_id,
             attribution.protocol_confidence,
             attribution.category_id,
@@ -1904,6 +1921,21 @@ fn build_analytics_batch(
     })
 }
 
+/// Each analytics batch can contain multiple lifecycle snapshots of one flow.
+/// Analytics stores version rows once per gateway/boot/batch, so keep the
+/// final snapshot for each flow while preserving the original row order.
+fn deduplicate_flow_versions(flows: Vec<AnalyticsFlow>) -> Vec<AnalyticsFlow> {
+    let mut last_index = HashMap::with_capacity(flows.len());
+    for (index, flow) in flows.iter().enumerate() {
+        last_index.insert(flow.flow_id.clone(), index);
+    }
+    flows
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, flow)| (last_index.get(&flow.flow_id) == Some(&index)).then_some(flow))
+        .collect()
+}
+
 fn normalized_id(value: &str) -> String {
     if value.is_empty() {
         "unknown".to_owned()
@@ -2170,8 +2202,25 @@ fn sample_matches(key: &FlowKey, current: &ActiveFlow, gateway: &str, flow: &Flo
         && current.last_seen_at >= to_i64(flow.first_seen_unix_ms.saturating_sub(1))
 }
 
-// Late DPI must not erase the independently established DNS/application identity.
-fn apply_late_protocol(current: &mut FlowAttribution, incoming: &FlowAttribution) {
+// Late DPI can fill missing identity fields, but must not replace an
+// independently established DNS/application identity.
+fn apply_late_classification(current: &mut FlowAttribution, incoming: &FlowAttribution) {
+    if current.organization_id == "unknown"
+        && !incoming.organization_id.is_empty()
+        && incoming.organization_id != "unknown"
+    {
+        current
+            .organization_id
+            .clone_from(&incoming.organization_id);
+        current.organization_confidence = incoming.organization_confidence;
+    }
+    if current.application_id == "unknown"
+        && !incoming.application_id.is_empty()
+        && incoming.application_id != "unknown"
+    {
+        current.application_id.clone_from(&incoming.application_id);
+        current.application_confidence = incoming.application_confidence;
+    }
     current.protocol_id.clone_from(&incoming.protocol_id);
     current.protocol_confidence = incoming.protocol_confidence;
     if incoming.category_id != "unknown" {
@@ -2185,11 +2234,26 @@ fn apply_late_protocol(current: &mut FlowAttribution, incoming: &FlowAttribution
     current.evidence_json.clone_from(&incoming.evidence_json);
 }
 
-fn apply_late_protocol_to_analytics_flow(
+fn apply_late_classification_to_analytics_flow(
     flow: &mut AnalyticsFlow,
     attribution: &FlowAttribution,
     now_ms: u64,
 ) {
+    if flow.organization_id == "unknown"
+        && !attribution.organization_id.is_empty()
+        && attribution.organization_id != "unknown"
+    {
+        flow.organization_id
+            .clone_from(&attribution.organization_id);
+        flow.organization_confidence = attribution.organization_confidence;
+    }
+    if flow.application_id == "unknown"
+        && !attribution.application_id.is_empty()
+        && attribution.application_id != "unknown"
+    {
+        flow.application_id.clone_from(&attribution.application_id);
+        flow.application_confidence = attribution.application_confidence;
+    }
     flow.protocol_id.clone_from(&attribution.protocol_id);
     flow.protocol_confidence = attribution.protocol_confidence;
     if attribution.category_id != "unknown" {

@@ -96,6 +96,25 @@ const classifierAvailabilityKey = (availability: string) =>
   CLASSIFIER_AVAILABILITY_KEYS[availability] ??
   CLASSIFIER_AVAILABILITY_KEYS.unavailable;
 
+function diagnosticsBackendName(diagnostics: DiagnosticsInfo | null): string {
+  return (
+    diagnostics?.analytics_backend ?? diagnostics?.db_backend ?? "database"
+  );
+}
+
+function diagnosticsDatabaseSizeBytes(diagnostics: DiagnosticsInfo): number {
+  if (
+    diagnostics.metadata_database_size_bytes !== undefined ||
+    diagnostics.analytics_database_size_bytes !== undefined
+  ) {
+    return (
+      (diagnostics.metadata_database_size_bytes ?? 0) +
+      (diagnostics.analytics_database_size_bytes ?? 0)
+    );
+  }
+  return diagnostics.db_size_bytes ?? 0;
+}
+
 function MetricRow({
   label,
   value,
@@ -614,15 +633,13 @@ export function SettingsDashboard({ username }: { username: string }) {
           <div className="hidden sm:flex items-center gap-2 text-xs text-foreground-muted">
             <span className="flex items-center gap-1.5">
               <HardDrive className="size-3.5 text-accent" />
-              <span>
-                {diagnostics?.db_backend
-                  ? `${diagnostics.db_backend.toUpperCase()}`
-                  : "Database"}
-              </span>
+              <span>{diagnosticsBackendName(diagnostics).toUpperCase()}</span>
             </span>
             <span>•</span>
             <span className="font-mono">
-              {diagnostics ? formatBytes(diagnostics.db_size_bytes) : "—"}
+              {diagnostics
+                ? formatBytes(diagnosticsDatabaseSizeBytes(diagnostics))
+                : "—"}
             </span>
           </div>
         </div>
@@ -2006,16 +2023,22 @@ export function SettingsDashboard({ username }: { username: string }) {
                     />
                     <MetricRow
                       label={t("diagnostics.dbBackend")}
-                      value={diagnostics.db_backend.toUpperCase()}
+                      value={diagnosticsBackendName(diagnostics).toUpperCase()}
                     />
                     <MetricRow
                       label={t("diagnostics.dbSize")}
-                      value={formatBytes(diagnostics.db_size_bytes)}
+                      value={formatBytes(
+                        diagnosticsDatabaseSizeBytes(diagnostics),
+                      )}
                       mono
                     />
                     <MetricRow
                       label={t("diagnostics.activeFlows")}
-                      value={diagnostics.active_flows.toLocaleString()}
+                      value={(
+                        diagnostics.active_flow_count ??
+                        diagnostics.active_flows ??
+                        0
+                      ).toLocaleString()}
                       mono
                     />
                     <MetricRow

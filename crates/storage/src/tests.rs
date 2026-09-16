@@ -753,6 +753,22 @@ fn active_flow_count_tracks_metadata_sessions() {
 }
 
 #[test]
+fn outbox_keeps_only_the_last_flow_version_per_batch() {
+    let mut storage = setup();
+    let mut telemetry = batch(1, FlowLifecycle::Ended);
+    telemetry.flows.push(telemetry.flows[0].clone());
+
+    storage
+        .persist_classified_batch(&telemetry, &[], &[], NOW)
+        .unwrap();
+
+    let records = storage.outbox_batch(1).unwrap();
+    let analytics = AnalyticsBatch::decode(&records[0].payload).unwrap();
+    assert_eq!(analytics.flows.len(), 1);
+    assert_eq!(analytics.flows[0].ended_at, Some(NOW + 1_000));
+}
+
+#[test]
 fn late_transport_dpi_preserves_application_and_tracker_identity() {
     let mut current = FlowAttribution {
         domain: Some("tracker.example".into()),
@@ -763,9 +779,13 @@ fn late_transport_dpi_preserves_application_and_tracker_identity() {
         confidence: 1.0,
         ..Default::default()
     };
-    super::apply_late_protocol(
+    super::apply_late_classification(
         &mut current,
         &FlowAttribution {
+            organization_id: "new-owner".into(),
+            application_id: "new-application".into(),
+            organization_confidence: 0.8,
+            application_confidence: 0.8,
             protocol_id: "tls".into(),
             protocol_confidence: 1.0,
             confidence: 0.8,
@@ -779,4 +799,24 @@ fn late_transport_dpi_preserves_application_and_tracker_identity() {
     assert_eq!(current.category_id, "p2p");
     assert_eq!(current.traffic_role, "tracker_service");
     assert!((current.confidence - 1.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn late_dpi_fills_unknown_application_and_organization() {
+    let mut current = FlowAttribution::default();
+    super::apply_late_classification(
+        &mut current,
+        &FlowAttribution {
+            organization_id: "example-owner".into(),
+            application_id: "example-app".into(),
+            organization_confidence: 0.9,
+            application_confidence: 0.95,
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(current.organization_id, "example-owner");
+    assert_eq!(current.application_id, "example-app");
+    assert!((current.organization_confidence - 0.9).abs() < f64::EPSILON);
+    assert!((current.application_confidence - 0.95).abs() < f64::EPSILON);
 }

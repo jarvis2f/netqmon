@@ -61,6 +61,7 @@ COPY --from=collector-builder /netqmon-classifier-manager /usr/local/bin/netqmon
 COPY --from=collector-builder /usr/src/netqmon/migrations /app/migrations
 COPY --from=ui-builder /usr/src/netqmon/apps/controller-ui/.next/standalone /app
 COPY --from=ui-builder /usr/src/netqmon/apps/controller-ui/.next/static /app/apps/controller-ui/.next/static
+COPY --from=ui-builder /usr/src/netqmon/apps/controller-ui/public /app/apps/controller-ui/public
 COPY deploy/docker/controller-entrypoint.sh /usr/local/bin/netqmon-controller-entrypoint
 COPY deploy/docker/controller-healthcheck.sh /usr/local/bin/netqmon-controller-healthcheck
 

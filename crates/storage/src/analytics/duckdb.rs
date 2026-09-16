@@ -666,7 +666,39 @@ fn insert_flow_version(
         "INSERT INTO flow_session_versions VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
             ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36
-         )",
+         ) ON CONFLICT (gateway_id, flow_id, boot_id, batch_sequence) DO UPDATE SET
+            device_id = excluded.device_id,
+            ip_version = excluded.ip_version,
+            protocol = excluded.protocol,
+            client_ip = excluded.client_ip,
+            client_port = excluded.client_port,
+            remote_ip = excluded.remote_ip,
+            remote_port = excluded.remote_port,
+            direction = excluded.direction,
+            domain = excluded.domain,
+            organization_id = excluded.organization_id,
+            application_id = excluded.application_id,
+            category_id = excluded.category_id,
+            traffic_role = excluded.traffic_role,
+            protocol_id = excluded.protocol_id,
+            organization_confidence = excluded.organization_confidence,
+            application_confidence = excluded.application_confidence,
+            protocol_confidence = excluded.protocol_confidence,
+            classification_confidence = excluded.classification_confidence,
+            classification_reason = excluded.classification_reason,
+            classification_evidence_json = excluded.classification_evidence_json,
+            upload_bytes = excluded.upload_bytes,
+            download_bytes = excluded.download_bytes,
+            packets = excluded.packets,
+            started_at = excluded.started_at,
+            last_seen_at = excluded.last_seen_at,
+            ended_at = excluded.ended_at,
+            checkpointed_at = excluded.checkpointed_at,
+            scope = excluded.scope,
+            path_type = excluded.path_type,
+            nat = excluded.nat,
+            source_segment = excluded.source_segment,
+            destination_segment = excluded.destination_segment",
         params![
             flow.gateway_id,
             flow.flow_id,
@@ -1019,5 +1051,32 @@ mod tests {
             .unwrap();
         assert_eq!(page.total, 1);
         assert_eq!(page.rows[0].protocol_id, "quic");
+    }
+
+    #[test]
+    fn duplicate_flow_versions_in_one_batch_keep_the_last_snapshot() {
+        let mut store = DuckDbAnalyticsStore::open_in_memory().unwrap();
+        let mut batch = test_batch(1, "tls", 120_000);
+        let mut latest = batch.flows[0].clone();
+        latest.application_id = "example-app".to_owned();
+        latest.application_confidence = 0.9;
+        latest.checkpointed_at += 1;
+        batch.flows.push(latest);
+
+        assert_eq!(
+            store.apply_batch(&batch).unwrap(),
+            ApplyBatchResult::Applied
+        );
+        let page = store
+            .flows(&FlowQuery {
+                from: 0,
+                to: 1_000_000,
+                gateway_id: Some("gateway-1".to_owned()),
+                limit: 10,
+                ..FlowQuery::default()
+            })
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].application_id, "example-app");
     }
 }
