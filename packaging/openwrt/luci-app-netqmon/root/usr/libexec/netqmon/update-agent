@@ -126,7 +126,7 @@ download_manifest() {
 
 manifest_field() {
     local channel="$1" arch="$2" expr="$3"
-    jsonfilter -i "$MANIFEST" -e "@.channels.${channel}.packages[@.name='netqmon-agent'][@.openwrt_arch='${arch}'].${expr}" 2>/dev/null | head -n 1
+    jsonfilter -i "$MANIFEST" -e "@.channels.${channel}.packages[@.openwrt_arch='${arch}'].${expr}" 2>/dev/null | head -n 1
 }
 
 channel_field() {
