@@ -247,6 +247,14 @@ impl MetadataStore for SqliteMetadataStore {
         MetadataStore::acknowledge_outbox_with_completed_flows(&mut self.inner, id, completed_flows)
     }
 
+    fn acknowledge_outbox_batch(
+        &mut self,
+        ids: &[i64],
+        completed_flows: &[super::CompletedFlowCheckpoint],
+    ) -> StorageResult<()> {
+        MetadataStore::acknowledge_outbox_batch(&mut self.inner, ids, completed_flows)
+    }
+
     fn outbox_depth(&self) -> StorageResult<u64> {
         MetadataStore::outbox_depth(&self.inner)
     }

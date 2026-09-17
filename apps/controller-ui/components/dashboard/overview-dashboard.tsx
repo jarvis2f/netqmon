@@ -114,6 +114,7 @@ function metricRate(bytesPerSecond: number, available: boolean) {
 export function OverviewDashboard({ username }: { username: string }) {
   const t = useTranslations("overview");
   const tNav = useTranslations("navigation");
+  const tStatus = useTranslations("common.status");
   const locale = useLocale();
   const router = useRouter();
 
@@ -194,14 +195,20 @@ export function OverviewDashboard({ username }: { username: string }) {
           (totals.get(category) ?? 0) + item.upload_bytes + item.download_bytes,
         );
       }
-      const sorted = [...totals.entries()].sort(
-        (left, right) => right[1] - left[1],
-      );
+      const sorted = [...totals.entries()]
+        .filter(([, value]) => value > 0)
+        .sort((left, right) => right[1] - left[1]);
+      const formatName = (id: string) =>
+        id === "unknown" ? tStatus("unknown") : formatIdentifier(id);
       if (sorted.length <= 6)
-        return sorted.map(([id, value]) => ({ id, name: id, value }));
+        return sorted.map(([id, value]) => ({
+          id,
+          name: formatName(id),
+          value,
+        }));
       const visible = sorted
         .slice(0, 5)
-        .map(([id, value]) => ({ id, name: id, value }));
+        .map(([id, value]) => ({ id, name: formatName(id), value }));
       visible.push({
         id: "other",
         name: t("other"),
@@ -209,7 +216,7 @@ export function OverviewDashboard({ username }: { username: string }) {
       });
       return visible;
     },
-    [t],
+    [t, tStatus],
   );
 
   const applySnapshot = useCallback(

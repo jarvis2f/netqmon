@@ -228,6 +228,13 @@ export interface DiagnosticsInfo {
   analytics_outbox_oldest_age_ms?: number;
   analytics_last_success_at?: number | null;
   analytics_last_error?: string | null;
+  analytics_batches_processed_total?: number;
+  analytics_rows_written_total?: number;
+  analytics_last_write_duration_ms?: number | null;
+  analytics_last_rollup_duration_ms?: number | null;
+  analytics_last_rollup_rows?: number | null;
+  analytics_worker_idle?: boolean;
+  duckdb_threads?: number;
   active_flow_count?: number;
   // Legacy collector fields retained while mixed-version installs are upgraded.
   db_backend?: string;

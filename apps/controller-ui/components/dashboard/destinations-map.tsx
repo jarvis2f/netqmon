@@ -330,8 +330,12 @@ export function DestinationsMap({
 
         // Destination Label: Priority is Application Name -> Domain -> City/Country -> IP
         const labelText =
-          flow.application_name ||
-          (flow.application ? formatIdentifier(flow.application) : null) ||
+          (flow.application_name && flow.application_name !== "unknown"
+            ? flow.application_name
+            : null) ||
+          (flow.application && flow.application !== "unknown"
+            ? formatIdentifier(flow.application)
+            : null) ||
           flow.domain ||
           flow.city ||
           flow.country_name ||

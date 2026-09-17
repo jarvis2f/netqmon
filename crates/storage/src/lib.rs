@@ -856,8 +856,29 @@ impl SqliteStorage {
         id: i64,
         completed_flows: &[crate::metadata::CompletedFlowCheckpoint],
     ) -> StorageResult<()> {
+        self.acknowledge_outbox_batch(&[id], completed_flows)
+    }
+
+    /// Acknowledges several analytics batches and removes ended flow
+    /// checkpoints in one SQLite transaction.
+    ///
+    /// # Errors
+    /// Returns an error if SQLite cannot acknowledge the batches and clean up flows.
+    pub fn acknowledge_outbox_batch(
+        &mut self,
+        ids: &[i64],
+        completed_flows: &[crate::metadata::CompletedFlowCheckpoint],
+    ) -> StorageResult<()> {
         let transaction = self.connection.transaction()?;
-        transaction.execute("DELETE FROM analytics_outbox WHERE id = ?1", [id])?;
+        if !ids.is_empty() {
+            let placeholders = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("DELETE FROM analytics_outbox WHERE id IN ({placeholders})");
+            let mut statement = transaction.prepare(&sql)?;
+            let params = rusqlite::params_from_iter(ids.iter());
+            statement.execute(params)?;
+        }
         let mut removed_flow_ids = Vec::new();
         for flow in completed_flows {
             let latest: Option<AnalyticsFlow> = transaction
@@ -1302,6 +1323,14 @@ impl crate::metadata::MetadataStore for SqliteStorage {
         completed_flows: &[crate::metadata::CompletedFlowCheckpoint],
     ) -> StorageResult<()> {
         SqliteStorage::acknowledge_outbox_with_completed_flows(self, id, completed_flows)
+    }
+
+    fn acknowledge_outbox_batch(
+        &mut self,
+        ids: &[i64],
+        completed_flows: &[crate::metadata::CompletedFlowCheckpoint],
+    ) -> StorageResult<()> {
+        SqliteStorage::acknowledge_outbox_batch(self, ids, completed_flows)
     }
 
     fn outbox_depth(&self) -> StorageResult<u64> {

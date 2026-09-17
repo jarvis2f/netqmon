@@ -5,10 +5,10 @@ pub mod duckdb;
 mod models;
 
 pub use models::{
-    AnalyticsBatch, AnalyticsFlow, AnalyticsFlowIdentity, AnalyticsOverview, AnalyticsResolution,
-    AnalyticsSummary, ApplyBatchResult, FlowPage, FlowQuery, FlowSort, GeoTraffic, SummaryQuery,
-    TrafficBreakdown, TrafficBreakdownQuery, TrafficDelta, TrafficDimension, TrafficPoint,
-    TrafficQuery, resolution_for_range,
+    AnalyticsBatch, AnalyticsFlow, AnalyticsFlowIdentity, AnalyticsOverview, AnalyticsQueryPlan,
+    AnalyticsQuerySegment, AnalyticsResolution, AnalyticsSummary, ApplyBatchResult, FlowPage,
+    FlowQuery, FlowSort, GeoTraffic, SummaryQuery, TrafficBreakdown, TrafficBreakdownQuery,
+    TrafficDelta, TrafficDimension, TrafficPoint, TrafficQuery, resolution_for_range,
 };
 
 use crate::{RetentionPolicy, StorageResult};
@@ -24,6 +24,20 @@ pub trait AnalyticsStore: Send {
     /// # Errors
     /// Returns an error if the batch cannot be applied.
     fn apply_batch(&mut self, batch: &AnalyticsBatch) -> StorageResult<ApplyBatchResult>;
+    /// Applies several outbox batches in one backend operation. Backends may
+    /// override this to use one transaction for the complete slice.
+    ///
+    /// # Errors
+    /// Returns an error if the analytics backend cannot apply the batches.
+    fn apply_batches(
+        &mut self,
+        batches: &[AnalyticsBatch],
+    ) -> StorageResult<Vec<ApplyBatchResult>> {
+        batches
+            .iter()
+            .map(|batch| self.apply_batch(batch))
+            .collect()
+    }
     /// # Errors
     /// Returns an error if the analytics backend cannot run the query.
     fn traffic_series(&self, query: &TrafficQuery) -> StorageResult<Vec<TrafficPoint>>;
@@ -84,7 +98,7 @@ pub trait AnalyticsStore: Send {
     fn unknown_ratio(&self, since: u64) -> StorageResult<f64>;
     /// # Errors
     /// Returns an error if rollups cannot be written.
-    fn rollup(&mut self, now: u64) -> StorageResult<()>;
+    fn rollup(&mut self, now: u64) -> StorageResult<u64>;
     /// # Errors
     /// Returns an error if retention cleanup cannot be completed.
     fn run_retention(&mut self, now: u64, policy: RetentionPolicy) -> StorageResult<()>;

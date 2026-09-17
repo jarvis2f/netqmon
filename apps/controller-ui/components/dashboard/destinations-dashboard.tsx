@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import dynamic from "next/dynamic";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useLocale, useTranslations } from "next-intl";
 import {
@@ -98,6 +98,7 @@ export function DestinationsDashboard({
   const t = useTranslations("destinations");
   const tNav = useTranslations("navigation");
   const tStatus = useTranslations("common.status");
+  const tCommon = useTranslations("common");
   const locale = useLocale();
   const router = useRouter();
 
@@ -302,7 +303,9 @@ export function DestinationsDashboard({
             <ExternalLink className="size-3 shrink-0 opacity-0 group-hover:opacity-70 transition-opacity" />
           </a>
         ) : (
-          <span className="text-foreground-muted">{t("notEnabled")}</span>
+          <span className="text-foreground-muted">
+            {geoSummary?.enabled ? tStatus("unknown") : t("notEnabled")}
+          </span>
         ),
     },
     {
@@ -319,7 +322,9 @@ export function DestinationsDashboard({
             </span>
           </div>
         ) : (
-          <span className="text-foreground-muted">{t("notEnabled")}</span>
+          <span className="text-foreground-muted">
+            {geoSummary?.enabled ? tStatus("unknown") : t("notEnabled")}
+          </span>
         ),
     },
     {
@@ -344,27 +349,49 @@ export function DestinationsDashboard({
 
   const hasPrevious = initialPage > 1;
   const hasNext = initialPage * PAGE_SIZE < total;
+  const countryTotal =
+    geoSummary?.top_countries.reduce((sum, item) => sum + item.bytes, 0) ?? 0;
   const topCountries =
     geoSummary?.top_countries.map((item) => ({
       id: item.country_code,
       name: item.country_name,
       subtitle: item.country_code,
       value: item.bytes,
+      percentage: countryTotal > 0 ? item.bytes / countryTotal : 0,
       icon: <CountryFlag code={item.country_code} />,
     })) ?? [];
+  const asnTotal =
+    geoSummary?.top_asns.reduce((sum, item) => sum + item.bytes, 0) ?? 0;
   const topAsns =
     geoSummary?.top_asns.map((item) => ({
       id: String(item.asn),
       name: `AS${item.asn}`,
       subtitle: item.organization,
       value: item.bytes,
+      percentage: asnTotal > 0 ? item.bytes / asnTotal : 0,
     })) ?? [];
-  const countryDistribution =
-    geoSummary?.country_distribution.map((item) => ({
+  const countryDistribution = useMemo(() => {
+    if (!geoSummary?.top_countries?.length) return [];
+    const active = geoSummary.top_countries.filter((item) => item.bytes > 0);
+    const totalBytes = active.reduce((sum, item) => sum + item.bytes, 0);
+    if (totalBytes === 0) return [];
+    const top = active.slice(0, 5);
+    const rest = active.slice(5);
+    const restBytes = rest.reduce((sum, item) => sum + item.bytes, 0);
+    const result = top.map((item) => ({
       id: item.country_code,
       name: item.country_name,
       value: item.bytes,
-    })) ?? [];
+    }));
+    if (restBytes > 0) {
+      result.push({
+        id: "other",
+        name: tCommon("other"),
+        value: restBytes,
+      });
+    }
+    return result;
+  }, [geoSummary, tCommon]);
 
   const toolbar = (
     <div className="flex flex-wrap items-center justify-between gap-3">
@@ -552,7 +579,10 @@ export function DestinationsDashboard({
                 value={
                   selected.country_name
                     ? `${selected.country_name}${selected.country_code ? ` (${selected.country_code})` : ""}`
-                    : selected.country_code || t("notEnabled")
+                    : selected.country_code ||
+                      (geoSummary?.enabled
+                        ? tStatus("unknown")
+                        : t("notEnabled"))
                 }
               />
               <PropertyRow
@@ -561,13 +591,22 @@ export function DestinationsDashboard({
               />
               <PropertyRow
                 label={t("properties.asn")}
-                value={selected.asn ? `AS${selected.asn}` : t("notEnabled")}
+                value={
+                  selected.asn
+                    ? `AS${selected.asn}`
+                    : geoSummary?.enabled
+                      ? tStatus("unknown")
+                      : t("notEnabled")
+                }
                 href={selected.asn ? cloudflareAsnUrl(selected.asn) : undefined}
                 external
               />
               <PropertyRow
                 label={t("properties.organization")}
-                value={selected.organization || t("notEnabled")}
+                value={
+                  selected.organization ||
+                  (geoSummary?.enabled ? tStatus("unknown") : t("notEnabled"))
+                }
               />
             </section>
             <section>

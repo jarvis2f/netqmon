@@ -83,8 +83,11 @@ export function RankList({
     );
   }
 
-  const displayedItems = items.slice(0, maxItems);
-  const maxValue = Math.max(...items.map((i) => i.value), 1);
+  const displayedItems = items
+    .filter((item) => item.value > 0)
+    .sort((left, right) => right.value - left.value)
+    .slice(0, maxItems);
+  const maxValue = Math.max(...displayedItems.map((i) => i.value), 1);
 
   return (
     <Card
@@ -134,6 +137,10 @@ export function RankList({
                   ? item.percentage
                   : item.percentage * 100
                 : (item.value / maxValue) * 100;
+            const percentageLabel =
+              pct > 0 && pct < 0.1
+                ? "<0.1%"
+                : formatPercent(pct, pct < 1 ? 1 : 0, false);
 
             const formattedValue =
               item.unitType === "bitrate"
@@ -173,7 +180,7 @@ export function RankList({
                       {formattedValue}
                     </span>
                     <span className="text-[10px] text-foreground-muted w-9 text-right">
-                      {formatPercent(pct, 0, false)}
+                      {percentageLabel}
                     </span>
                   </div>
                 </div>

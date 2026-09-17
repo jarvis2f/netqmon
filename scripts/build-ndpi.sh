@@ -9,7 +9,7 @@ git clone --quiet --depth 1 --branch 4.14 https://github.com/ntop/nDPI.git "$sou
 git -C "$source_dir/ndpi" checkout --quiet "$revision"
 cd "$source_dir/ndpi"
 ./autogen.sh --with-only-libndpi --prefix="$prefix"
-make -j2
+make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
 make install
 mkdir -p "$prefix/share/licenses/ndpi"
 cp COPYING "$prefix/share/licenses/ndpi/"

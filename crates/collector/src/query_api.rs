@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -72,6 +72,8 @@ pub(crate) fn router() -> Router<CollectorState> {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PageQuery {
+    from: Option<u64>,
+    to: Option<u64>,
     limit: Option<u32>,
     offset: Option<u64>,
 }
@@ -555,12 +557,55 @@ async fn clients(
         Err(e) => return *e,
     };
     let inner = state.lock();
-    let (rows, total) = match inner.storage.devices(page.limit, page.offset) {
+    let (rows, total) = match inner.storage.devices(u32::MAX, 0) {
         Ok(v) => v,
         Err(e) => return storage_error(e),
     };
-    let mut items = Vec::with_capacity(rows.len());
-    for device in rows {
+    let analytics = summary_query(
+        0,
+        now_ms(),
+        Page {
+            limit: u32::MAX,
+            offset: 0,
+        },
+    );
+    let traffic_map: HashMap<u64, AnalyticsSummary> = inner
+        .storage
+        .analytics()
+        .client_traffic(&analytics)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| (s.device_id, s))
+        .collect();
+
+    let mut device_entries = rows
+        .into_iter()
+        .map(|device| {
+            let dev_id = positive_id_as_u64(device.id);
+            let traffic = traffic_map.get(&dev_id).cloned();
+            (device, traffic)
+        })
+        .collect::<Vec<_>>();
+
+    device_entries.sort_by(|(a_dev, a_traf), (b_dev, b_traf)| {
+        let a_bytes = a_traf
+            .as_ref()
+            .map_or(0, |t| t.upload_bytes.saturating_add(t.download_bytes));
+        let b_bytes = b_traf
+            .as_ref()
+            .map_or(0, |t| t.upload_bytes.saturating_add(t.download_bytes));
+        b_bytes
+            .cmp(&a_bytes)
+            .then_with(|| b_dev.last_seen.cmp(&a_dev.last_seen))
+            .then_with(|| a_dev.id.cmp(&b_dev.id))
+    });
+
+    let offset = usize::try_from(page.offset).unwrap_or(usize::MAX);
+    let limit = usize::try_from(page.limit).unwrap_or(usize::MAX);
+    let paged = device_entries.into_iter().skip(offset).take(limit);
+
+    let mut items = Vec::new();
+    for (device, traffic) in paged {
         let evidence = match inner
             .storage
             .device_evidence(&device.gateway_id, &device.mac)
@@ -572,21 +617,6 @@ async fn clients(
             Ok(rows) => rows,
             Err(error) => return storage_error(error),
         };
-        let mut analytics = summary_query(
-            0,
-            now_ms(),
-            Page {
-                limit: 1,
-                offset: 0,
-            },
-        );
-        analytics.device_id = Some(positive_id_as_u64(device.id));
-        let traffic = inner
-            .storage
-            .analytics()
-            .client_traffic(&analytics)
-            .ok()
-            .and_then(|mut v| v.pop());
         items.push(device_json(
             &device,
             traffic.as_ref(),
@@ -769,13 +799,22 @@ async fn applications(
     State(state): State<CollectorState>,
     query: Result<Query<PageQuery>, QueryRejection>,
 ) -> Response {
-    let page = match Page::parse(query) {
+    let Query(query) = match query {
+        Ok(v) => v,
+        Err(error) => {
+            return api_error(StatusCode::BAD_REQUEST, "invalid_query", &error.body_text());
+        }
+    };
+    let page = match Page::from_values(query.limit, query.offset) {
         Ok(v) => v,
         Err(e) => return *e,
     };
-    let now = now_ms();
+    let (from, to) = match parse_time_range(query.from, query.to) {
+        Ok(v) => v,
+        Err(e) => return *e,
+    };
     let inner = state.lock();
-    let q = summary_query(0, now, page);
+    let q = summary_query(from, to, page);
     match inner.storage.analytics().application_summary(&q) {
         Ok(rows) => page_ok(
             rows.iter()
@@ -854,11 +893,11 @@ async fn application_detail(
             "application id contains unsupported characters",
         );
     }
-    if query
-        .category
-        .as_deref()
-        .is_some_and(|value| !valid_entity_id(value))
-    {
+    let normalized_category = match query.category.as_deref() {
+        Some("undefined") | Some("null") | Some("") => None,
+        other => other,
+    };
+    if normalized_category.is_some_and(|value| !valid_entity_id(value)) {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_category_id",
@@ -876,18 +915,17 @@ async fn application_detail(
     let inner = state.lock();
     let mut q = summary_query(from, to, page);
     q.application_id = Some(id.clone());
-    q.category_id.clone_from(&query.category);
+    q.category_id = normalized_category.map(str::to_owned);
     let summary = match inner.storage.analytics().application_summary(&q) {
         Ok(mut rows) => rows.pop(),
         Err(e) => return storage_error(e),
     };
-    let Some(summary) = summary else {
-        return api_error(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "application was not found",
-        );
-    };
+    let summary = summary.unwrap_or_else(|| AnalyticsSummary {
+        key: id.clone(),
+        application_id: Some(id.clone()),
+        category_id: normalized_category.map(str::to_owned),
+        ..AnalyticsSummary::default()
+    });
     let mut protocol_query = q.clone();
     protocol_query.limit = 200;
     protocol_query.offset = 0;
@@ -902,8 +940,12 @@ async fn application_detail(
         .analytics()
         .domain_summary(&protocol_query)
         .map_or(0, |v| v.len());
+    let category_id_display = summary
+        .category_id
+        .or_else(|| normalized_category.map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned());
     api_ok(
-        json!({"application_id":id,"category_id":query.category.unwrap_or_else(||"unknown".to_owned()),"upload_bytes":summary.upload_bytes,"download_bytes":summary.download_bytes,"packets":summary.packets,"flow_count":summary.flow_count,"last_seen":summary.last_seen_at,"protocol_count":protocol_count,"client_count":client_count,"domain_count":domain_count}),
+        json!({"application_id":id,"category_id":category_id_display,"upload_bytes":summary.upload_bytes,"download_bytes":summary.download_bytes,"packets":summary.packets,"flow_count":summary.flow_count,"last_seen":summary.last_seen_at,"protocol_count":protocol_count,"client_count":client_count,"domain_count":domain_count}),
     )
 }
 
@@ -924,16 +966,20 @@ async fn application_related(
         Ok(v) => v,
         Err(e) => return *e,
     };
+    let normalized_category = match query.category.as_deref() {
+        Some("undefined") | Some("null") | Some("") => None,
+        other => other.map(str::to_owned),
+    };
     let inner = state.lock();
     let mut q = summary_query(from, to, page);
     q.application_id = Some(id.clone());
-    q.category_id.clone_from(&query.category);
+    q.category_id = normalized_category.clone();
     q.scope = Some(netqmon_protocol::v1::FlowScope::Internet as u8);
     match relation.as_str() {
         "traffic" => {
             let mut t = traffic_query(from, to);
             t.application_id = Some(id);
-            t.category_id = query.category;
+            t.category_id = normalized_category;
             t.scope = q.scope;
             match inner.storage.analytics().traffic_series(&t) {
                 Ok(rows) => api_ok(
@@ -1124,11 +1170,20 @@ async fn geo_summary(
             entry.1 = entry.1.saturating_add(bytes);
         }
     }
-    let top_countries = countries
+    let mut country_rows = countries.into_iter().collect::<Vec<_>>();
+    country_rows.sort_by(|a, b| b.1.1.cmp(&a.1.1).then_with(|| a.0.cmp(&b.0)));
+    let top_countries = country_rows
         .iter()
         .map(|(code, (name, bytes))| json!({"country_code":code,"country_name":name,"bytes":bytes}))
         .collect::<Vec<_>>();
-    let top_asns=asns.iter().map(|(asn,(org,bytes))|json!({"asn":asn.parse::<u64>().unwrap_or(0),"organization":org,"bytes":bytes})).collect::<Vec<_>>();
+    let mut asn_rows = asns.into_iter().collect::<Vec<_>>();
+    asn_rows.sort_by(|a, b| b.1.1.cmp(&a.1.1).then_with(|| a.0.cmp(&b.0)));
+    let top_asns = asn_rows
+        .iter()
+        .map(|(asn, (org, bytes))| {
+            json!({"asn":asn.parse::<u64>().unwrap_or(0),"organization":org,"bytes":bytes})
+        })
+        .collect::<Vec<_>>();
     let mut distribution = top_countries.clone();
     distribution.sort_by(|a, b| b["bytes"].as_u64().cmp(&a["bytes"].as_u64()));
     let _ = &mut q;
@@ -1166,8 +1221,9 @@ async fn insights(
     }
     let snapshot = state.realtime_snapshot();
     let inner = state.lock();
+    let analytics = inner.storage.analytics();
     match crate::insights::detect_from_analytics(
-        inner.storage.analytics(),
+        &*analytics,
         inner.storage.metadata(),
         &snapshot,
         crate::insights::InsightWindow { from, to, limit },
@@ -1737,7 +1793,7 @@ async fn diagnostics(State(state): State<CollectorState>) -> Response {
         Err(e) => return storage_error(e),
     };
     api_ok(
-        json!({"collector_version":env!("CARGO_PKG_VERSION"),"analytics_backend":inner.storage.analytics_backend(),"metadata_database_size_bytes":metadata_size,"analytics_database_size_bytes":analytics_size,"analytics_outbox_depth":depth,"analytics_outbox_oldest_age_ms":age,"analytics_last_success_at":inner.analytics_last_success_at_ms,"analytics_last_error":inner.analytics_last_error,"active_flow_count":active,"unknown_ratio":unknown,"gateway":gateway,"retention":retention_json(policy),"geo_enabled":inner.geo_provider.is_enabled(),"classification":inner.classifier.diagnostics(),"classifier_manager":classifier_manager_status(),"sampling":state.sampling.diagnostics(),"recognition":crate::recognition_diagnostics::diagnostics(&inner,now.saturating_sub(DAY_MS)),"topology":topology}),
+        json!({"collector_version":env!("CARGO_PKG_VERSION"),"analytics_backend":inner.storage.analytics_backend(),"metadata_database_size_bytes":metadata_size,"analytics_database_size_bytes":analytics_size,"analytics_outbox_depth":depth,"analytics_outbox_oldest_age_ms":age,"analytics_last_success_at":inner.analytics_last_success_at_ms,"analytics_last_error":inner.analytics_last_error,"analytics_batches_processed_total":inner.analytics_batches_processed_total,"analytics_rows_written_total":inner.analytics_rows_written_total,"analytics_last_write_duration_ms":inner.analytics_last_write_duration_ms,"analytics_last_rollup_duration_ms":inner.analytics_last_rollup_duration_ms,"analytics_last_rollup_rows":inner.analytics_last_rollup_rows,"analytics_worker_idle":inner.analytics_worker_idle,"duckdb_threads":std::env::var("NETQMON_DUCKDB_THREADS").ok().and_then(|value| value.parse::<u8>().ok()).unwrap_or(1),"active_flow_count":active,"unknown_ratio":unknown,"gateway":gateway,"retention":retention_json(policy),"geo_enabled":inner.geo_provider.is_enabled(),"classification":inner.classifier.diagnostics(),"classifier_manager":classifier_manager_status(),"sampling":state.sampling.diagnostics(),"recognition":crate::recognition_diagnostics::diagnostics(&inner,now.saturating_sub(DAY_MS)),"topology":topology}),
     )
 }
 
@@ -1876,6 +1932,7 @@ fn summary_item(
     };
     let mut item = json!({"id":key,"name":key,"upload_bytes":row.upload_bytes,"download_bytes":row.download_bytes,"packets":row.packets,"flow_count":row.flow_count,"last_seen":row.last_seen_at,"client_count":row.distinct_devices,"device_id":row.device_id});
     if kind == "application" {
+        item["application_id"] = json!(key);
         let metadata = classifier.application_metadata(&row.key);
         item["name"] = json!(
             metadata
@@ -1883,8 +1940,36 @@ fn summary_item(
                 .map_or_else(|| row.key.clone(), |m| m.name.clone())
         );
         item["icon"] = icon_json(metadata);
+        let category = row.category_id.as_deref().unwrap_or("unknown");
+        item["category_id"] = json!(category);
+        item["traffic_class"] = json!(category);
+        let org_id = row.organization_id.as_deref().unwrap_or("unknown");
+        item["organization_id"] = json!(org_id);
+        if org_id != "unknown" {
+            let org_meta = classifier.organization_metadata(org_id);
+            item["organization_name"] = json!(org_meta.as_ref().map(|m| m.name.clone()));
+        } else {
+            item["organization_name"] = json!(null);
+        }
     }
-    if kind == "organization" || kind == "protocol" || kind == "domain" {
+    if kind == "organization" {
+        let org_id = if row.key.is_empty() {
+            "unknown"
+        } else {
+            &row.key
+        };
+        item["organization_id"] = json!(org_id);
+        if org_id != "unknown" {
+            let org_meta = classifier.organization_metadata(org_id);
+            item["name"] = json!(
+                org_meta
+                    .as_ref()
+                    .map_or_else(|| org_id.to_owned(), |m| m.name.clone())
+            );
+        } else {
+            item["name"] = json!("unknown");
+        }
+    } else if kind == "protocol" || kind == "domain" {
         item["name"] = json!(if row.key.is_empty() {
             "unknown"
         } else {

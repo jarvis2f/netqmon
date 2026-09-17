@@ -215,6 +215,16 @@ pub trait MetadataStore: Send {
         id: i64,
         completed_flows: &[CompletedFlowCheckpoint],
     ) -> StorageResult<()>;
+    /// Acknowledges several committed analytics batches in one SQLite
+    /// transaction and removes only the confirmed ended flow checkpoints.
+    ///
+    /// # Errors
+    /// Returns an error if SQLite cannot atomically acknowledge the batches.
+    fn acknowledge_outbox_batch(
+        &mut self,
+        ids: &[i64],
+        completed_flows: &[CompletedFlowCheckpoint],
+    ) -> StorageResult<()>;
     /// # Errors
     /// Returns an error if SQLite cannot complete the metadata operation.
     fn outbox_depth(&self) -> StorageResult<u64>;

@@ -315,6 +315,11 @@ impl LicenseCoordinator {
                 if response.status().as_u16() == 401 || response.status().as_u16() == 403 =>
             {
                 self.apply_community("revoked")?;
+                let mut identity = snapshot;
+                identity.installation_credential = None;
+                identity.edition = "community".into();
+                identity.license_status = "revoked".into();
+                let _ = self.save_identity(identity);
                 return self.fail(format!(
                     "Cloud rejected device credential ({})",
                     response.status()

@@ -18,8 +18,6 @@ export default async function ApplicationsPage({
     <ApplicationsDashboard
       username={session.username}
       initialSearch={valueOf(query.search) ?? ""}
-      initialSelectedId={valueOf(query.id)}
-      initialSelectedCategory={valueOf(query.category)}
     />
   );
 }

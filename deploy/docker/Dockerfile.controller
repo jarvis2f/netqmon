@@ -1,6 +1,34 @@
-FROM rust:alpine AS cargo-planner
+FROM debian:bookworm-slim AS duckdb-runtime
 
-RUN cargo install cargo-chef --locked --version 0.1.78
+ARG TARGETARCH
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl unzip \
+    && rm -rf /var/lib/apt/lists/* \
+    && case "${TARGETARCH}" in \
+         amd64) duckdb_arch=amd64 ;; \
+         arm64) duckdb_arch=arm64 ;; \
+         *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+       esac \
+    && mkdir -p /duckdb \
+    && curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v1.5.5/libduckdb-linux-${duckdb_arch}.zip" -o /tmp/libduckdb.zip \
+    && unzip -j /tmp/libduckdb.zip 'libduckdb.so*' 'duckdb.h' 'duckdb.hpp' -d /duckdb \
+    && rm -f /tmp/libduckdb.zip \
+    && test -s /duckdb/libduckdb.so \
+    && test -s /duckdb/duckdb.h
+
+
+FROM debian:bookworm-slim AS ndpi-builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends autoconf automake ca-certificates file g++ gcc git libtool make pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY scripts/build-ndpi.sh /tmp/build-ndpi.sh
+RUN /tmp/build-ndpi.sh /usr/local
+
+
+FROM lukemathwalker/cargo-chef:latest-rust-1.98.1-bookworm AS cargo-planner
 
 WORKDIR /usr/src/netqmon
 
@@ -11,20 +39,24 @@ COPY migrations ./migrations
 RUN cargo chef prepare --recipe-path recipe.json
 
 
-FROM rust:alpine AS collector-builder
+FROM lukemathwalker/cargo-chef:latest-rust-1.98.1-bookworm AS collector-builder
 
-RUN apk add --no-cache musl-dev protobuf-dev make gcc g++ autoconf automake libtool pkgconf git binutils
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends binutils pkg-config protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY scripts/build-ndpi.sh /tmp/build-ndpi.sh
-RUN /tmp/build-ndpi.sh /usr/local && \
-    find /usr/local/lib -maxdepth 1 -type f -name 'libndpi.so*' -exec strip --strip-unneeded {} +
+COPY --from=ndpi-builder /usr/local/lib/libndpi.so* /usr/local/lib/
+COPY --from=ndpi-builder /usr/local/lib/pkgconfig/libndpi.pc /usr/local/lib/pkgconfig/libndpi.pc
+COPY --from=ndpi-builder /usr/local/include/ndpi /usr/local/include/ndpi
+COPY --from=ndpi-builder /usr/local/share/licenses/ndpi /usr/local/share/licenses/ndpi
+COPY --from=duckdb-runtime /duckdb /usr/local/duckdb
+
 ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
-# nDPI is LGPL and remains a replaceable shared library on musl.
-ENV RUSTFLAGS="-C target-feature=-crt-static"
-
+ENV DUCKDB_LIB_DIR=/usr/local/duckdb
+ENV DUCKDB_INCLUDE_DIR=/usr/local/duckdb
+ENV LD_LIBRARY_PATH=/usr/local/duckdb:/usr/local/lib
 WORKDIR /usr/src/netqmon
 
-COPY --from=cargo-planner /usr/local/cargo/bin/cargo-chef /usr/local/bin/cargo-chef
 COPY --from=cargo-planner /usr/src/netqmon/recipe.json ./recipe.json
 
 ARG TARGETARCH
@@ -32,6 +64,7 @@ ENV CARGO_TARGET_DIR=/usr/src/netqmon/target/${TARGETARCH:-local}
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/usr/src/netqmon/target \
     cargo chef cook --locked --release --recipe-path recipe.json \
     --package netqmon-collector \
     --package netqmon-classifier-manager
@@ -45,12 +78,14 @@ ENV NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX=${NETQMON_CLASSIFIER_COMPONENT_P
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/usr/src/netqmon/target \
     cargo build --locked --release --bin netqmon-collector --bin netqmon-classifier-manager && \
     cp "/usr/src/netqmon/target/${TARGETARCH:-local}/release/netqmon-collector" /netqmon-collector && \
-    cp "/usr/src/netqmon/target/${TARGETARCH:-local}/release/netqmon-classifier-manager" /netqmon-classifier-manager
+    cp "/usr/src/netqmon/target/${TARGETARCH:-local}/release/netqmon-classifier-manager" /netqmon-classifier-manager && \
+    strip --strip-unneeded /netqmon-collector /netqmon-classifier-manager /usr/local/lib/libndpi.so* /usr/local/duckdb/libduckdb.so*
 
 
-FROM node:22-alpine AS ui-builder
+FROM node:22.14.0-bookworm-slim AS ui-builder
 
 WORKDIR /usr/src/netqmon
 
@@ -66,25 +101,18 @@ COPY apps/controller-ui ./apps/controller-ui
 
 RUN pnpm --filter @netqmon/controller-ui build
 
-# Next's standalone trace includes both glibc and musl sharp optional packages.
-# The runtime image is Alpine, so retain only the musl variants before the
-# standalone tree is copied into the final image. Cleaning the builder output
-# keeps the unused glibc libvips payload out of the image layer itself.
-RUN for package in /usr/src/netqmon/apps/controller-ui/.next/standalone/node_modules/.pnpm/@img+sharp-linux-* /usr/src/netqmon/apps/controller-ui/.next/standalone/node_modules/.pnpm/@img+sharp-libvips-linux-*; do \
-      case "${package}" in \
-        *linuxmusl-*) ;; \
-        *) rm -rf "${package}" ;; \
-      esac; \
-    done
-
-FROM node:22-alpine
+FROM node:22.14.0-bookworm-slim
 
 LABEL org.opencontainers.image.source=https://github.com/jarvis2f/netqmon
 LABEL org.opencontainers.image.description="Netqmon Controller"
 
-RUN apk add --no-cache ca-certificates tini tzdata wget libgcc libstdc++
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tini tzdata wget libgcc-s1 libstdc++6 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/tini /sbin/tini
 
 COPY --from=collector-builder /usr/local/lib/libndpi.so* /usr/local/lib/
+COPY --from=collector-builder /usr/local/duckdb/libduckdb.so* /usr/local/lib/
 COPY --from=collector-builder /usr/local/share/licenses/ndpi /usr/local/share/licenses/ndpi
 ENV LD_LIBRARY_PATH=/usr/local/lib
 
@@ -111,6 +139,7 @@ ENV NETQMON_COLLECTOR_GEO_DIR=/data/geo
 ENV NETQMON_COLLECTOR_DATABASE_PATH=/data/netqmon.db
 ENV NETQMON_ANALYTICS_BACKEND=duckdb
 ENV NETQMON_DUCKDB_PATH=/data/netqmon-analytics.duckdb
+ENV NETQMON_DUCKDB_THREADS=1
 ENV NETQMON_COLLECTOR_MAC_DATASET_PATH=/data/mac-prefixes.json
 ENV NETQMON_COMPONENT_API_URL=https://netqmon.com
 ENV NETQMON_CLOUD_API_URL=https://netqmon.com
@@ -129,4 +158,4 @@ EXPOSE 3000 8090
 HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=6 \
     CMD ["netqmon-controller-healthcheck"]
 
-ENTRYPOINT ["/sbin/tini", "--", "netqmon-controller-entrypoint"]
+ENTRYPOINT ["/usr/bin/tini", "--", "netqmon-controller-entrypoint"]

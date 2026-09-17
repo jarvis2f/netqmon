@@ -17,6 +17,38 @@ const CACHE_CAPACITY: usize = 4096;
 const CACHE_TTL: Duration = Duration::from_secs(300);
 const WINDOW: Duration = Duration::from_secs(3600);
 type CacheKey = (String, String, String);
+type FlowEndings = HashMap<FlowTuple, Vec<(u64, u64, Instant)>>;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct FlowTuple {
+    client_ip: Vec<u8>,
+    remote_ip: Vec<u8>,
+    client_port: u32,
+    remote_port: u32,
+    protocol: u32,
+}
+
+impl FlowTuple {
+    fn from_sample(key: &FlowSampleKey) -> Self {
+        Self {
+            client_ip: key.client_ip.clone(),
+            remote_ip: key.remote_ip.clone(),
+            client_port: key.client_port,
+            remote_port: key.remote_port,
+            protocol: key.protocol,
+        }
+    }
+
+    fn from_flow(flow: &netqmon_protocol::v1::FlowDelta) -> Self {
+        Self {
+            client_ip: flow.client_ip.clone(),
+            remote_ip: flow.remote_ip.clone(),
+            client_port: flow.client_port,
+            remote_port: flow.remote_port,
+            protocol: flow.protocol,
+        }
+    }
+}
 
 /// One application matched from sampled packet payloads by classifierd.
 #[derive(Clone, Debug, PartialEq)]
@@ -57,6 +89,8 @@ pub struct SampleAnalysis {
 }
 struct FlowState {
     key: FlowSampleKey,
+    scope: String,
+    tuple: FlowTuple,
     bytes: u32,
     packets: [usize; 2],
     last_packet_ms: u64,
@@ -84,7 +118,7 @@ struct Stats {
     started: Instant,
     buckets: VecDeque<(Instant, MinuteStats)>,
     configs: HashMap<String, SampleConfig>,
-    endings: Vec<(String, String, netqmon_protocol::v1::FlowDelta, Instant)>,
+    endings: HashMap<String, FlowEndings>,
     health: HashMap<(String, String), (u64, u64)>,
     seen_flows: HashMap<String, Instant>,
     results: HashMap<CacheKey, CachedResult>,
@@ -95,7 +129,7 @@ impl Default for Stats {
             started: Instant::now(),
             buckets: VecDeque::new(),
             configs: HashMap::new(),
-            endings: Vec::new(),
+            endings: HashMap::new(),
             health: HashMap::new(),
             seen_flows: HashMap::new(),
             results: HashMap::new(),
@@ -153,25 +187,30 @@ impl SamplingService {
                         let mut stats = worker_stats
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        stats
-                            .endings
-                            .retain(|(_, _, _, at)| now.duration_since(*at) < CACHE_TTL);
+                        stats.endings.retain(|_, flows| {
+                            flows.retain(|_, endings| {
+                                endings.retain(|(_, _, at)| now.duration_since(*at) < CACHE_TTL);
+                                !endings.is_empty()
+                            });
+                            !flows.is_empty()
+                        });
                         stats.endings.clone()
                     };
                     for (id, entry) in &mut flows {
-                        let ended = endings.iter().any(|(gateway, boot, flow, at)| {
-                            gateway == &id.0
-                                && boot == &id.1
-                                && now.duration_since(*at) >= Duration::from_secs(1)
-                                && entry.key.client_ip == flow.client_ip
-                                && entry.key.remote_ip == flow.remote_ip
-                                && entry.key.client_port == flow.client_port
-                                && entry.key.remote_port == flow.remote_port
-                                && entry.key.protocol == flow.protocol
-                                && entry.key.first_seen_unix_ms
-                                    <= flow.last_seen_unix_ms.saturating_add(1)
-                                && entry.last_packet_ms.saturating_add(1) >= flow.first_seen_unix_ms
-                        });
+                        let ended = endings
+                            .get(&entry.scope)
+                            .and_then(|flows| flows.get(&entry.tuple))
+                            .is_some_and(|candidates| {
+                                candidates.iter().any(
+                                    |(first_seen_unix_ms, last_seen_unix_ms, at)| {
+                                        now.duration_since(*at) >= Duration::from_secs(1)
+                                            && entry.key.first_seen_unix_ms
+                                                <= last_seen_unix_ms.saturating_add(1)
+                                            && entry.last_packet_ms.saturating_add(1)
+                                                >= *first_seen_unix_ms
+                                    },
+                                )
+                            });
                         if (entry.expires <= now || ended) && entry.engine.is_some() {
                             let result = entry.engine.as_mut().and_then(|engine| engine.finish());
                             if let Some(result) = result {
@@ -249,6 +288,8 @@ impl SamplingService {
                                 id.clone(),
                                 FlowState {
                                     key: key.clone(),
+                                    scope: format!("{}\0{}", id.0, id.1),
+                                    tuple: FlowTuple::from_sample(&key),
                                     bytes: 0,
                                     packets: [0, 0],
                                     last_packet_ms: 0,
@@ -432,19 +473,29 @@ impl SamplingService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
-        stats
-            .endings
-            .retain(|(_, _, _, at)| now.duration_since(*at) < CACHE_TTL);
+        stats.endings.retain(|_, flows| {
+            flows.retain(|_, endings| {
+                endings.retain(|(_, _, at)| now.duration_since(*at) < CACHE_TTL);
+                !endings.is_empty()
+            });
+            !flows.is_empty()
+        });
         for flow in &batch.flows {
             if flow.lifecycle == netqmon_protocol::v1::FlowLifecycle::Ended as i32
-                && stats.endings.len() < CACHE_CAPACITY
+                && stats
+                    .endings
+                    .values()
+                    .map(|flows| flows.values().map(Vec::len).sum::<usize>())
+                    .sum::<usize>()
+                    < CACHE_CAPACITY
             {
-                stats.endings.push((
-                    batch.gateway_id.clone(),
-                    batch.boot_id.clone(),
-                    flow.clone(),
-                    now,
-                ));
+                stats
+                    .endings
+                    .entry(format!("{}\0{}", batch.gateway_id, batch.boot_id))
+                    .or_default()
+                    .entry(FlowTuple::from_flow(flow))
+                    .or_default()
+                    .push((flow.first_seen_unix_ms, flow.last_seen_unix_ms, now));
             }
         }
         stats.seen_flows.retain(|_, expires| *expires > now);

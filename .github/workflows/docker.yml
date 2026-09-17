@@ -2,6 +2,13 @@ name: Docker
 
 on:
   workflow_dispatch:
+    inputs:
+      build_profile:
+        description: "BuildKit output detail"
+        required: false
+        default: plain
+        type: choice
+        options: [auto, plain, tty]
   push:
     tags:
       - 'v*'
@@ -76,6 +83,9 @@ jobs:
           build-args: |
             NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX=${{ vars.NETQMON_CLASSIFIER_COMPONENT_PUBLIC_KEY_HEX }}
           outputs: type=image,"name=ghcr.io/${{ github.repository }}",push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          sbom: false
+          progress: ${{ inputs.build_profile || 'auto' }}
           cache-from: type=gha,scope=controller-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=controller-${{ matrix.arch }}
 
@@ -84,6 +94,54 @@ jobs:
         env:
           IMAGE_DIGEST: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
         run: docker pull "$IMAGE_DIGEST"
+
+      - name: Record image size diagnostics
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        env:
+          IMAGE_DIGEST: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ runner.temp }}/image-diagnostics"
+          docker image inspect "$IMAGE_DIGEST" --format '{{json .}}' > "${{ runner.temp }}/image-diagnostics/${{ matrix.arch }}-inspect.json"
+          docker history --no-trunc "$IMAGE_DIGEST" > "${{ runner.temp }}/image-diagnostics/${{ matrix.arch }}-history.txt"
+          docker system df -v > "${{ runner.temp }}/image-diagnostics/${{ matrix.arch }}-disk-usage.txt"
+          docker pull --quiet "$IMAGE_DIGEST" > "${{ runner.temp }}/image-diagnostics/${{ matrix.arch }}-pull.txt"
+          image_id="$(docker image inspect "$IMAGE_DIGEST" --format '{{.Id}}')"
+          image_id_prefix="${image_id#sha256:}"
+          image_id_prefix="${image_id_prefix:0:12}"
+          expanded_bytes="$(docker image inspect "$IMAGE_DIGEST" --format '{{.Size}}')"
+          unique_size="$(awk -v id="$image_id_prefix" '$0 ~ id {print $(NF-2); found=1} END {if (!found) print "unavailable"}' "${{ runner.temp }}/image-diagnostics/${{ matrix.arch }}-disk-usage.txt")"
+          printf 'expanded_bytes=%s\nunique_layer_size=%s\n' "$expanded_bytes" "$unique_size" > "${{ runner.temp }}/image-diagnostics/${{ matrix.arch }}-size.txt"
+          if docker buildx imagetools inspect "$IMAGE_DIGEST" --raw > "${{ runner.temp }}/image-diagnostics/${{ matrix.arch }}-manifest.json" 2>/dev/null; then
+            jq -r '"compressed_layer_bytes=" + (([.layers[]?.size] | add) // 0 | tostring)' \
+              "${{ runner.temp }}/image-diagnostics/${{ matrix.arch }}-manifest.json" \
+              >> "${{ runner.temp }}/image-diagnostics/${{ matrix.arch }}-size.txt"
+          fi
+
+      - name: Verify native dependencies and runtime sizes
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        env:
+          IMAGE_DIGEST: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint sh "$IMAGE_DIGEST" -c '
+            set -eu
+            echo "== ldd netqmon-collector =="
+            ldd /usr/local/bin/netqmon-collector
+            echo "== ldd netqmon-classifier-manager =="
+            ldd /usr/local/bin/netqmon-classifier-manager
+            echo "== native and application sizes =="
+            du -h -d 1 /usr/local/lib /usr/local/bin /app 2>/dev/null | sort -h
+          ' > "${{ runner.temp }}/image-diagnostics/${{ matrix.arch }}-runtime.txt"
+
+      - name: Upload image size diagnostics
+        if: always() && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-diagnostics-${{ matrix.arch }}
+          path: ${{ runner.temp }}/image-diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Smoke test Controller compose startup
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'

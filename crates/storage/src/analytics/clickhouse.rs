@@ -3,9 +3,10 @@ use std::collections::BTreeMap;
 use serde_json::{Value, json};
 
 use super::{
-    AnalyticsBatch, AnalyticsFlow, AnalyticsResolution, AnalyticsStore, AnalyticsSummary,
-    ApplyBatchResult, FlowPage, FlowQuery, GeoTraffic, SummaryQuery, TrafficBreakdown,
-    TrafficBreakdownQuery, TrafficDelta, TrafficDimension, TrafficPoint, TrafficQuery,
+    AnalyticsBatch, AnalyticsFlow, AnalyticsQueryPlan, AnalyticsResolution, AnalyticsStore,
+    AnalyticsSummary, ApplyBatchResult, FlowPage, FlowQuery, GeoTraffic, SummaryQuery,
+    TrafficBreakdown, TrafficBreakdownQuery, TrafficDelta, TrafficDimension, TrafficPoint,
+    TrafficQuery,
 };
 use crate::{ClickHouseClient, ClickHouseConfig, RetentionPolicy, StorageResult};
 
@@ -14,7 +15,11 @@ const INITIAL_MIGRATION: &str =
 const MINUTE_MS: u64 = 60_000;
 const HOUR_MS: u64 = 60 * MINUTE_MS;
 const DAY_MS: u64 = 24 * HOUR_MS;
-const FACT_DIMENSIONS: &str = "gateway_id, scope, direction, transport_protocol, path_type, nat, device_id, organization_id, application_id, category_id, protocol_id, domain, remote_ip";
+#[derive(Clone, Copy)]
+enum TrafficFact {
+    Core,
+    Endpoint,
+}
 
 /// `ClickHouse` implementation of the analytics-only contract.
 #[derive(Clone, Debug)]
@@ -51,11 +56,55 @@ impl ClickHouseAnalyticsStore {
         Ok(store)
     }
 
-    fn table(resolution: AnalyticsResolution) -> &'static str {
-        match resolution {
-            AnalyticsResolution::Minute => "traffic_minute",
-            AnalyticsResolution::Hour => "traffic_hour",
-            AnalyticsResolution::Day => "traffic_day",
+    fn table(resolution: AnalyticsResolution, fact: TrafficFact) -> &'static str {
+        match (fact, resolution) {
+            (TrafficFact::Core, AnalyticsResolution::Minute) => "traffic_core_minute",
+            (TrafficFact::Core, AnalyticsResolution::Hour) => "traffic_core_hour",
+            (TrafficFact::Core, AnalyticsResolution::Day) => "traffic_core_day",
+            (TrafficFact::Endpoint, AnalyticsResolution::Minute) => "traffic_endpoint_minute",
+            (TrafficFact::Endpoint, AnalyticsResolution::Hour) => "traffic_endpoint_hour",
+            (TrafficFact::Endpoint, AnalyticsResolution::Day) => "traffic_endpoint_day",
+        }
+    }
+
+    fn planned_source(from: u64, to: u64, fact: TrafficFact) -> String {
+        let segments = AnalyticsQueryPlan::for_range(from, to).segments;
+        if segments.is_empty() {
+            return format!(
+                "SELECT * FROM {} FINAL WHERE 1 = 0",
+                Self::table(AnalyticsResolution::Minute, fact)
+            );
+        }
+        segments
+            .iter()
+            .map(|segment| {
+                format!(
+                    "SELECT * FROM {} FINAL WHERE timestamp >= {} AND timestamp < {}",
+                    Self::table(segment.table, fact),
+                    segment.from,
+                    segment.to
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ")
+    }
+
+    fn fact_for_query(query: &TrafficQuery) -> TrafficFact {
+        if query.domain.is_some() || query.remote_ip.is_some() {
+            TrafficFact::Endpoint
+        } else {
+            TrafficFact::Core
+        }
+    }
+
+    fn fact_for_summary(query: &SummaryQuery, dimension: &str) -> TrafficFact {
+        if matches!(dimension, "domain" | "remote_ip")
+            || query.domain.is_some()
+            || query.remote_ip.is_some()
+        {
+            TrafficFact::Endpoint
+        } else {
+            TrafficFact::Core
         }
     }
 
@@ -65,6 +114,11 @@ impl ClickHouseAnalyticsStore {
         dimension: &'static str,
     ) -> StorageResult<Vec<AnalyticsSummary>> {
         let where_clause = summary_where(query);
+        let source = Self::planned_source(
+            query.from,
+            query.to,
+            Self::fact_for_summary(query, dimension),
+        );
         let device_id = if dimension == "device_id" {
             "device_id"
         } else {
@@ -77,13 +131,11 @@ impl ClickHouseAnalyticsStore {
                     max(timestamp) AS last_seen_at, uniqExact(device_id) AS distinct_devices,
                     argMax(domain, timestamp) AS last_domain,
                     argMax(application_id, timestamp) AS latest_application_id
-             FROM {} FINAL WHERE {where_clause}
+             FROM ({}) AS traffic WHERE {where_clause}
              GROUP BY {dimension}
              ORDER BY upload_bytes + download_bytes DESC, key
              LIMIT {} OFFSET {}",
-            Self::table(query.resolution),
-            query.limit,
-            query.offset,
+            source, query.limit, query.offset,
         );
         let response = self.client.query_json(&sql)?;
         Ok(json_rows(&response)
@@ -99,6 +151,8 @@ impl ClickHouseAnalyticsStore {
                 distinct_devices: value_u64(&row["distinct_devices"]),
                 last_domain: optional_string(&row["last_domain"]),
                 application_id: optional_string(&row["latest_application_id"]),
+                category_id: optional_string(&row["latest_category_id"]),
+                organization_id: optional_string(&row["latest_organization_id"]),
             })
             .collect())
     }
@@ -106,10 +160,11 @@ impl ClickHouseAnalyticsStore {
 
 impl AnalyticsStore for ClickHouseAnalyticsStore {
     fn overview(&self, from: u64, to: u64) -> StorageResult<super::AnalyticsOverview> {
+        let source = Self::planned_source(from, to, TrafficFact::Core);
         let response = self.client.query_json(&format!(
             "SELECT uniqExactIf(application_id, application_id != 'unknown') AS application_count,
                     sum(upload_bytes) AS upload_bytes, sum(download_bytes) AS download_bytes
-             FROM traffic_minute FINAL WHERE timestamp >= {from} AND timestamp < {to}"
+             FROM ({source}) AS traffic WHERE timestamp >= {from} AND timestamp < {to}"
         ))?;
         let row = &response["data"][0];
         Ok(super::AnalyticsOverview {
@@ -119,6 +174,7 @@ impl AnalyticsStore for ClickHouseAnalyticsStore {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn apply_batch(&mut self, batch: &AnalyticsBatch) -> StorageResult<ApplyBatchResult> {
         let query = format!(
             "SELECT count() AS count FROM processed_batches FINAL
@@ -139,22 +195,51 @@ impl AnalyticsStore for ClickHouseAnalyticsStore {
             .collect::<Vec<_>>();
         self.client
             .insert_json_each_row("flow_session_versions", &flow_rows)?;
+        let attribution_rows = batch
+            .flows
+            .iter()
+            .map(|flow| {
+                json!({
+                    "gateway_id": flow.gateway_id,
+                    "flow_id": flow.flow_id,
+                    "started_at": flow.started_at,
+                    "timestamp": flow.started_at / MINUTE_MS * MINUTE_MS,
+                    "scope": flow.scope,
+                    "direction": flow.direction,
+                    "transport_protocol": flow.protocol,
+                    "path_type": flow.path_type,
+                    "nat": flow.nat,
+                    "device_id": flow.device_id,
+                    "organization_id": flow.organization_id,
+                    "application_id": flow.application_id,
+                    "category_id": flow.category_id,
+                    "protocol_id": flow.protocol_id,
+                    "domain": flow.domain,
+                    "remote_ip": crate::to_hex(&flow.remote_ip),
+                    "upload_bytes": flow.upload_bytes,
+                    "download_bytes": flow.download_bytes,
+                    "packets": flow.packets,
+                    "flow_count": 1_u64,
+                    "updated_at": flow.checkpointed_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.client
+            .insert_json_each_row("flow_traffic_attribution", &attribution_rows)?;
 
-        let mut aggregates = BTreeMap::<TrafficKey, TrafficDelta>::new();
+        let mut core_aggregates = BTreeMap::<CoreTrafficKey, TrafficDelta>::new();
+        let mut endpoint_aggregates = BTreeMap::<EndpointTrafficKey, TrafficDelta>::new();
         for row in &batch.traffic {
             let mut row = row.clone();
             row.timestamp = row.timestamp / MINUTE_MS * MINUTE_MS;
-            let key = TrafficKey::from(&row);
-            if let Some(current) = aggregates.get_mut(&key) {
-                current.upload_bytes = current.upload_bytes.saturating_add(row.upload_bytes);
-                current.download_bytes = current.download_bytes.saturating_add(row.download_bytes);
-                current.packets = current.packets.saturating_add(row.packets);
-                current.flow_count = current.flow_count.saturating_add(row.flow_count);
-            } else {
-                aggregates.insert(key, row);
-            }
+            aggregate_delta(&mut core_aggregates, CoreTrafficKey::from(&row), &row);
+            aggregate_delta(
+                &mut endpoint_aggregates,
+                EndpointTrafficKey::from(&row),
+                &row,
+            );
         }
-        let traffic_rows = aggregates
+        let core_rows = core_aggregates
             .values()
             .map(|delta| {
                 json!({
@@ -165,6 +250,28 @@ impl AnalyticsStore for ClickHouseAnalyticsStore {
                     "transport_protocol": delta.transport_protocol,
                     "path_type": delta.path_type,
                     "nat": delta.nat,
+                    "device_id": delta.device_id,
+                    "organization_id": delta.organization_id,
+                    "application_id": delta.application_id,
+                    "category_id": delta.category_id,
+                    "protocol_id": delta.protocol_id,
+                    "upload_bytes": delta.upload_bytes,
+                    "download_bytes": delta.download_bytes,
+                    "packets": delta.packets,
+                    "flow_count": delta.flow_count,
+                    "boot_id": batch.boot_id,
+                    "batch_sequence": batch.sequence,
+                })
+            })
+            .collect::<Vec<_>>();
+        let endpoint_rows = endpoint_aggregates
+            .values()
+            .map(|delta| {
+                json!({
+                    "timestamp": delta.timestamp,
+                    "gateway_id": delta.gateway_id,
+                    "scope": delta.scope,
+                    "direction": delta.direction,
                     "device_id": delta.device_id,
                     "organization_id": delta.organization_id,
                     "application_id": delta.application_id,
@@ -182,7 +289,9 @@ impl AnalyticsStore for ClickHouseAnalyticsStore {
             })
             .collect::<Vec<_>>();
         self.client
-            .insert_json_each_row("traffic_minute", &traffic_rows)?;
+            .insert_json_each_row("traffic_core_minute", &core_rows)?;
+        self.client
+            .insert_json_each_row("traffic_endpoint_minute", &endpoint_rows)?;
 
         // Write the marker last. If any earlier request failed, replaying the
         // same row identities is safe because the fact tables use ReplacingMergeTree.
@@ -198,13 +307,14 @@ impl AnalyticsStore for ClickHouseAnalyticsStore {
     }
 
     fn traffic_series(&self, query: &TrafficQuery) -> StorageResult<Vec<TrafficPoint>> {
+        let source = Self::planned_source(query.from, query.to, Self::fact_for_query(query));
         let sql = format!(
             "SELECT timestamp, sum(upload_bytes) AS upload_bytes,
                     sum(download_bytes) AS download_bytes, sum(packets) AS packets,
                     sum(flow_count) AS flow_count
-             FROM {} FINAL WHERE {}
+             FROM ({}) AS traffic WHERE {}
              GROUP BY timestamp ORDER BY timestamp",
-            Self::table(query.resolution),
+            source,
             traffic_where(query),
         );
         let response = self.client.query_json(&sql)?;
@@ -234,15 +344,20 @@ impl AnalyticsStore for ClickHouseAnalyticsStore {
             TrafficDimension::Destination => "remote_ip",
             TrafficDimension::TransportProtocol => "transport_protocol",
         };
+        let fact = match query.dimension {
+            TrafficDimension::Domain | TrafficDimension::Destination => TrafficFact::Endpoint,
+            _ => Self::fact_for_query(&query.traffic),
+        };
+        let source = Self::planned_source(query.traffic.from, query.traffic.to, fact);
         let sql = format!(
             "SELECT toString({dimension}) AS key, sum(upload_bytes) AS upload_bytes,
                     sum(download_bytes) AS download_bytes, sum(packets) AS packets,
                     sum(flow_count) AS flow_count, max(timestamp) AS last_seen_at
-             FROM {} FINAL WHERE {}
+             FROM ({}) AS traffic WHERE {}
              GROUP BY {dimension}
              ORDER BY upload_bytes + download_bytes DESC, key
              LIMIT {} OFFSET {}",
-            Self::table(query.traffic.resolution),
+            source,
             traffic_where(&query.traffic),
             query.limit,
             query.offset,
@@ -315,7 +430,63 @@ impl AnalyticsStore for ClickHouseAnalyticsStore {
     }
 
     fn application_summary(&self, query: &SummaryQuery) -> StorageResult<Vec<AnalyticsSummary>> {
-        self.summary(query, "application_id")
+        let mut catalog_query = query.clone();
+        catalog_query.limit = u32::MAX;
+        catalog_query.offset = 0;
+        let mut rows = self.summary(&catalog_query, "application_id")?;
+        rows.retain(|row| {
+            row.upload_bytes > 0 || row.download_bytes > 0 || row.packets > 0 || row.flow_count > 0
+        });
+        let flow_response = self.client.query_json(&format!(
+            "SELECT application_id, sum(upload_bytes) AS upload_bytes,
+                    sum(download_bytes) AS download_bytes, sum(packets) AS packets,
+                    count() AS flow_count, max(last_seen_at) AS last_seen_at,
+                    uniqExact(device_id) AS distinct_devices,
+                    argMax(domain, last_seen_at) AS last_domain
+             FROM flow_sessions_latest
+             WHERE {} AND application_id != ''
+             GROUP BY application_id",
+            flow_summary_where(query)
+        ))?;
+        for row in json_rows(&flow_response) {
+            let flow_row = AnalyticsSummary {
+                key: value_string(&row["application_id"]),
+                device_id: 0,
+                upload_bytes: value_u64(&row["upload_bytes"]),
+                download_bytes: value_u64(&row["download_bytes"]),
+                packets: value_u64(&row["packets"]),
+                flow_count: value_u64(&row["flow_count"]),
+                last_seen_at: value_u64(&row["last_seen_at"]),
+                distinct_devices: value_u64(&row["distinct_devices"]),
+                last_domain: optional_string(&row["last_domain"]),
+                application_id: Some(value_string(&row["application_id"])),
+                category_id: optional_string(&row["category_id"]),
+                organization_id: optional_string(&row["organization_id"]),
+            };
+            if let Some(existing) = rows.iter_mut().find(|item| item.key == flow_row.key) {
+                existing.last_seen_at = existing.last_seen_at.max(flow_row.last_seen_at);
+                if existing.last_domain.is_none() {
+                    existing.last_domain = flow_row.last_domain;
+                }
+                existing.distinct_devices =
+                    existing.distinct_devices.max(flow_row.distinct_devices);
+            } else {
+                rows.push(flow_row);
+            }
+        }
+        rows.sort_by(|left, right| {
+            let left_total = left.upload_bytes.saturating_add(left.download_bytes);
+            let right_total = right.upload_bytes.saturating_add(right.download_bytes);
+            right_total
+                .cmp(&left_total)
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        let start = usize::try_from(query.offset).unwrap_or(usize::MAX);
+        Ok(rows
+            .into_iter()
+            .skip(start)
+            .take(query.limit as usize)
+            .collect())
     }
 
     fn organization_summary(&self, query: &SummaryQuery) -> StorageResult<Vec<AnalyticsSummary>> {
@@ -350,12 +521,13 @@ impl AnalyticsStore for ClickHouseAnalyticsStore {
     }
 
     fn geo_traffic(&self, query: &SummaryQuery) -> StorageResult<Vec<GeoTraffic>> {
+        let source = Self::planned_source(query.from, query.to, TrafficFact::Endpoint);
         let sql = format!(
             "SELECT remote_ip, sum(upload_bytes) AS upload_bytes,
                     sum(download_bytes) AS download_bytes
-             FROM {} FINAL WHERE {}
+             FROM ({}) AS traffic WHERE {}
              GROUP BY remote_ip ORDER BY upload_bytes + download_bytes DESC",
-            Self::table(query.resolution),
+            source,
             summary_where(query),
         );
         let response = self.client.query_json(&sql)?;
@@ -372,22 +544,52 @@ impl AnalyticsStore for ClickHouseAnalyticsStore {
     }
 
     fn unknown_ratio(&self, since: u64) -> StorageResult<f64> {
+        let source = Self::planned_source(since, now_ms(), TrafficFact::Core);
         let response = self.client.query_json(&format!(
             "SELECT if(sum(upload_bytes + download_bytes) = 0, 0.0,
                        sumIf(upload_bytes + download_bytes, application_id = 'unknown')
                        / sum(upload_bytes + download_bytes)) AS ratio
-             FROM traffic_minute FINAL WHERE timestamp >= {since}"
+             FROM ({source}) AS traffic WHERE timestamp >= {since}"
         ))?;
         Ok(value_f64(&response["data"][0]["ratio"]))
     }
 
-    fn rollup(&mut self, now: u64) -> StorageResult<()> {
+    fn rollup(&mut self, now: u64) -> StorageResult<u64> {
         let hour_end = now / HOUR_MS * HOUR_MS;
-        let hour_start = hour_end.saturating_sub(HOUR_MS);
-        self.insert_rollup("traffic_hour", "traffic_minute", hour_start, hour_end, now)?;
+        let mut rows_written = self.advance_rollup(
+            "core_hour",
+            "traffic_core_hour",
+            "traffic_core_minute",
+            hour_end,
+            HOUR_MS,
+            false,
+        )?;
+        rows_written = rows_written.saturating_add(self.advance_rollup(
+            "endpoint_hour",
+            "traffic_endpoint_hour",
+            "traffic_endpoint_minute",
+            hour_end,
+            HOUR_MS,
+            true,
+        )?);
         let day_end = now / DAY_MS * DAY_MS;
-        let day_start = day_end.saturating_sub(DAY_MS);
-        self.insert_rollup("traffic_day", "traffic_hour", day_start, day_end, now)
+        rows_written = rows_written.saturating_add(self.advance_rollup(
+            "core_day",
+            "traffic_core_day",
+            "traffic_core_hour",
+            day_end,
+            DAY_MS,
+            false,
+        )?);
+        rows_written = rows_written.saturating_add(self.advance_rollup(
+            "endpoint_day",
+            "traffic_endpoint_day",
+            "traffic_endpoint_hour",
+            day_end,
+            DAY_MS,
+            true,
+        )?);
+        Ok(rows_written)
     }
 
     fn run_retention(&mut self, now: u64, policy: RetentionPolicy) -> StorageResult<()> {
@@ -397,11 +599,17 @@ impl AnalyticsStore for ClickHouseAnalyticsStore {
             statements.push(format!(
                 "ALTER TABLE flow_session_versions DELETE WHERE last_seen_at < {cutoff} SETTINGS mutations_sync = 1"
             ));
+            statements.push(format!(
+                "ALTER TABLE flow_traffic_attribution DELETE WHERE timestamp < {cutoff} SETTINGS mutations_sync = 1"
+            ));
         }
         for (table, days) in [
-            ("traffic_minute", policy.minute_days),
-            ("traffic_hour", policy.hour_days),
-            ("traffic_day", policy.day_days),
+            ("traffic_core_minute", policy.minute_days),
+            ("traffic_core_hour", policy.hour_days),
+            ("traffic_core_day", policy.day_days),
+            ("traffic_endpoint_minute", policy.minute_days),
+            ("traffic_endpoint_hour", policy.hour_days),
+            ("traffic_endpoint_day", policy.day_days),
         ] {
             if days != 0 {
                 let cutoff = now.saturating_sub(u64::from(days) * DAY_MS);
@@ -420,7 +628,9 @@ impl AnalyticsStore for ClickHouseAnalyticsStore {
         let response = self.client.query_json(
             "SELECT sum(bytes_on_disk) AS bytes FROM system.parts
              WHERE active AND database = currentDatabase()
-               AND table IN ('processed_batches', 'flow_session_versions', 'traffic_minute', 'traffic_hour', 'traffic_day')",
+               AND table IN ('processed_batches', 'flow_session_versions', 'flow_traffic_attribution',
+                             'traffic_core_minute', 'traffic_core_hour', 'traffic_core_day',
+                             'traffic_endpoint_minute', 'traffic_endpoint_hour', 'traffic_endpoint_day')",
         )?;
         Ok(value_u64(&response["data"][0]["bytes"]))
     }
@@ -431,6 +641,69 @@ impl AnalyticsStore for ClickHouseAnalyticsStore {
 }
 
 impl ClickHouseAnalyticsStore {
+    fn rollup_watermark(&self, name: &str) -> StorageResult<u64> {
+        let response = self.client.query_json(&format!(
+            "SELECT completed_until FROM analytics_rollup_state FINAL WHERE rollup_name = {} LIMIT 1",
+            sql_string(name)
+        ))?;
+        Ok(response["data"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .map_or(0, |row| value_u64(&row["completed_until"])))
+    }
+
+    fn set_rollup_watermark(&self, name: &str, completed_until: u64) -> StorageResult<()> {
+        self.client
+            .execute(&format!(
+                "INSERT INTO analytics_rollup_state(rollup_name, completed_until, updated_at)
+                 VALUES ({}, {}, {})",
+                sql_string(name),
+                completed_until,
+                now_ms()
+            ))
+            .map(|_| ())
+    }
+
+    fn advance_rollup(
+        &self,
+        name: &str,
+        target: &'static str,
+        source: &'static str,
+        last_complete_bucket: u64,
+        bucket_ms: u64,
+        endpoint: bool,
+    ) -> StorageResult<u64> {
+        let mut watermark = self.rollup_watermark(name)?;
+        if watermark == 0 {
+            let response = self.client.query_json(&format!(
+                "SELECT min(timestamp) AS first FROM {source} FINAL"
+            ))?;
+            let first = response["data"]
+                .as_array()
+                .and_then(|rows| rows.first())
+                .map(|row| value_u64(&row["first"]))
+                .filter(|value| *value > 0);
+            watermark = first.map_or(last_complete_bucket, |timestamp| {
+                timestamp / bucket_ms * bucket_ms
+            });
+        }
+        let mut rows_written = 0_u64;
+        while watermark < last_complete_bucket {
+            let bucket_end = watermark.saturating_add(bucket_ms);
+            rows_written = rows_written.saturating_add(self.insert_rollup(
+                target,
+                source,
+                watermark,
+                bucket_end,
+                now_ms(),
+                endpoint,
+            )?);
+            watermark = bucket_end;
+            self.set_rollup_watermark(name, watermark)?;
+        }
+        Ok(rows_written)
+    }
+
     fn insert_rollup(
         &self,
         target: &'static str,
@@ -438,21 +711,39 @@ impl ClickHouseAnalyticsStore {
         start: u64,
         end: u64,
         version: u64,
-    ) -> StorageResult<()> {
+        endpoint: bool,
+    ) -> StorageResult<u64> {
+        let (dimensions, select_dimensions) = if endpoint {
+            (
+                "gateway_id, scope, direction, device_id, organization_id, application_id, category_id, protocol_id, domain, remote_ip",
+                "gateway_id, scope, direction, device_id, organization_id, application_id, category_id, protocol_id, domain, remote_ip",
+            )
+        } else {
+            (
+                "gateway_id, scope, direction, transport_protocol, path_type, nat, device_id, organization_id, application_id, category_id, protocol_id",
+                "gateway_id, scope, direction, transport_protocol, path_type, nat, device_id, organization_id, application_id, category_id, protocol_id",
+            )
+        };
+        let grouped = self.client.query_json(&format!(
+            "SELECT count() AS rows FROM (SELECT {dimensions} FROM {source} FINAL WHERE timestamp >= {start} AND timestamp < {end} GROUP BY {dimensions})"
+        ))?;
+        let rows = grouped["data"]
+            .as_array()
+            .and_then(|items| items.first())
+            .map_or(0, |item| value_u64(&item["rows"]));
         self.client.execute(&format!(
-            "INSERT INTO {target}({FACT_DIMENSIONS}, timestamp, upload_bytes, download_bytes, packets, flow_count, rollup_version)
-             SELECT gateway_id, scope, direction, transport_protocol, path_type, nat, device_id, organization_id,
-                    application_id, category_id, protocol_id, domain, remote_ip, {start},
+            "INSERT INTO {target}({dimensions}, timestamp, upload_bytes, download_bytes, packets, flow_count, rollup_version)
+             SELECT {select_dimensions}, {start},
                     sum(upload_bytes), sum(download_bytes), sum(packets), sum(flow_count), {version}
              FROM {source} FINAL WHERE timestamp >= {start} AND timestamp < {end}
-             GROUP BY {FACT_DIMENSIONS}"
+             GROUP BY {dimensions}"
         ))?;
-        Ok(())
+        Ok(rows)
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct TrafficKey {
+struct CoreTrafficKey {
     timestamp: u64,
     gateway_id: String,
     scope: u8,
@@ -465,11 +756,24 @@ struct TrafficKey {
     application_id: String,
     category_id: String,
     protocol_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct EndpointTrafficKey {
+    timestamp: u64,
+    gateway_id: String,
+    scope: u8,
+    direction: u8,
+    device_id: u64,
+    organization_id: String,
+    application_id: String,
+    category_id: String,
+    protocol_id: String,
     domain: String,
     remote_ip: Vec<u8>,
 }
 
-impl From<&TrafficDelta> for TrafficKey {
+impl From<&TrafficDelta> for CoreTrafficKey {
     fn from(row: &TrafficDelta) -> Self {
         Self {
             timestamp: row.timestamp,
@@ -484,9 +788,39 @@ impl From<&TrafficDelta> for TrafficKey {
             application_id: row.application_id.clone(),
             category_id: row.category_id.clone(),
             protocol_id: row.protocol_id.clone(),
+        }
+    }
+}
+
+impl From<&TrafficDelta> for EndpointTrafficKey {
+    fn from(row: &TrafficDelta) -> Self {
+        Self {
+            timestamp: row.timestamp,
+            gateway_id: row.gateway_id.clone(),
+            scope: row.scope,
+            direction: row.direction,
+            device_id: row.device_id,
+            organization_id: row.organization_id.clone(),
+            application_id: row.application_id.clone(),
+            category_id: row.category_id.clone(),
+            protocol_id: row.protocol_id.clone(),
             domain: row.domain.clone(),
             remote_ip: row.remote_ip.clone(),
         }
+    }
+}
+
+fn aggregate_delta<K>(rows: &mut BTreeMap<K, TrafficDelta>, key: K, delta: &TrafficDelta)
+where
+    K: Ord,
+{
+    if let Some(current) = rows.get_mut(&key) {
+        current.upload_bytes = current.upload_bytes.saturating_add(delta.upload_bytes);
+        current.download_bytes = current.download_bytes.saturating_add(delta.download_bytes);
+        current.packets = current.packets.saturating_add(delta.packets);
+        current.flow_count = current.flow_count.saturating_add(delta.flow_count);
+    } else {
+        rows.insert(key, delta.clone());
     }
 }
 
@@ -604,6 +938,37 @@ fn traffic_where(query: &TrafficQuery) -> String {
 fn summary_where(query: &SummaryQuery) -> String {
     let mut filters = vec![format!(
         "timestamp >= {} AND timestamp < {}",
+        query.from, query.to
+    )];
+    push_string_filter(&mut filters, "gateway_id", query.gateway_id.as_deref());
+    push_number_filter(&mut filters, "device_id", query.device_id);
+    push_number_filter(&mut filters, "scope", query.scope.map(u64::from));
+    push_number_filter(&mut filters, "direction", query.direction.map(u64::from));
+    push_string_filter(
+        &mut filters,
+        "organization_id",
+        query.organization_id.as_deref(),
+    );
+    push_string_filter(
+        &mut filters,
+        "application_id",
+        query.application_id.as_deref(),
+    );
+    push_string_filter(&mut filters, "category_id", query.category_id.as_deref());
+    push_string_filter(&mut filters, "protocol_id", query.protocol_id.as_deref());
+    push_string_filter(&mut filters, "domain", query.domain.as_deref());
+    if let Some(remote_ip) = &query.remote_ip {
+        filters.push(format!(
+            "remote_ip = {}",
+            sql_string(&crate::to_hex(remote_ip))
+        ));
+    }
+    filters.join(" AND ")
+}
+
+fn flow_summary_where(query: &SummaryQuery) -> String {
+    let mut filters = vec![format!(
+        "last_seen_at >= {} AND last_seen_at < {}",
         query.from, query.to
     )];
     push_string_filter(&mut filters, "gateway_id", query.gateway_id.as_deref());

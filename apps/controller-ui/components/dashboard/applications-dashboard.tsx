@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { Search } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { AppLayout } from "@/components/app-shell/app-layout";
@@ -24,18 +24,15 @@ import type { ApiEnvelope, ApplicationSummary } from "@/lib/network-types";
 export function ApplicationsDashboard({
   username,
   initialSearch,
-  initialSelectedId,
-  initialSelectedCategory,
 }: {
   username: string;
   initialSearch: string;
-  initialSelectedId?: string;
-  initialSelectedCategory?: string;
 }) {
   const t = useTranslations("applications");
   const tNav = useTranslations("navigation");
   const tStatus = useTranslations("common.status");
   const router = useRouter();
+  const searchParams = useSearchParams();
   const searchRef = useRef<HTMLInputElement>(null);
 
   const [items, setItems] = useState<ApplicationSummary[]>([]);
@@ -43,12 +40,17 @@ export function ApplicationsDashboard({
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState(initialSearch);
   const [reloadKey, setReloadKey] = useState(0);
+  const selectedQuery = {
+    id: searchParams.get("id") ?? undefined,
+    category: searchParams.get("category") ?? undefined,
+  };
+
   const selected =
     items.find(
       (item) =>
-        item.application_id === initialSelectedId &&
-        (!initialSelectedCategory ||
-          item.category_id === initialSelectedCategory),
+        item.application_id === selectedQuery.id &&
+        (!selectedQuery.category ||
+          item.category_id === selectedQuery.category),
     ) ?? null;
 
   useEffect(() => {
@@ -242,9 +244,9 @@ export function ApplicationsDashboard({
           data={filtered}
           keyExtractor={(row) => `${row.application_id}:${row.category_id}`}
           loading={loading}
-          onRowClick={(row) =>
-            replaceQuery({ id: row.application_id, category: row.category_id })
-          }
+          onRowClick={(row) => {
+            replaceQuery({ id: row.application_id, category: row.category_id });
+          }}
           emptyState={
             <EmptyState
               title={t("notFound")}
@@ -257,7 +259,9 @@ export function ApplicationsDashboard({
 
       <SidePanel
         open={Boolean(selected)}
-        onClose={() => replaceQuery({ id: "", category: "" })}
+        onClose={() => {
+          replaceQuery({ id: "", category: "" });
+        }}
         title={
           selected?.application_id === "unknown"
             ? tStatus("unknown")

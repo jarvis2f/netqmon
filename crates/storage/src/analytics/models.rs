@@ -70,8 +70,8 @@ pub struct AnalyticsFlowIdentity {
 
 /// A per-flow traffic contribution, enriched by the collector.
 ///
-/// Implementations aggregate these rows in memory by all dimensions before
-/// writing `traffic_minute`.
+/// Implementations aggregate these rows in memory before writing the core and
+/// endpoint minute facts.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TrafficDelta {
     pub timestamp: u64,
@@ -119,6 +119,100 @@ pub enum AnalyticsResolution {
     Minute,
     Hour,
     Day,
+}
+
+/// A disjoint set of aggregate tables used to answer a range query without
+/// mixing bucket sizes for the same timestamp.  Complete days use the compact
+/// day table, edge days use hours, and edge hours use minute rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnalyticsQuerySegment {
+    pub table: AnalyticsResolution,
+    pub from: u64,
+    pub to: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnalyticsQueryPlan {
+    pub segments: Vec<AnalyticsQuerySegment>,
+}
+
+impl AnalyticsQueryPlan {
+    #[must_use]
+    pub fn for_range(from: u64, to: u64) -> Self {
+        const HOUR_MS: u64 = 60 * 60 * 1_000;
+        const DAY_MS: u64 = 24 * HOUR_MS;
+        if from >= to {
+            return Self {
+                segments: Vec::new(),
+            };
+        }
+        // Callers use `u64::MAX` as an open-ended diagnostic range. There is
+        // no meaningful rollup boundary for that sentinel.
+        if to == u64::MAX {
+            return Self {
+                segments: vec![AnalyticsQuerySegment {
+                    table: AnalyticsResolution::Minute,
+                    from,
+                    to,
+                }],
+            };
+        }
+        let mut segments = Vec::new();
+        let day_from = from.div_ceil(DAY_MS) * DAY_MS;
+        let day_to = to / DAY_MS * DAY_MS;
+        if day_from < day_to {
+            segments.push(AnalyticsQuerySegment {
+                table: AnalyticsResolution::Day,
+                from: day_from,
+                to: day_to,
+            });
+        }
+
+        let add_edge = |segments: &mut Vec<AnalyticsQuerySegment>, edge_from: u64, edge_to: u64| {
+            if edge_from >= edge_to {
+                return;
+            }
+            let hour_from = edge_from.div_ceil(HOUR_MS) * HOUR_MS;
+            let hour_to = edge_to / HOUR_MS * HOUR_MS;
+            if hour_from >= hour_to {
+                segments.push(AnalyticsQuerySegment {
+                    table: AnalyticsResolution::Minute,
+                    from: edge_from,
+                    to: edge_to,
+                });
+                return;
+            }
+            if edge_from < hour_from.min(edge_to) {
+                segments.push(AnalyticsQuerySegment {
+                    table: AnalyticsResolution::Minute,
+                    from: edge_from,
+                    to: hour_from.min(edge_to),
+                });
+            }
+            if hour_from < hour_to {
+                segments.push(AnalyticsQuerySegment {
+                    table: AnalyticsResolution::Hour,
+                    from: hour_from,
+                    to: hour_to,
+                });
+            }
+            if hour_to < edge_to {
+                segments.push(AnalyticsQuerySegment {
+                    table: AnalyticsResolution::Minute,
+                    from: hour_to,
+                    to: edge_to,
+                });
+            }
+        };
+        if day_from >= to || day_to <= from {
+            add_edge(&mut segments, from, to);
+        } else {
+            add_edge(&mut segments, from, day_from);
+            add_edge(&mut segments, day_to, to);
+        }
+        segments.sort_by_key(|segment| segment.from);
+        Self { segments }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -241,7 +335,7 @@ pub struct SummaryQuery {
     pub offset: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AnalyticsSummary {
     pub key: String,
     pub device_id: u64,
@@ -253,6 +347,8 @@ pub struct AnalyticsSummary {
     pub distinct_devices: u64,
     pub last_domain: Option<String>,
     pub application_id: Option<String>,
+    pub category_id: Option<String>,
+    pub organization_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,5 +1,7 @@
+use std::ops::{Deref, DerefMut};
 #[cfg(feature = "analytics-duckdb")]
 use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use netqmon_protocol::v1::{FlowDelta, TelemetryBatch};
 
@@ -9,7 +11,7 @@ use crate::analytics::{
 };
 use crate::metadata::{
     CompletedFlowCheckpoint, DeviceAddressRecord, DeviceRecord, GatewayDetails, MetadataStore,
-    OutboxRecord, SqliteMetadataStore,
+    SqliteMetadataStore,
 };
 use crate::{
     DeviceEvidenceRecord, DeviceIdentityUpdate, FlowAttribution, GatewayRecord, PersistDisposition,
@@ -80,6 +82,20 @@ impl AnalyticsStore for AnalyticsBackend {
             Self::DuckDb(store) => store.apply_batch(batch),
             #[cfg(feature = "analytics-clickhouse")]
             Self::ClickHouse(store) => store.apply_batch(batch),
+            #[cfg(test)]
+            Self::AnalyticsFailure => Err(test_analytics_error()),
+        }
+    }
+
+    fn apply_batches(
+        &mut self,
+        batches: &[AnalyticsBatch],
+    ) -> StorageResult<Vec<ApplyBatchResult>> {
+        match self {
+            #[cfg(feature = "analytics-duckdb")]
+            Self::DuckDb(store) => store.apply_batches(batches),
+            #[cfg(feature = "analytics-clickhouse")]
+            Self::ClickHouse(store) => store.apply_batches(batches),
             #[cfg(test)]
             Self::AnalyticsFailure => Err(test_analytics_error()),
         }
@@ -284,7 +300,7 @@ impl AnalyticsStore for AnalyticsBackend {
         }
     }
 
-    fn rollup(&mut self, now: u64) -> StorageResult<()> {
+    fn rollup(&mut self, now: u64) -> StorageResult<u64> {
         match self {
             #[cfg(feature = "analytics-duckdb")]
             Self::DuckDb(store) => store.rollup(now),
@@ -331,7 +347,35 @@ fn test_analytics_error() -> StorageError {
 #[derive(Debug)]
 pub struct Storage {
     metadata: SqliteMetadataStore,
-    analytics: AnalyticsBackend,
+    analytics: Arc<Mutex<AnalyticsBackend>>,
+}
+
+/// Read guard for the analytics backend. Queries lock only the backend and do
+/// not need to hold the collector's state mutex.
+pub struct AnalyticsReadGuard<'a>(MutexGuard<'a, AnalyticsBackend>);
+
+impl Deref for AnalyticsReadGuard<'_> {
+    type Target = dyn AnalyticsStore;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+pub struct AnalyticsMutGuard<'a>(MutexGuard<'a, AnalyticsBackend>);
+
+impl Deref for AnalyticsMutGuard<'_> {
+    type Target = dyn AnalyticsStore;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+impl DerefMut for AnalyticsMutGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self.0
+    }
 }
 
 impl Storage {
@@ -354,14 +398,14 @@ impl Storage {
     ) -> StorageResult<Self> {
         Ok(Self {
             metadata: SqliteMetadataStore::open(metadata_path)?,
-            analytics: AnalyticsBackend::open_duckdb(analytics_path)?,
+            analytics: Arc::new(Mutex::new(AnalyticsBackend::open_duckdb(analytics_path)?)),
         })
     }
 
     pub fn from_stores(metadata: SqliteMetadataStore, analytics: AnalyticsBackend) -> Self {
         Self {
             metadata,
-            analytics,
+            analytics: Arc::new(Mutex::new(analytics)),
         }
     }
 
@@ -373,12 +417,24 @@ impl Storage {
         &mut self.metadata
     }
 
-    pub fn analytics(&self) -> &dyn AnalyticsStore {
-        &self.analytics
+    pub fn analytics(&self) -> AnalyticsReadGuard<'_> {
+        AnalyticsReadGuard(
+            self.analytics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
-    pub fn analytics_mut(&mut self) -> &mut dyn AnalyticsStore {
-        &mut self.analytics
+    pub fn analytics_mut(&mut self) -> AnalyticsMutGuard<'_> {
+        AnalyticsMutGuard(
+            self.analytics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    pub fn analytics_backend_handle(&self) -> Arc<Mutex<AnalyticsBackend>> {
+        Arc::clone(&self.analytics)
     }
 
     /// Applies and acknowledges at most `limit` committed SQLite outbox rows.
@@ -387,25 +443,26 @@ impl Storage {
     /// Returns a storage error if the underlying metadata or analytics operation fails.
     pub fn process_outbox(&mut self, limit: u32) -> StorageResult<u32> {
         let records = self.metadata.outbox_batch(limit)?;
-        let mut processed = 0_u32;
-        for record in records {
-            self.process_outbox_record(&record)?;
-            processed = processed.saturating_add(1);
+        if records.is_empty() {
+            return Ok(0);
         }
-        Ok(processed)
-    }
-
-    fn process_outbox_record(&mut self, record: &OutboxRecord) -> StorageResult<()> {
-        let batch = AnalyticsBatch::decode(&record.payload).map_err(StorageError::Serialization)?;
-        self.analytics.apply_batch(&batch)?;
-        let completed_flows = batch
-            .flows
+        let batches = records
             .iter()
+            .map(|record| {
+                AnalyticsBatch::decode(&record.payload).map_err(StorageError::Serialization)
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
+        self.analytics_mut().apply_batches(&batches)?;
+        let ids = records.iter().map(|record| record.id).collect::<Vec<_>>();
+        let completed_flows = batches
+            .iter()
+            .flat_map(|batch| batch.flows.iter())
             .filter(|flow| flow.ended_at.is_some())
             .map(|flow| CompletedFlowCheckpoint { flow: flow.clone() })
             .collect::<Vec<_>>();
         self.metadata
-            .acknowledge_outbox_with_completed_flows(record.id, &completed_flows)
+            .acknowledge_outbox_batch(&ids, &completed_flows)?;
+        Ok(u32::try_from(records.len()).unwrap_or(u32::MAX))
     }
 
     /// # Errors
@@ -595,13 +652,13 @@ impl Storage {
     /// Returns a storage error if the underlying metadata or analytics operation fails.
     pub fn run_retention(&mut self, now_ms: u64, policy: RetentionPolicy) -> StorageResult<()> {
         self.metadata.run_metadata_retention(now_ms, policy)?;
-        self.analytics.run_retention(now_ms, policy)
+        self.analytics_mut().run_retention(now_ms, policy)
     }
 
     /// # Errors
     /// Returns a storage error if the underlying metadata or analytics operation fails.
-    pub fn roll_up_hour_and_day(&mut self, now_ms: u64) -> StorageResult<()> {
-        self.analytics.rollup(now_ms)
+    pub fn roll_up_hour_and_day(&mut self, now_ms: u64) -> StorageResult<u64> {
+        self.analytics_mut().rollup(now_ms)
     }
 
     /// # Errors
@@ -613,7 +670,7 @@ impl Storage {
     /// # Errors
     /// Returns a storage error if the underlying metadata or analytics operation fails.
     pub fn unknown_ratio(&self, since_ms: u64) -> StorageResult<f64> {
-        self.analytics.unknown_ratio(since_ms)
+        self.analytics().unknown_ratio(since_ms)
     }
 
     /// # Errors
@@ -625,11 +682,11 @@ impl Storage {
     /// # Errors
     /// Returns a storage error if the underlying metadata or analytics operation fails.
     pub fn analytics_database_size_bytes(&self) -> StorageResult<u64> {
-        self.analytics.database_size_bytes()
+        self.analytics().database_size_bytes()
     }
 
     pub fn analytics_backend(&self) -> &'static str {
-        self.analytics.backend_name()
+        self.analytics().backend_name()
     }
 
     /// # Errors
@@ -667,7 +724,11 @@ impl Storage {
             remote_port: u16::try_from(flow.remote_port).unwrap_or_default(),
             started_at: flow.first_seen_unix_ms,
         };
-        let latest = match self.analytics.flow_by_tuple(&identity) {
+        let latest_result = {
+            let analytics = self.analytics();
+            analytics.flow_by_tuple(&identity)
+        };
+        let latest = match latest_result {
             Ok(latest) => latest,
             Err(analytics_error) => {
                 let queued = self.metadata.append_reclassification_with_latest(

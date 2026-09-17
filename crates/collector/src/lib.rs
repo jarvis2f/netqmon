@@ -47,6 +47,8 @@ use netqmon_protocol::{
 };
 #[cfg(test)]
 use netqmon_storage::SqliteStorage;
+use netqmon_storage::analytics::{AnalyticsBatch, AnalyticsStore};
+use netqmon_storage::metadata::CompletedFlowCheckpoint;
 use netqmon_storage::{
     AnalyticsBackend, ClickHouseConfig, DEFAULT_DATABASE_PATH, DeviceIdentityUpdate,
     FlowAttribution, PersistDisposition, SqliteMetadataStore, Storage, StorageError,
@@ -221,7 +223,7 @@ fn open_analytics_store(config: &CollectorConfig) -> Result<AnalyticsBackend, Bo
             }
             #[cfg(not(feature = "analytics-clickhouse"))]
             {
-                return Err(ConfigError("NETQMON_ANALYTICS_BACKEND=clickhouse requires the analytics-clickhouse feature".to_owned()).into());
+                Err(ConfigError("NETQMON_ANALYTICS_BACKEND=clickhouse requires the analytics-clickhouse feature".to_owned()).into())
             }
         }
         _ => unreachable!("CollectorConfig validates analytics backend"),
@@ -368,6 +370,8 @@ async fn bind_listeners(
 struct CollectorState {
     enrollment_token_hash: [u8; 32],
     inner: Arc<Mutex<CollectorInner>>,
+    analytics_backend: Arc<Mutex<AnalyticsBackend>>,
+    analytics_notify: Arc<tokio::sync::Notify>,
     icon_service: Arc<IconService>,
     sampling: Arc<dpi::SamplingService>,
     license: Arc<license::LicenseCoordinator>,
@@ -446,6 +450,7 @@ impl CollectorState {
             gateway_id: record.id,
             agent_token_hash: record.agent_token_hash,
         });
+        let analytics_backend = storage.analytics_backend_handle();
         let inner = Arc::new(Mutex::new(CollectorInner {
             gateway,
             storage,
@@ -462,6 +467,12 @@ impl CollectorState {
             traffic_bytes: 0,
             analytics_last_success_at_ms: None,
             analytics_last_error: None,
+            analytics_batches_processed_total: 0,
+            analytics_rows_written_total: 0,
+            analytics_last_write_duration_ms: None,
+            analytics_last_rollup_duration_ms: None,
+            analytics_last_rollup_rows: None,
+            analytics_worker_idle: true,
         }));
         let weak = Arc::downgrade(&inner);
         let sampling = Arc::new(dpi::SamplingService::new(
@@ -482,6 +493,8 @@ impl CollectorState {
         Ok(Self {
             enrollment_token_hash: hash_token(enrollment_token),
             inner,
+            analytics_backend,
+            analytics_notify: Arc::new(tokio::sync::Notify::new()),
             icon_service: Arc::new(IconService::new(icon_cache_config)),
             sampling,
             license,
@@ -610,7 +623,10 @@ impl CollectorState {
             PersistDisposition::Accepted => {
                 #[cfg(test)]
                 inner.storage.process_outbox(ANALYTICS_OUTBOX_BATCH_SIZE)?;
-                Ok(self.finish_accepted_batch(&mut inner, batch, &attributions))
+                let disposition = self.finish_accepted_batch(&mut inner, batch, &attributions);
+                drop(inner);
+                self.analytics_notify.notify_one();
+                Ok(disposition)
             }
         }
     }
@@ -747,12 +763,30 @@ impl CollectorState {
     }
 
     fn run_maintenance(&self, retention: bool) -> Result<(), StorageError> {
-        let mut inner = self.lock();
         if retention {
+            let mut inner = self.lock();
             let policy = inner.storage.load_retention_policy()?;
             inner.storage.run_retention(unix_time_ms(), policy)
         } else {
-            inner.storage.roll_up_hour_and_day(unix_time_ms())
+            let started = std::time::Instant::now();
+            let result = self
+                .analytics_backend
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .rollup(unix_time_ms());
+            let mut inner = self.lock();
+            inner.analytics_last_rollup_duration_ms =
+                Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+            if let Ok(rows) = result.as_ref() {
+                inner.analytics_last_rollup_rows = Some(*rows);
+            }
+            if started.elapsed() > Duration::from_secs(1) {
+                tracing::warn!(
+                    duration_ms = started.elapsed().as_millis(),
+                    "analytics rollup is slow"
+                );
+            }
+            result.map(|_| ())
         }
     }
 
@@ -825,6 +859,12 @@ struct CollectorInner {
     traffic_bytes: u64,
     analytics_last_success_at_ms: Option<u64>,
     analytics_last_error: Option<String>,
+    analytics_batches_processed_total: u64,
+    analytics_rows_written_total: u64,
+    analytics_last_write_duration_ms: Option<u64>,
+    analytics_last_rollup_duration_ms: Option<u64>,
+    analytics_last_rollup_rows: Option<u64>,
+    analytics_worker_idle: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -1306,14 +1346,15 @@ fn classify_batch(
                 .traffic_role
                 .clone()
                 .unwrap_or_else(|| "unknown".to_owned());
-            let protocol_id = classification
-                .protocol
-                .as_ref()
-                .map_or_else(|| "unknown".to_owned(), |value| value.id.clone());
-            let protocol_confidence = classification
-                .protocol
-                .as_ref()
-                .map_or(0.0, |value| value.confidence);
+            let (protocol_id, protocol_confidence) = if let Some(ref p) = classification.protocol {
+                if !p.id.is_empty() && p.id != "unknown" {
+                    (p.id.clone(), p.confidence)
+                } else {
+                    infer_flow_l7_protocol(flow, dpi_result)
+                }
+            } else {
+                infer_flow_l7_protocol(flow, dpi_result)
+            };
             let confidence = if application_id != "unknown" {
                 application_confidence
             } else if protocol_id != "unknown" {
@@ -1386,6 +1427,90 @@ fn classify_batch(
             Ok(attribution)
         })
         .collect()
+}
+
+fn infer_flow_l7_protocol(
+    flow: &netqmon_protocol::v1::FlowDelta,
+    dpi_result: Option<&crate::dpi::engine::DpiResult>,
+) -> (String, f64) {
+    if let Some(dpi) = dpi_result {
+        if let Some(app_proto) = dpi
+            .metadata
+            .get("application_protocol")
+            .filter(|s| !s.is_empty())
+        {
+            return (app_proto.to_ascii_lowercase(), dpi.confidence);
+        }
+        if !dpi.protocol.is_empty() && !dpi.protocol.eq_ignore_ascii_case("unknown") {
+            let proto_name = dpi
+                .protocol
+                .split('.')
+                .next()
+                .unwrap_or(&dpi.protocol)
+                .to_ascii_lowercase();
+            return (proto_name, dpi.confidence);
+        }
+    }
+    if !flow.protocol_hint.is_empty() {
+        return ("unknown".to_owned(), 0.0);
+    }
+    let transport = flow.protocol;
+    let port1 = u16::try_from(flow.client_port).unwrap_or(0);
+    let port2 = u16::try_from(flow.remote_port).unwrap_or(0);
+    let matches_port = |p: u16| port1 == p || port2 == p;
+
+    if matches_port(53) {
+        return ("dns".to_owned(), 0.85);
+    }
+    if matches_port(853) {
+        return ("dot".to_owned(), 0.85);
+    }
+    if matches_port(443) {
+        if transport == 17 {
+            return ("quic".to_owned(), 0.85);
+        }
+        return ("tls".to_owned(), 0.85);
+    }
+    if matches_port(80) || matches_port(8080) {
+        return ("http".to_owned(), 0.8);
+    }
+    if matches_port(22) {
+        return ("ssh".to_owned(), 0.85);
+    }
+    if matches_port(123) {
+        return ("ntp".to_owned(), 0.85);
+    }
+    if matches_port(1900) {
+        return ("ssdp".to_owned(), 0.85);
+    }
+    if matches_port(5353) {
+        return ("mdns".to_owned(), 0.85);
+    }
+    if matches_port(51820) {
+        return ("wireguard".to_owned(), 0.85);
+    }
+    if matches_port(1883) || matches_port(8883) {
+        return ("mqtt".to_owned(), 0.85);
+    }
+    if matches_port(21) {
+        return ("ftp".to_owned(), 0.8);
+    }
+    if matches_port(25) || matches_port(465) || matches_port(587) {
+        return ("smtp".to_owned(), 0.85);
+    }
+    if matches_port(993) || matches_port(143) {
+        return ("imap".to_owned(), 0.85);
+    }
+    if matches_port(995) || matches_port(110) {
+        return ("pop3".to_owned(), 0.85);
+    }
+    if matches_port(3389) {
+        return ("rdp".to_owned(), 0.85);
+    }
+    if matches_port(5060) || matches_port(5061) {
+        return ("sip".to_owned(), 0.85);
+    }
+    ("unknown".to_owned(), 0.0)
 }
 
 fn resolve_batch_domain<'a>(
@@ -1735,6 +1860,7 @@ fn analytics_replay_delay(
     Some(batch_elapsed.max(ANALYTICS_REPLAY_MIN_YIELD))
 }
 
+#[allow(clippy::too_many_lines)]
 fn spawn_analytics_writer(
     state: CollectorState,
 ) -> (
@@ -1742,6 +1868,7 @@ fn spawn_analytics_writer(
     tokio::task::JoinHandle<()>,
 ) {
     let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let analytics_notify = state.analytics_notify.clone();
     let task = tokio::spawn(async move {
         let mut backoff = ANALYTICS_RETRY_MIN;
         let mut shutdown_failures = 0_u8;
@@ -1750,9 +1877,9 @@ fn spawn_analytics_writer(
             let worker_state = state.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let started_at = std::time::Instant::now();
-                let mut inner = worker_state.lock();
-                let processed = inner.storage.process_outbox(ANALYTICS_OUTBOX_BATCH_SIZE)?;
-                let remaining = inner.storage.outbox_depth()?;
+                let processed =
+                    process_analytics_outbox(&worker_state, ANALYTICS_OUTBOX_BATCH_SIZE)?;
+                let remaining = worker_state.lock().storage.outbox_depth()?;
                 Ok::<_, StorageError>((processed, remaining, started_at.elapsed()))
             })
             .await;
@@ -1763,15 +1890,42 @@ fn spawn_analytics_writer(
                         let mut inner = state.lock();
                         inner.analytics_last_success_at_ms = Some(unix_time_ms());
                         inner.analytics_last_error = None;
+                        inner.analytics_last_write_duration_ms =
+                            Some(u64::try_from(batch_elapsed.as_millis()).unwrap_or(u64::MAX));
+                        inner.analytics_batches_processed_total = inner
+                            .analytics_batches_processed_total
+                            .saturating_add(u64::from(processed.batches));
+                        inner.analytics_rows_written_total = inner
+                            .analytics_rows_written_total
+                            .saturating_add(processed.rows_written);
+                        inner.analytics_worker_idle = processed.batches == 0;
+                    }
+                    if batch_elapsed > Duration::from_secs(1) {
+                        tracing::warn!(
+                            batches = processed.batches,
+                            rows = processed.rows_written,
+                            duration_ms = batch_elapsed.as_millis(),
+                            "analytics write is slow"
+                        );
+                    } else if processed.batches > 0 {
+                        tracing::debug!(
+                            batches = processed.batches,
+                            rows = processed.rows_written,
+                            duration_ms = batch_elapsed.as_millis(),
+                            "analytics batch processed"
+                        );
                     }
                     backoff = ANALYTICS_RETRY_MIN;
                     shutdown_failures = 0;
                     let shutting_down = *shutdown_rx.borrow();
-                    if let Some(delay) =
-                        analytics_replay_delay(batch_elapsed, processed, remaining, shutting_down)
-                    {
+                    if let Some(delay) = analytics_replay_delay(
+                        batch_elapsed,
+                        processed.batches,
+                        remaining,
+                        shutting_down,
+                    ) {
                         tracing::debug!(
-                            processed,
+                            processed = processed.batches,
                             remaining,
                             ?delay,
                             "yielding between analytics replay batches"
@@ -1786,12 +1940,22 @@ fn spawn_analytics_writer(
                         }
                         continue;
                     }
-                    if processed > 0 {
+                    if processed.batches > 0 {
                         continue;
                     }
                     if should_shutdown {
                         break;
                     }
+                    tokio::select! {
+                        () = analytics_notify.notified() => {},
+                        () = tokio::time::sleep(Duration::from_secs(1)) => {},
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    continue;
                 }
                 Ok(Err(error)) => {
                     tracing::error!(%error, "analytics outbox write failed; keeping rows for retry");
@@ -1831,6 +1995,59 @@ fn spawn_analytics_writer(
         }
     });
     (shutdown, task)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AnalyticsWriteStats {
+    batches: u32,
+    rows_written: u64,
+}
+
+/// Replays analytics without holding the collector state mutex while the
+/// analytics backend executes. SQLite outbox reads and acknowledgements remain
+/// short critical sections, while the backend transaction runs independently.
+fn process_analytics_outbox(
+    state: &CollectorState,
+    limit: u32,
+) -> Result<AnalyticsWriteStats, StorageError> {
+    let records = {
+        let inner = state.lock();
+        inner.storage.metadata().outbox_batch(limit)?
+    };
+    if records.is_empty() {
+        return Ok(AnalyticsWriteStats {
+            batches: 0,
+            rows_written: 0,
+        });
+    }
+    let batches = records
+        .iter()
+        .map(|record| AnalyticsBatch::decode(&record.payload).map_err(StorageError::Serialization))
+        .collect::<Result<Vec<_>, _>>()?;
+    state
+        .analytics_backend
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .apply_batches(&batches)?;
+    let ids = records.iter().map(|record| record.id).collect::<Vec<_>>();
+    let completed_flows = batches
+        .iter()
+        .flat_map(|batch| batch.flows.iter())
+        .filter(|flow| flow.ended_at.is_some())
+        .map(|flow| CompletedFlowCheckpoint { flow: flow.clone() })
+        .collect::<Vec<_>>();
+    let mut inner = state.lock();
+    inner
+        .storage
+        .metadata_mut()
+        .acknowledge_outbox_batch(&ids, &completed_flows)?;
+    Ok(AnalyticsWriteStats {
+        batches: u32::try_from(records.len()).unwrap_or(u32::MAX),
+        rows_written: batches
+            .iter()
+            .map(|batch| u64::try_from(batch.flows.len() + batch.traffic.len()).unwrap_or(u64::MAX))
+            .sum(),
+    })
 }
 
 /// Keeps a late-starting or restarted dynamically managed classifier visible

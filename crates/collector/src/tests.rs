@@ -818,6 +818,22 @@ async fn application_detail_filters_duplicate_unknown_rows_by_category() {
     );
 
     let router = internal_router(state);
+    let applications = parse_json(
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/applications?limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(applications["data"].as_array().unwrap().len(), 1);
+    assert_eq!(applications["data"][0]["application_id"], "unknown");
+
     let detail = parse_json(
         router
             .clone()
@@ -1537,8 +1553,9 @@ fn insights_flag_high_upload_from_recent_history_without_blocking() {
     let state = query_state();
     let snapshot = state.realtime_snapshot();
     let inner = state.lock();
+    let analytics = inner.storage.analytics();
     let items = crate::insights::detect_from_analytics(
-        inner.storage.analytics(),
+        &*analytics,
         inner.storage.metadata(),
         &snapshot,
         crate::insights::InsightWindow {
@@ -1728,17 +1745,15 @@ impl GeoProvider for TestGeoProvider {
         ip: IpAddr,
         lang: Option<&str>,
     ) -> Result<Option<netqmon_geo::GeoRecord>, netqmon_geo::GeoError> {
-        let country_name = if let Some(l) = lang {
-            if l.starts_with("zh") {
+        let us = "198.51.100.1".parse::<IpAddr>().unwrap();
+        let cn = "198.51.100.2".parse::<IpAddr>().unwrap();
+        if ip == us {
+            let country_name = if lang.is_some_and(|l| l.starts_with("zh")) {
                 "美国"
             } else {
                 "United States"
-            }
-        } else {
-            "United States"
-        };
-        Ok(
-            (ip == "198.51.100.1".parse::<IpAddr>().unwrap()).then(|| netqmon_geo::GeoRecord {
+            };
+            return Ok(Some(netqmon_geo::GeoRecord {
                 country_code: Some("US".to_owned()),
                 country_name: Some(country_name.to_owned()),
                 region: Some("California".to_owned()),
@@ -1747,8 +1762,23 @@ impl GeoProvider for TestGeoProvider {
                 longitude: Some(-118.2437),
                 asn: Some(64_496),
                 organization: Some("Example Network".to_owned()),
-            }),
-        )
+            }));
+        }
+        if ip == cn {
+            let country_name = if lang.is_some_and(|l| l.starts_with("zh")) {
+                "中国"
+            } else {
+                "China"
+            };
+            return Ok(Some(netqmon_geo::GeoRecord {
+                country_code: Some("CN".to_owned()),
+                country_name: Some(country_name.to_owned()),
+                asn: Some(64_497),
+                organization: Some("Example China Network".to_owned()),
+                ..netqmon_geo::GeoRecord::default()
+            }));
+        }
+        Ok(None)
     }
 
     fn is_enabled(&self) -> bool {
@@ -1804,10 +1834,34 @@ async fn destinations_are_enriched_by_the_configured_geo_provider() {
 async fn geo_summary_aggregates_country_and_asn_traffic() {
     let state = query_state();
     state.lock().geo_provider = Arc::new(TestGeoProvider);
+    let gateway_id = state.lock().gateway.as_ref().unwrap().gateway_id.clone();
+    let timestamp = test_now_ms();
+    seed_analytics(
+        &state,
+        13,
+        Vec::new(),
+        vec![traffic_delta(
+            &gateway_id,
+            timestamp,
+            FlowScope::Internet as u8,
+            Direction::Download as u8,
+            "unknown",
+            "unknown",
+            "unknown",
+            6,
+            vec![198, 51, 100, 2],
+            900,
+            1_000,
+        )],
+    );
     let response = internal_router(state.clone())
         .oneshot(
             Request::builder()
-                .uri("/internal/geo")
+                .uri(format!(
+                    "/internal/geo?from={}&to={}",
+                    test_query_from(),
+                    test_query_to()
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1817,14 +1871,11 @@ async fn geo_summary_aggregates_country_and_asn_traffic() {
     let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
     let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(value["data"]["enabled"], true);
-    assert_eq!(value["data"]["top_countries"][0]["country_code"], "US");
-    assert_eq!(
-        value["data"]["top_countries"][0]["country_name"],
-        "United States"
-    );
-    assert_eq!(value["data"]["top_countries"][0]["bytes"], 150);
-    assert_eq!(value["data"]["top_asns"][0]["asn"], 64_496);
-    assert_eq!(value["data"]["country_distribution"][0]["bytes"], 150);
+    assert_eq!(value["data"]["top_countries"][0]["country_code"], "CN");
+    assert_eq!(value["data"]["top_countries"][0]["country_name"], "China");
+    assert_eq!(value["data"]["top_countries"][0]["bytes"], 1_900);
+    assert_eq!(value["data"]["top_asns"][0]["asn"], 64_497);
+    assert_eq!(value["data"]["country_distribution"][0]["bytes"], 1_900);
 
     // Test with ?lang=zh-CN
     let response_zh = internal_router(state)
@@ -1839,7 +1890,7 @@ async fn geo_summary_aggregates_country_and_asn_traffic() {
     assert_eq!(response_zh.status(), StatusCode::OK);
     let body_zh = to_bytes(response_zh.into_body(), 16 * 1024).await.unwrap();
     let value_zh: serde_json::Value = serde_json::from_slice(&body_zh).unwrap();
-    assert_eq!(value_zh["data"]["top_countries"][0]["country_name"], "美国");
+    assert_eq!(value_zh["data"]["top_countries"][0]["country_name"], "中国");
 }
 
 #[tokio::test]
@@ -3868,8 +3919,9 @@ fn insights_detect_enhancements_from_backend_neutral_analytics() {
 
     let snapshot = state.realtime_snapshot();
     let inner = state.lock();
+    let analytics = inner.storage.analytics();
     let insights = detect_from_analytics(
-        inner.storage.analytics(),
+        &*analytics,
         inner.storage.metadata(),
         &snapshot,
         InsightWindow {

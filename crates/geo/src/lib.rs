@@ -347,6 +347,13 @@ fn merge_city(
         city.country.iso_code,
         resolve_names(&city.country.names, lang),
     );
+    if target.country_code.is_none() {
+        fill_country(
+            target,
+            city.registered_country.iso_code,
+            resolve_names(&city.registered_country.names, lang),
+        );
+    }
     target.region = target.region.take().or_else(|| {
         city.subdivisions
             .first()
@@ -383,6 +390,13 @@ fn merge_country(
         country.country.iso_code,
         resolve_names(&country.country.names, lang),
     );
+    if target.country_code.is_none() {
+        fill_country(
+            target,
+            country.registered_country.iso_code,
+            resolve_names(&country.registered_country.names, lang),
+        );
+    }
     Ok(())
 }
 
