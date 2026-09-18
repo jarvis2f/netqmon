@@ -8,9 +8,10 @@
       <env name="NETQMON_COLLECTOR_ENROLLMENT_TOKEN" value="netqmon-local-enrollment-token" />
       <env name="NETQMON_COLLECTOR_GEO_DIR" value="$PROJECT_DIR$/target/geo" />
       <env name="NETQMON_CLASSIFIER_SOCKET" value="/tmp/netqmon/classifierd.sock" />
-      <env name="NETQMON_DPI_ENABLED" value="false" />
+      <env name="NETQMON_DPI_ENABLED" value="true" />
       <env name="DYLD_LIBRARY_PATH" value="/opt/homebrew/lib:$DYLD_LIBRARY_PATH" />
       <env name="NETQMON_LICENSE_STATE_PATH" value="target/license.json" />
+      <env name="NETQMON_CLOUD_API_URL" value="http://127.0.0.1:8080" />
       <env name="RUST_LOG" value="info" />
     </envs>
     <option name="emulateTerminal" value="false" />
