@@ -664,6 +664,83 @@ async fn application_detail_filters_duplicate_unknown_rows_by_category() {
 }
 
 #[tokio::test]
+async fn unknown_application_does_not_associate_organization_from_flow_sessions() {
+    let state = query_state();
+    {
+        let inner = state.lock();
+        let connection = inner.storage.connection();
+        let gateway_id: String = connection
+            .query_row("SELECT id FROM gateways LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO traffic_application_minute
+                 (timestamp, gateway_id, application_id, category_id, upload_bytes, download_bytes, packets, flow_count)
+                 VALUES (1700000000000, ?1, 'unknown', 'web', 500, 500, 10, 1)",
+                [&gateway_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO flow_sessions
+                 (id, gateway_id, ip_version, protocol, client_ip, client_port, remote_ip, remote_port,
+                  direction, application_id, category_id, organization_id, upload_bytes, download_bytes,
+                  packets, started_at, last_seen_at, checkpointed_at)
+                 VALUES ('flow-apple-unknown', ?1, 4, 6, X'C000020A', 50001, X'C6336401', 443,
+                         1, 'unknown', 'web', 'apple', 500, 500, 10, 1700000000000, 1700000000000, 1700000000000)",
+                [&gateway_id],
+            )
+            .unwrap();
+    }
+
+    let router = internal_router(state);
+    let list_response = parse_json(
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/applications?limit=50&offset=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let items = list_response["data"].as_array().unwrap();
+    let unknown_app = items
+        .iter()
+        .find(|item| item["application_id"] == "unknown")
+        .expect("unknown application item");
+    assert!(
+        unknown_app["organization_id"].is_null(),
+        "unknown application should have null organization_id, got {:?}",
+        unknown_app["organization_id"]
+    );
+    assert!(
+        unknown_app["organization_name"].is_null(),
+        "unknown application should have null organization_name, got {:?}",
+        unknown_app["organization_name"]
+    );
+
+    let detail_response = parse_json(
+        router
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/applications/unknown?category=web")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(detail_response["data"]["application_id"], "unknown");
+    assert_eq!(detail_response["data"]["organization_id"], "unknown");
+    assert!(detail_response["data"]["organization_name"].is_null());
+}
+
+#[tokio::test]
 async fn traffic_scope_and_direction_filter_metrics_chart_and_breakdown_together() {
     let state = query_state();
     {

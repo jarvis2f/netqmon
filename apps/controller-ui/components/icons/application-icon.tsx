@@ -1,6 +1,7 @@
 "use client";
 
 import { dashboardIcons } from "@/lib/dashboard-icons";
+import { getCategoryIcon } from "@/lib/category-icons";
 import type { IconMetadata } from "@/lib/network-types";
 import { hasSimpleBrandIcon, SimpleBrandIcon } from "./simple-brand-icon";
 import {
@@ -12,14 +13,19 @@ import { LazyRemoteIcon } from "./lazy-remote-icon";
 
 export function ApplicationIcon({
   applicationId,
+  category,
   icon,
   size = "sm",
 }: {
   applicationId: string;
+  category?: string | null;
   icon?: IconMetadata | null;
   size?: IconSize;
 }) {
   if (!applicationId || applicationId === "unknown") {
+    if (category && category !== "unknown") {
+      return <IconFallback icon={getCategoryIcon(category)} size={size} />;
+    }
     return <IconFallback icon={dashboardIcons.unknown} size={size} />;
   }
   if (hasSimpleBrandIcon(icon?.local_fallback)) {

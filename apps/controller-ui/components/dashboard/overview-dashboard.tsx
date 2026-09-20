@@ -120,9 +120,11 @@ export function OverviewDashboard({ username }: { username: string }) {
   const [snapshot, setSnapshot] = useState<RealtimeSnapshot>(EMPTY_SNAPSHOT);
   const [deviceCount, setDeviceCount] = useState<number | null>(null);
   const [gatewayStatus, setGatewayStatus] = useState<
-    "online" | "offline" | "degraded"
-  >("offline");
-  const [streamConnected, setStreamConnected] = useState(false);
+    "online" | "offline" | "degraded" | "loading"
+  >("loading");
+  const [streamStatus, setStreamStatus] = useState<
+    "live" | "delayed" | "loading"
+  >("loading");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [topApplications, setTopApplications] = useState<RankItem[]>([]);
@@ -198,10 +200,14 @@ export function OverviewDashboard({ username }: { username: string }) {
         (left, right) => right[1] - left[1],
       );
       if (sorted.length <= 6)
-        return sorted.map(([id, value]) => ({ id, name: id, value }));
+        return sorted.map(([id, value]) => ({
+          id,
+          name: formatIdentifier(id),
+          value,
+        }));
       const visible = sorted
         .slice(0, 5)
-        .map(([id, value]) => ({ id, name: id, value }));
+        .map(([id, value]) => ({ id, name: formatIdentifier(id), value }));
       visible.push({
         id: "other",
         name: t("other"),
@@ -223,6 +229,8 @@ export function OverviewDashboard({ username }: { username: string }) {
           if (!current) return current;
           const online =
             Date.now() - next.generated_at <= current.offline_after_ms;
+          const nextStatus = online ? "online" : "offline";
+          setGatewayStatus(nextStatus);
           const health = next.gateway_health;
           const captureReasons = health
             ? [
@@ -321,11 +329,14 @@ export function OverviewDashboard({ username }: { username: string }) {
             (await overviewRes.json()) as ApiEnvelope<OverviewData>;
           if (mounted.current && payload.data) {
             setGateway(payload.data.gateway);
+            const rawStatus = payload.data.gateway_status;
+            const finalStatus: "online" | "offline" | "degraded" =
+              rawStatus === "online" || rawStatus === "degraded"
+                ? rawStatus
+                : "offline";
+            setGatewayStatus(finalStatus);
             applySnapshot(payload.data.realtime);
             setDeviceCount(payload.data.device_count);
-            setGatewayStatus(
-              payload.data.gateway_status as "online" | "offline" | "degraded",
-            );
           }
         }
 
@@ -366,6 +377,7 @@ export function OverviewDashboard({ username }: { username: string }) {
         if ((err as Error).name !== "AbortError" && mounted.current) {
           setError(t("loadError"));
           setGatewayStatus("offline");
+          setStreamStatus("delayed");
         }
       } finally {
         if (mounted.current) setLoading(false);
@@ -374,9 +386,16 @@ export function OverviewDashboard({ username }: { username: string }) {
 
     void loadOverview();
     const events = new EventSource("/api/realtime");
+    const streamTimeout = window.setTimeout(() => {
+      if (mounted.current) {
+        setStreamStatus((curr) => (curr === "loading" ? "delayed" : curr));
+      }
+    }, 8000);
+
     events.onopen = () => {
       if (!mounted.current) return;
-      setStreamConnected(true);
+      window.clearTimeout(streamTimeout);
+      setStreamStatus("live");
       setError(null);
     };
     events.addEventListener("snapshot", (event) => {
@@ -391,12 +410,13 @@ export function OverviewDashboard({ username }: { username: string }) {
       if (!mounted.current) return;
       try {
         const status = (JSON.parse(event.data) as { status?: string }).status;
-        setGatewayStatus(status === "online" ? "online" : "degraded");
+        const nextStatus = status === "online" ? "online" : "degraded";
+        setGatewayStatus(nextStatus);
         setGateway((current) =>
           current
             ? {
                 ...current,
-                status: status === "online" ? "online" : "degraded",
+                status: nextStatus,
               }
             : current,
         );
@@ -406,12 +426,13 @@ export function OverviewDashboard({ username }: { username: string }) {
     });
     events.onerror = () => {
       if (!mounted.current) return;
-      setStreamConnected(false);
+      setStreamStatus("delayed");
     };
 
     return () => {
       mounted.current = false;
       controller.abort();
+      window.clearTimeout(streamTimeout);
       events.close();
     };
   }, [applySnapshot, categoryItems, locale, rankItems, t]);
@@ -454,13 +475,18 @@ export function OverviewDashboard({ username }: { username: string }) {
     uploadBps: point.upload_bytes_per_second * 8,
   }));
 
+  const isLiveState: boolean | "loading" =
+    streamStatus === "loading"
+      ? "loading"
+      : streamStatus === "live" && gatewayStatus === "online";
+
   return (
     <AppLayout
       title={tNav("overview")}
       subtitle={t("subtitle")}
       gatewayStatus={gatewayStatus}
       gatewayName={gateway?.name}
-      isLive={streamConnected && gatewayStatus === "online"}
+      isLive={isLiveState}
       username={username}
       warningBanner={error}
     >

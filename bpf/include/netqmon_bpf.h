@@ -179,7 +179,7 @@ struct dns_event {
     __u32 packet_length;
     __u16 payload_length;
     __u8 ip_version;
-    __u8 reserved;
+    __u8 truncated;
     __u8 client_address[16];
     __u8 payload[DNS_MAX_PAYLOAD_LENGTH];
     __u32 reserved_tail;

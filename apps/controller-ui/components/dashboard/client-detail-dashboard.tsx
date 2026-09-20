@@ -157,6 +157,9 @@ export function ClientDetailDashboard({
   const [scope, setScope] = useState<Scope>("internet");
   const [scopeRates, setScopeRates] = useState<ScopedThroughput | null>(null);
 
+  const [lastSeen, setLastSeen] = useState(0);
+  const [now, setNow] = useState(0);
+
   const tabs: Array<{ id: Tab; label: string }> = [
     { id: "overview", label: t("detail.tabs.overview") },
     { id: "applications", label: t("detail.tabs.applications") },
@@ -164,6 +167,11 @@ export function ClientDetailDashboard({
     { id: "destinations", label: t("detail.tabs.destinations") },
     { id: "flows", label: t("detail.tabs.flows") },
   ];
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -238,13 +246,18 @@ export function ClientDetailDashboard({
       const addresses = new Set(
         data.detail.addresses.map((address) => address.ip),
       );
-      setActiveFlows(
-        snapshot.active_flows.filter(
-          (flow) =>
-            addresses.has(flow.client_ip) &&
-            (scope === "all" || flow.scope === scope),
-        ).length,
+      const matchingFlows = snapshot.active_flows.filter(
+        (flow) =>
+          addresses.has(flow.client_ip) &&
+          (scope === "all" || flow.scope === scope),
       );
+      setActiveFlows(matchingFlows.length);
+      if (
+        snapshot.clients[data.detail.client.mac] ||
+        matchingFlows.length > 0
+      ) {
+        setLastSeen((current) => Math.max(current, snapshot.generated_at));
+      }
       if (client)
         setRealtimePoints((points) =>
           [
@@ -277,7 +290,9 @@ export function ClientDetailDashboard({
 
   const client = data?.detail.client;
   const identityEvidence = client?.identity?.evidence ?? [];
-  const online = Boolean(streamConnected && realtime);
+  const effectiveLastSeen = Math.max(lastSeen, client?.last_seen ?? 0);
+  const online =
+    now > 0 && effectiveLastSeen > 0 && now - effectiveLastSeen <= 30_000;
   const downloadRate = splitBitrate(
     (realtime?.download_bytes_per_second ?? 0) * 8,
   );
@@ -616,7 +631,7 @@ export function ClientDetailDashboard({
           : t("detail.fallbackSubtitle")
       }
       username={username}
-      isLive={streamConnected && online}
+      isLive={streamConnected}
       headerActions={
         <Link
           href="/clients"

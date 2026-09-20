@@ -10,6 +10,7 @@ pub struct DnsEvent {
     pub ifindex: u32,
     pub packet_length: u32,
     pub client_address: IpAddr,
+    pub truncated: bool,
     pub payload: Vec<u8>,
 }
 
@@ -34,11 +35,13 @@ impl TryFrom<&[u8]> for DnsEvent {
             }
             version => return Err(DnsEventDecodeError::IpVersion(version)),
         };
+        let truncated = bytes[19] != 0;
         Ok(Self {
             timestamp_ns: u64::from_ne_bytes(bytes[0..8].try_into().expect("fixed slice")),
             ifindex: u32::from_ne_bytes(bytes[8..12].try_into().expect("fixed slice")),
             packet_length: u32::from_ne_bytes(bytes[12..16].try_into().expect("fixed slice")),
             client_address,
+            truncated,
             payload: bytes[36..36 + payload_length].to_vec(),
         })
     }
@@ -94,7 +97,17 @@ mod tests {
             event.client_address,
             "192.0.2.20".parse::<IpAddr>().unwrap()
         );
+        assert!(!event.truncated);
         assert_eq!(event.payload.len(), DNS_MAX_PAYLOAD_LENGTH);
+    }
+
+    #[test]
+    fn decodes_truncated_event() {
+        let mut bytes = event(4, 100);
+        bytes[19] = 1;
+        let event = DnsEvent::try_from(bytes.as_slice()).unwrap();
+        assert!(event.truncated);
+        assert_eq!(event.payload.len(), 100);
     }
 
     #[test]

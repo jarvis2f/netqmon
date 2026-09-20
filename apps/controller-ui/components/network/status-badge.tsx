@@ -13,7 +13,8 @@ export type EntityStatus =
   | "ended"
   | "unknown"
   | "live"
-  | "warning";
+  | "warning"
+  | "loading";
 
 interface StatusBadgeProps {
   status: EntityStatus;
@@ -79,6 +80,12 @@ const STATUS_CONFIG: Record<
     border: "border-border",
     dot: "bg-foreground-muted",
   },
+  loading: {
+    bg: "bg-surface-subtle text-foreground-muted",
+    text: "text-foreground-muted",
+    border: "border-border",
+    dot: "bg-foreground-muted animate-pulse",
+  },
 };
 
 /**
@@ -92,7 +99,7 @@ export function StatusBadge({ status, label, className }: StatusBadgeProps) {
   return (
     <span
       className={cn(
-        "inline-flex h-[22px] items-center gap-1.5 rounded-[5px] border px-2 text-[11px] font-medium tracking-tight",
+        "inline-flex h-[22px] items-center gap-1.5 rounded-[5px] border px-2 text-[11px] font-medium tracking-tight shrink-0 whitespace-nowrap",
         config.bg,
         config.border,
         className,
@@ -100,7 +107,7 @@ export function StatusBadge({ status, label, className }: StatusBadgeProps) {
       role="status"
     >
       <span className={cn("size-1.5 rounded-full shrink-0", config.dot)} />
-      <span>{displayLabel}</span>
+      <span className="whitespace-nowrap">{displayLabel}</span>
     </span>
   );
 }
@@ -124,7 +131,7 @@ export function DotStatus({
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1.5 text-xs text-foreground-secondary",
+        "inline-flex items-center gap-1.5 text-xs text-foreground-secondary shrink-0 whitespace-nowrap",
         className,
       )}
       role="status"
@@ -133,7 +140,7 @@ export function DotStatus({
         className={cn("size-1.5 rounded-full shrink-0", config.dot)}
         aria-hidden="true"
       />
-      <span className="tabular-nums">{displayLabel}</span>
+      <span className="tabular-nums whitespace-nowrap">{displayLabel}</span>
     </span>
   );
 }

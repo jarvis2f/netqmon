@@ -29,7 +29,7 @@ use crate::device::DeviceObservationCache;
 use crate::dhcp::{DEFAULT_LEASE_PATH, parse_packet, read_leases};
 use crate::dhcp_event::DhcpEvent;
 use crate::discovery;
-use crate::dns_event::DnsEvent;
+use crate::dns_event::{DNS_MAX_PAYLOAD_LENGTH, DnsEvent};
 use crate::dns_observation::observations;
 use crate::dns_parser::parse_response;
 use crate::flow::{FlowCounters, FlowKey, FlowRuntime};
@@ -312,13 +312,17 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                     log_debug(
                         dns_log_level,
                         format_args!(
-                            "dns event ip={} client={} packet_length={} payload_length={}",
+                            "dns event ip={} client={} packet_length={} payload_length={} truncated={}",
                             if event.client_address.is_ipv4() { 4 } else { 6 },
                             event.client_address,
                             event.packet_length,
-                            event.payload.len()
+                            event.payload.len(),
+                            event.truncated
                         ),
                     );
+                    let is_truncated = event.truncated
+                        || (event.payload.len() >= DNS_MAX_PAYLOAD_LENGTH
+                            && event.packet_length > DNS_MAX_PAYLOAD_LENGTH as u32);
                     let observed_at = std::time::SystemTime::now();
                     let parsed = parse_response(&event.payload);
                     drop(event.payload);
@@ -356,10 +360,22 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                                 }
                             }
                         }
-                        Err(error) => log_warn(
-                            dns_log_level,
-                            format_args!("DNS response parse failed: {error}"),
-                        ),
+                        Err(error) => {
+                            if is_truncated {
+                                log_debug(
+                                    dns_log_level,
+                                    format_args!(
+                                        "truncated DNS response parse failed: {error} (client={} packet_length={})",
+                                        event.client_address, event.packet_length
+                                    ),
+                                );
+                            } else {
+                                log_warn(
+                                    dns_log_level,
+                                    format_args!("DNS response parse failed: {error}"),
+                                );
+                            }
+                        }
                     }
                 }
                 Err(error) => log_warn(
@@ -584,7 +600,7 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                 );
                 let failures = std::mem::take(&mut processor.failures_since_report);
                 if failures != 0 {
-                    log_warn(
+                    log_debug(
                         log_level,
                         format_args!(
                             "device discovery parse/decode failures in last 30s: {failures}; totals: {:?}",

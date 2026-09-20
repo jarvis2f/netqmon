@@ -35,6 +35,8 @@
       "warning": "Warning",
       "live": "LIVE",
       "delayed": "Delayed",
+      "loading": "Loading",
+      "connecting": "Connecting",
       "review": "Review",
       "clear": "Clear"
     },

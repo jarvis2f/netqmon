@@ -16,7 +16,12 @@ export function ApplicationIdentity({
   const unknown = id === "unknown";
   return (
     <div className="flex min-w-0 items-center gap-2.5">
-      <ApplicationIcon applicationId={id} icon={icon} size="md" />
+      <ApplicationIcon
+        applicationId={id}
+        category={category}
+        icon={icon}
+        size="md"
+      />
       <div className="min-w-0">
         <div className="truncate font-medium text-foreground">
           {unknown ? "Unknown" : name || formatIdentifier(id)}

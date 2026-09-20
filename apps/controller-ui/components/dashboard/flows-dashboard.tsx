@@ -6,6 +6,7 @@ import { ExternalLink } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { AppLayout } from "@/components/app-shell/app-layout";
 import { ApplicationIcon } from "@/components/icons/application-icon";
+import { CategoryIcon } from "@/components/icons/category-icon";
 import { ClientDeviceIcon } from "@/components/icons/client-device-icon";
 import { ProtocolIcon } from "@/components/icons/protocol-icon";
 import {
@@ -468,6 +469,7 @@ export function FlowsDashboard(props: Props) {
             client={{
               name: row.client_name ?? row.client_ip,
               mac: row.client_mac,
+              identity: row.client_identity,
             }}
             size="md"
           />
@@ -498,7 +500,14 @@ export function FlowsDashboard(props: Props) {
         return (
           <div className="flex min-w-0 items-center gap-2">
             {applicationId !== "unknown" ? (
-              <ApplicationIcon applicationId={applicationId} size="md" />
+              <ApplicationIcon
+                applicationId={applicationId}
+                category={row.category}
+                icon={row.icon}
+                size="md"
+              />
+            ) : row.category && row.category !== "unknown" ? (
+              <CategoryIcon category={row.category} size="md" />
             ) : (
               <ProtocolIcon protocol={row.protocol_id ?? "unknown"} size="md" />
             )}

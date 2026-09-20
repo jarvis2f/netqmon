@@ -990,15 +990,16 @@ fn query_client_flows(
             let client_ip: Vec<u8> = row.get(1)?;
             let remote_ip: Vec<u8> = row.get(3)?;
             let application = row.get::<_, String>(8)?;
-            let application_name = classifier
-                .application_metadata(&application)
+            let application_metadata = classifier.application_metadata(&application);
+            let application_name = application_metadata
                 .as_ref()
                 .map(|metadata| metadata.name.clone());
+            let icon = icon_json(application_metadata);
             Ok(json!({
             "id": row.get::<_, String>(0)?, "client_ip": format_ip(&client_ip), "client_port": row.get::<_, i64>(2)?,
             "remote_ip": format_ip(&remote_ip), "remote_port": row.get::<_, i64>(4)?, "protocol": row.get::<_, i64>(5)?,
             "direction": row.get::<_, i64>(6)?, "domain": row.get::<_, Option<String>>(7)?,
-            "application": application, "application_name": application_name, "category": row.get::<_, String>(9)?,
+            "application": application, "application_name": application_name, "icon": icon, "category": row.get::<_, String>(9)?,
             "confidence": row.get::<_, f64>(10)?, "reason": row.get::<_, String>(11)?,
             "upload_bytes": row.get::<_, i64>(12)?, "download_bytes": row.get::<_, i64>(13)?,
             "packets": row.get::<_, i64>(14)?, "started_at": row.get::<_, i64>(15)?,
@@ -1035,10 +1036,13 @@ async fn applications(
                     SUM(t.packets), SUM(t.flow_count), MAX(t.timestamp),
                     (SELECT COUNT(DISTINCT f.device_id) FROM flow_sessions f
                      WHERE f.application_id = t.application_id AND f.device_id IS NOT NULL),
-                    (SELECT f.organization_id FROM flow_sessions f
-                     WHERE f.application_id = t.application_id
-                       AND f.organization_id IS NOT NULL AND f.organization_id != 'unknown'
-                     LIMIT 1)
+                    CASE
+                        WHEN t.application_id = 'unknown' THEN NULL
+                        ELSE (SELECT f.organization_id FROM flow_sessions f
+                              WHERE f.application_id = t.application_id
+                                AND f.organization_id IS NOT NULL AND f.organization_id != 'unknown'
+                              LIMIT 1)
+                    END
              FROM traffic_application_minute t GROUP BY t.application_id, t.category_id
              ORDER BY SUM(t.upload_bytes + t.download_bytes) DESC, t.application_id
              LIMIT ?1 OFFSET ?2",
@@ -1047,7 +1051,11 @@ async fn applications(
             .query_map(params![i64::from(page.limit), to_i64(page.offset)], |row| {
                 let application_id = row.get::<_, String>(0)?;
                 let application_metadata = inner.classifier.application_metadata(&application_id);
-                let organization_id = row.get::<_, Option<String>>(8)?;
+                let organization_id = if application_id == "unknown" {
+                    None
+                } else {
+                    row.get::<_, Option<String>>(8)?
+                };
                 let organization_metadata = organization_id
                     .as_deref()
                     .filter(|id| !id.is_empty() && *id != "unknown")
@@ -1214,7 +1222,7 @@ async fn application_detail(
                         COUNT(DISTINCT hex(remote_ip)), AVG(COALESCE(classification_confidence, 0)),
                         COALESCE(MAX(classification_reason), 'no matching rule'),
                         COALESCE(MAX(CASE
-                            WHEN organization_id IS NOT NULL AND organization_id != 'unknown'
+                            WHEN ?1 != 'unknown' AND organization_id IS NOT NULL AND organization_id != 'unknown'
                             THEN organization_id
                         END), 'unknown')
                  FROM flow_sessions
@@ -1234,6 +1242,11 @@ async fn application_detail(
             );
             match classifier {
                 Ok((clients, domains, destinations, confidence, reason, organization)) => {
+                    let organization = if id == "unknown" {
+                        "unknown".to_owned()
+                    } else {
+                        organization
+                    };
                     let observed_protocols = query_application_protocols(connection, &id, category)
                         .unwrap_or_else(|_| Vec::new());
                     let application_metadata = inner.classifier.application_metadata(&id);
@@ -2106,6 +2119,7 @@ fn query_flow_page(
                 f.classification_reason, f.classification_evidence_json, f.upload_bytes,
                 f.download_bytes, f.packets, f.started_at, f.last_seen_at, f.ended_at,
                 f.device_id, COALESCE(d.display_name, d.hostname, ''), d.mac,
+                d.device_type, d.model, d.vendor, d.os_family,
                 f.scope, f.path_type, f.nat, f.source_segment, f.destination_segment, {}
          FROM flow_sessions f LEFT JOIN devices d ON d.id = f.device_id{where_clause}
          ORDER BY {} {order}, f.id ASC LIMIT ?",
@@ -2302,10 +2316,11 @@ fn flow_row_json(
     let application = row
         .get::<_, Option<String>>(9)?
         .unwrap_or_else(|| "unknown".to_owned());
-    let application_name = classifier
-        .application_metadata(&application)
+    let application_metadata = classifier.application_metadata(&application);
+    let application_name = application_metadata
         .as_ref()
         .map(|metadata| metadata.name.clone());
+    let icon = icon_json(application_metadata);
     Ok(json!({
         "id": row.get::<_, String>(0)?, "client_ip": format_ip(&client_ip),
         "client_port": row.get::<_, i64>(2)?, "remote_ip": format_ip(&remote_ip),
@@ -2314,6 +2329,7 @@ fn flow_row_json(
         "organization": row.get::<_, Option<String>>(8)?.unwrap_or_else(|| "unknown".to_owned()),
         "application": application,
         "application_name": application_name,
+        "icon": icon,
         "category": row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "unknown".to_owned()),
         "traffic_role": row.get::<_, Option<String>>(11)?.unwrap_or_else(|| "unknown".to_owned()),
         "protocol_id": row.get::<_, Option<String>>(12)?.unwrap_or_else(|| "unknown".to_owned()),
@@ -2328,12 +2344,18 @@ fn flow_row_json(
         "last_seen": row.get::<_, i64>(23)?, "ended_at": row.get::<_, Option<i64>>(24)?,
         "client_id": row.get::<_, Option<i64>>(25)?, "client_name": row.get::<_, String>(26)?,
         "client_mac": row.get::<_, Option<Vec<u8>>>(27)?.map(|mac| format_mac(&mac)),
-        "scope": flow_scope_name(row.get::<_, i32>(28)?),
-        "path_type": flow_path_name(row.get::<_, i32>(29)?),
-        "nat": flow_nat_name(row.get::<_, i32>(30)?),
-        "source_segment": row.get::<_, String>(31)?,
-        "destination_segment": row.get::<_, String>(32)?,
-        "cursor_value": row.get::<_, i64>(33)?,
+        "client_identity": {
+            "device_type": row.get::<_, Option<String>>(28)?,
+            "model": row.get::<_, Option<String>>(29)?,
+            "vendor": row.get::<_, Option<String>>(30)?,
+            "os_family": row.get::<_, Option<String>>(31)?,
+        },
+        "scope": flow_scope_name(row.get::<_, i32>(32)?),
+        "path_type": flow_path_name(row.get::<_, i32>(33)?),
+        "nat": flow_nat_name(row.get::<_, i32>(34)?),
+        "source_segment": row.get::<_, String>(35)?,
+        "destination_segment": row.get::<_, String>(36)?,
+        "cursor_value": row.get::<_, i64>(37)?,
     }))
 }
 

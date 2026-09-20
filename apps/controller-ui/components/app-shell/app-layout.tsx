@@ -10,8 +10,8 @@ interface AppLayoutProps {
   title?: string;
   subtitle?: string;
   gatewayName?: string;
-  gatewayStatus?: "online" | "offline" | "degraded";
-  isLive?: boolean;
+  gatewayStatus?: "online" | "offline" | "degraded" | "loading";
+  isLive?: boolean | "loading";
   username?: string;
   toolbar?: React.ReactNode;
   warningBanner?: string | React.ReactNode;

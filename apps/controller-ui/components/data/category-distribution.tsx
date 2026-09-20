@@ -1,13 +1,17 @@
 "use client";
 
+import React, { useState } from "react";
 import { useTranslations } from "next-intl";
 import { formatBytes, formatPercent } from "@/lib/formatters";
 import { cn } from "@/lib/utils";
+import { CategoryIcon } from "@/components/icons/category-icon";
+import { CountryFlag } from "@/components/icons/country-flag";
 
 export interface CategoryItem {
   id: string;
   name: string;
   value: number;
+  icon?: React.ReactNode;
 }
 
 interface CategoryDistributionProps {
@@ -28,6 +32,10 @@ const COLORS = [
   "var(--foreground-muted)",
 ];
 
+function isCountryCode(id: string) {
+  return /^[a-zA-Z]{2}$/.test(id.trim());
+}
+
 export function CategoryDistribution({
   items,
   loading = false,
@@ -39,6 +47,7 @@ export function CategoryDistribution({
   const tOverview = useTranslations("overview");
   const tTraffic = useTranslations("traffic.columns");
   const tApps = useTranslations("applications");
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
 
   const displayTitle = title ?? tOverview("categoryDistribution");
   const displayEmptyMessage = emptyMessage ?? tApps("notFoundEmpty");
@@ -47,31 +56,34 @@ export function CategoryDistribution({
     return (
       <section
         className={cn(
-          "rounded-md border border-border bg-surface",
+          "flex flex-col rounded-md border border-border bg-surface select-none",
           compact ? "p-3" : "p-4",
           className,
         )}
         aria-label="Loading category distribution"
       >
-        <div className="h-4 w-36 animate-pulse rounded bg-surface-subtle" />
-        <div
-          className={cn(
-            "flex items-center",
-            compact ? "mt-2 gap-4" : "mt-4 gap-8",
-          )}
-        >
-          <div
-            className={cn(
-              "animate-pulse rounded-full bg-surface-subtle",
-              compact ? "size-24" : "size-36",
-            )}
-          />
-          <div className={cn("flex-1", compact ? "space-y-2" : "space-y-3")}>
-            {Array.from({ length: 4 }).map((_, index) => (
-              <div
-                key={index}
-                className="h-3 animate-pulse rounded bg-surface-subtle"
-              />
+        <div className="flex items-center justify-between pb-2 border-b border-border/60">
+          <div className="h-4 w-32 animate-pulse rounded bg-surface-subtle" />
+          <div className="h-3 w-16 animate-pulse rounded bg-surface-subtle" />
+        </div>
+        <div className="flex flex-1 flex-col sm:flex-row items-center gap-5 mt-3">
+          <div className="flex items-center justify-center shrink-0 my-auto">
+            <div
+              className={cn(
+                "animate-pulse rounded-full bg-surface-subtle shrink-0",
+                compact ? "size-24" : "size-32",
+              )}
+            />
+          </div>
+          <div className="flex-1 w-full space-y-2.5 my-auto">
+            {Array.from({ length: compact ? 4 : 5 }).map((_, index) => (
+              <div key={index} className="space-y-1">
+                <div className="flex items-center justify-between">
+                  <div className="h-3 w-24 animate-pulse rounded bg-surface-subtle" />
+                  <div className="h-3 w-12 animate-pulse rounded bg-surface-subtle" />
+                </div>
+                <div className="h-1.5 w-full animate-pulse rounded bg-surface-subtle" />
+              </div>
             ))}
           </div>
         </div>
@@ -84,18 +96,20 @@ export function CategoryDistribution({
     return (
       <section
         className={cn(
-          "rounded-md border border-border bg-surface",
+          "flex flex-col rounded-md border border-border bg-surface select-none",
           compact ? "p-3" : "p-4",
           className,
         )}
       >
-        <h3 className="text-xs font-semibold tracking-tight text-foreground">
-          {displayTitle}
-        </h3>
+        <div className="flex items-center justify-between pb-2 border-b border-border/60">
+          <h3 className="text-xs font-semibold tracking-tight text-foreground">
+            {displayTitle}
+          </h3>
+        </div>
         <div
           className={cn(
-            "flex items-center justify-center rounded border border-dashed border-border text-xs text-foreground-muted",
-            compact ? "mt-2 h-28" : "mt-3 h-44",
+            "flex flex-1 items-center justify-center rounded border border-dashed border-border text-xs text-foreground-muted",
+            compact ? "mt-2 min-h-36" : "mt-3 min-h-48",
           )}
         >
           {displayEmptyMessage}
@@ -120,91 +134,163 @@ export function CategoryDistribution({
     .map((item) => `${item.name} ${formatPercent(item.percentage, 0)}`)
     .join(", ");
 
+  const donutSize = compact ? 100 : 132;
+  const radius = 15.9;
+  const strokeWidth = compact ? 4.5 : 5;
+
   return (
     <section
       className={cn(
-        "rounded-md border border-border bg-surface",
+        "flex flex-col rounded-md border border-border bg-surface select-none",
         compact ? "p-3" : "p-4",
         className,
       )}
       aria-label={`Category distribution. ${summary}`}
     >
-      <h3 className="text-xs font-semibold tracking-tight text-foreground">
-        {displayTitle}
-      </h3>
+      {/* Header */}
+      <div className="flex items-center justify-between pb-2 border-b border-border/60 shrink-0">
+        <h3 className="text-xs font-semibold tracking-tight text-foreground">
+          {displayTitle}
+        </h3>
+        <span className="text-[11px] font-medium text-foreground-muted tabular-nums">
+          {tTraffic("total")}:{" "}
+          <span className="font-semibold text-foreground">
+            {formatBytes(total)}
+          </span>
+        </span>
+      </div>
+
+      {/* Main Content: Left-Right Layout */}
       <div
         className={cn(
-          "grid items-center",
-          compact
-            ? "mt-2 gap-3 sm:grid-cols-[112px_1fr]"
-            : "mt-3 gap-5 sm:grid-cols-[160px_1fr]",
+          "flex flex-1 flex-col sm:flex-row items-center mt-3 min-h-0",
+          compact ? "gap-3 sm:gap-4" : "gap-5",
         )}
       >
-        <div
-          className={cn("relative mx-auto", compact ? "size-28" : "size-36")}
-        >
-          <svg
-            viewBox="0 0 42 42"
-            className="size-full -rotate-90"
-            role="img"
-            aria-label={summary}
+        {/* Left: Donut Chart Centered */}
+        <div className="flex items-center justify-center shrink-0 my-auto">
+          <div
+            className="relative shrink-0"
+            style={{ width: donutSize, height: donutSize }}
           >
-            <circle
-              cx="21"
-              cy="21"
-              r="15.9"
-              fill="none"
-              stroke="var(--surface-subtle)"
-              strokeWidth="5"
-            />
-            {segments.map((item) => (
+            <svg
+              viewBox="0 0 42 42"
+              className="size-full -rotate-90"
+              role="img"
+              aria-label={summary}
+            >
               <circle
-                key={item.id}
                 cx="21"
                 cy="21"
-                r="15.9"
+                r={radius}
                 fill="none"
-                pathLength="100"
-                stroke={item.color}
-                strokeWidth="5"
-                strokeDasharray={`${item.percentage * 100} ${100 - item.percentage * 100}`}
-                strokeDashoffset={-item.offset}
+                stroke="var(--surface-subtle)"
+                strokeWidth={strokeWidth}
               />
-            ))}
-          </svg>
-          <div className="absolute inset-0 flex flex-col items-center justify-center text-center">
-            <span className="text-[10px] font-semibold uppercase tracking-wider text-foreground-muted">
-              {tTraffic("total")}
-            </span>
-            <span
-              className={cn(
-                "font-semibold tabular-nums text-foreground",
-                compact ? "mt-0 text-xs" : "mt-0.5 text-sm",
-              )}
-            >
-              {formatBytes(total)}
-            </span>
+              {segments.map((item) => {
+                const isHovered = hoveredId === item.id;
+                const hasHover = Boolean(hoveredId);
+                return (
+                  <circle
+                    key={item.id}
+                    cx="21"
+                    cy="21"
+                    r={radius}
+                    fill="none"
+                    pathLength="100"
+                    stroke={item.color}
+                    strokeWidth={isHovered ? strokeWidth + 1.5 : strokeWidth}
+                    strokeDasharray={`${item.percentage * 100} ${100 - item.percentage * 100}`}
+                    strokeDashoffset={-item.offset}
+                    className="transition-all duration-200"
+                    style={{
+                      opacity: hasHover && !isHovered ? 0.45 : 1,
+                    }}
+                    onMouseEnter={() => setHoveredId(item.id)}
+                    onMouseLeave={() => setHoveredId(null)}
+                  />
+                );
+              })}
+            </svg>
+            <div className="absolute inset-0 flex flex-col items-center justify-center text-center pointer-events-none">
+              <span className="text-[9px] font-medium uppercase tracking-wider text-foreground-muted truncate max-w-[70px]">
+                {segments[0]?.name ?? tTraffic("total")}
+              </span>
+              <span
+                className={cn(
+                  "font-semibold tabular-nums text-foreground",
+                  compact ? "text-xs" : "text-sm",
+                )}
+              >
+                {formatPercent(segments[0]?.percentage ?? 0, 0)}
+              </span>
+            </div>
           </div>
         </div>
-        <ol className={compact ? "space-y-1.5" : "space-y-2.5"}>
-          {segments.map((item) => (
-            <li
-              key={item.id}
-              className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 text-xs"
-            >
-              <span
-                className="size-2 rounded-sm"
-                style={{ backgroundColor: item.color }}
-                aria-hidden="true"
-              />
-              <span className="truncate font-medium text-foreground-secondary">
-                {item.name}
-              </span>
-              <span className="font-mono tabular-nums text-foreground">
-                {formatPercent(item.percentage, 0)}
-              </span>
-            </li>
-          ))}
+
+        {/* Right: Detailed Distribution List */}
+        <ol className="flex flex-1 flex-col justify-center space-y-2 w-full min-w-0 my-auto">
+          {segments.map((item) => {
+            const isCountry = isCountryCode(item.id);
+            const isHovered = hoveredId === item.id;
+            const hasHover = Boolean(hoveredId);
+
+            return (
+              <li
+                key={item.id}
+                className={cn(
+                  "group flex flex-col gap-1 rounded-sm px-1.5 py-0.5 transition-colors cursor-default",
+                  isHovered
+                    ? "bg-surface-hover/70"
+                    : "hover:bg-surface-hover/40",
+                )}
+                style={{
+                  opacity: hasHover && !isHovered ? 0.6 : 1,
+                }}
+                onMouseEnter={() => setHoveredId(item.id)}
+                onMouseLeave={() => setHoveredId(null)}
+              >
+                <div className="flex items-center justify-between text-xs">
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    <span
+                      className="size-2 shrink-0 rounded-sm"
+                      style={{ backgroundColor: item.color }}
+                      aria-hidden="true"
+                    />
+                    <span className="shrink-0 flex items-center justify-center">
+                      {item.icon ??
+                        (isCountry ? (
+                          <CountryFlag code={item.id} size="sm" />
+                        ) : (
+                          <CategoryIcon category={item.id} size="sm" />
+                        ))}
+                    </span>
+                    <span className="truncate font-medium text-foreground-secondary group-hover:text-foreground">
+                      {item.name}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2 pl-2 shrink-0">
+                    <span className="text-[11px] tabular-nums text-foreground-muted">
+                      {formatBytes(item.value)}
+                    </span>
+                    <span className="w-9 text-right font-mono text-[11px] tabular-nums font-semibold text-foreground">
+                      {formatPercent(item.percentage, 0)}
+                    </span>
+                  </div>
+                </div>
+                {/* Progress track */}
+                <div className="h-1 w-full rounded-full bg-surface-subtle overflow-hidden">
+                  <div
+                    className="h-full rounded-full transition-all duration-300"
+                    style={{
+                      width: `${Math.max(item.percentage * 100, 1.5)}%`,
+                      backgroundColor: item.color,
+                    }}
+                  />
+                </div>
+              </li>
+            );
+          })}
         </ol>
       </div>
     </section>

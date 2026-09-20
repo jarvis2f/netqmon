@@ -118,6 +118,12 @@ export interface FlowSummary {
   client_id?: number | null;
   client_name?: string;
   client_mac?: string | null;
+  client_identity?: {
+    device_type?: string | null;
+    model?: string | null;
+    vendor?: string | null;
+    os_family?: string | null;
+  } | null;
   client_ip: string;
   client_port: number;
   remote_ip: string;
@@ -128,6 +134,7 @@ export interface FlowSummary {
   organization?: string;
   application: string;
   application_name?: string | null;
+  icon?: IconMetadata | null;
   category: string;
   traffic_role?: string;
   protocol_id?: string;

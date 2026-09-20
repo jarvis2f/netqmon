@@ -210,6 +210,7 @@ static __always_inline void maybe_capture_dns(struct __sk_buff *skb,
     __u64 capture_length;
     __u32 payload_offset;
     __u16 udp_length;
+    __u8 truncated = 0;
 
     if ((void *)(udp + 1) > data_end || netqmon_ntohs(udp->source) != DNS_PORT)
         return;
@@ -219,13 +220,17 @@ static __always_inline void maybe_capture_dns(struct __sk_buff *skb,
         return;
     capture_length = udp_length - sizeof(struct udp_header);
     available = (__u32)((__u8 *)data_end - payload);
-    if (capture_length > available)
+    if (capture_length > available) {
         capture_length = available;
+        truncated = 1;
+    }
     asm volatile("" : "+r"(capture_length));
     if (capture_length == 0)
         return;
-    if (capture_length > DNS_MAX_PAYLOAD_LENGTH)
+    if (capture_length > DNS_MAX_PAYLOAD_LENGTH) {
         capture_length = DNS_MAX_PAYLOAD_LENGTH;
+        truncated = 1;
+    }
     /* Preserve 1..512 while making the range explicit to older verifiers. */
     capture_length = ((capture_length - 1) &
                       (DNS_MAX_PAYLOAD_LENGTH - 1)) + 1;
@@ -247,6 +252,7 @@ static __always_inline void maybe_capture_dns(struct __sk_buff *skb,
     event->packet_length = skb->len;
     event->payload_length = capture_length;
     event->ip_version = ip_version;
+    event->truncated = truncated;
     if (ip_version == 4)
         __builtin_memcpy(event->client_address, client_address, 4);
     else

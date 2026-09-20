@@ -56,7 +56,7 @@ const NAV_ITEMS: NavItem[] = [
 interface SidebarProps {
   mobileOpen?: boolean;
   onMobileClose?: () => void;
-  gatewayStatus?: "online" | "offline" | "degraded";
+  gatewayStatus?: "online" | "offline" | "degraded" | "loading";
 }
 
 const SIDEBAR_COLLAPSED_KEY = "netqmon_sidebar_collapsed";
@@ -85,6 +85,7 @@ export function Sidebar({
   gatewayStatus = "online",
 }: SidebarProps) {
   const t = useTranslations("navigation");
+  const tCommon = useTranslations("common");
   const pathname = usePathname();
   const reduce = useReducedMotion();
   const mobilePanelRef = useRef<HTMLElement>(null);
@@ -208,25 +209,31 @@ export function Sidebar({
   };
 
   const statusColor =
-    gatewayStatus === "online"
-      ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]"
-      : gatewayStatus === "degraded"
-        ? "bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.4)]"
-        : "bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.4)]";
+    gatewayStatus === "loading"
+      ? "bg-foreground-muted animate-pulse shadow-[0_0_8px_rgba(150,150,150,0.4)]"
+      : gatewayStatus === "online"
+        ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]"
+        : gatewayStatus === "degraded"
+          ? "bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.4)]"
+          : "bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.4)]";
 
   const statusTitle =
-    gatewayStatus === "online"
-      ? t("statusNormal")
-      : gatewayStatus === "degraded"
-        ? t("statusDegraded")
-        : t("statusOffline");
+    gatewayStatus === "loading"
+      ? tCommon("status.loading")
+      : gatewayStatus === "online"
+        ? t("statusNormal")
+        : gatewayStatus === "degraded"
+          ? t("statusDegraded")
+          : t("statusOffline");
 
   const statusDesc =
-    gatewayStatus === "online"
-      ? t("statusNormalDesc")
-      : gatewayStatus === "degraded"
-        ? t("statusDegradedDesc")
-        : t("statusOfflineDesc");
+    gatewayStatus === "loading"
+      ? tCommon("status.connecting")
+      : gatewayStatus === "online"
+        ? t("statusNormalDesc")
+        : gatewayStatus === "degraded"
+          ? t("statusDegradedDesc")
+          : t("statusOfflineDesc");
 
   const sidebarContent = (
     <div className="flex h-full flex-col justify-between p-2.5">

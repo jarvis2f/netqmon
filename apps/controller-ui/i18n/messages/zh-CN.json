@@ -35,6 +35,8 @@
       "warning": "警告",
       "live": "实时",
       "delayed": "延迟",
+      "loading": "加载中",
+      "connecting": "连接中",
       "review": "需复核",
       "clear": "正常"
     },

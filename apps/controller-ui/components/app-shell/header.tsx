@@ -1,7 +1,16 @@
 "use client";
 
 import React, { useState } from "react";
-import { Menu, Sun, Moon, Laptop, LogOut, User, Server } from "lucide-react";
+import {
+  Menu,
+  Sun,
+  Moon,
+  Laptop,
+  LogOut,
+  User,
+  Server,
+  Loader2,
+} from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useTranslations } from "next-intl";
 import { useTheme } from "@/components/theme-provider";
@@ -12,8 +21,8 @@ interface HeaderProps {
   title?: string;
   subtitle?: string;
   gatewayName?: string;
-  gatewayStatus?: "online" | "offline" | "degraded";
-  isLive?: boolean;
+  gatewayStatus?: "online" | "offline" | "degraded" | "loading";
+  isLive?: boolean | "loading";
   username?: string;
   onMobileMenuToggle?: () => void;
   actions?: React.ReactNode;
@@ -82,7 +91,11 @@ export function Header({
         {/* Gateway Status Badge */}
         <div
           className="hidden md:flex items-center gap-1.5 px-2 py-1 rounded-md border border-border bg-surface-subtle text-xs text-foreground-secondary"
-          title={`Connected to ${gatewayName}`}
+          title={
+            gatewayStatus === "loading"
+              ? t("status.loading")
+              : `Connected to ${gatewayName}`
+          }
         >
           <Server className="size-3.5 text-foreground-muted" />
           <span className="font-medium truncate max-w-[120px]">
@@ -96,7 +109,15 @@ export function Header({
 
         {/* Realtime Live Indicator */}
         <div className="flex items-center">
-          {isLive ? (
+          {isLive === "loading" ? (
+            <span
+              className="inline-flex h-[22px] items-center gap-1.5 rounded-[5px] border border-border bg-surface-subtle px-2 text-[11px] font-medium text-foreground-muted"
+              title="Connecting to Realtime Stream..."
+            >
+              <Loader2 className="size-2.5 animate-spin text-foreground-muted" />
+              <span>{t("status.connecting")}</span>
+            </span>
+          ) : isLive ? (
             <span
               className="inline-flex h-[22px] items-center gap-1.5 rounded-[5px] border border-success/30 bg-success-soft px-2 text-[11px] font-medium text-success"
               title="Realtime SSE Stream Active"
