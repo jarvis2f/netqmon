@@ -458,6 +458,7 @@ export function DestinationsDashboard({
               />
               <CategoryDistribution
                 compact
+                variant="country"
                 title={t("countryDistribution")}
                 items={countryDistribution}
                 loading={loading}

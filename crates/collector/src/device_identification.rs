@@ -89,9 +89,17 @@ impl DeviceIdentifier {
         let inputs = latest
             .iter()
             .enumerate()
-            .map(|(index, observation)| DeviceFingerprintInput {
-                entry_id: index.to_string(),
-                evidence: observation_device_inputs(observation),
+            .map(|(index, observation)| {
+                let mut evidence = observation_device_inputs(observation);
+                if !is_locally_administered(&observation.mac) {
+                    if let Some(vendor) = self.mac_dataset.lookup(&observation.mac) {
+                        evidence.push(device_text_input("mac_vendor", vendor));
+                    }
+                }
+                DeviceFingerprintInput {
+                    entry_id: index.to_string(),
+                    evidence,
+                }
             })
             .collect();
         let mut matches = classifier.classify_devices(inputs).unwrap_or_else(|error| {
@@ -1102,6 +1110,35 @@ mod tests {
                 .iter()
                 .any(|item| item.source == "mac_random")
         );
+    }
+
+    #[test]
+    fn identify_batch_supplies_mac_vendor_to_classifier() {
+        let dataset = MacPrefixDataset::from_ieee_oui(
+            "24-0A-C4 (hex)\t\tEspressif Inc.\n",
+            "http://example.test/oui.txt",
+        )
+        .unwrap();
+        let identifier = DeviceIdentifier {
+            mac_dataset: dataset,
+        };
+        let observation = DeviceObservation {
+            mac: vec![0x24, 0x0a, 0xc4, 0x01, 0x02, 0x03],
+            ip: vec![192, 168, 1, 100],
+            hostname: String::new(),
+            last_seen_unix_ms: 100,
+            dhcp: None,
+        };
+        let classifier = ClassifierHandle::test_default();
+        let mut updates = identifier.identify_batch(
+            &classifier,
+            &[observation],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(updates.len(), 1);
+        let update = updates.remove(0);
+        assert_eq!(update.vendor.as_deref(), Some("Espressif Inc."));
     }
 
     #[test]

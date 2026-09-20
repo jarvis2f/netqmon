@@ -16,6 +16,7 @@ export interface CategoryItem {
 
 interface CategoryDistributionProps {
   items: CategoryItem[];
+  variant?: "category" | "country";
   loading?: boolean;
   className?: string;
   title?: string;
@@ -32,12 +33,9 @@ const COLORS = [
   "var(--foreground-muted)",
 ];
 
-function isCountryCode(id: string) {
-  return /^[a-zA-Z]{2}$/.test(id.trim());
-}
-
 export function CategoryDistribution({
   items,
+  variant = "category",
   loading = false,
   className,
   title,
@@ -231,7 +229,7 @@ export function CategoryDistribution({
         {/* Right: Detailed Distribution List */}
         <ol className="flex flex-1 flex-col justify-center space-y-2 w-full min-w-0 my-auto">
           {segments.map((item) => {
-            const isCountry = isCountryCode(item.id);
+            const isCountry = variant === "country";
             const isHovered = hoveredId === item.id;
             const hasHover = Boolean(hoveredId);
 

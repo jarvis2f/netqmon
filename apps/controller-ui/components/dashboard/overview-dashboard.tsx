@@ -547,6 +547,7 @@ export function OverviewDashboard({ username }: { username: string }) {
           className="min-w-0"
         />
         <CategoryDistribution
+          variant="category"
           items={categories}
           loading={loading}
           className="min-w-0 xl:min-h-[364px]"

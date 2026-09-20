@@ -532,4 +532,5 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: ${{ runner.temp }}/openwrt-release-assets/*
