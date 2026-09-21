@@ -25,6 +25,10 @@ start_service() {
     [ -n "$interfaces" ] || interfaces="$interface"
     config_get controller_url main controller_url "http://127.0.0.1:8090"
     config_get token main token ""
+    [ -n "$token" ] || {
+        logger -t netqmon "netqmon-agent not started: token is not configured in /etc/config/netqmon"
+        return 0
+    }
     config_get poll_interval_ms main poll_interval_ms 1000
     config_get batch_interval_ms main batch_interval_ms 1000
     config_get max_flows main max_flows 65536

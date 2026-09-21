@@ -27,6 +27,7 @@ pub(super) const DEFAULT_CREDENTIAL_PATH: &str = "/etc/netqmon/credentials.toml"
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_ENROLL_RETRY_DELAY: Duration = Duration::from_secs(30);
 const COMPRESSION_THRESHOLD_BYTES: usize = 1_024;
 
 pub(super) struct TelemetryQueue {
@@ -281,6 +282,7 @@ fn sender_loop(
     });
     let mut sequence = 0_u64;
     let mut probe_results = Vec::<ProbeResult>::new();
+    let mut enroll_retry_delay = RETRY_DELAY;
     loop {
         let mut batch = match buffer.pop_timeout(RETRY_DELAY) {
             Some(batch) => batch,
@@ -306,10 +308,19 @@ fn sender_loop(
                             eprintln!("telemetry credentials could not be persisted: {error:#}");
                         }
                         credentials = Some(enrolled);
+                        enroll_retry_delay = RETRY_DELAY;
                     }
                     Err(error) => {
                         eprintln!("agent enrollment failed: {error:#}");
-                        if should_stop(&shutdown) {
+                        let delay = if settings.enrollment_token.is_empty() {
+                            MAX_ENROLL_RETRY_DELAY
+                        } else {
+                            let current = enroll_retry_delay;
+                            enroll_retry_delay =
+                                (enroll_retry_delay * 2).min(MAX_ENROLL_RETRY_DELAY);
+                            current
+                        };
+                        if should_stop(&shutdown, delay) {
                             return;
                         }
                         continue;
@@ -327,20 +338,30 @@ fn sender_loop(
                 Err(SendError::Unauthorized) => {
                     eprintln!("telemetry credential was rejected; attempting enrollment again");
                     credentials = None;
+                    enroll_retry_delay = RETRY_DELAY;
                 }
                 Err(SendError::Other(error)) => {
                     eprintln!("telemetry upload failed: {error:#}");
                 }
             }
-            if should_stop(&shutdown) {
+            if should_stop(&shutdown, RETRY_DELAY) {
                 return;
             }
         }
     }
 }
 
-fn should_stop(shutdown: &AtomicBool) -> bool {
-    thread::sleep(RETRY_DELAY);
+fn should_stop(shutdown: &AtomicBool, delay: Duration) -> bool {
+    let interval = Duration::from_millis(100);
+    let mut remaining = delay;
+    while remaining > Duration::ZERO {
+        if shutdown.load(Ordering::Relaxed) {
+            return true;
+        }
+        let step = remaining.min(interval);
+        thread::sleep(step);
+        remaining = remaining.saturating_sub(step);
+    }
     shutdown.load(Ordering::Relaxed)
 }
 
