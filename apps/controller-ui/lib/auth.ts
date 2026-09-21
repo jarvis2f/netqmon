@@ -7,8 +7,17 @@ import {
   SESSION_COOKIE,
   type SessionPayload,
 } from "@/lib/session-token";
+import { isDemoMode } from "@/lib/runtime-mode";
 
 export async function verifySession(): Promise<SessionPayload | null> {
+  if (isDemoMode()) {
+    return {
+      token: "demo",
+      userId: "demo",
+      username: "Demo",
+      expiresAt: Number.MAX_SAFE_INTEGER,
+    };
+  }
   const sealed = (await cookies()).get(SESSION_COOKIE)?.value;
   const session = await openSession(sealed);
   if (!session) return null;

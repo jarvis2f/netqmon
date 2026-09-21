@@ -5,6 +5,8 @@ import { NextIntlClientProvider } from "next-intl";
 import { getLocale, getMessages, getTranslations } from "next-intl/server";
 import { ThemeProvider } from "@/components/theme-provider";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { RuntimeModeProvider } from "@/components/runtime-mode-provider";
+import { isDemoMode } from "@/lib/runtime-mode";
 import "flag-icons/css/flag-icons.min.css";
 import "./globals.css";
 
@@ -32,6 +34,7 @@ export default async function RootLayout({
 }) {
   const locale = await getLocale();
   const messages = await getMessages();
+  const isDemo = isDemoMode();
 
   return (
     <html
@@ -42,7 +45,11 @@ export default async function RootLayout({
       <body className="min-h-screen bg-background text-foreground antialiased selection:bg-accent/20 selection:text-accent">
         <NextIntlClientProvider locale={locale} messages={messages}>
           <ThemeProvider defaultTheme="system">
-            <TooltipProvider delay={200}>{children}</TooltipProvider>
+            <TooltipProvider delay={200}>
+              <RuntimeModeProvider isDemo={isDemo}>
+                {children}
+              </RuntimeModeProvider>
+            </TooltipProvider>
           </ThemeProvider>
         </NextIntlClientProvider>
       </body>

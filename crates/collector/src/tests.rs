@@ -2421,7 +2421,7 @@ fn auth_logout_request(token: &str) -> Request<Body> {
 }
 
 async fn parse_json(response: axum::http::Response<Body>) -> serde_json::Value {
-    let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+    let body = to_bytes(response.into_body(), 256 * 1024).await.unwrap();
     serde_json::from_slice(&body).unwrap()
 }
 
@@ -3753,4 +3753,89 @@ async fn insights_detect_first_batch_of_low_cost_enhancements() {
     assert_eq!(fanouts[0].code, "destination.fanout_spike");
     assert_eq!(fanouts[0].category, "destination");
     assert!(fanouts[0].params["count"].as_i64().unwrap() >= 55);
+}
+
+#[tokio::test]
+async fn demo_router_blocks_mutation_methods() {
+    let mut state = test_state();
+    let demo_provider = demo::DemoRealtimeProvider::start(&state);
+    state.demo_provider = Some(demo_provider);
+
+    let router = internal_router(state);
+
+    // GET /internal/overview returns 200
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/internal/overview")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = parse_json(res).await;
+    assert_eq!(body["data"]["gateway_status"], "online");
+    assert!(body["data"]["realtime"]["generated_at"].as_u64().unwrap() > 0);
+
+    // POST /internal/settings/retention/run returns 403 demo_read_only
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/internal/settings/retention/run")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let body = parse_json(res).await;
+    assert_eq!(body["error"]["code"], "demo_read_only");
+
+    // PUT /internal/settings/retention returns 403 demo_read_only
+    let req = axum::http::Request::builder()
+        .method("PUT")
+        .uri("/internal/settings/retention")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from("{}"))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let body = parse_json(res).await;
+    assert_eq!(body["error"]["code"], "demo_read_only");
+
+    // POST /internal/settings/rules/reload returns 403 demo_read_only
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/internal/settings/rules/reload")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let body = parse_json(res).await;
+    assert_eq!(body["error"]["code"], "demo_read_only");
+
+    // GET /internal/settings/diagnostics is not part of the public Demo API.
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/internal/settings/diagnostics")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn demo_overview_returns_online_fallback_when_no_gateway() {
+    let mut state = test_state();
+    let demo_provider = demo::DemoRealtimeProvider::start(&state);
+    state.demo_provider = Some(demo_provider);
+
+    let router = internal_router(state);
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/internal/overview")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = router.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = parse_json(res).await;
+    assert_eq!(body["data"]["gateway_status"], "online");
+    assert_eq!(body["data"]["gateway"]["name"], "Demo Gateway");
+    assert_eq!(body["data"]["gateway"]["status"], "online");
+    assert!(body["data"]["gateway"]["last_seen"].as_i64().unwrap() > 0);
 }

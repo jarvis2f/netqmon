@@ -16,6 +16,7 @@ import { useTranslations } from "next-intl";
 import { useTheme } from "@/components/theme-provider";
 import { StatusBadge } from "@/components/network/status-badge";
 import { LanguageSwitcher } from "@/components/app-shell/language-switcher";
+import { useRuntimeMode } from "@/components/runtime-mode-provider";
 
 interface HeaderProps {
   title?: string;
@@ -41,6 +42,7 @@ export function Header({
   const t = useTranslations("common");
   const tA11y = useTranslations("accessibility.sidebar");
   const { theme, setTheme } = useTheme();
+  const { isDemo } = useRuntimeMode();
   const router = useRouter();
   const [userMenuOpen, setUserMenuOpen] = useState(false);
 
@@ -78,6 +80,11 @@ export function Header({
           <h1 className="text-sm font-semibold tracking-tight text-foreground truncate">
             {title}
           </h1>
+          {isDemo && (
+            <span className="inline-flex items-center rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-600 dark:text-amber-400 select-none">
+              {t("demoBadge")}
+            </span>
+          )}
           {subtitle && (
             <span className="hidden sm:inline text-xs text-foreground-muted truncate">
               {subtitle}
@@ -181,14 +188,20 @@ export function Header({
                   </span>
                 </div>
                 <div className="mt-1">
-                  <button
-                    type="button"
-                    onClick={logout}
-                    className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-xs text-danger hover:bg-danger-soft transition-colors cursor-pointer"
-                  >
-                    <LogOut className="size-3.5" />
-                    <span>{t("user.logout")}</span>
-                  </button>
+                  {isDemo ? (
+                    <div className="px-2 py-1.5 text-[11px] text-foreground-muted select-none">
+                      {t("demoEnvironment")}
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={logout}
+                      className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-xs text-danger hover:bg-danger-soft transition-colors cursor-pointer"
+                    >
+                      <LogOut className="size-3.5" />
+                      <span>{t("user.logout")}</span>
+                    </button>
+                  )}
                 </div>
               </div>
             </>

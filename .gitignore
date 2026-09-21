@@ -13,6 +13,13 @@ out/
 !**/.env.example
 /data/
 cloudflare-radar_top-*-domains_*.csv
+*demo-source*.db
+*demo-working*.db
+netqmon-demo-template.db
+deploy/demo/*.db
+deploy/demo/*.db-*
+*.db-wal
+*.db-shm
 
 # Editors and operating systems
 .DS_Store
@@ -31,4 +38,3 @@ test-results/
 
 .omo
 .codegraph
-

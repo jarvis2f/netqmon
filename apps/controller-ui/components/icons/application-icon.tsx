@@ -28,26 +28,38 @@ export function ApplicationIcon({
     }
     return <IconFallback icon={dashboardIcons.unknown} size={size} />;
   }
-  if (hasSimpleBrandIcon(icon?.local_fallback)) {
+
+  const brandKey = hasSimpleBrandIcon(icon?.local_fallback)
+    ? icon?.local_fallback
+    : hasSimpleBrandIcon(applicationId)
+      ? applicationId
+      : null;
+
+  if (brandKey) {
     return (
       <span
         className={iconContainerClass(size, "text-foreground")}
         aria-hidden="true"
       >
-        <SimpleBrandIcon iconKey={icon?.local_fallback} />
+        <SimpleBrandIcon iconKey={brandKey} />
       </span>
     );
   }
+
+  const fallbackIcon =
+    category && category !== "unknown"
+      ? getCategoryIcon(category)
+      : dashboardIcons.genericApplication;
+
   if (icon?.domain || (icon?.fallback_domains?.length ?? 0) > 0) {
     return (
       <LazyRemoteIcon
         src={`/api/icons/application/${encodeURIComponent(applicationId)}`}
         size={size}
-        fallback={
-          <IconFallback icon={dashboardIcons.genericApplication} size={size} />
-        }
+        fallback={<IconFallback icon={fallbackIcon} size={size} />}
       />
     );
   }
-  return <IconFallback icon={dashboardIcons.genericApplication} size={size} />;
+
+  return <IconFallback icon={fallbackIcon} size={size} />;
 }

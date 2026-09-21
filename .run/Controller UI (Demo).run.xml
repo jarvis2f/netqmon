@@ -1,0 +1,16 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Controller UI (Demo)" type="js.build_tools.npm" factoryName="npm">
+    <package-json value="$PROJECT_DIR$/apps/controller-ui/package.json" />
+    <command value="run" />
+    <scripts>
+      <script value="dev" />
+    </scripts>
+    <node-interpreter value="project" />
+    <envs>
+      <env name="NETQMON_DEMO_MODE" value="true" />
+      <env name="NETQMON_COLLECTOR_INTERNAL_URL" value="http://127.0.0.1:8091" />
+      <env name="NETQMON_SESSION_SECRET" value="netqmon-demo-session-secret" />
+    </envs>
+    <method v="2" />
+  </configuration>
+</component>

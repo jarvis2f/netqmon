@@ -332,6 +332,7 @@ import {
   siSway,
   siSymantec,
   siSyncthing,
+  siSynology,
   siTabelog,
   siTailscale,
   siTaobao,
@@ -749,6 +750,7 @@ const icons: Record<string, SimpleIcon> = {
   sway: siSway,
   symantec: siSymantec,
   syncthing: siSyncthing,
+  synology: siSynology,
   tabelog: siTabelog,
   tailscale: siTailscale,
   taobao: siTaobao,
@@ -832,10 +834,28 @@ const icons: Record<string, SimpleIcon> = {
   zhihu: siZhihu,
   zillow: siZillow,
   zoom: siZoom,
+  // Additional aliases for common application identifiers
+  "apple-music": siApplemusic,
+  "docker-hub": siDocker,
+  "playstation-network": siPlaystation,
+  "synology-dsm": siSynology,
+  "cloudflare-backup": siCloudflare,
+  "cloudflare-dns": siCloudflare,
+  "google-dns": siGoogle,
 };
 
+function resolveIcon(iconKey?: string | null): SimpleIcon | undefined {
+  if (!iconKey) return undefined;
+  const key = iconKey.toLowerCase().trim();
+  return (
+    icons[key] ??
+    icons[key.replace(/[-_\s]/g, "")] ??
+    icons[key.split(/[-_]/)[0]]
+  );
+}
+
 export function hasSimpleBrandIcon(iconKey?: string | null) {
-  return Boolean(iconKey && icons[iconKey]);
+  return Boolean(resolveIcon(iconKey));
 }
 
 export function SimpleBrandIcon({
@@ -845,7 +865,7 @@ export function SimpleBrandIcon({
   iconKey?: string | null;
   className?: string;
 }) {
-  const icon = iconKey ? icons[iconKey] : undefined;
+  const icon = resolveIcon(iconKey);
   if (!icon) return null;
   return (
     <svg

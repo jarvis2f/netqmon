@@ -76,8 +76,8 @@ export function DestinationsMap({
   onSelectDestination,
   loading = false,
   className = "",
-  sourceGatewayName = "Gateway",
-  sourceCoordinates = { lat: 30.2741, lng: 120.1551 },
+  sourceGatewayName = "OpenWrt",
+  sourceCoordinates = { lat: -33.8688, lng: 151.2093 }, // Sydney, Australia
 }: DestinationsMapProps) {
   const t = useTranslations("destinations");
   const tStatus = useTranslations("common.status");
@@ -129,7 +129,7 @@ export function DestinationsMap({
         worldCopyJump: true,
         minZoom: 2,
         maxZoom: 16,
-      }).setView([25, 20], 2.2);
+      }).setView([-15, 135], 2.2);
 
       mapInstanceRef.current = map;
     }

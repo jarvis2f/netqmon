@@ -340,14 +340,21 @@ async fn overview(
                 },
             )
             .optional()?;
-        let gateway_status = gateway.as_ref().map_or("unenrolled", |gateway| {
-            if now.saturating_sub(to_u64(gateway.5)) <= offline_after_ms {
-                "online"
-            } else {
-                "offline"
-            }
-        });
-        let capture_warning = if gateway_status == "offline" {
+        let is_demo = state.is_demo();
+        let gateway_status = if is_demo {
+            "online"
+        } else {
+            gateway.as_ref().map_or("unenrolled", |gateway| {
+                if now.saturating_sub(to_u64(gateway.5)) <= offline_after_ms {
+                    "online"
+                } else {
+                    "offline"
+                }
+            })
+        };
+        let capture_warning = if is_demo {
+            None
+        } else if gateway_status == "offline" {
             Some("No gateway telemetry has arrived within the offline threshold".to_owned())
         } else if let Some(health) = snapshot.gateway_health.as_ref() {
             let mut reasons = Vec::new();
@@ -383,26 +390,51 @@ async fn overview(
         } else {
             Some("Capture health telemetry has not been reported".to_owned())
         };
-        let gateway = gateway.map(|gateway| {
-            let health = snapshot.gateway_health.as_ref();
-            json!({
-                "id": gateway.0,
-                "name": gateway.1,
-                "status": gateway_status,
-                "last_seen": gateway.5,
-                "agent_version": health.map_or(gateway.2.as_str(), |value| value.agent_version.as_str()),
-                "kernel_version": health.map_or(gateway.3.as_str(), |value| value.kernel_version.as_str()),
-                "openwrt_version": health.map_or(gateway.4.as_str(), |value| value.openwrt_version.as_str()),
-                "offloading_status": health.map_or("unknown", |value| value.hardware_flow_offload.as_str()),
-                "capture_interface": health.map_or("", |value| value.capture_interface.as_str()),
-                "capture_interfaces": health.map_or_else(Vec::new, |value| value.capture_interfaces.clone()),
-                "interface_counter_sanity": health.map_or("unknown", |value| value.interface_counter_sanity.as_str()),
-                "interface_delta_bytes": health.map_or(0, |value| value.interface_delta_bytes),
-                "flow_delta_bytes": health.map_or(0, |value| value.flow_delta_bytes),
-                "capture_warning": capture_warning,
-                "offline_after_ms": offline_after_ms,
+        let gateway = gateway
+            .map(|gateway| {
+                let health = snapshot.gateway_health.as_ref();
+                let last_seen = if is_demo { to_i64(now) } else { gateway.5 };
+                json!({
+                    "id": gateway.0,
+                    "name": gateway.1,
+                    "status": gateway_status,
+                    "last_seen": last_seen,
+                    "agent_version": health.map_or(gateway.2.as_str(), |value| value.agent_version.as_str()),
+                    "kernel_version": health.map_or(gateway.3.as_str(), |value| value.kernel_version.as_str()),
+                    "openwrt_version": health.map_or(gateway.4.as_str(), |value| value.openwrt_version.as_str()),
+                    "offloading_status": health.map_or(if is_demo { "disabled" } else { "unknown" }, |value| value.hardware_flow_offload.as_str()),
+                    "capture_interface": health.map_or(if is_demo { "br-lan" } else { "" }, |value| value.capture_interface.as_str()),
+                    "capture_interfaces": health.map_or_else(|| if is_demo { vec!["br-lan".to_string()] } else { Vec::new() }, |value| value.capture_interfaces.clone()),
+                    "interface_counter_sanity": health.map_or(if is_demo { "ok" } else { "unknown" }, |value| value.interface_counter_sanity.as_str()),
+                    "interface_delta_bytes": health.map_or(0, |value| value.interface_delta_bytes),
+                    "flow_delta_bytes": health.map_or(0, |value| value.flow_delta_bytes),
+                    "capture_warning": capture_warning,
+                    "offline_after_ms": offline_after_ms,
+                })
             })
-        });
+            .or_else(|| {
+                if is_demo {
+                    Some(json!({
+                        "id": "demo-gateway",
+                        "name": "Demo Gateway",
+                        "status": "online",
+                        "last_seen": to_i64(now),
+                        "agent_version": "v1.0.0-demo",
+                        "kernel_version": "6.6.0",
+                        "openwrt_version": "OpenWrt 24.10",
+                        "offloading_status": "disabled",
+                        "capture_interface": "br-lan",
+                        "capture_interfaces": ["br-lan"],
+                        "interface_counter_sanity": "ok",
+                        "interface_delta_bytes": 0,
+                        "flow_delta_bytes": 0,
+                        "capture_warning": None::<String>,
+                        "offline_after_ms": offline_after_ms,
+                    }))
+                } else {
+                    None
+                }
+            });
         Ok(json!({
             "gateway_status": gateway_status,
             "gateway": gateway,

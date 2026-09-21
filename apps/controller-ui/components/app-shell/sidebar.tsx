@@ -26,6 +26,7 @@ import {
   SPRING_PRESS,
 } from "@/lib/ease";
 import { cn } from "@/lib/utils";
+import { useRuntimeMode } from "@/components/runtime-mode-provider";
 
 export interface NavItem {
   key:
@@ -86,6 +87,10 @@ export function Sidebar({
 }: SidebarProps) {
   const t = useTranslations("navigation");
   const tCommon = useTranslations("common");
+  const { isDemo } = useRuntimeMode();
+  const visibleNavItems = isDemo
+    ? NAV_ITEMS.filter((item) => item.key !== "settings")
+    : NAV_ITEMS;
   const pathname = usePathname();
   const reduce = useReducedMotion();
   const mobilePanelRef = useRef<HTMLElement>(null);
@@ -277,7 +282,7 @@ export function Sidebar({
 
         {/* Navigation List: all menu items with beUI active indicator */}
         <nav className="space-y-1" aria-label={t("mainNavigation")}>
-          {NAV_ITEMS.map(renderNavItem)}
+          {visibleNavItems.map(renderNavItem)}
         </nav>
       </div>
 

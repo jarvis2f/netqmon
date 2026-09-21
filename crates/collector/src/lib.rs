@@ -2,6 +2,7 @@
 
 mod auth;
 mod classifier;
+pub mod demo;
 mod device_identification;
 mod dpi;
 mod icons;
@@ -10,6 +11,8 @@ mod license;
 mod query_api;
 mod realtime;
 mod recognition_diagnostics;
+
+pub use demo::demo_mode;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -91,6 +94,9 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 /// Returns an error for missing or invalid configuration, listener binding
 /// failures, or serving failures.
 pub async fn run_from_env() -> Result<(), Box<dyn Error>> {
+    if demo::demo_mode() {
+        return run_demo_from_env().await;
+    }
     let config = CollectorConfig::from_env()?;
     let dpi_enabled = dpi_enabled_from_env()?;
     if dpi_enabled && !dpi::native_available() {
@@ -161,6 +167,86 @@ pub async fn run_from_env() -> Result<(), Box<dyn Error>> {
     let public = axum::serve(public_listener, public_router(state.clone()));
     let internal = axum::serve(internal_listener, internal_router(state));
     tokio::try_join!(public, internal)?;
+    Ok(())
+}
+
+async fn run_demo_from_env() -> Result<(), Box<dyn Error>> {
+    tracing::info!("starting netqmon-collector in DEMO MODE (read-only)");
+    let internal_addr = parse_addr("NETQMON_COLLECTOR_INTERNAL_ADDR", DEFAULT_INTERNAL_ADDR)?;
+    if !internal_addr.ip().is_loopback() {
+        return Err(ConfigError(
+            "NETQMON_COLLECTOR_INTERNAL_ADDR must use a loopback address".to_owned(),
+        )
+        .into());
+    }
+    let database_path = env::var_os("NETQMON_COLLECTOR_DATABASE_PATH")
+        .map_or_else(|| PathBuf::from(DEFAULT_DATABASE_PATH), PathBuf::from);
+    let geo_directory = env::var_os("NETQMON_COLLECTOR_GEO_DIR")
+        .map_or_else(|| default_geo_directory(&database_path), PathBuf::from);
+    let mac_dataset_path = env::var_os("NETQMON_COLLECTOR_MAC_DATASET_PATH")
+        .map_or_else(|| default_mac_dataset_path(&database_path), PathBuf::from);
+
+    if let Some(parent) = database_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // If demo runtime database does not exist yet, attempt to initialize it from template
+    if !database_path.exists() {
+        let template_path = PathBuf::from("netqmon-demo-template.db");
+        if template_path.exists() {
+            tracing::info!(
+                template = %template_path.display(),
+                output = %database_path.display(),
+                "initializing runtime demo database from template"
+            );
+            if let Err(err) = std::fs::copy(&template_path, &database_path) {
+                tracing::warn!("failed to copy demo template database: {err}");
+            }
+        }
+    }
+
+    if !database_path.is_file() {
+        return Err(ConfigError(format!(
+            "demo database does not exist: {}",
+            database_path.display()
+        ))
+        .into());
+    }
+
+    let sqlite = SqliteStorage::open(&database_path)
+        .map_err(|err| ConfigError(format!("failed to open SQLite: {err}")))?;
+
+    if let Err(err) = demo::ensure_demo_database_freshness(sqlite.connection()) {
+        tracing::warn!("failed to ensure demo database freshness: {err}");
+    }
+
+    let storage = Storage::sqlite(sqlite);
+
+    let geo_load = LocalDbProvider::load(&geo_directory);
+    let device_identifier = DeviceIdentifier::load(&mac_dataset_path);
+    let classifier = ClassifierHandle::disabled();
+    let icon_cache_config = IconCacheConfig::from_env();
+
+    let mut state = CollectorState::with_geo_provider(
+        "demo-token",
+        storage,
+        classifier,
+        Arc::new(geo_load.provider),
+        geo_directory,
+        device_identifier,
+        icon_cache_config,
+    )
+    .map_err(|err| ConfigError(format!("failed to initialize collector state: {err}")))?;
+
+    let demo_provider = demo::DemoRealtimeProvider::start(&state);
+    state.demo_provider = Some(demo_provider);
+    demo::spawn_demo_freshness_task(state.clone(), Duration::from_secs(1800));
+
+    let internal_listener = TcpListener::bind(internal_addr).await?;
+    tracing::info!(address = %internal_addr, "Demo internal API listener started (public ingestion listener :8090 is DISABLED)");
+
+    let internal = axum::serve(internal_listener, internal_router(state));
+    internal.await?;
     Ok(())
 }
 
@@ -294,9 +380,13 @@ struct CollectorState {
     icon_service: Arc<IconService>,
     sampling: Arc<dpi::SamplingService>,
     license: Arc<license::LicenseCoordinator>,
+    demo_provider: Option<Arc<demo::DemoRealtimeProvider>>,
 }
 
 impl CollectorState {
+    pub(crate) fn is_demo(&self) -> bool {
+        self.demo_provider.is_some()
+    }
     #[cfg(test)]
     fn open(enrollment_token: &str, database_path: &Path) -> Result<Self, rusqlite::Error> {
         Self::with_storage(
@@ -392,6 +482,7 @@ impl CollectorState {
             icon_service: Arc::new(IconService::new(icon_cache_config)),
             sampling,
             license,
+            demo_provider: None,
         })
     }
 
@@ -642,6 +733,9 @@ impl CollectorState {
     }
 
     fn realtime_snapshot(&self) -> RealtimeSnapshot {
+        if let Some(demo) = &self.demo_provider {
+            return demo.snapshot();
+        }
         self.lock().realtime.snapshot()
     }
 
@@ -651,6 +745,9 @@ impl CollectorState {
         RealtimeSnapshot,
         tokio::sync::broadcast::Receiver<RealtimeEvent>,
     ) {
+        if let Some(demo) = &self.demo_provider {
+            return (demo.snapshot(), demo.subscribe());
+        }
         let inner = self.lock();
         (inner.realtime.snapshot(), inner.realtime.subscribe())
     }
@@ -1322,6 +1419,26 @@ fn public_router(state: CollectorState) -> Router {
         .with_state(state)
 }
 
+async fn demo_read_only_guard(
+    State(state): State<CollectorState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if state.is_demo() {
+        let method = request.method();
+        if method != axum::http::Method::GET
+            && method != axum::http::Method::HEAD
+            && method != axum::http::Method::OPTIONS
+        {
+            return demo::read_only_rejection();
+        }
+        if request.uri().path().starts_with("/internal/settings") {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    }
+    next.run(request).await
+}
+
 fn internal_router(state: CollectorState) -> Router {
     Router::new()
         .route("/internal/health", get(health))
@@ -1329,6 +1446,10 @@ fn internal_router(state: CollectorState) -> Router {
         .merge(auth::router())
         .merge(icons::router())
         .merge(query_api::router())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            demo_read_only_guard,
+        ))
         .with_state(state)
 }
 

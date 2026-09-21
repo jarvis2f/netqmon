@@ -73,6 +73,8 @@
       "signedInAs": "当前登录为",
       "logout": "退出登录"
     },
+    "demoBadge": "演示",
+    "demoEnvironment": "演示环境",
     "theme": {
       "switchTheme": "当前主题：{theme}。点击切换主题。",
       "themeTitle": "主题：{theme} (点击切换)"

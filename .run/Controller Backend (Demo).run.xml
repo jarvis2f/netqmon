@@ -1,0 +1,26 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Controller Backend (Demo)" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
+    <option name="buildProfileId" value="dev" />
+    <option name="command" value="run --package netqmon-collector" />
+    <option name="workingDirectory" value="file://$PROJECT_DIR$" />
+    <envs>
+      <env name="NETQMON_DEMO_MODE" value="true" />
+      <env name="NETQMON_COLLECTOR_DATABASE_PATH" value="$PROJECT_DIR$/netqmon-demo-template.db" />
+      <env name="NETQMON_COLLECTOR_GEO_DIR" value="$PROJECT_DIR$/target/geo" />
+      <env name="DYLD_LIBRARY_PATH" value="/opt/homebrew/lib:$DYLD_LIBRARY_PATH" />
+      <env name="RUST_LOG" value="info" />
+    </envs>
+    <option name="emulateTerminal" value="false" />
+    <option name="channel" value="DEFAULT" />
+    <option name="requiredFeatures" value="true" />
+    <option name="allFeatures" value="false" />
+    <option name="withSudo" value="false" />
+    <option name="buildTarget" value="REMOTE" />
+    <option name="backtrace" value="SHORT" />
+    <option name="isRedirectInput" value="false" />
+    <option name="redirectInputPath" value="" />
+    <method v="2">
+      <option name="CARGO.BUILD_TASK_PROVIDER" enabled="true" />
+    </method>
+  </configuration>
+</component>

@@ -1,0 +1,19 @@
+services:
+  controller-demo:
+    image: ${NETQMON_DEMO_IMAGE:-ghcr.io/jarvis2f/netqmon-demo:0.1.0-demo}
+    build:
+      context: ../..
+      dockerfile: deploy/demo/Dockerfile
+    container_name: netqmon-controller-demo
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NETQMON_DEMO_MODE=true
+      - NETQMON_DEMO_DATABASE_TEMPLATE=/demo/netqmon-demo.db
+      - NETQMON_COLLECTOR_DATABASE_PATH=/data/netqmon.db
+    volumes:
+      - demo_data:/data
+
+volumes:
+  demo_data:

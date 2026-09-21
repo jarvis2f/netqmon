@@ -22,13 +22,20 @@ export function OrganizationIcon({
   if (!organizationId || organizationId === "unknown") {
     return <IconFallback icon={dashboardIcons.unknown} size={size} />;
   }
-  if (hasSimpleBrandIcon(icon?.local_fallback)) {
+
+  const brandKey = hasSimpleBrandIcon(icon?.local_fallback)
+    ? icon?.local_fallback
+    : hasSimpleBrandIcon(organizationId)
+      ? organizationId
+      : null;
+
+  if (brandKey) {
     return (
       <span
         className={iconContainerClass(size, "text-foreground")}
         aria-hidden="true"
       >
-        <SimpleBrandIcon iconKey={icon?.local_fallback} />
+        <SimpleBrandIcon iconKey={brandKey} />
       </span>
     );
   }

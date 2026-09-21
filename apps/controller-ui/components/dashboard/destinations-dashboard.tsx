@@ -472,6 +472,8 @@ export function DestinationsDashboard({
               items={mapItems}
               onSelectDestination={(ip) => updateUrl({ ip })}
               loading={loading}
+              sourceGatewayName="OpenWrt"
+              sourceCoordinates={{ lat: -33.8688, lng: 151.2093 }}
             />
           ) : (
             <DataTable

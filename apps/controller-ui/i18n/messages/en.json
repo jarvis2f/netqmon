@@ -73,6 +73,8 @@
       "signedInAs": "Signed in as",
       "logout": "Log out"
     },
+    "demoBadge": "Demo",
+    "demoEnvironment": "Demo Environment",
     "theme": {
       "switchTheme": "Current theme: {theme}. Click to switch theme.",
       "themeTitle": "Theme: {theme} (Click to cycle)"

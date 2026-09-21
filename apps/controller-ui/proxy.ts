@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { openSession, SESSION_COOKIE } from "@/lib/session-token";
+import { isDemoMode } from "@/lib/runtime-mode";
 
 const PUBLIC_PATHS = new Set([
   "/setup",
@@ -11,6 +12,32 @@ const PUBLIC_PATHS = new Set([
 
 export async function proxy(request: NextRequest) {
   const path = request.nextUrl.pathname;
+  const isDemo = isDemoMode();
+
+  if (isDemo) {
+    if (path === "/login" || path === "/setup") {
+      return NextResponse.redirect(new URL("/netqmon", request.url));
+    }
+    if (path === "/settings" || path.startsWith("/settings/")) {
+      return NextResponse.redirect(new URL("/netqmon", request.url));
+    }
+    if (path.startsWith("/api/")) {
+      const method = request.method.toUpperCase();
+      if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
+        return Response.json(
+          {
+            error: {
+              code: "demo_read_only",
+              message: "This demo environment is read-only.",
+            },
+          },
+          { status: 403 },
+        );
+      }
+    }
+    return NextResponse.next();
+  }
+
   if (PUBLIC_PATHS.has(path)) {
     return NextResponse.next();
   }

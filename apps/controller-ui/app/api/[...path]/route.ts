@@ -1,5 +1,6 @@
 import { verifySession } from "@/lib/auth";
 import { collectorFetch, upstreamUnavailable } from "@/lib/collector";
+import { isDemoMode } from "@/lib/runtime-mode";
 
 const RESOURCES = new Set([
   "overview",
@@ -23,6 +24,7 @@ export const dynamic = "force-dynamic";
 function validatePath(path: string[]): boolean {
   return (
     path.length > 0 &&
+    !(isDemoMode() && path[0] === "settings") &&
     RESOURCES.has(path[0]) &&
     path.every((part: string) => /^[a-zA-Z0-9._-]+$/.test(part))
   );
@@ -61,6 +63,17 @@ export async function PUT(
   request: Request,
   context: { params: Promise<{ path: string[] }> },
 ) {
+  if (isDemoMode()) {
+    return Response.json(
+      {
+        error: {
+          code: "demo_read_only",
+          message: "This demo environment is read-only.",
+        },
+      },
+      { status: 403 },
+    );
+  }
   if (!(await verifySession()))
     return Response.json({ error: "unauthorized" }, { status: 401 });
   const { path } = await context.params;
@@ -92,6 +105,17 @@ export async function POST(
   request: Request,
   context: { params: Promise<{ path: string[] }> },
 ) {
+  if (isDemoMode()) {
+    return Response.json(
+      {
+        error: {
+          code: "demo_read_only",
+          message: "This demo environment is read-only.",
+        },
+      },
+      { status: 403 },
+    );
+  }
   if (!(await verifySession()))
     return Response.json({ error: "unauthorized" }, { status: 401 });
   const { path } = await context.params;

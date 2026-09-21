@@ -1,0 +1,7 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Controller (Demo)" type="CompoundRunConfigurationType" factoryName="Compound">
+    <toRun name="Controller Backend (Demo)" type="CargoCommandRunConfiguration" />
+    <toRun name="Controller UI (Demo)" type="js.build_tools.npm" />
+    <method v="2" />
+  </configuration>
+</component>
