@@ -285,6 +285,7 @@ impl LicenseCoordinator {
             capabilities: &[
                 "rule_bundle_v1",
                 "rule_ir_v1",
+                "rule_ir_v2",
                 "domain",
                 "cidr",
                 "classifier_domains_v1",
@@ -540,6 +541,7 @@ mod tests {
                         serde_json::json!([
                             "rule_bundle_v1",
                             "rule_ir_v1",
+                            "rule_ir_v2",
                             "domain",
                             "cidr",
                             "classifier_domains_v1",
