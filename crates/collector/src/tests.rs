@@ -1769,6 +1769,7 @@ fn asn_test_flow(remote_ip: Vec<u8>, client_port: u32, timestamp: u64) -> FlowDe
         remote_port: 443,
         first_seen_unix_ms: timestamp,
         last_seen_unix_ms: timestamp,
+        lifecycle: FlowLifecycle::Ended as i32,
         ..Default::default()
     }
 }
