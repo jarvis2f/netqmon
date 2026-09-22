@@ -56,6 +56,7 @@ WORKDIR /app
 
 COPY --from=collector-builder /netqmon-collector /usr/local/bin/netqmon-collector
 COPY --from=collector-builder /usr/src/netqmon/migrations /app/migrations
+COPY --from=ui-builder /usr/src/netqmon/apps/controller-ui/public /app/apps/controller-ui/public
 COPY --from=ui-builder /usr/src/netqmon/apps/controller-ui/.next/standalone /app
 COPY --from=ui-builder /usr/src/netqmon/apps/controller-ui/.next/static /app/apps/controller-ui/.next/static
 COPY deploy/demo/entrypoint.sh /usr/local/bin/netqmon-demo-entrypoint
