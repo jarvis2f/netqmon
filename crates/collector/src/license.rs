@@ -845,7 +845,8 @@ mod tests {
 
         // Check fails due to 500 error, but < 24h grace retains Pro lease
         let err = coordinator.check().await.unwrap_err();
-        assert!(err.contains("Cloud check failed (500"));
+        assert!(err.contains("Cloud device check failed (HTTP 500"));
+        assert!(err.contains("gateway timeout"));
         let status = coordinator.status().unwrap();
         assert_eq!(status.edition, "pro");
         assert_eq!(status.license_status, "active");
@@ -857,7 +858,8 @@ mod tests {
 
         // Check fails again, now triggering Community downgrade
         let err = coordinator.check().await.unwrap_err();
-        assert!(err.contains("Cloud check failed (500"));
+        assert!(err.contains("Cloud device check failed (HTTP 500"));
+        assert!(err.contains("gateway timeout"));
         let status = coordinator.status().unwrap();
         assert_eq!(status.edition, "community");
         assert_eq!(status.license_status, "offline_grace_expired");
