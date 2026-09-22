@@ -49,6 +49,27 @@ pub struct CachedResult {
     expires: Instant,
 }
 
+#[cfg(test)]
+impl CachedResult {
+    pub(crate) fn for_test(
+        gateway: String,
+        boot: String,
+        key: FlowSampleKey,
+        last_packet_ms: u64,
+        result: Option<DpiResult>,
+    ) -> Self {
+        Self {
+            gateway,
+            boot,
+            key,
+            last_packet_ms,
+            result,
+            signatures: Vec::new(),
+            expires: Instant::now(),
+        }
+    }
+}
+
 /// Everything the attribution pipeline needs for one analysed flow.
 #[derive(Clone, Default)]
 pub struct SampleAnalysis {

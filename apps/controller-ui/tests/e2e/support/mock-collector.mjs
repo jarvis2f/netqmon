@@ -96,7 +96,8 @@ function applicationRows(now) {
   ];
 }
 
-function clientRows(now) {
+function clientRows(now, scenario = "live") {
+  const lastTrafficOffset = scenario === "offline" ? 120_000 : 3_000;
   return [
     {
       id: 101,
@@ -133,6 +134,7 @@ function clientRows(now) {
         ],
       },
       last_seen: now - 3_000,
+      last_traffic_seen: now - lastTrafficOffset,
       upload_bytes: 81_000_000,
       download_bytes: 904_000_000,
       flow_count: 19,
@@ -167,6 +169,7 @@ function clientRows(now) {
         ],
       },
       last_seen: now - 11_000,
+      last_traffic_seen: now - (scenario === "offline" ? 120_000 : 11_000),
       upload_bytes: 7_000_000,
       download_bytes: 520_000_000,
       flow_count: 8,
@@ -803,7 +806,7 @@ function handleInternal(request, response, pathname, params, state) {
       envelope({
         gateway_status: scenario === "offline" ? "offline" : "online",
         realtime: realtimeSnapshot(now, scenario),
-        device_count: clientRows(now).length,
+        device_count: clientRows(now, scenario).length,
         gateway: gateway(now, scenario),
       }),
     );
@@ -869,7 +872,7 @@ function handleInternal(request, response, pathname, params, state) {
       json(
         response,
         200,
-        envelope(clientRows(now).slice(0, id === "youtube" ? 2 : 1)),
+        envelope(clientRows(now, scenario).slice(0, id === "youtube" ? 2 : 1)),
       );
     else if (relation === "domains")
       json(response, 200, envelope(domainRows(now, id)));
@@ -899,14 +902,14 @@ function handleInternal(request, response, pathname, params, state) {
     return true;
   }
   if (path === "clients" && request.method === "GET") {
-    json(response, 200, envelope(clientRows(now)));
+    json(response, 200, envelope(clientRows(now, scenario)));
     return true;
   }
   if (path.startsWith("clients/") && request.method === "GET") {
     const [, id, relation] = path.split("/");
     const client =
-      clientRows(now).find((row) => String(row.id) === id) ??
-      clientRows(now)[0];
+      clientRows(now, scenario).find((row) => String(row.id) === id) ??
+      clientRows(now, scenario)[0];
     if (!relation)
       json(
         response,

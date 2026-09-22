@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use crate::{
     ActiveFlow, DeviceEvidenceRecord, DeviceIdentityUpdate, FlowAttribution, FlowKey,
     GatewayRecord, PersistDisposition, RetentionPolicy, SessionRecord, StorageBackend,
-    StorageError, StorageResult, TrafficTotal, UserRecord,
+    StorageError, StorageResult, TrafficTotal, UserRecord, flow_lifecycle_end_at,
 };
 
 fn flow_scope_name(value: i32) -> &'static str {
@@ -669,7 +669,7 @@ impl ClickHouseStorage {
             .unwrap_or(0);
 
         let sql = format!(
-            "SELECT d.id AS id, d.gateway_id AS gateway_id, d.mac AS mac, d.hostname AS hostname, d.display_name AS display_name, d.vendor AS vendor, d.first_seen AS first_seen, d.last_seen AS last_seen, coalesce(sum(t.upload_bytes), 0) AS up, coalesce(sum(t.download_bytes), 0) AS down FROM devices AS d FINAL LEFT JOIN traffic_device_minute AS t ON d.id = t.device_id GROUP BY d.id, d.gateway_id, d.mac, d.hostname, d.display_name, d.vendor, d.first_seen, d.last_seen ORDER BY last_seen DESC LIMIT {limit} OFFSET {offset} FORMAT JSON"
+            "SELECT d.id AS id, d.gateway_id AS gateway_id, d.mac AS mac, d.hostname AS hostname, d.display_name AS display_name, d.vendor AS vendor, d.first_seen AS first_seen, d.last_seen AS last_seen, f.last_traffic_seen AS last_traffic_seen, coalesce(sum(t.upload_bytes), 0) AS up, coalesce(sum(t.download_bytes), 0) AS down FROM devices AS d FINAL LEFT JOIN traffic_device_minute AS t ON d.id = t.device_id LEFT JOIN (SELECT device_id, max(last_seen_at) AS last_traffic_seen FROM flow_sessions FINAL WHERE upload_bytes > 0 OR download_bytes > 0 OR packets > 0 GROUP BY device_id) AS f ON d.id = f.device_id GROUP BY d.id, d.gateway_id, d.mac, d.hostname, d.display_name, d.vendor, d.first_seen, d.last_seen, f.last_traffic_seen ORDER BY last_seen DESC LIMIT {limit} OFFSET {offset} FORMAT JSON"
         );
         let res = self.client.query_json(&sql)?;
         let mut items = Vec::new();
@@ -718,6 +718,7 @@ impl ClickHouseStorage {
                     "vendor": r["vendor"].as_str(),
                     "first_seen": r["first_seen"].as_i64().or_else(|| r["first_seen"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0),
                     "last_seen": r["last_seen"].as_i64().or_else(|| r["last_seen"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0),
+                    "last_traffic_seen": r["last_traffic_seen"].as_i64().or_else(|| r["last_traffic_seen"].as_str().and_then(|s| s.parse().ok())),
                     "active_flows": 0,
                     "upload_bytes": r["up"].as_i64().or_else(|| r["up"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0),
                     "download_bytes": r["down"].as_i64().or_else(|| r["down"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0),
@@ -739,6 +740,20 @@ impl ClickHouseStorage {
         );
         let res = self.client.query_json(&sql)?;
         if let Some(row) = res["data"].as_array().and_then(|a| a.first()) {
+            let traffic_sql = format!(
+                "SELECT maxOrNull(last_seen_at) AS last_traffic_seen FROM flow_sessions FINAL WHERE device_id = {id} AND (upload_bytes > 0 OR download_bytes > 0 OR packets > 0) FORMAT JSON"
+            );
+            let traffic_res = self.client.query_json(&traffic_sql)?;
+            let last_traffic_seen = traffic_res["data"]
+                .as_array()
+                .and_then(|rows| rows.first())
+                .and_then(|traffic| {
+                    traffic["last_traffic_seen"].as_i64().or_else(|| {
+                        traffic["last_traffic_seen"]
+                            .as_str()
+                            .and_then(|s| s.parse().ok())
+                    })
+                });
             let mac_hex = row["mac"].as_str().unwrap_or("");
             let mac_bytes = from_hex(mac_hex).unwrap_or_default();
             let mac_str = format_mac_bytes(&mac_bytes);
@@ -781,6 +796,7 @@ impl ClickHouseStorage {
                 "vendor": row["vendor"].as_str(),
                 "first_seen": row["first_seen"].as_i64().or_else(|| row["first_seen"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0),
                 "last_seen": row["last_seen"].as_i64().or_else(|| row["last_seen"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0),
+                "last_traffic_seen": last_traffic_seen,
                 "addresses": addrs,
                 "active_flows": 0,
                 "self_host_application": self_host_application,
@@ -1573,7 +1589,8 @@ impl StorageBackend for ClickHouseStorage {
 
             let checkpoint =
                 received_at.saturating_sub(current.checkpointed_at) >= FLOW_CHECKPOINT_MS;
-            if ended || checkpoint {
+            let ended_at = ended.then(|| flow_lifecycle_end_at(flow, received_at));
+            if (ended || checkpoint) && current.last_seen_at > 0 {
                 let dev_id = device_id_from_mac(&current.client_mac);
                 session_rows.push(json!({
                     "id": key.id(),
@@ -1608,9 +1625,11 @@ impl StorageBackend for ClickHouseStorage {
                     "packets": current.packets,
                     "started_at": current.started_at,
                     "last_seen_at": current.last_seen_at,
-                    "ended_at": if ended { Value::from(received_at) } else { Value::Null },
+                    "ended_at": ended_at,
                     "checkpointed_at": received_at,
                 }));
+            }
+            if ended || checkpoint {
                 current.checkpointed_at = received_at;
             }
 

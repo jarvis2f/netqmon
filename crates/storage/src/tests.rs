@@ -742,6 +742,55 @@ fn long_flow_checkpoints_and_resumes_after_restart() {
 }
 
 #[test]
+fn lifecycle_events_do_not_advance_last_traffic_seen() {
+    let mut storage = setup();
+    let mut active = batch(1, FlowLifecycle::Active);
+    active.flows[0].last_seen_unix_ms = NOW + 1_000;
+    storage.persist_batch(&active, NOW).unwrap();
+
+    let mut idle = batch(2, FlowLifecycle::Idle);
+    idle.device_observations[0].last_seen_unix_ms = NOW + 10_000;
+    idle.flows[0].upload_bytes = 0;
+    idle.flows[0].download_bytes = 0;
+    idle.flows[0].packets = 0;
+    idle.flows[0].last_seen_unix_ms = NOW + 20_000;
+    storage
+        .persist_batch(&idle, NOW + FLOW_CHECKPOINT_MS as u64)
+        .unwrap();
+
+    let traffic_seen: i64 = storage
+        .connection()
+        .query_row("SELECT last_seen_at FROM flow_sessions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let device_seen: i64 = storage
+        .connection()
+        .query_row("SELECT last_seen FROM devices", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(traffic_seen, to_i64(NOW + 1_000));
+    assert_eq!(device_seen, to_i64(NOW + 10_000));
+
+    let mut ended = idle;
+    ended.sequence = 3;
+    ended.flows[0].lifecycle = FlowLifecycle::Ended as i32;
+    ended.flows[0].last_seen_unix_ms = NOW + 30_000;
+    storage
+        .persist_batch(&ended, NOW + FLOW_CHECKPOINT_MS as u64 + 1_000)
+        .unwrap();
+
+    let session: (i64, i64) = storage
+        .connection()
+        .query_row(
+            "SELECT last_seen_at, ended_at FROM flow_sessions",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(session, (to_i64(NOW + 1_000), to_i64(NOW + 30_000)));
+}
+
+#[test]
 fn retention_removes_expired_rows_but_keeps_day_rollups() {
     let mut storage = setup();
     storage

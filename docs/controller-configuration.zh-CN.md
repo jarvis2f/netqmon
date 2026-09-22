@@ -63,6 +63,8 @@ NetQmon Controller 是整个网络监控系统的核心服务端，通常通过 
 | `NETQMON_COLLECTOR_MAC_DATASET_PATH` | `/data/mac-prefixes.json` | MAC 地址前缀厂商识别库离线缓存路径。 |
 | `NETQMON_SERVICE_BINDING_TTL_SECONDS` | `86400` | 局域网设备服务发现与端口绑定关系的缓存有效期（秒）。 |
 
+当 ASN 数据库可用时，Collector 会在遥测写入期间查询每个有效的远端 IP，并将 ASN 传给本地分类器。查询结果仅在单个遥测批次或延迟 DPI 重分类批次内去重；未命中或查询失败会保持 ASN 为空，且不会阻塞流量写入或分类。
+
 ### 2.5 分类管理器与组件升级（Classifier Manager）
 
 | 环境变量 | 默认值 | 作用说明 |

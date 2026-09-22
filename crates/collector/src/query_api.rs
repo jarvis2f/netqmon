@@ -2553,6 +2553,10 @@ fn query_clients(connection: &Connection, page: Page) -> rusqlite::Result<(Vec<V
                   FROM device_evidence e WHERE e.gateway_id = d.gateway_id AND e.mac = d.mac), '[]'),
                 d.vendor_confidence, d.device_type_confidence, d.os_confidence,
                 d.model_confidence, d.private_mac, d.last_seen,
+                (SELECT MAX(flow_sessions.last_seen_at) FROM flow_sessions
+                 WHERE flow_sessions.device_id = d.id
+                   AND (flow_sessions.upload_bytes > 0 OR flow_sessions.download_bytes > 0
+                        OR flow_sessions.packets > 0)),
                 COALESCE(SUM(t.upload_bytes), 0), COALESCE(SUM(t.download_bytes), 0),
                 COALESCE(SUM(t.flow_count), 0),
                 (SELECT ip FROM device_addresses a WHERE a.device_id = d.id
@@ -2574,7 +2578,7 @@ fn query_clients(connection: &Connection, page: Page) -> rusqlite::Result<(Vec<V
         .query_map(params![i64::from(page.limit), to_i64(page.offset)], |row| {
             let mac: Vec<u8> = row.get(1)?;
             let ip = row
-                .get::<_, Option<Vec<u8>>>(18)?
+                .get::<_, Option<Vec<u8>>>(19)?
                 .map(|value| format_ip(&value));
             Ok(json!({
                 "id": row.get::<_, i64>(0)?,
@@ -2583,14 +2587,15 @@ fn query_clients(connection: &Connection, page: Page) -> rusqlite::Result<(Vec<V
                 "vendor": row.get::<_, Option<String>>(3)?,
                 "identity": device_identity_json(row, 3)?,
                 "last_seen": row.get::<_, i64>(14)?,
-                "upload_bytes": row.get::<_, i64>(15)?,
-                "download_bytes": row.get::<_, i64>(16)?,
-                "flow_count": row.get::<_, i64>(17)?,
+                "last_traffic_seen": row.get::<_, Option<i64>>(15)?,
+                "upload_bytes": row.get::<_, i64>(16)?,
+                "download_bytes": row.get::<_, i64>(17)?,
+                "flow_count": row.get::<_, i64>(18)?,
                 "ip": ip,
-                "self_host_application": row.get::<_, Option<String>>(19)?.map(|application_id| json!({
+                "self_host_application": row.get::<_, Option<String>>(20)?.map(|application_id| json!({
                     "application_id": application_id,
-                    "confidence": row.get::<_, f64>(20).unwrap_or(0.0),
-                    "source": row.get::<_, Option<String>>(21).ok().flatten(),
+                    "confidence": row.get::<_, f64>(21).unwrap_or(0.0),
+                    "source": row.get::<_, Option<String>>(22).ok().flatten(),
                     "role": "server",
                 })),
             }))
@@ -2611,7 +2616,12 @@ fn query_client_detail(connection: &Connection, id: i64) -> rusqlite::Result<Opt
                         'metadata_json', e.metadata_json))
                       FROM device_evidence e WHERE e.gateway_id = d.gateway_id AND e.mac = d.mac), '[]'),
                     d.vendor_confidence, d.device_type_confidence, d.os_confidence,
-                    d.model_confidence, d.private_mac, d.first_seen, d.last_seen, COALESCE(SUM(t.upload_bytes), 0),
+                    d.model_confidence, d.private_mac, d.first_seen, d.last_seen,
+                    (SELECT MAX(flow_sessions.last_seen_at) FROM flow_sessions
+                     WHERE flow_sessions.device_id = d.id
+                       AND (flow_sessions.upload_bytes > 0 OR flow_sessions.download_bytes > 0
+                            OR flow_sessions.packets > 0)),
+                    COALESCE(SUM(t.upload_bytes), 0),
                     COALESCE(SUM(t.download_bytes), 0), COALESCE(SUM(t.flow_count), 0)
              FROM devices d LEFT JOIN traffic_device_minute t ON t.device_id = d.id
              WHERE d.id = ?1 GROUP BY d.id",
@@ -2626,9 +2636,10 @@ fn query_client_detail(connection: &Connection, id: i64) -> rusqlite::Result<Opt
                     "identity": device_identity_json(row, 3)?,
                     "first_seen": row.get::<_, i64>(14)?,
                     "last_seen": row.get::<_, i64>(15)?,
-                    "upload_bytes": row.get::<_, i64>(16)?,
-                    "download_bytes": row.get::<_, i64>(17)?,
-                    "flow_count": row.get::<_, i64>(18)?,
+                    "last_traffic_seen": row.get::<_, Option<i64>>(16)?,
+                    "upload_bytes": row.get::<_, i64>(17)?,
+                    "download_bytes": row.get::<_, i64>(18)?,
+                    "flow_count": row.get::<_, i64>(19)?,
                 }))
             },
         )

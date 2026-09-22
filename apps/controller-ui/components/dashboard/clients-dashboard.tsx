@@ -39,8 +39,24 @@ interface RealtimeSnapshot {
   gateway_health?: { topology?: TopologySummary | null } | null;
 }
 
+interface DeviceSeenEvent {
+  mac?: string;
+  ip?: string;
+  observed_at?: number;
+}
+
 function online(client: ClientSummary, now: number) {
-  return now > 0 && now - client.last_seen <= 30_000;
+  const lastTrafficSeen = client.last_traffic_seen ?? 0;
+  return now > 0 && lastTrafficSeen > 0 && now - lastTrafficSeen <= 30_000;
+}
+
+function clientStatus(
+  client: ClientSummary,
+  loading: boolean,
+  now: number,
+): "loading" | "online" | "offline" {
+  if (loading || now === 0) return "loading";
+  return online(client, now) ? "online" : "offline";
 }
 
 function clientName(client: ClientSummary) {
@@ -169,6 +185,26 @@ export function ClientsDashboard({
     );
     setRealtimeRates(snapshot.clients ?? {});
     setTopology(snapshot.gateway_health?.topology ?? null);
+    setItems((current) =>
+      current.map((client) => {
+        const rate =
+          snapshot.clients?.[client.mac] ??
+          snapshot.clients?.[client.mac.toLowerCase()] ??
+          (client.ip ? snapshot.clients?.[client.ip] : undefined);
+        const hasTraffic =
+          (rate?.upload_bytes_per_second ?? 0) > 0 ||
+          (rate?.download_bytes_per_second ?? 0) > 0;
+        return hasTraffic
+          ? {
+              ...client,
+              last_traffic_seen: Math.max(
+                client.last_traffic_seen ?? 0,
+                snapshot.generated_at,
+              ),
+            }
+          : client;
+      }),
+    );
   }, []);
 
   useEffect(() => {
@@ -177,6 +213,27 @@ export function ClientsDashboard({
     events.addEventListener("snapshot", (event) => {
       try {
         applySnapshot(JSON.parse(event.data) as RealtimeSnapshot);
+      } catch {
+        // Ignore decode issues
+      }
+    });
+    events.addEventListener("device_seen", (event) => {
+      try {
+        const seen = JSON.parse(event.data) as DeviceSeenEvent;
+        const observedAt = seen.observed_at;
+        if (!seen.mac || typeof observedAt !== "number") return;
+        const mac = seen.mac.toLowerCase();
+        setItems((current) =>
+          current.map((client) =>
+            client.mac.toLowerCase() === mac && observedAt > client.last_seen
+              ? {
+                  ...client,
+                  ip: client.ip || seen.ip || null,
+                  last_seen: observedAt,
+                }
+              : client,
+          ),
+        );
       } catch {
         // Ignore decode issues
       }
@@ -232,17 +289,15 @@ export function ClientsDashboard({
       ].some((value) => value?.toLowerCase().includes(query)),
     );
   }, [items, search]);
-  const onlineClientCount = items.filter((client) =>
-    online(client, now),
-  ).length;
+  const onlineClientCount = loading
+    ? 0
+    : items.filter((client) => online(client, now)).length;
 
   const columns: ColumnDef<ClientSummary>[] = [
     {
       id: "status",
       header: t("columns.status"),
-      cell: (row) => (
-        <DotStatus status={online(row, now) ? "online" : "offline"} />
-      ),
+      cell: (row) => <DotStatus status={clientStatus(row, loading, now)} />,
     },
     {
       id: "name",
@@ -301,6 +356,15 @@ export function ClientsDashboard({
       header: t("columns.lastSeen"),
       align: "right",
       cell: (row) => formatTimestamp(row.last_seen, "relative"),
+    },
+    {
+      id: "last_traffic_seen",
+      header: t("columns.lastTrafficSeen"),
+      align: "right",
+      cell: (row) =>
+        row.last_traffic_seen
+          ? formatTimestamp(row.last_traffic_seen, "relative")
+          : tStatus("unknown"),
     },
   ];
 
@@ -404,7 +468,7 @@ export function ClientsDashboard({
         subtitle={selected?.ip || selected?.mac}
         statusBadge={
           selected && (
-            <DotStatus status={online(selected, now) ? "online" : "offline"} />
+            <DotStatus status={clientStatus(selected, loading, now)} />
           )
         }
         footerActions={
@@ -498,6 +562,14 @@ export function ClientsDashboard({
               <PropertyRow
                 label={t("properties.lastSeen")}
                 value={formatTimestamp(selected.last_seen, "date")}
+              />
+              <PropertyRow
+                label={t("properties.lastTrafficSeen")}
+                value={
+                  selected.last_traffic_seen
+                    ? formatTimestamp(selected.last_traffic_seen, "date")
+                    : tStatus("unknown")
+                }
               />
             </section>
           </>

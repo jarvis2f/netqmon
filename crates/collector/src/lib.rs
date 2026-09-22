@@ -595,6 +595,7 @@ impl CollectorState {
         let classified = classify_batch(
             &inner.storage,
             &inner.classifier,
+            inner.geo_provider.as_ref(),
             &mut service_bindings,
             &favicon_endpoints,
             batch,
@@ -1160,11 +1161,13 @@ struct IngestStats {
 fn classify_batch(
     storage: &Storage,
     classifier: &ClassifierHandle,
+    geo_provider: &dyn GeoProvider,
     service_bindings: &mut ServiceBindingCache,
     favicon_endpoints: &FaviconEndpointCache,
     batch: &TelemetryBatch,
     analyses: &[Option<dpi::SampleAnalysis>],
 ) -> Result<Vec<FlowAttribution>, StorageError> {
+    let remote_asns = lookup_batch_remote_asns(geo_provider, batch);
     batch
         .flows
         .iter()
@@ -1208,7 +1211,10 @@ fn classify_batch(
             let input = ClassificationInput {
                 domain: domain.as_deref(),
                 remote_ip,
-                remote_asn: None,
+                remote_asn: remote_asns
+                    .get(&remote_ip)
+                    .copied()
+                    .and_then(BatchAsnLookup::asn),
                 remote_port: u16::try_from(flow.remote_port).unwrap_or(0),
                 protocol: u8::try_from(flow.protocol).unwrap_or(0),
                 dpi: dpi_result.map(|result| DpiEvidence {
@@ -1356,6 +1362,57 @@ fn classify_batch(
             Ok(attribution)
         })
         .collect()
+}
+
+/// Result of one Geo ASN lookup retained only for a single classification batch.
+///
+/// Keeping misses and failures distinct ensures a repeatedly observed address never
+/// causes repeated provider work, even when its ASN cannot be supplied.
+#[derive(Clone, Copy, Debug)]
+enum BatchAsnLookup {
+    Found(u32),
+    Missing,
+    Failed,
+}
+
+impl BatchAsnLookup {
+    const fn asn(self) -> Option<u32> {
+        match self {
+            Self::Found(asn) => Some(asn),
+            Self::Missing | Self::Failed => None,
+        }
+    }
+}
+
+fn lookup_batch_remote_asns(
+    geo_provider: &dyn GeoProvider,
+    batch: &TelemetryBatch,
+) -> HashMap<IpAddr, BatchAsnLookup> {
+    if !geo_provider.is_enabled() {
+        return HashMap::new();
+    }
+
+    let mut lookups = HashMap::new();
+    for flow in &batch.flows {
+        let Some(remote_ip) = decode_ip(&flow.remote_ip) else {
+            continue;
+        };
+        if lookups.contains_key(&remote_ip) {
+            continue;
+        }
+        let result = match geo_provider.lookup(remote_ip) {
+            Ok(Some(record)) => record
+                .asn
+                .map_or(BatchAsnLookup::Missing, BatchAsnLookup::Found),
+            Ok(None) => BatchAsnLookup::Missing,
+            Err(error) => {
+                tracing::debug!(%error, %remote_ip, "Geo ASN lookup skipped for classification");
+                BatchAsnLookup::Failed
+            }
+        };
+        lookups.insert(remote_ip, result);
+    }
+    lookups
 }
 
 fn resolve_batch_domain<'a>(
@@ -1863,6 +1920,7 @@ fn apply_sample_result(
     let classified = classify_batch(
         &inner.storage,
         &inner.classifier,
+        inner.geo_provider.as_ref(),
         &mut service_bindings,
         &inner.favicon_endpoints,
         &batch,

@@ -32,6 +32,7 @@ export interface ClientSummary {
   vendor: string | null;
   identity?: DeviceIdentity | null;
   last_seen: number;
+  last_traffic_seen?: number | null;
   upload_bytes: number;
   download_bytes: number;
   flow_count: number;

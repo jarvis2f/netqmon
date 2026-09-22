@@ -310,6 +310,7 @@ async fn discovery_only_device_accumulates_evidence_and_field_confidence() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), 65536).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["data"][0]["last_traffic_seen"].is_null());
     let identity = &json["data"][0]["identity"];
     assert_eq!(identity["device_type"], "printer");
     assert!(identity["device_type_confidence"].as_f64().unwrap() > 0.9);
@@ -606,6 +607,44 @@ async fn internal_query_api_covers_all_core_resources_with_stable_schema() {
         assert!(value.get("data").is_some(), "{uri}");
         assert!(value.get("pagination").is_some(), "{uri}");
     }
+}
+
+#[tokio::test]
+async fn client_queries_expose_last_traffic_seen_separately_from_discovery() {
+    let router = internal_router(query_state());
+
+    let list = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/internal/clients?limit=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let list_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(list.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(
+        list_json["data"][0]["last_traffic_seen"],
+        serde_json::json!(1_700_000_000_000_i64)
+    );
+
+    let detail = router
+        .oneshot(
+            Request::builder()
+                .uri("/internal/clients/1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let detail_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(detail.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(
+        detail_json["data"]["client"]["last_traffic_seen"],
+        serde_json::json!(1_700_000_000_000_i64)
+    );
 }
 
 #[tokio::test]
@@ -1573,6 +1612,375 @@ impl GeoProvider for TestGeoProvider {
     fn is_enabled(&self) -> bool {
         true
     }
+}
+
+#[derive(Debug)]
+struct CountingAsnGeoProvider {
+    asns: HashMap<IpAddr, u32>,
+    failures: std::collections::HashSet<IpAddr>,
+    calls: std::sync::Mutex<HashMap<IpAddr, usize>>,
+}
+
+impl CountingAsnGeoProvider {
+    fn new(
+        asns: impl IntoIterator<Item = (IpAddr, u32)>,
+        failures: impl IntoIterator<Item = IpAddr>,
+    ) -> Self {
+        Self {
+            asns: asns.into_iter().collect(),
+            failures: failures.into_iter().collect(),
+            calls: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn call_count(&self, ip: IpAddr) -> usize {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&ip)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+impl GeoProvider for CountingAsnGeoProvider {
+    fn lookup(&self, ip: IpAddr) -> Result<Option<netqmon_geo::GeoRecord>, netqmon_geo::GeoError> {
+        *self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(ip)
+            .or_default() += 1;
+        if self.failures.contains(&ip) {
+            return Err(netqmon_geo::GeoError::new("test lookup failure"));
+        }
+        Ok(self
+            .asns
+            .get(&ip)
+            .copied()
+            .map(|asn| netqmon_geo::GeoRecord {
+                asn: Some(asn),
+                ..Default::default()
+            }))
+    }
+
+    fn is_enabled(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug)]
+struct AsnClassifierRequest {
+    domain: Option<String>,
+    remote_ip: Option<String>,
+    remote_asn: Option<u32>,
+    has_dpi: bool,
+}
+
+fn spawn_asn_classifier_server(
+    socket_path: PathBuf,
+    expected_requests: usize,
+) -> std::thread::JoinHandle<Vec<AsnClassifierRequest>> {
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::os::unix::net::UnixListener::bind(socket_path).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut observed = Vec::new();
+
+        for _ in 0..expected_requests {
+            let mut line = String::new();
+            assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+            let netqmon_classifier_client::ClientRequest::ClassifyBatch {
+                request_id,
+                request,
+            } = serde_json::from_str(&line).unwrap()
+            else {
+                panic!("collector must use classify_batch IPC");
+            };
+            let entries = request
+                .entries
+                .into_iter()
+                .map(|entry| {
+                    observed.push(AsnClassifierRequest {
+                        domain: entry.domain.clone(),
+                        remote_ip: entry.remote_ip.clone(),
+                        remote_asn: entry.remote_asn,
+                        has_dpi: entry.dpi_evidence.is_some(),
+                    });
+                    let asn = entry.remote_asn;
+                    let suffix = asn.unwrap_or_default();
+                    netqmon_classifier_client::ClassificationResult {
+                        entry_id: entry.entry_id,
+                        organization: asn.map(|_| netqmon_classifier_client::ClassifiedEntity {
+                            id: format!("asn-org-{suffix}"),
+                            confidence: 0.91,
+                        }),
+                        application: asn.map(|_| netqmon_classifier_client::ClassifiedEntity {
+                            id: format!("asn-app-{suffix}"),
+                            confidence: 0.92,
+                        }),
+                        traffic_class: asn.map(|_| netqmon_classifier_client::ClassifiedEntity {
+                            id: "test-asn".to_owned(),
+                            confidence: 0.9,
+                        }),
+                        traffic_role: None,
+                        protocol: entry.dpi_evidence.as_ref().map(|_| {
+                            netqmon_classifier_client::ClassifiedEntity {
+                                id: "late-dpi".to_owned(),
+                                confidence: 0.95,
+                            }
+                        }),
+                        evidence: asn
+                            .map(|value| {
+                                vec![netqmon_classifier_client::ClassificationEvidence {
+                                    evidence_type: "remote_asn".to_owned(),
+                                    value: value.to_string(),
+                                    source: "test-geo".to_owned(),
+                                    weight: 0.92,
+                                }]
+                            })
+                            .unwrap_or_default(),
+                        device_evidence: Vec::new(),
+                        error: None,
+                    }
+                })
+                .collect();
+            let response = netqmon_classifier_client::ServerResponse::ClassificationBatch {
+                request_id,
+                result: netqmon_classifier_client::ClassificationBatchResult { entries },
+            };
+            writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+            writer.flush().unwrap();
+        }
+        observed
+    })
+}
+
+fn asn_test_flow(remote_ip: Vec<u8>, client_port: u32, timestamp: u64) -> FlowDelta {
+    FlowDelta {
+        ip_version: u32::try_from(if remote_ip.len() == 4 { 4 } else { 6 }).unwrap(),
+        protocol: 6,
+        client_ip: vec![192, 0, 2, 1],
+        client_port,
+        remote_ip,
+        remote_port: 443,
+        first_seen_unix_ms: timestamp,
+        last_seen_unix_ms: timestamp,
+        packets: 1,
+        lifecycle: FlowLifecycle::Ended as i32,
+        ..Default::default()
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn collector_forwards_batch_local_geo_asns_to_classifier_and_late_dpi() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("asn-classifier.sock");
+    let server = spawn_asn_classifier_server(socket_path.clone(), 11);
+    let classifier = crate::classifier::ClassifierHandle::connect(socket_path).unwrap();
+    let state = CollectorState::with_storage(
+        ENROLLMENT_TOKEN,
+        SqliteStorage::open_in_memory().unwrap(),
+        classifier,
+    )
+    .unwrap();
+    let enrollment = state
+        .enroll(&EnrollRequest {
+            enrollment_token: ENROLLMENT_TOKEN.to_owned(),
+            agent_version: "test".to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+            boot_id: "asn-test".to_owned(),
+            gateway_name: "asn-test".to_owned(),
+        })
+        .unwrap();
+    let v4: IpAddr = "203.0.113.10".parse().unwrap();
+    let v6: IpAddr = "2001:db8::10".parse().unwrap();
+    let missed: IpAddr = "198.51.100.10".parse().unwrap();
+    let failed: IpAddr = "2001:db8::bad".parse().unwrap();
+    let v4_bytes = vec![203, 0, 113, 10];
+    let v6_bytes = "2001:db8::10"
+        .parse::<std::net::Ipv6Addr>()
+        .unwrap()
+        .octets()
+        .to_vec();
+    let failed_bytes = "2001:db8::bad"
+        .parse::<std::net::Ipv6Addr>()
+        .unwrap()
+        .octets()
+        .to_vec();
+    let primary_geo = Arc::new(CountingAsnGeoProvider::new(
+        [(v4, 64_512), (v6, 64_513)],
+        [failed],
+    ));
+    state.lock().geo_provider = primary_geo.clone();
+
+    let timestamp = 1_700_000_000_000;
+    let initial = TelemetryBatch {
+        gateway_id: enrollment.gateway_id.clone(),
+        boot_id: "asn-test".to_owned(),
+        sequence: 1,
+        sent_at: timestamp,
+        agent_version: "test".to_owned(),
+        protocol_version: PROTOCOL_VERSION,
+        dns_observations: vec![DnsObservation {
+            client_ip: vec![192, 0, 2, 1],
+            domain: "generic.cdn.test".to_owned(),
+            answer_ip: v6_bytes.clone(),
+            record_type: DnsRecordType::Aaaa as i32,
+            ttl_seconds: 60,
+            observed_at_unix_ms: timestamp,
+        }],
+        flows: vec![
+            asn_test_flow(v4_bytes.clone(), 50_001, timestamp),
+            asn_test_flow(v4_bytes.clone(), 50_002, timestamp),
+            asn_test_flow(v6_bytes.clone(), 50_003, timestamp),
+            asn_test_flow(vec![198, 51, 100, 10], 50_004, timestamp),
+            asn_test_flow(vec![198, 51, 100, 10], 50_005, timestamp),
+            asn_test_flow(failed_bytes.clone(), 50_006, timestamp),
+            asn_test_flow(failed_bytes.clone(), 50_007, timestamp),
+        ],
+        ..Default::default()
+    };
+    assert_eq!(
+        state.accept_batch(&initial).unwrap(),
+        BatchDisposition::Accepted
+    );
+    assert_eq!(primary_geo.call_count(v4), 1);
+    assert_eq!(primary_geo.call_count(v6), 1);
+    assert_eq!(primary_geo.call_count(missed), 1);
+    assert_eq!(primary_geo.call_count(failed), 1);
+
+    let (organization, application, evidence): (String, String, String) = state
+        .lock()
+        .storage
+        .connection()
+        .query_row(
+            "SELECT organization_id, application_id, classification_evidence_json FROM flow_sessions WHERE client_port=50001",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(organization, "asn-org-64512");
+    assert_eq!(application, "asn-app-64512");
+    assert!(evidence.contains("remote_asn"));
+    assert!(evidence.contains("64512"));
+
+    let second = TelemetryBatch {
+        gateway_id: enrollment.gateway_id.clone(),
+        boot_id: "asn-test".to_owned(),
+        sequence: 2,
+        sent_at: timestamp + 1,
+        agent_version: "test".to_owned(),
+        protocol_version: PROTOCOL_VERSION,
+        flows: vec![asn_test_flow(v4_bytes.clone(), 50_008, timestamp + 1)],
+        ..Default::default()
+    };
+    state.accept_batch(&second).unwrap();
+    assert_eq!(primary_geo.call_count(v4), 2, "ASN cache is batch-local");
+
+    let replacement_geo = Arc::new(CountingAsnGeoProvider::new(
+        [(v4, 64_514), (v6, 64_515)],
+        [],
+    ));
+    state.lock().geo_provider = replacement_geo.clone();
+    let replacement = TelemetryBatch {
+        gateway_id: enrollment.gateway_id.clone(),
+        boot_id: "asn-test".to_owned(),
+        sequence: 3,
+        sent_at: timestamp + 2,
+        agent_version: "test".to_owned(),
+        protocol_version: PROTOCOL_VERSION,
+        flows: vec![asn_test_flow(v4_bytes, 50_009, timestamp + 2)],
+        ..Default::default()
+    };
+    state.accept_batch(&replacement).unwrap();
+    assert_eq!(replacement_geo.call_count(v4), 1);
+    let replacement_application: String = state
+        .lock()
+        .storage
+        .connection()
+        .query_row(
+            "SELECT application_id FROM flow_sessions WHERE client_port=50009",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(replacement_application, "asn-app-64514");
+
+    let late = dpi::CachedResult::for_test(
+        enrollment.gateway_id,
+        "asn-test".to_owned(),
+        netqmon_protocol::v1::FlowSampleKey {
+            ip_version: 6,
+            protocol: 6,
+            client_ip: vec![192, 0, 2, 1],
+            client_port: 50_003,
+            remote_ip: v6_bytes,
+            remote_port: 443,
+            first_seen_unix_ms: timestamp,
+        },
+        timestamp + 3,
+        Some(dpi::engine::DpiResult {
+            protocol: "tls".to_owned(),
+            confidence: 0.9,
+            metadata: std::collections::BTreeMap::from([(
+                "hostname".to_owned(),
+                "sni.example.test".to_owned(),
+            )]),
+            source: "ndpi".to_owned(),
+        }),
+    );
+    apply_sample_result(&mut state.lock(), &late).unwrap();
+    let (protocol, late_evidence): (String, String) = state
+        .lock()
+        .storage
+        .connection()
+        .query_row(
+            "SELECT protocol_id, classification_evidence_json FROM flow_sessions WHERE client_port=50003",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(protocol, "late-dpi");
+    assert!(late_evidence.contains("64515"));
+
+    let requests = server.join().unwrap();
+    assert!(requests.iter().any(|request| {
+        request.remote_ip.as_deref() == Some("203.0.113.10") && request.remote_asn == Some(64_512)
+    }));
+    assert!(requests.iter().any(|request| {
+        request.remote_ip.as_deref() == Some("2001:db8::10")
+            && request.remote_asn == Some(64_515)
+            && request.has_dpi
+    }));
+    assert!(requests.iter().any(|request| {
+        request.domain.as_deref() == Some("sni.example.test")
+            && request.remote_asn == Some(64_515)
+            && request.has_dpi
+    }));
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.remote_ip.as_deref() == Some("198.51.100.10"))
+            .filter(|request| request.remote_asn.is_none())
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.remote_ip.as_deref() == Some("2001:db8::bad"))
+            .filter(|request| request.remote_asn.is_none())
+            .count(),
+        2
+    );
+    assert!(requests.iter().any(|request| {
+        request.remote_ip.as_deref() == Some("203.0.113.10") && request.remote_asn == Some(64_514)
+    }));
 }
 
 #[tokio::test]
@@ -3536,6 +3944,7 @@ fn hostname_domain_rules_fill_unknown_dns_without_overriding_dns_applications() 
         let result = classify_batch(
             &inner.storage,
             &inner.classifier,
+            inner.geo_provider.as_ref(),
             &mut ServiceBindingCache::default(),
             &FaviconEndpointCache::default(),
             &batch,
@@ -3581,6 +3990,7 @@ fn local_hostname_does_not_identify_selfhost_or_bind_reverse_proxy_port() {
     let identified = classify_batch(
         &inner.storage,
         &inner.classifier,
+        inner.geo_provider.as_ref(),
         &mut bindings,
         &FaviconEndpointCache::default(),
         &batch,
@@ -3595,6 +4005,7 @@ fn local_hostname_does_not_identify_selfhost_or_bind_reverse_proxy_port() {
     let without_hostname = classify_batch(
         &inner.storage,
         &inner.classifier,
+        inner.geo_provider.as_ref(),
         &mut bindings,
         &FaviconEndpointCache::default(),
         &batch,
