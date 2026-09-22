@@ -1,5 +1,7 @@
 use std::{
-    env, fs,
+    env,
+    fmt::Write as _,
+    fs,
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -66,6 +68,23 @@ struct CheckResponse {
     allowed_rule: Option<CloudAllowedRule>,
     #[serde(default)]
     sealed_rule_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudErrorEnvelope {
+    error: CloudErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudErrorBody {
+    code: String,
+    message: String,
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    details: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -238,7 +257,7 @@ impl LicenseCoordinator {
             .await
             .map_err(display)?;
         if !response.status().is_success() {
-            return Err(format!("Cloud activation rejected ({})", response.status()));
+            return self.fail(cloud_response_message(response, "activation").await);
         }
         let activated: ActivateResponse = response.json().await.map_err(display)?;
         if activated.installation_id != snapshot.installation_id {
@@ -258,6 +277,7 @@ impl LicenseCoordinator {
         self.check_inner().await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn check_inner(&self) -> Result<LicenseStatus, String> {
         self.ensure_identity()?;
         let snapshot = self.snapshot()?;
@@ -314,20 +334,20 @@ impl LicenseCoordinator {
             Ok(response)
                 if response.status().as_u16() == 401 || response.status().as_u16() == 403 =>
             {
-                self.apply_community("revoked")?;
+                let status = response.status();
+                let message = cloud_response_message(response, "device check").await;
+                self.apply_community(cloud_local_status(status, &message))?;
                 return self.fail(format!(
-                    "Cloud rejected device credential ({})",
-                    response.status()
+                    "Cloud rejected device credential ({status}): {message}"
                 ));
             }
             Ok(response) => {
-                return self.transport_failure(
-                    format!("Cloud check failed ({})", response.status()),
-                    &snapshot,
-                );
+                let message = cloud_response_message(response, "device check").await;
+                return self.transport_failure(message, &snapshot);
             }
             Err(error) => return self.transport_failure(error.to_string(), &snapshot),
         };
+        let no_compatible_rule = response.edition == "pro" && response.allowed_rule.is_none();
         let lease = EntitlementLease {
             edition: response.edition.clone(),
             license_status: response.license_status.clone(),
@@ -348,10 +368,18 @@ impl LicenseCoordinator {
         identity.license_status = response.license_status;
         identity.lease_valid_until = Some(response.lease_valid_until.timestamp());
         self.save_identity(identity)?;
+        let rule_error = if no_compatible_rule {
+            Some(
+                "Pro license is active, but Cloud has no compatible Pro rule package for this installation."
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
         *self
             .last_error
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = None;
+            .unwrap_or_else(PoisonError::into_inner) = rule_error;
         self.status()
     }
 
@@ -478,6 +506,63 @@ fn now() -> i64 {
         .ok()
         .and_then(|value| i64::try_from(value.as_secs()).ok())
         .unwrap_or(i64::MAX)
+}
+
+async fn cloud_response_message(response: reqwest::Response, operation: &str) -> String {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if let Ok(envelope) = serde_json::from_str::<CloudErrorEnvelope>(&body) {
+        let error = envelope.error;
+        let mut message = format!(
+            "Cloud {operation} failed (HTTP {status}, code={}): {}",
+            error.code, error.message
+        );
+        if let Some(category) = error.category {
+            let _ = write!(message, " [category={category}]");
+        }
+        if let Some(action) = error.action {
+            let _ = write!(message, " Action: {action}.");
+        }
+        if let Some(details) = error.details {
+            let details = serde_json::to_string(&details).unwrap_or_else(|_| "{}".to_owned());
+            let _ = write!(message, " Details: {details}");
+        }
+        message
+    } else {
+        let body = body.trim();
+        let body = truncate_body(body, 1024);
+        if body.is_empty() {
+            format!("Cloud {operation} failed (HTTP {status})")
+        } else {
+            format!("Cloud {operation} failed (HTTP {status}): {body}")
+        }
+    }
+}
+
+fn cloud_local_status(status: reqwest::StatusCode, message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("license_expired") || lower.contains("license expired") {
+        "expired"
+    } else if lower.contains("license_revoked") || lower.contains("license revoked") {
+        "revoked"
+    } else if lower.contains("account_disabled") || lower.contains("account disabled") {
+        "disabled"
+    } else if status == reqwest::StatusCode::UNAUTHORIZED {
+        "credential_invalid"
+    } else {
+        "access_denied"
+    }
+}
+
+fn truncate_body(body: &str, max_len: usize) -> &str {
+    if body.len() <= max_len {
+        return body;
+    }
+    let end = body
+        .char_indices()
+        .find_map(|(index, character)| (index + character.len_utf8() > max_len).then_some(index))
+        .unwrap_or(max_len);
+    &body[..end]
 }
 
 fn display(error: impl std::fmt::Display) -> String {
@@ -637,7 +722,14 @@ mod tests {
                         } else if code == 403 {
                             (
                                 axum::http::StatusCode::FORBIDDEN,
-                                Json(serde_json::json!({ "error": "license_revoked" })),
+                                Json(serde_json::json!({
+                                    "error": {
+                                        "code": "license_revoked",
+                                        "category": "license",
+                                        "message": "The Pro license has been revoked.",
+                                        "action": "contact_support"
+                                    }
+                                })),
                             )
                         } else {
                             (
@@ -677,6 +769,9 @@ mod tests {
                 .unwrap_err()
                 .contains("rejected device credential (403")
         );
+        let error = coordinator.status().unwrap().last_error.unwrap();
+        assert!(error.contains("license_revoked"));
+        assert!(error.contains("contact_support"));
 
         // 3. Status must immediately downgrade to Community with revoked status
         let current_status = coordinator.status().unwrap();
