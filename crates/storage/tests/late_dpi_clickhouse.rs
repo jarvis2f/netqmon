@@ -77,6 +77,11 @@ fn self_host_client_identity_is_single_application_per_ip() {
     let gateway_id = format!("self-host-{}-{now}", std::process::id());
     let server_ip = vec![192, 0, 2, 31];
     let mac = vec![2, 0, 0, 0, 0, 31];
+    assert!(
+        storage
+            .save_gateway(&gateway_id, "self-host-test", "test", &[42; 32], now)
+            .unwrap()
+    );
     let mut batch = TelemetryBatch {
         gateway_id,
         boot_id: "self-host-test".into(),

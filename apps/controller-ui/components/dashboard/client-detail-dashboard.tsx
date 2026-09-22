@@ -157,7 +157,7 @@ export function ClientDetailDashboard({
   const [scope, setScope] = useState<Scope>("internet");
   const [scopeRates, setScopeRates] = useState<ScopedThroughput | null>(null);
 
-  const [lastSeen, setLastSeen] = useState(0);
+  const [lastTrafficSeen, setLastTrafficSeen] = useState(0);
   const [now, setNow] = useState(0);
 
   const tabs: Array<{ id: Tab; label: string }> = [
@@ -211,14 +211,16 @@ export function ClientDetailDashboard({
             envelopes[failed].error?.message ??
               `Client detail request failed (${responses[failed].status})`,
           );
+        const detail = envelopes[0].data as ClientDetailPayload;
         setData({
-          detail: envelopes[0].data as ClientDetailPayload,
+          detail,
           traffic: envelopes[1].data as TrafficPayload,
           applications: envelopes[2].data as ApplicationSummary[],
           domains: envelopes[3].data as DomainSummary[],
           destinations: envelopes[4].data as DestinationSummary[],
           flows: envelopes[5].data as FlowSummary[],
         });
+        setLastTrafficSeen(detail.client.last_traffic_seen ?? 0);
         setError(null);
       } catch (loadError) {
         if (!controller.signal.aborted)
@@ -238,10 +240,11 @@ export function ClientDetailDashboard({
       if (!data) return;
       const rates = snapshot.client_scopes?.[data.detail.client.mac] ?? null;
       setScopeRates(rates);
-      const client =
-        scope === "all"
-          ? (snapshot.clients[data.detail.client.mac] ?? null)
-          : (rates?.[scope] ?? null);
+      const clientTraffic =
+        snapshot.clients[data.detail.client.mac] ??
+        snapshot.clients[data.detail.client.mac.toLowerCase()] ??
+        null;
+      const client = scope === "all" ? clientTraffic : (rates?.[scope] ?? null);
       setRealtime(client);
       const addresses = new Set(
         data.detail.addresses.map((address) => address.ip),
@@ -252,12 +255,13 @@ export function ClientDetailDashboard({
           (scope === "all" || flow.scope === scope),
       );
       setActiveFlows(matchingFlows.length);
-      if (
-        snapshot.clients[data.detail.client.mac] ||
-        matchingFlows.length > 0
-      ) {
-        setLastSeen((current) => Math.max(current, snapshot.generated_at));
-      }
+      const hasTraffic =
+        (clientTraffic?.upload_bytes_per_second ?? 0) > 0 ||
+        (clientTraffic?.download_bytes_per_second ?? 0) > 0;
+      if (hasTraffic)
+        setLastTrafficSeen((current) =>
+          Math.max(current, snapshot.generated_at),
+        );
       if (client)
         setRealtimePoints((points) =>
           [
@@ -290,9 +294,16 @@ export function ClientDetailDashboard({
 
   const client = data?.detail.client;
   const identityEvidence = client?.identity?.evidence ?? [];
-  const effectiveLastSeen = Math.max(lastSeen, client?.last_seen ?? 0);
+  const effectiveLastTrafficSeen = Math.max(
+    lastTrafficSeen,
+    client?.last_traffic_seen ?? 0,
+  );
   const online =
-    now > 0 && effectiveLastSeen > 0 && now - effectiveLastSeen <= 30_000;
+    now > 0 &&
+    effectiveLastTrafficSeen > 0 &&
+    now - effectiveLastTrafficSeen <= 30_000;
+  const status =
+    loading || !client || now === 0 ? "loading" : online ? "online" : "offline";
   const downloadRate = splitBitrate(
     (realtime?.download_bytes_per_second ?? 0) * 8,
   );
@@ -645,7 +656,7 @@ export function ClientDetailDashboard({
           className="flex min-w-max items-center gap-1"
           aria-label={t("detail.fallbackSubtitle")}
         >
-          <DotStatus status={online ? "online" : "offline"} />
+          <DotStatus status={status} />
           <div className="mx-2 h-5 w-px bg-border" />
           <Select
             value={scope}
@@ -730,9 +741,7 @@ export function ClientDetailDashboard({
             />
             <MetricCard
               label={t("detail.activeFlows")}
-              value={
-                online && streamConnected ? activeFlows.toLocaleString() : "—"
-              }
+              value={streamConnected ? activeFlows.toLocaleString() : "—"}
               icon={Activity}
               loading={loading}
               subtext={t("detail.currentSessions")}

@@ -236,4 +236,6 @@ jobs:
       - name: Verify late classification on real ClickHouse
         env:
           NETQMON_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
-        run: cargo test -p netqmon-storage --test late_dpi_clickhouse -- --ignored
+        # Both ignored tests share the disposable database; serialize them so
+        # ClickHouse schema migrations cannot race with each other.
+        run: cargo test -p netqmon-storage --test late_dpi_clickhouse -- --ignored --test-threads=1

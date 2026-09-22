@@ -320,7 +320,7 @@
     "detail": {
       "back": "应用",
       "unknownApp": "未知应用",
-      "subtitle": "流量类别：{category} · 分类置信度 {confidence}%",
+      "subtitle": "流量类别：{category} · 分类置信度 {confidence}",
       "fallbackSubtitle": "应用流量及关联活动",
       "allRecordedTraffic": "所有已记录流量",
       "distinctClients": "分类关联的客户端数",
@@ -448,7 +448,8 @@
       "download": "下行",
       "upload": "上行",
       "flows": "连接流",
-      "lastSeen": "最后活跃"
+      "lastSeen": "最后活跃",
+      "lastTrafficSeen": "最后流量"
     },
     "properties": {
       "identity": "身份标识",
@@ -464,7 +465,8 @@
       "yes": "是",
       "no": "否",
       "flows": "连接流",
-      "lastSeen": "最后活跃"
+      "lastSeen": "最后活跃",
+      "lastTrafficSeen": "最后流量"
     },
     "detail": {
       "back": "客户端",

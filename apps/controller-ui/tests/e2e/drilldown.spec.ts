@@ -28,7 +28,23 @@ test("opens a client side panel and drills into full client details", async ({
 
   await page.getByRole("tab", { name: "Applications" }).click();
   await expect(page).toHaveURL(/\/clients\/101\?tab=applications$/);
-  await expect(page.getByRole("row", { name: /youtube/ })).toBeVisible();
+  await expect(page.getByRole("row", { name: /youtube/i })).toBeVisible();
+});
+
+test("uses last traffic for client online status and recovers with new traffic", async ({
+  page,
+  request,
+}) => {
+  await setCollectorScenario(request, "offline");
+  await page.getByRole("link", { name: "Clients" }).click();
+
+  const row = page.getByRole("row", { name: /Office Laptop/ });
+  await expect(row.getByRole("status")).toContainText("Offline");
+
+  await setCollectorScenario(request, "live");
+  await expect(
+    page.getByRole("row", { name: /Office Laptop/ }).getByRole("status"),
+  ).toContainText("Online");
 });
 
 test("opens an application side panel and drills into full application details", async ({
@@ -39,7 +55,7 @@ test("opens an application side panel and drills into full application details",
     page.getByRole("heading", { name: "Applications" }),
   ).toBeVisible();
 
-  await page.getByRole("row", { name: /youtube/ }).click();
+  await page.getByRole("row", { name: /youtube/i }).click();
   await expect(page.getByRole("heading", { name: "youtube" })).toBeVisible();
   await page.getByRole("link", { name: "Open full details" }).click();
 

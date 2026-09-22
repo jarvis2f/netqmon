@@ -63,6 +63,11 @@ In a standard deployment (such as via `docker-compose.yml`), the Controller cont
 | `NETQMON_COLLECTOR_MAC_DATASET_PATH` | `/data/mac-prefixes.json` | Path to the cached MAC OUI vendor prefix database. |
 | `NETQMON_SERVICE_BINDING_TTL_SECONDS` | `86400` | Expiration time (in seconds) for LAN service discovery and port binding observations. |
 
+When an ASN database is available, the collector enriches each valid remote IP during
+telemetry ingestion and supplies the ASN to the local classifier. Lookups are deduplicated
+within an ingestion or late-DPI reclassification batch only; a missing record or lookup error
+leaves ASN unset and never blocks traffic persistence or classification.
+
 ### 2.5 Classifier Manager & Component Updates
 
 | Variable | Default | Description |

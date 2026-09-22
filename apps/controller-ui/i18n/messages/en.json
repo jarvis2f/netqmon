@@ -320,7 +320,7 @@
     "detail": {
       "back": "Applications",
       "unknownApp": "Unknown application",
-      "subtitle": "Traffic Class: {category} · {confidence}% classifier confidence",
+      "subtitle": "Traffic Class: {category} · {confidence} classifier confidence",
       "fallbackSubtitle": "Application traffic and related activity",
       "allRecordedTraffic": "All recorded traffic",
       "distinctClients": "Distinct classified clients",
@@ -448,7 +448,8 @@
       "download": "Download",
       "upload": "Upload",
       "flows": "Flows",
-      "lastSeen": "Last Seen"
+      "lastSeen": "Last Seen",
+      "lastTrafficSeen": "Last Traffic"
     },
     "properties": {
       "identity": "Identity",
@@ -464,7 +465,8 @@
       "yes": "Yes",
       "no": "No",
       "flows": "Flows",
-      "lastSeen": "Last seen"
+      "lastSeen": "Last seen",
+      "lastTrafficSeen": "Last traffic"
     },
     "detail": {
       "back": "Clients",

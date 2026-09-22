@@ -2195,8 +2195,11 @@ fn update_active_flows(
             current.add(flow, attribution);
             let checkpoint =
                 received_at.saturating_sub(current.checkpointed_at) >= FLOW_CHECKPOINT_MS;
+            let ended_at = ended.then(|| flow_lifecycle_end_at(flow, received_at));
+            if (ended || checkpoint) && current.last_seen_at > 0 {
+                write_flow_session(tx, &key, current, ended_at, received_at)?;
+            }
             if ended || checkpoint {
-                write_flow_session(tx, &key, current, ended, received_at)?;
                 current.checkpointed_at = received_at;
             }
         }
@@ -2211,7 +2214,7 @@ fn write_flow_session(
     tx: &Transaction<'_>,
     key: &FlowKey,
     flow: &ActiveFlow,
-    ended: bool,
+    ended_at: Option<i64>,
     checkpointed_at: i64,
 ) -> rusqlite::Result<()> {
     let device_id = device_id_for_mac(tx, &key.gateway_id, &flow.client_mac)?;
@@ -2231,7 +2234,8 @@ fn write_flow_session(
             device_id = COALESCE(excluded.device_id, flow_sessions.device_id),
             upload_bytes = excluded.upload_bytes, download_bytes = excluded.download_bytes,
             packets = excluded.packets, last_seen_at = excluded.last_seen_at,
-            ended_at = excluded.ended_at, checkpointed_at = excluded.checkpointed_at,
+            ended_at = COALESCE(excluded.ended_at, flow_sessions.ended_at),
+            checkpointed_at = excluded.checkpointed_at,
             domain = excluded.domain, organization_id = excluded.organization_id,
             application_id = excluded.application_id, category_id = excluded.category_id,
             traffic_role = excluded.traffic_role, protocol_id = excluded.protocol_id,
@@ -2260,7 +2264,7 @@ fn write_flow_session(
             flow.packets,
             flow.started_at,
             flow.last_seen_at,
-            ended.then_some(flow.last_seen_at),
+            ended_at,
             checkpointed_at,
             flow.attribution.domain,
             flow.attribution.organization_id,
@@ -2438,13 +2442,18 @@ impl ActiveFlow {
         } else {
             observed_started_at
         };
+        let last_seen_at = if flow_has_traffic(flow) {
+            to_i64(flow.last_seen_unix_ms).max(started_at)
+        } else {
+            0
+        };
         Self {
             client_mac: flow.client_mac.clone(),
             upload_bytes: 0,
             download_bytes: 0,
             packets: 0,
             started_at,
-            last_seen_at: started_at,
+            last_seen_at,
             checkpointed_at: started_at,
             attribution,
             scope: i64::from(flow.scope),
@@ -2464,7 +2473,9 @@ impl ActiveFlow {
             .download_bytes
             .saturating_add(to_i64(flow.download_bytes));
         self.packets = self.packets.saturating_add(to_i64(flow.packets));
-        self.last_seen_at = self.last_seen_at.max(to_i64(flow.last_seen_unix_ms));
+        if flow_has_traffic(flow) {
+            self.last_seen_at = self.last_seen_at.max(to_i64(flow.last_seen_unix_ms));
+        }
         self.scope = i64::from(flow.scope);
         self.path_type = i64::from(flow.path_type);
         self.nat = i64::from(flow.nat);
@@ -2481,6 +2492,19 @@ impl ActiveFlow {
         {
             self.attribution.clone_from(attribution);
         }
+    }
+}
+
+pub(crate) fn flow_has_traffic(flow: &FlowDelta) -> bool {
+    flow.upload_bytes > 0 || flow.download_bytes > 0 || flow.packets > 0
+}
+
+pub(crate) fn flow_lifecycle_end_at(flow: &FlowDelta, received_at: i64) -> i64 {
+    let observed_at = to_i64(flow.last_seen_unix_ms);
+    if observed_at > 0 {
+        observed_at
+    } else {
+        received_at
     }
 }
 

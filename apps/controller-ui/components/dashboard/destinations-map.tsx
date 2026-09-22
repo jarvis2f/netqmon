@@ -438,7 +438,7 @@ export function DestinationsMap({
 
   return (
     <div
-      className={`relative w-full overflow-hidden rounded-xl border border-border bg-slate-100 dark:bg-[#07131f] ${className}`}
+      className={`relative isolate w-full overflow-hidden rounded-xl border border-border bg-slate-100 dark:bg-[#07131f] ${className}`}
       style={{ height: "560px", minHeight: "480px" }}
     >
       {/* Map Leaflet Container */}
