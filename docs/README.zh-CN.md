@@ -3,10 +3,11 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <strong>简体中文</strong>
+  <a href="../README.md">English</a> · <strong>简体中文</strong>
 </p>
 
 <p align="center">
+  <a href="https://demo.netqmon.com" target="_blank"><img src="https://img.shields.io/badge/Live%20Demo-demo.netqmon.com-10B981?style=flat-square&logo=googlechrome&logoColor=white" alt="Live Demo"></a>
   <img src="https://img.shields.io/badge/OpenWrt-24.10%2B-00B5E2?style=flat-square&logo=openwrt&logoColor=white" alt="OpenWrt 24.10+">
   <img src="https://img.shields.io/badge/Rust-eBPF-000000?style=flat-square&logo=rust&logoColor=white" alt="Rust + eBPF">
   <img src="https://img.shields.io/badge/Controller-Docker-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
@@ -14,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="apps/controller-ui/public/netqmon-cloud-banner-1920*400.png" width="100%" alt="NetQmon Cloud">
+  <img src="../apps/controller-ui/public/netqmon-cloud-banner-1920*400.png" width="100%" alt="NetQmon Cloud">
 </p>
 
 NetQmon 是一个面向 OpenWrt 的自托管网络可观测平台。它希望解决一件很直接的事情：让你知道网络里是谁在使用流量、访问了什么服务、流量去了哪里，以及这些活动在一段时间内发生了什么变化。
@@ -22,6 +23,13 @@ NetQmon 是一个面向 OpenWrt 的自托管网络可观测平台。它希望解
 轻量级 Agent 运行在网关上，通过 TC eBPF 采集 Flow 遥测；Controller 负责存储、分类、实时展示、历史查询和 Web 界面。路由器专注于采集，复杂分析留给更适合做这件事的 Controller。
 
 > NetQmon 当前专注于 **Observability**，不试图替代防火墙、QoS 或网络策略系统。
+
+## 截图
+
+<p align="center">
+  <img src="./netqmon-controller-screenshot-01.png" width="49%" alt="NetQmon Controller Overview">
+  <img src="./netqmon-controller-screenshot-02.png" width="49%" alt="NetQmon Controller Clients">
+</p>
 
 ## 核心能力
 
@@ -64,7 +72,9 @@ cd netqmon
 docker compose up -d
 ```
 
-Controller 健康检查通过后，访问 `http://localhost:3000`。
+1. Controller 健康检查通过后，在浏览器访问 `http://localhost:3000`，按照引导完成管理员初始化设置。
+2. 登录后前往 **「设置」** 页面，点击执行 **「更新地理位置与 ASN 数据库」**，以启用目标国家/地区与 ASN 归属分析。
+3. 确认你在 `docker-compose.yml`（或环境变量）中配置的接入令牌（**Enrollment Token**），后续配置 OpenWrt Agent 接入时将用到此令牌。
 
 默认使用 SQLite 作为存储后端。在需要更高写入吞吐或更长数据保留期时，可以启用 ClickHouse。详细环境变量、端口与存储配置见 [Controller 配置与端口说明](controller-configuration.zh-CN.md)。
 
@@ -148,6 +158,8 @@ NetQmon 使用 [Apache License 2.0](LICENSE)。
 ---
 
 <p align="center">
+  <a href="https://demo.netqmon.com">在线 Demo</a>
+  ·
   <a href="https://netqmon.com">网站</a>
   ·
   <a href="https://github.com/jarvis2f/netqmon/releases">Releases</a>

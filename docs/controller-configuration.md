@@ -72,7 +72,7 @@ leaves ASN unset and never blocks traffic persistence or classification.
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `NETQMON_CLASSIFIER_UPDATE_CHANNEL` | `beta` | Classifier component update channel: `stable`, `beta`, or `dev`. |
+| `NETQMON_CLASSIFIER_UPDATE_CHANNEL` | `stable` | Classifier component update channel: `stable`, `beta`, or `dev`. |
 | `NETQMON_CLASSIFIER_UPDATE_INTERVAL_SECONDS` | `300` | Periodic check interval for component updates (in seconds, default 5 minutes). |
 
 ### 2.6 Logging & Debugging

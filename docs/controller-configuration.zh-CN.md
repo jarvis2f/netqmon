@@ -69,7 +69,7 @@ NetQmon Controller 是整个网络监控系统的核心服务端，通常通过 
 
 | 环境变量 | 默认值 | 作用说明 |
 | :--- | :--- | :--- |
-| `NETQMON_CLASSIFIER_UPDATE_CHANNEL` | `beta` | 分类器组件更新通道，可选 `stable` / `beta` / `dev`。 |
+| `NETQMON_CLASSIFIER_UPDATE_CHANNEL` | `stable` | 分类器组件更新通道，可选 `stable` / `beta` / `dev`。 |
 | `NETQMON_CLASSIFIER_UPDATE_INTERVAL_SECONDS` | `300` | 自动检查组件更新的周期（秒，默认 5 分钟）。 |
 
 ### 2.6 日志与调试
