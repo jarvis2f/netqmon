@@ -6,7 +6,6 @@ RELEASES_API_URL="https://api.github.com/repos/jarvis2f/netqmon/releases?per_pag
 TMP_DIR="${TMPDIR:-/tmp}/netqmon-update"
 MANIFEST="$TMP_DIR/manifest.json"
 RELEASES="$TMP_DIR/releases.json"
-PACKAGE="$TMP_DIR/netqmon-agent.ipk"
 SERVICE=/etc/init.d/netqmon
 AGENT=/usr/bin/netqmon-agent
 
@@ -28,8 +27,17 @@ fail() {
 }
 
 current_version() {
-    local version
-    version="$(opkg list-installed netqmon-agent 2>/dev/null | awk '$1 == "netqmon-agent" {print $3; exit}')"
+    local manager version
+    manager="$(package_manager 2>/dev/null || true)"
+    version=
+    case "$manager" in
+        opkg)
+            version="$(opkg list-installed netqmon-agent 2>/dev/null | awk '$1 == "netqmon-agent" {print $3; exit}')"
+            ;;
+        apk)
+            version="$(apk info -v netqmon-agent 2>/dev/null | awk 'NR == 1 {sub(/^netqmon-agent-/, ""); print; exit}')"
+            ;;
+    esac
     if [ -n "$version" ]; then
         printf '%s' "$version"
         return 0
@@ -40,14 +48,46 @@ current_version() {
     fi
 }
 
+package_manager() {
+    if command -v opkg >/dev/null 2>&1; then
+        printf 'opkg'
+    elif command -v apk >/dev/null 2>&1; then
+        printf 'apk'
+    else
+        return 1
+    fi
+}
+
+package_format() {
+    local manager
+    manager="$(package_manager)" || return 1
+    case "$manager" in
+        opkg) printf 'ipk' ;;
+        apk) printf 'apk' ;;
+        *) return 1 ;;
+    esac
+}
+
 openwrt_arch() {
-    opkg print-architecture 2>/dev/null | awk '
-        NF >= 3 && $2 != "all" && $2 != "noarch" && $3 >= best {
-            arch = $2
-            best = $3
-        }
-        END { print arch }
-    '
+    local manager
+    manager="$(package_manager)" || return 1
+    case "$manager" in
+        opkg)
+            opkg print-architecture 2>/dev/null | awk '
+                NF >= 3 && $2 != "all" && $2 != "noarch" && $3 >= best {
+                    arch = $2
+                    best = $3
+                }
+                END { print arch }
+            '
+            ;;
+        apk)
+            apk --print-arch 2>/dev/null
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 update_channel() {
@@ -72,6 +112,8 @@ emit_common_fields() {
     json_string "${channel:-$(configured_update_channel)}"
     printf ',"architecture":'
     json_string "${arch:-$(openwrt_arch)}"
+    printf ',"package_format":'
+    json_string "${format:-$(package_format)}"
     printf ',"update_available":%s' "${update_available:-false}"
     printf ',"last_check":'
     json_string "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -125,8 +167,8 @@ download_manifest() {
 }
 
 manifest_field() {
-    local channel="$1" arch="$2" expr="$3"
-    jsonfilter -i "$MANIFEST" -e "@.channels.${channel}.packages[@.openwrt_arch='${arch}'].${expr}" 2>/dev/null | head -n 1
+    local channel="$1" arch="$2" format="$3" expr="$4"
+    jsonfilter -i "$MANIFEST" -e "@.channels.${channel}.packages[@.name='netqmon-agent'][@.openwrt_arch='${arch}'][@.package_format='${format}'].${expr}" 2>/dev/null | head -n 1
 }
 
 channel_field() {
@@ -135,22 +177,24 @@ channel_field() {
 }
 
 validate_package_url() {
-    case "$1" in
-        https://github.com/jarvis2f/netqmon/releases/download/*/netqmon-agent_*.ipk) return 0 ;;
+    case "$format:$1" in
+        ipk:https://github.com/jarvis2f/netqmon/releases/download/*/netqmon-agent_*.ipk) return 0 ;;
+        apk:https://github.com/jarvis2f/netqmon/releases/download/*/netqmon-agent-*.apk) return 0 ;;
         *) return 1 ;;
     esac
 }
 
 resolve_update() {
     channel="$(update_channel)"
+    format="$(package_format)" || fail "no supported OpenWrt package manager was found"
     arch="$(openwrt_arch)"
     [ -n "$arch" ] || fail "failed to detect OpenWrt architecture"
 
     latest_version="$(channel_field "$channel" version)"
-    package_url="$(manifest_field "$channel" "$arch" url)"
-    sha256="$(manifest_field "$channel" "$arch" sha256)"
-    package_arch="$(manifest_field "$channel" "$arch" openwrt_arch)"
-    latest_package_version="$(manifest_field "$channel" "$arch" version)"
+    package_url="$(manifest_field "$channel" "$arch" "$format" url)"
+    sha256="$(manifest_field "$channel" "$arch" "$format" sha256)"
+    package_arch="$(manifest_field "$channel" "$arch" "$format" openwrt_arch)"
+    latest_package_version="$(manifest_field "$channel" "$arch" "$format" version)"
 
     [ -n "$latest_version" ] || fail "manifest channel has no version"
     [ "$package_arch" = "$arch" ] || fail "manifest has no package for this architecture"
@@ -160,11 +204,22 @@ resolve_update() {
     validate_package_url "$package_url" || fail "manifest package URL is not trusted"
 
     current="$(current_version)"
-    if opkg compare-versions "$latest_package_version" '>' "$current" >/dev/null 2>&1; then
-        update_available=true
-    else
-        update_available=false
-    fi
+    case "$(package_manager)" in
+        opkg)
+            if opkg compare-versions "$latest_package_version" '>' "$current" >/dev/null 2>&1; then
+                update_available=true
+            else
+                update_available=false
+            fi
+            ;;
+        apk)
+            if [ "$(apk version -t "$latest_package_version" "$current" 2>/dev/null)" = ">" ]; then
+                update_available=true
+            else
+                update_available=false
+            fi
+            ;;
+    esac
 }
 
 check_call() {
@@ -176,18 +231,29 @@ check_call() {
 }
 
 apply_call() {
-    local actual rc
+    local actual install_log install_rc manager package rc
     download_manifest
     resolve_update
     [ "$update_available" = true ] || fail "no newer package is available on the selected update channel"
-    wget -q -O "$PACKAGE" "$package_url" || fail "failed to download agent package"
-    actual="$(sha256sum "$PACKAGE" | awk '{print $1}')"
+    manager="$(package_manager)"
+    package="$TMP_DIR/netqmon-agent.$format"
+    wget -q -O "$package" "$package_url" || fail "failed to download agent package"
+    actual="$(sha256sum "$package" | awk '{print $1}')"
     [ "$actual" = "$sha256" ] || fail "downloaded package checksum mismatch"
 
     "$SERVICE" stop >/dev/null 2>&1 || true
-    if ! opkg install "$PACKAGE" >/tmp/netqmon-opkg.log 2>&1; then
+    if [ "$manager" = "opkg" ]; then
+        install_log=/tmp/netqmon-opkg.log
+        opkg install "$package" >"$install_log" 2>&1
+        install_rc=$?
+    else
+        install_log=/tmp/netqmon-apk.log
+        apk add --allow-untrusted "$package" >"$install_log" 2>&1
+        install_rc=$?
+    fi
+    if [ "$install_rc" -ne 0 ]; then
         "$SERVICE" start >/dev/null 2>&1 || true
-        fail "opkg install failed; existing agent was restarted"
+        fail "$manager install failed; existing agent was restarted"
     fi
     "$SERVICE" start >/dev/null 2>&1 || true
     "$AGENT" doctor >/tmp/netqmon-doctor.log 2>&1

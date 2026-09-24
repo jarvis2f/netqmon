@@ -294,6 +294,56 @@ jobs:
             ver: "ipk"
             arch: armv7hf
 
+          # --- snapshots (apk) ---
+          - platform: x86_64
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: x86_64
+          - platform: aarch64_generic
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: aarch64
+          - platform: aarch64_cortex-a53
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: aarch64
+          - platform: aarch64_cortex-a72
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: aarch64
+          - platform: aarch64_cortex-a76
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: aarch64
+          - platform: arm_cortex-a7_vfpv4
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: armv7hf
+          - platform: arm_cortex-a7_neon-vfpv4
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: armv7hf
+          - platform: arm_cortex-a9_neon
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: armv7hf
+          - platform: arm_cortex-a9_vfpv3-d16
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: armv7hf
+          - platform: arm_cortex-a15_neon-vfpv4
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: armv7hf
+          - platform: arm_cortex-a5_vfpv4
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: armv7hf
+          - platform: arm_cortex-a8_vfpv3
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: armv7hf
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -317,14 +367,46 @@ jobs:
             version="${GITHUB_REF_NAME#v}"
             cargo_version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
             test "${version}" = "${cargo_version}"
-            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${version}/" packaging/openwrt/netqmon/Makefile
-            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${version}/" packaging/openwrt/luci-app-netqmon/Makefile
+            package_version="${version}"
+            if [ "${{ matrix.ver }}" = "apk" ] && [[ "${version}" == *-* ]]; then
+              # apk accepts a numeric release version with an optional commit hash suffix.
+              # Keep IPK metadata identical to the Cargo/tag version, but make prereleases
+              # valid APK versions that sort before the corresponding final release.
+              package_version="${version%%-*}~${GITHUB_SHA}"
+            fi
+            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${package_version}/" packaging/openwrt/netqmon/Makefile
+            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${package_version}/" packaging/openwrt/luci-app-netqmon/Makefile
           fi
 
       - name: Build with OpenWrt SDK
+        if: matrix.sdk_ver != 'snapshots'
         uses: openwrt/gh-action-sdk@main
         env:
           ARCH: ${{ matrix.sdk_ver == 'snapshots' && matrix.platform || format('{0}-{1}', matrix.platform, matrix.sdk_ver) }}
+          FEED_DIR: ${{ github.workspace }}/packaging/openwrt
+          PACKAGES: netqmon luci-app-netqmon
+          NO_SHFMT_CHECK: "1"
+          NO_REFRESH_CHECK: "1"
+          V: s
+
+      - name: Build with OpenWrt snapshot SDK (attempt 1)
+        if: matrix.sdk_ver == 'snapshots'
+        id: build_snapshot_sdk
+        continue-on-error: true
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: ${{ matrix.platform }}
+          FEED_DIR: ${{ github.workspace }}/packaging/openwrt
+          PACKAGES: netqmon luci-app-netqmon
+          NO_SHFMT_CHECK: "1"
+          NO_REFRESH_CHECK: "1"
+          V: s
+
+      - name: Retry OpenWrt snapshot SDK after a rolling snapshot update
+        if: matrix.sdk_ver == 'snapshots' && steps.build_snapshot_sdk.outcome == 'failure'
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: ${{ matrix.platform }}
           FEED_DIR: ${{ github.workspace }}/packaging/openwrt
           PACKAGES: netqmon luci-app-netqmon
           NO_SHFMT_CHECK: "1"
@@ -406,6 +488,28 @@ jobs:
             arch: mipsel32r2
             status: "Compatibility Test"
 
+          # --- snapshots (apk) ---
+          - platform: riscv64_riscv64
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: riscv64
+            status: "Candidate Official"
+          - platform: mipsel_24kc
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: mipsel32r2
+            status: "Experimental"
+          - platform: mipsel_74kc
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: mipsel32r2
+            status: "Experimental"
+          - platform: mipsel_24kc_24kf
+            sdk_ver: snapshots
+            ver: "apk"
+            arch: mipsel32r2
+            status: "Compatibility Test"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -429,14 +533,46 @@ jobs:
             version="${GITHUB_REF_NAME#v}"
             cargo_version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
             test "${version}" = "${cargo_version}"
-            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${version}/" packaging/openwrt/netqmon/Makefile
-            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${version}/" packaging/openwrt/luci-app-netqmon/Makefile
+            package_version="${version}"
+            if [ "${{ matrix.ver }}" = "apk" ] && [[ "${version}" == *-* ]]; then
+              # apk accepts a numeric release version with an optional commit hash suffix.
+              # Keep IPK metadata identical to the Cargo/tag version, but make prereleases
+              # valid APK versions that sort before the corresponding final release.
+              package_version="${version%%-*}~${GITHUB_SHA}"
+            fi
+            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${package_version}/" packaging/openwrt/netqmon/Makefile
+            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${package_version}/" packaging/openwrt/luci-app-netqmon/Makefile
           fi
 
       - name: Build with OpenWrt SDK
+        if: matrix.sdk_ver != 'snapshots'
         uses: openwrt/gh-action-sdk@main
         env:
           ARCH: ${{ matrix.sdk_ver == 'snapshots' && matrix.platform || format('{0}-{1}', matrix.platform, matrix.sdk_ver) }}
+          FEED_DIR: ${{ github.workspace }}/packaging/openwrt
+          PACKAGES: netqmon luci-app-netqmon
+          NO_SHFMT_CHECK: "1"
+          NO_REFRESH_CHECK: "1"
+          V: s
+
+      - name: Build with OpenWrt snapshot SDK (attempt 1)
+        if: matrix.sdk_ver == 'snapshots'
+        id: build_snapshot_sdk
+        continue-on-error: true
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: ${{ matrix.platform }}
+          FEED_DIR: ${{ github.workspace }}/packaging/openwrt
+          PACKAGES: netqmon luci-app-netqmon
+          NO_SHFMT_CHECK: "1"
+          NO_REFRESH_CHECK: "1"
+          V: s
+
+      - name: Retry OpenWrt snapshot SDK after a rolling snapshot update
+        if: matrix.sdk_ver == 'snapshots' && steps.build_snapshot_sdk.outcome == 'failure'
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: ${{ matrix.platform }}
           FEED_DIR: ${{ github.workspace }}/packaging/openwrt
           PACKAGES: netqmon luci-app-netqmon
           NO_SHFMT_CHECK: "1"
@@ -499,7 +635,7 @@ jobs:
       - name: Download package artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: openwrt-*-ipk
+          pattern: openwrt-*-*
           path: ${{ runner.temp }}/openwrt-packages
 
       - name: Prepare release assets and channel manifest
@@ -514,7 +650,7 @@ jobs:
             if [ ! -e "$release_assets/$name" ]; then
               cp "$package" "$release_assets/$name"
             fi
-          done < <(find "$package_root" -type f -name '*.ipk' -print0 | sort -z)
+          done < <(find "$package_root" -type f \( -name '*.ipk' -o -name '*.apk' \) -print0 | sort -z)
 
           version="${GITHUB_REF_NAME#v}"
           if [[ "$version" == *-* ]]; then
@@ -524,7 +660,7 @@ jobs:
           fi
           python3 scripts/release/generate_openwrt_manifest.py \
             --repository "$GITHUB_REPOSITORY" \
-            --release "$channel:$GITHUB_REF_NAME:$release_assets" \
+            --release "$channel:$GITHUB_REF_NAME:$package_root" \
             --output "$release_assets/openwrt-agent-manifest.json"
 
       - name: Publish packages and manifest to GitHub Release
