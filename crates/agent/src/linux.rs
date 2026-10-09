@@ -1620,12 +1620,9 @@ where
     let mut batch_next = vec![0_u8; batch_key_size];
     let mut batch_previous = vec![0_u8; batch_key_size];
     let mut has_previous = false;
-    let batch_options = libbpf_rs::libbpf_sys::bpf_map_batch_opts {
-        sz: size_of::<libbpf_rs::libbpf_sys::bpf_map_batch_opts>() as _,
-        elem_flags: MapFlags::ANY.bits(),
-        flags: MapFlags::ANY.bits(),
-        ..Default::default()
-    };
+    let mut batch_options = crate::bpf_opts::map_batch();
+    batch_options.elem_flags = MapFlags::ANY.bits();
+    batch_options.flags = MapFlags::ANY.bits();
     let mut snapshot = Vec::with_capacity(BATCH_SIZE as usize);
     let mut keys_scanned = 0_u64;
     let mut retained_entries = 0_u64;
@@ -1930,10 +1927,7 @@ fn resolve_interface(interface: &str) -> Result<i32, AgentError> {
 }
 
 fn probe_map_creation() -> Result<(), AgentError> {
-    let opts = libbpf_rs::libbpf_sys::bpf_map_create_opts {
-        sz: size_of::<libbpf_rs::libbpf_sys::bpf_map_create_opts>() as _,
-        ..Default::default()
-    };
+    let opts = crate::bpf_opts::map_create();
 
     // 1. Probe BPF syscall & Hash map support (observed_ifindexes, sample_budgets)
     MapHandle::create(

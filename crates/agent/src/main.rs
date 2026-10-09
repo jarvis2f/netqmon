@@ -43,6 +43,9 @@ mod topology;
 mod transport;
 
 #[cfg(target_os = "linux")]
+mod bpf_opts;
+
+#[cfg(target_os = "linux")]
 #[allow(dead_code, unused_imports, unsafe_code)]
 mod bpf {
     include!(concat!(env!("OUT_DIR"), "/flow.skel.rs"));
@@ -58,14 +61,11 @@ mod bpf {
         attach_type: libbpf_rs::libbpf_sys::bpf_attach_type,
         first: bool,
     ) -> libbpf_rs::Result<OwnedFd> {
-        let options = libbpf_rs::libbpf_sys::bpf_link_create_opts {
-            sz: size_of::<libbpf_rs::libbpf_sys::bpf_link_create_opts>() as _,
-            flags: if first {
-                libbpf_rs::libbpf_sys::BPF_F_BEFORE
-            } else {
-                0
-            },
-            ..Default::default()
+        let mut options = crate::bpf_opts::link_create();
+        options.flags = if first {
+            libbpf_rs::libbpf_sys::BPF_F_BEFORE
+        } else {
+            0
         };
         let fd = unsafe {
             libbpf_rs::libbpf_sys::bpf_link_create(

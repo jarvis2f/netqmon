@@ -1,6 +1,6 @@
 use std::fmt;
 use std::fs;
-use std::mem::{MaybeUninit, size_of};
+use std::mem::MaybeUninit;
 use std::os::fd::AsFd as _;
 
 use libbpf_rs::skel::{OpenSkel as _, SkelBuilder as _};
@@ -405,10 +405,7 @@ fn map_check(
     value_size: u32,
     max_entries: u32,
 ) -> Check {
-    let options = libbpf_rs::libbpf_sys::bpf_map_create_opts {
-        sz: size_of::<libbpf_rs::libbpf_sys::bpf_map_create_opts>() as _,
-        ..Default::default()
-    };
+    let options = crate::bpf_opts::map_create();
     match MapHandle::create(
         map_type,
         Some("nqm_doctor"),
