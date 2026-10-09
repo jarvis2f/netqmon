@@ -123,11 +123,20 @@ async fn check_license(State(state): State<CollectorState>) -> Response {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PageQuery {
     limit: Option<u32>,
     offset: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowPageQuery {
+    limit: Option<u32>,
+    offset: Option<u64>,
+    from: Option<u64>,
+    to: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -185,6 +194,10 @@ impl Page {
                 &error.body_text(),
             ))
         })?;
+        Self::from_query(query)
+    }
+
+    fn from_query(query: PageQuery) -> Result<Self, Box<Response>> {
         let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE);
         let offset = query.offset.unwrap_or(0);
         if limit == 0 || limit > MAX_PAGE_SIZE {
@@ -202,6 +215,16 @@ impl Page {
             )));
         }
         Ok(Self { limit, offset })
+    }
+}
+
+fn query_window(from: Option<u64>, to: Option<u64>) -> Result<Option<(i64, i64)>, &'static str> {
+    match (from, to) {
+        (None, None) => Ok(None),
+        (Some(from), Some(to)) if from < to && i64::try_from(to).is_ok() => {
+            Ok(Some((to_i64(from), to_i64(to))))
+        }
+        _ => Err("from and to must be supplied together as a valid timestamp range"),
     }
 }
 
@@ -693,19 +716,36 @@ fn query_direction_name(value: Option<i64>) -> &'static str {
 
 async fn clients(
     State(state): State<CollectorState>,
-    query: Result<Query<PageQuery>, QueryRejection>,
+    query: Result<Query<WindowPageQuery>, QueryRejection>,
 ) -> Response {
-    let page = match Page::parse(query) {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => {
+            return api_error(StatusCode::BAD_REQUEST, "invalid_query", &error.body_text());
+        }
+    };
+    let page = match Page::from_query(PageQuery {
+        limit: query.limit,
+        offset: query.offset,
+    }) {
         Ok(page) => page,
         Err(response) => return *response,
     };
+    let window = match query_window(query.from, query.to) {
+        Ok(window) => window,
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_time_range", message),
+    };
     let inner = state.lock();
     if let Some(clickhouse) = inner.storage.clickhouse_storage() {
-        return clickhouse
-            .query_clients(page.limit, page.offset)
-            .map_or_else(storage_error, |(items, total)| page_ok(items, page, total));
+        let query = match window {
+            Some((from, to)) => {
+                clickhouse.query_clients_in_range(page.limit, page.offset, from, to)
+            }
+            None => clickhouse.query_clients(page.limit, page.offset),
+        };
+        return query.map_or_else(storage_error, |(items, total)| page_ok(items, page, total));
     }
-    query_clients(inner.storage.connection(), page)
+    query_clients(inner.storage.connection(), page, window)
         .map_or_else(storage_error, |(items, total)| page_ok(items, page, total))
 }
 
@@ -1017,21 +1057,67 @@ fn query_client_flows(
 
 async fn applications(
     State(state): State<CollectorState>,
-    query: Result<Query<PageQuery>, QueryRejection>,
+    query: Result<Query<WindowPageQuery>, QueryRejection>,
 ) -> Response {
-    let page = match Page::parse(query) {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => {
+            return api_error(StatusCode::BAD_REQUEST, "invalid_query", &error.body_text());
+        }
+    };
+    let page = match Page::from_query(PageQuery {
+        limit: query.limit,
+        offset: query.offset,
+    }) {
         Ok(page) => page,
         Err(response) => return *response,
+    };
+    let window = match query_window(query.from, query.to) {
+        Ok(window) => window,
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_time_range", message),
     };
     let inner = state.lock();
     let connection = inner.storage.connection();
     let result = (|| -> rusqlite::Result<(Vec<Value>, u64)> {
-        let total: i64 = scalar(
-            connection,
-            "SELECT COUNT(*) FROM (SELECT 1 FROM traffic_application_minute GROUP BY application_id, category_id)",
-            [],
-        )?;
-        let mut statement = connection.prepare(
+        let total = if let Some((from, to)) = window {
+            scalar(
+                connection,
+                "SELECT COUNT(*) FROM (
+                    SELECT 1 FROM traffic_application_minute
+                    WHERE timestamp >= ?1 AND timestamp < ?2
+                    GROUP BY application_id, category_id
+                 )",
+                params![from, to],
+            )?
+        } else {
+            scalar(
+                connection,
+                "SELECT COUNT(*) FROM (
+                    SELECT 1 FROM traffic_application_minute
+                    GROUP BY application_id, category_id
+                 )",
+                [],
+            )?
+        };
+        let query_sql = if window.is_some() {
+            "SELECT t.application_id, t.category_id, SUM(t.upload_bytes), SUM(t.download_bytes),
+                    SUM(t.packets), SUM(t.flow_count), MAX(t.timestamp),
+                    (SELECT COUNT(DISTINCT f.device_id) FROM flow_sessions f
+                     WHERE f.application_id = t.application_id AND f.device_id IS NOT NULL
+                       AND f.last_seen_at >= ?1 AND f.last_seen_at < ?2),
+                    CASE
+                        WHEN t.application_id = 'unknown' THEN NULL
+                        ELSE (SELECT f.organization_id FROM flow_sessions f
+                              WHERE f.application_id = t.application_id
+                                AND f.organization_id IS NOT NULL AND f.organization_id != 'unknown'
+                              LIMIT 1)
+                    END
+             FROM traffic_application_minute t
+             WHERE t.timestamp >= ?1 AND t.timestamp < ?2
+             GROUP BY t.application_id, t.category_id
+             ORDER BY SUM(t.upload_bytes + t.download_bytes) DESC, t.application_id
+             LIMIT ?3 OFFSET ?4"
+        } else {
             "SELECT t.application_id, t.category_id, SUM(t.upload_bytes), SUM(t.download_bytes),
                     SUM(t.packets), SUM(t.flow_count), MAX(t.timestamp),
                     (SELECT COUNT(DISTINCT f.device_id) FROM flow_sessions f
@@ -1045,42 +1131,54 @@ async fn applications(
                     END
              FROM traffic_application_minute t GROUP BY t.application_id, t.category_id
              ORDER BY SUM(t.upload_bytes + t.download_bytes) DESC, t.application_id
-             LIMIT ?1 OFFSET ?2",
-        )?;
-        let items = statement
-            .query_map(params![i64::from(page.limit), to_i64(page.offset)], |row| {
-                let application_id = row.get::<_, String>(0)?;
-                let application_metadata = inner.classifier.application_metadata(&application_id);
-                let organization_id = if application_id == "unknown" {
-                    None
-                } else {
-                    row.get::<_, Option<String>>(8)?
-                };
-                let organization_metadata = organization_id
-                    .as_deref()
-                    .filter(|id| !id.is_empty() && *id != "unknown")
-                    .and_then(|id| inner.classifier.organization_metadata(id));
-                Ok(json!({
-                    "application_id": application_id,
-                    "name": application_metadata
-                        .as_ref()
-                        .map(|metadata| metadata.name.clone()),
-                    "category_id": row.get::<_, String>(1)?,
-                    "upload_bytes": row.get::<_, i64>(2)?,
-                    "download_bytes": row.get::<_, i64>(3)?,
-                    "packets": row.get::<_, i64>(4)?,
-                    "flow_count": row.get::<_, i64>(5)?,
-                    "last_seen": row.get::<_, i64>(6)?,
-                    "client_count": row.get::<_, i64>(7)?,
-                    "organization_id": organization_id,
-                    "organization_name": organization_metadata.as_ref().map(|metadata| metadata.name.clone()),
-                    "icon": icon_json(application_metadata),
-                }))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+             LIMIT ?1 OFFSET ?2"
+        };
+        let mut statement = connection.prepare(query_sql)?;
+        let map_row = |row: &Row<'_>| map_application_row(row, &inner);
+        let items = match window {
+            Some((from, to)) => statement
+                .query_map(
+                    params![from, to, i64::from(page.limit), to_i64(page.offset)],
+                    map_row,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => statement
+                .query_map(params![i64::from(page.limit), to_i64(page.offset)], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
         Ok((items, to_u64(total)))
     })();
     result.map_or_else(storage_error, |(items, total)| page_ok(items, page, total))
+}
+
+fn map_application_row(row: &Row<'_>, inner: &crate::CollectorInner) -> rusqlite::Result<Value> {
+    let application_id = row.get::<_, String>(0)?;
+    let application_metadata = inner.classifier.application_metadata(&application_id);
+    let organization_id = if application_id == "unknown" {
+        None
+    } else {
+        row.get::<_, Option<String>>(8)?
+    };
+    let organization_metadata = organization_id
+        .as_deref()
+        .filter(|id| !id.is_empty() && *id != "unknown")
+        .and_then(|id| inner.classifier.organization_metadata(id));
+    Ok(json!({
+        "application_id": application_id,
+        "name": application_metadata
+            .as_ref()
+            .map(|metadata| metadata.name.clone()),
+        "category_id": row.get::<_, String>(1)?,
+        "upload_bytes": row.get::<_, i64>(2)?,
+        "download_bytes": row.get::<_, i64>(3)?,
+        "packets": row.get::<_, i64>(4)?,
+        "flow_count": row.get::<_, i64>(5)?,
+        "last_seen": row.get::<_, i64>(6)?,
+        "client_count": row.get::<_, i64>(7)?,
+        "organization_id": organization_id,
+        "organization_name": organization_metadata.as_ref().map(|metadata| metadata.name.clone()),
+        "icon": icon_json(application_metadata),
+    }))
 }
 
 async fn organizations(
@@ -2508,9 +2606,32 @@ fn summary_row(row: &rusqlite::Row<'_>, names: &[&str]) -> rusqlite::Result<Valu
     Ok(Value::Object(object))
 }
 
-fn query_clients(connection: &Connection, page: Page) -> rusqlite::Result<(Vec<Value>, u64)> {
+fn query_clients(
+    connection: &Connection,
+    page: Page,
+    window: Option<(i64, i64)>,
+) -> rusqlite::Result<(Vec<Value>, u64)> {
     let total: i64 = scalar(connection, "SELECT COUNT(*) FROM devices", [])?;
-    let mut statement = connection.prepare(
+    let traffic_join = if window.is_some() {
+        "(SELECT device_id, SUM(upload_bytes) AS upload_bytes,
+                SUM(download_bytes) AS download_bytes, SUM(flow_count) AS flow_count,
+                MAX(timestamp) AS timestamp
+         FROM traffic_device_minute WHERE timestamp >= ?1 AND timestamp < ?2
+         GROUP BY device_id)"
+    } else {
+        "traffic_device_minute"
+    };
+    let session_window = if window.is_some() {
+        "AND flow_sessions.last_seen_at >= ?1 AND flow_sessions.last_seen_at < ?2"
+    } else {
+        ""
+    };
+    let page_window = if window.is_some() {
+        "?3 OFFSET ?4"
+    } else {
+        "?1 OFFSET ?2"
+    };
+    let sql = format!(
         "SELECT d.id, d.mac, COALESCE(d.display_name, d.hostname, ''), d.vendor,
                 d.device_type, d.os_family, d.model, d.identity_confidence,
                 COALESCE((SELECT json_group_array(json_object(
@@ -2524,7 +2645,7 @@ fn query_clients(connection: &Connection, page: Page) -> rusqlite::Result<(Vec<V
                 (SELECT MAX(flow_sessions.last_seen_at) FROM flow_sessions
                  WHERE flow_sessions.device_id = d.id
                    AND (flow_sessions.upload_bytes > 0 OR flow_sessions.download_bytes > 0
-                        OR flow_sessions.packets > 0)),
+                        OR flow_sessions.packets > 0) {session_window}),
                 COALESCE(SUM(t.upload_bytes), 0), COALESCE(SUM(t.download_bytes), 0),
                 COALESCE(SUM(t.flow_count), 0),
                 (SELECT ip FROM device_addresses a WHERE a.device_id = d.id
@@ -2538,37 +2659,47 @@ fn query_clients(connection: &Connection, page: Page) -> rusqlite::Result<(Vec<V
                 CASE WHEN (SELECT COUNT(*) FROM device_addresses a WHERE a.device_id=d.id)=1
                      THEN (SELECT application_source FROM device_addresses a WHERE a.device_id=d.id LIMIT 1)
                 END
-         FROM devices d LEFT JOIN traffic_device_minute t ON t.device_id = d.id
+         FROM devices d LEFT JOIN {traffic_join} t ON t.device_id = d.id
          GROUP BY d.id ORDER BY SUM(COALESCE(t.upload_bytes, 0) + COALESCE(t.download_bytes, 0)) DESC,
-                  d.id LIMIT ?1 OFFSET ?2",
-    )?;
-    let items = statement
-        .query_map(params![i64::from(page.limit), to_i64(page.offset)], |row| {
-            let mac: Vec<u8> = row.get(1)?;
-            let ip = row
-                .get::<_, Option<Vec<u8>>>(19)?
-                .map(|value| format_ip(&value));
-            Ok(json!({
-                "id": row.get::<_, i64>(0)?,
-                "mac": format_mac(&mac),
-                "name": row.get::<_, String>(2)?,
-                "vendor": row.get::<_, Option<String>>(3)?,
-                "identity": device_identity_json(row, 3)?,
-                "last_seen": row.get::<_, i64>(14)?,
-                "last_traffic_seen": row.get::<_, Option<i64>>(15)?,
-                "upload_bytes": row.get::<_, i64>(16)?,
-                "download_bytes": row.get::<_, i64>(17)?,
-                "flow_count": row.get::<_, i64>(18)?,
-                "ip": ip,
-                "self_host_application": row.get::<_, Option<String>>(20)?.map(|application_id| json!({
-                    "application_id": application_id,
-                    "confidence": row.get::<_, f64>(21).unwrap_or(0.0),
-                    "source": row.get::<_, Option<String>>(22).ok().flatten(),
-                    "role": "server",
-                })),
-            }))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+                  d.id LIMIT {page_window}"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let map_row = |row: &Row<'_>| {
+        let mac: Vec<u8> = row.get(1)?;
+        let ip = row
+            .get::<_, Option<Vec<u8>>>(19)?
+            .map(|value| format_ip(&value));
+        Ok(json!({
+            "id": row.get::<_, i64>(0)?,
+            "mac": format_mac(&mac),
+            "name": row.get::<_, String>(2)?,
+            "vendor": row.get::<_, Option<String>>(3)?,
+            "identity": device_identity_json(row, 3)?,
+            "last_seen": row.get::<_, i64>(14)?,
+            "last_traffic_seen": row.get::<_, Option<i64>>(15)?,
+            "upload_bytes": row.get::<_, i64>(16)?,
+            "download_bytes": row.get::<_, i64>(17)?,
+            "flow_count": row.get::<_, i64>(18)?,
+            "ip": ip,
+            "self_host_application": row.get::<_, Option<String>>(20)?.map(|application_id| json!({
+                "application_id": application_id,
+                "confidence": row.get::<_, f64>(21).unwrap_or(0.0),
+                "source": row.get::<_, Option<String>>(22).ok().flatten(),
+                "role": "server",
+            })),
+        }))
+    };
+    let items = match window {
+        Some((from, to)) => statement
+            .query_map(
+                params![from, to, i64::from(page.limit), to_i64(page.offset)],
+                map_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+        None => statement
+            .query_map(params![i64::from(page.limit), to_i64(page.offset)], map_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+    };
     Ok((items, to_u64(total)))
 }
 

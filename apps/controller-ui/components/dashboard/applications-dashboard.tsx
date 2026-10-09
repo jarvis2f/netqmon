@@ -7,6 +7,11 @@ import { Search } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { AppLayout } from "@/components/app-shell/app-layout";
 import { DataTable, type ColumnDef } from "@/components/data/data-table";
+import {
+  TimeRangePicker,
+  type CustomDateRange,
+  type TimeRangeValue,
+} from "@/components/data/time-range-picker";
 import { ApplicationIdentity } from "@/components/network/application-identity";
 import { PropertyRow, SidePanel } from "@/components/overlays/side-panel";
 import { EmptyState } from "@/components/states/empty-state";
@@ -21,16 +26,38 @@ import {
 } from "@/lib/formatters";
 import type { ApiEnvelope, ApplicationSummary } from "@/lib/network-types";
 
+const RANGE_MS: Record<Exclude<TimeRangeValue, "custom" | "15m">, number> = {
+  "1h": 60 * 60 * 1_000,
+  "24h": 24 * 60 * 60 * 1_000,
+  "7d": 7 * 24 * 60 * 60 * 1_000,
+  "30d": 30 * 24 * 60 * 60 * 1_000,
+};
+
+function rangeBounds(range: TimeRangeValue, from?: string, to?: string) {
+  const end = range === "custom" && to ? Date.parse(to) : Date.now();
+  const start =
+    range === "custom" && from
+      ? Date.parse(from)
+      : end - (RANGE_MS[range as keyof typeof RANGE_MS] || RANGE_MS["24h"]);
+  return { from: start, to: end };
+}
+
 export function ApplicationsDashboard({
   username,
   initialSearch,
   initialSelectedId,
   initialSelectedCategory,
+  initialRange,
+  initialFrom,
+  initialTo,
 }: {
   username: string;
   initialSearch: string;
   initialSelectedId?: string;
   initialSelectedCategory?: string;
+  initialRange: TimeRangeValue;
+  initialFrom?: string;
+  initialTo?: string;
 }) {
   const t = useTranslations("applications");
   const tNav = useTranslations("navigation");
@@ -56,7 +83,13 @@ export function ApplicationsDashboard({
     async function load() {
       setLoading(true);
       try {
-        const response = await fetch("/api/applications?limit=200", {
+        const bounds = rangeBounds(initialRange, initialFrom, initialTo);
+        const params = new URLSearchParams({
+          limit: "200",
+          from: String(bounds.from),
+          to: String(bounds.to),
+        });
+        const response = await fetch(`/api/applications?${params.toString()}`, {
           cache: "no-store",
           signal: controller.signal,
         });
@@ -81,7 +114,7 @@ export function ApplicationsDashboard({
     }
     void load();
     return () => controller.abort();
-  }, [reloadKey, t]);
+  }, [initialFrom, initialRange, initialTo, reloadKey, t]);
 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
@@ -115,6 +148,19 @@ export function ApplicationsDashboard({
     router.replace(`/applications${params.size ? `?${params}` : ""}`, {
       scroll: false,
     });
+  };
+
+  const handleRange = (range: TimeRangeValue, custom?: CustomDateRange) => {
+    const params = new URLSearchParams(window.location.search);
+    params.set("range", range);
+    if (range === "custom" && custom) {
+      params.set("from", custom.from);
+      params.set("to", custom.to);
+    } else {
+      params.delete("from");
+      params.delete("to");
+    }
+    router.replace(`/applications?${params.toString()}`, { scroll: false });
   };
 
   const filtered = useMemo(() => {
@@ -195,29 +241,41 @@ export function ApplicationsDashboard({
   ];
 
   const toolbar = (
-    <div className="flex items-center justify-between gap-3">
-      <label className="relative block w-full max-w-sm">
-        <Search className="pointer-events-none absolute left-2.5 top-2 size-3.5 text-foreground-muted z-10" />
-        <Input
-          ref={searchRef}
-          type="search"
-          value={search}
-          onChange={(event) => setSearch(event.target.value)}
-          onBlur={() => replaceQuery({ search })}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") replaceQuery({ search });
-          }}
-          placeholder={t("searchPlaceholder")}
-          aria-label={t("searchAria")}
-          className="pl-8 pr-12"
-        />
-        <kbd className="pointer-events-none absolute right-2 top-1.5 rounded border border-border bg-surface-subtle px-1.5 py-0.5 text-[10px] text-foreground-muted">
-          /
-        </kbd>
-      </label>
-      <span className="shrink-0 text-[11px] text-foreground-muted">
-        {t("applicationsCount", { count: filtered.length })}
-      </span>
+    <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+      <div className="flex items-center justify-between gap-3">
+        <label className="relative block w-full max-w-sm">
+          <Search className="pointer-events-none absolute left-2.5 top-2 size-3.5 text-foreground-muted z-10" />
+          <Input
+            ref={searchRef}
+            type="search"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            onBlur={() => replaceQuery({ search })}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") replaceQuery({ search });
+            }}
+            placeholder={t("searchPlaceholder")}
+            aria-label={t("searchAria")}
+            className="pl-8 pr-12"
+          />
+          <kbd className="pointer-events-none absolute right-2 top-1.5 rounded border border-border bg-surface-subtle px-1.5 py-0.5 text-[10px] text-foreground-muted">
+            /
+          </kbd>
+        </label>
+        <span className="shrink-0 text-[11px] text-foreground-muted">
+          {t("applicationsCount", { count: filtered.length })}
+        </span>
+      </div>
+      <TimeRangePicker
+        value={initialRange}
+        onChange={handleRange}
+        customRange={
+          initialFrom && initialTo
+            ? { from: initialFrom, to: initialTo }
+            : undefined
+        }
+        className="shrink-0 self-end xl:self-auto"
+      />
     </div>
   );
 

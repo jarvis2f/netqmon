@@ -656,6 +656,30 @@ impl ClickHouseStorage {
     ///
     /// Returns `StorageError` on query error.
     pub fn query_clients(&self, limit: u32, offset: u64) -> StorageResult<(Vec<Value>, u64)> {
+        self.query_clients_with_window(limit, offset, None)
+    }
+
+    /// Queries clients ranked by traffic in a half-open timestamp range.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StorageError` on query error.
+    pub fn query_clients_in_range(
+        &self,
+        limit: u32,
+        offset: u64,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> StorageResult<(Vec<Value>, u64)> {
+        self.query_clients_with_window(limit, offset, Some((from_ms, to_ms)))
+    }
+
+    fn query_clients_with_window(
+        &self,
+        limit: u32,
+        offset: u64,
+        window: Option<(i64, i64)>,
+    ) -> StorageResult<(Vec<Value>, u64)> {
         let count_sql = "SELECT count() AS c FROM devices FORMAT JSON";
         let count_res = self.client.query_json(count_sql)?;
         let total = count_res["data"]
@@ -668,8 +692,25 @@ impl ClickHouseStorage {
             })
             .unwrap_or(0);
 
+        let traffic_table = window.map_or_else(
+            || "traffic_device_minute AS t".to_owned(),
+            |(from_ms, to_ms)| {
+                format!(
+                    "(SELECT device_id, sum(upload_bytes) AS upload_bytes,
+                            sum(download_bytes) AS download_bytes, max(timestamp) AS timestamp
+                     FROM traffic_device_minute
+                     WHERE timestamp >= {from_ms} AND timestamp < {to_ms}
+                     GROUP BY device_id) AS t"
+                )
+            },
+        );
+        let order_by = if window.is_some() {
+            "sum(t.upload_bytes + t.download_bytes) DESC, d.id"
+        } else {
+            "last_seen DESC"
+        };
         let sql = format!(
-            "SELECT d.id AS id, d.gateway_id AS gateway_id, d.mac AS mac, d.hostname AS hostname, d.display_name AS display_name, d.vendor AS vendor, d.first_seen AS first_seen, d.last_seen AS last_seen, f.last_traffic_seen AS last_traffic_seen, coalesce(sum(t.upload_bytes), 0) AS up, coalesce(sum(t.download_bytes), 0) AS down FROM devices AS d FINAL LEFT JOIN traffic_device_minute AS t ON d.id = t.device_id LEFT JOIN (SELECT device_id, max(last_seen_at) AS last_traffic_seen FROM flow_sessions FINAL WHERE upload_bytes > 0 OR download_bytes > 0 OR packets > 0 GROUP BY device_id) AS f ON d.id = f.device_id GROUP BY d.id, d.gateway_id, d.mac, d.hostname, d.display_name, d.vendor, d.first_seen, d.last_seen, f.last_traffic_seen ORDER BY last_seen DESC LIMIT {limit} OFFSET {offset} FORMAT JSON"
+            "SELECT d.id AS id, d.gateway_id AS gateway_id, d.mac AS mac, d.hostname AS hostname, d.display_name AS display_name, d.vendor AS vendor, d.first_seen AS first_seen, d.last_seen AS last_seen, f.last_traffic_seen AS last_traffic_seen, coalesce(sum(t.upload_bytes), 0) AS up, coalesce(sum(t.download_bytes), 0) AS down FROM devices AS d FINAL LEFT JOIN {traffic_table} ON d.id = t.device_id LEFT JOIN (SELECT device_id, max(last_seen_at) AS last_traffic_seen FROM flow_sessions FINAL WHERE upload_bytes > 0 OR download_bytes > 0 OR packets > 0 GROUP BY device_id) AS f ON d.id = f.device_id GROUP BY d.id, d.gateway_id, d.mac, d.hostname, d.display_name, d.vendor, d.first_seen, d.last_seen, f.last_traffic_seen ORDER BY {order_by} LIMIT {limit} OFFSET {offset} FORMAT JSON"
         );
         let res = self.client.query_json(&sql)?;
         let mut items = Vec::new();

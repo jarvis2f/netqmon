@@ -219,6 +219,7 @@
     "topApplications": "热门应用",
     "topClients": "活跃客户端",
     "topDestinations": "主要目标",
+    "recent24HoursHint": "排行按最近 24 小时记录的流量统计。",
     "categoryDistribution": "流量类别分布",
     "gatewayHealth": "网关健康状态",
     "noGatewayEnrolled": "未注册网关",

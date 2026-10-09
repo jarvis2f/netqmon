@@ -2,11 +2,12 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Activity, ArrowDown, ArrowUp, Users } from "lucide-react";
+import { Activity, ArrowDown, ArrowUp, CircleAlert, Users } from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
 import { AppLayout } from "@/components/app-shell/app-layout";
 import { MetricCard } from "@/components/data/metric-card";
 import { RankList, type RankItem } from "@/components/data/rank-list";
+import { SimpleTooltip } from "@/components/ui/tooltip";
 import {
   CategoryDistribution,
   type CategoryItem,
@@ -218,6 +219,21 @@ export function OverviewDashboard({ username }: { username: string }) {
     [t],
   );
 
+  const recentRankingTitle = (label: string) => (
+    <span className="inline-flex items-center gap-1.5">
+      {label}
+      <SimpleTooltip content={t("recent24HoursHint")}>
+        <button
+          type="button"
+          aria-label={t("recent24HoursHint")}
+          className="inline-flex text-foreground-muted hover:text-foreground"
+        >
+          <CircleAlert className="size-3.5" />
+        </button>
+      </SimpleTooltip>
+    </span>
+  );
+
   const applySnapshot = useCallback(
     (next: RealtimeSnapshot) => {
       setSnapshot({
@@ -314,14 +330,30 @@ export function OverviewDashboard({ username }: { username: string }) {
 
     async function loadOverview() {
       try {
+        const destinationTo = Date.now();
+        const destinationFrom = destinationTo - 24 * 60 * 60 * 1_000;
+        const destinationParams = new URLSearchParams({
+          limit: "5",
+          from: String(destinationFrom),
+          to: String(destinationTo),
+          lang: locale,
+        });
+        const summaryParams = new URLSearchParams({
+          limit: "5",
+          from: String(destinationFrom),
+          to: String(destinationTo),
+        });
         const [overviewRes, appsRes, clientsRes, destsRes] = await Promise.all([
           fetch("/api/overview", { signal: controller.signal }),
-          fetch("/api/applications?limit=5", { signal: controller.signal }),
-          fetch("/api/clients?limit=5", { signal: controller.signal }),
-          fetch(
-            `/api/destinations?limit=5&lang=${encodeURIComponent(locale)}`,
-            { signal: controller.signal },
-          ),
+          fetch(`/api/applications?${summaryParams.toString()}`, {
+            signal: controller.signal,
+          }),
+          fetch(`/api/clients?${summaryParams.toString()}`, {
+            signal: controller.signal,
+          }),
+          fetch(`/api/destinations?${destinationParams.toString()}`, {
+            signal: controller.signal,
+          }),
         ]);
 
         if (overviewRes.ok) {
@@ -556,7 +588,7 @@ export function OverviewDashboard({ username }: { username: string }) {
 
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
         <RankList
-          title={t("topApplications")}
+          title={recentRankingTitle(t("topApplications"))}
           items={topApplications}
           loading={loading}
           viewAllHref="/applications"
@@ -565,7 +597,7 @@ export function OverviewDashboard({ username }: { username: string }) {
           }
         />
         <RankList
-          title={t("topClients")}
+          title={recentRankingTitle(t("topClients"))}
           items={topClients}
           loading={loading}
           viewAllHref="/clients"
@@ -574,7 +606,7 @@ export function OverviewDashboard({ username }: { username: string }) {
           }
         />
         <RankList
-          title={t("topDestinations")}
+          title={recentRankingTitle(t("topDestinations"))}
           items={topDestinations}
           loading={loading}
           viewAllHref="/destinations"

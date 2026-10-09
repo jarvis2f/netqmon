@@ -219,6 +219,7 @@
     "topApplications": "Top Applications",
     "topClients": "Top Clients",
     "topDestinations": "Top Destinations",
+    "recent24HoursHint": "Rankings use traffic recorded in the last 24 hours.",
     "categoryDistribution": "Category Distribution",
     "gatewayHealth": "Gateway Health",
     "noGatewayEnrolled": "No gateway enrolled",

@@ -14,7 +14,13 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 const INITIAL_MIGRATION: &str = include_str!("../../../migrations/sqlite/0001_initial.sql");
 const PROTOCOL_MIGRATION: &str =
     include_str!("../../../migrations/sqlite/0002_traffic_scope_protocol.sql");
-const MIGRATIONS: [(i64, &str); 2] = [(1, INITIAL_MIGRATION), (2, PROTOCOL_MIGRATION)];
+const SCOPE_TIMESTAMP_MIGRATION: &str =
+    include_str!("../../../migrations/sqlite/0003_traffic_scope_timestamp.sql");
+const MIGRATIONS: [(i64, &str); 3] = [
+    (1, INITIAL_MIGRATION),
+    (2, PROTOCOL_MIGRATION),
+    (3, SCOPE_TIMESTAMP_MIGRATION),
+];
 const MINUTE_MS: i64 = 60 * 1_000;
 const HOUR_MS: i64 = 60 * MINUTE_MS;
 const DAY_MS: i64 = 24 * HOUR_MS;

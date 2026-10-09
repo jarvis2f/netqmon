@@ -121,7 +121,7 @@ fn migration_and_gateway_survive_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(migrations, 2);
+    assert_eq!(migrations, 3);
     let index_exists: bool = storage
         .connection()
         .query_row(
@@ -146,6 +146,18 @@ fn migration_and_gateway_survive_reopen() {
         )
         .unwrap();
     assert!(insight_index_exists);
+    let scope_timestamp_index_exists: bool = storage
+        .connection()
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'index' AND name = 'traffic_scope_minute_scope_timestamp'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(scope_timestamp_index_exists);
 }
 
 #[test]

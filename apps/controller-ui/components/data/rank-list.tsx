@@ -19,7 +19,7 @@ export interface RankItem {
 }
 
 interface RankListProps {
-  title: string;
+  title: React.ReactNode;
   items: RankItem[];
   maxItems?: number;
   viewAllHref?: string;
