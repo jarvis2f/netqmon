@@ -1680,7 +1680,7 @@ fn load_active_flows(connection: &Connection) -> rusqlite::Result<HashMap<FlowKe
                 application_id, category_id, traffic_role, protocol_id, organization_confidence,
                 application_confidence, protocol_confidence, classification_confidence,
                 classification_reason, classification_evidence_json, scope, path_type, nat,
-                source_segment, destination_segment
+                source_segment, destination_segment, device_id
          FROM flow_sessions WHERE ended_at IS NULL",
     )?;
     statement
@@ -1698,6 +1698,7 @@ fn load_active_flows(connection: &Connection) -> rusqlite::Result<HashMap<FlowKe
                 },
                 ActiveFlow {
                     client_mac: Vec::new(),
+                    device_id: row.get(31)?,
                     upload_bytes: row.get(8)?,
                     download_bytes: row.get(9)?,
                     packets: row.get(10)?,
@@ -2199,6 +2200,9 @@ fn update_active_flows(
                 .entry(key.clone())
                 .or_insert_with(|| ActiveFlow::new(flow, attribution.clone(), received_at));
             current.add(flow, attribution);
+            if let Some(device_id) = device_id_for_mac(tx, &key.gateway_id, &current.client_mac)? {
+                current.device_id = Some(device_id);
+            }
             let checkpoint =
                 received_at.saturating_sub(current.checkpointed_at) >= FLOW_CHECKPOINT_MS;
             let ended_at = ended.then(|| flow_lifecycle_end_at(flow, received_at));
@@ -2223,7 +2227,7 @@ fn write_flow_session(
     ended_at: Option<i64>,
     checkpointed_at: i64,
 ) -> rusqlite::Result<()> {
-    let device_id = device_id_for_mac(tx, &key.gateway_id, &flow.client_mac)?;
+    let device_id = device_id_for_mac(tx, &key.gateway_id, &flow.client_mac)?.or(flow.device_id);
     tx.execute(
         "INSERT INTO flow_sessions(
             id, gateway_id, device_id, ip_version, protocol, client_ip, client_port,
@@ -2426,6 +2430,7 @@ impl FlowKey {
 #[derive(Clone, Debug)]
 struct ActiveFlow {
     client_mac: Vec<u8>,
+    device_id: Option<i64>,
     upload_bytes: i64,
     download_bytes: i64,
     packets: i64,
@@ -2455,6 +2460,7 @@ impl ActiveFlow {
         };
         Self {
             client_mac: flow.client_mac.clone(),
+            device_id: None,
             upload_bytes: 0,
             download_bytes: 0,
             packets: 0,

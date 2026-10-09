@@ -11,11 +11,28 @@ pub(crate) fn query_capture_insights(
     window: InsightWindow,
     lag_threshold_ms: u64,
 ) -> rusqlite::Result<Vec<Insight>> {
+    let received_at: Option<i64> =
+        connection.query_row("SELECT MAX(last_seen) FROM gateways", [], |row| row.get(0))?;
+    let received_at = received_at.map_or(snapshot.generated_at, to_u64);
+    Ok(query_capture_insights_with_received_at(
+        snapshot,
+        window,
+        lag_threshold_ms,
+        received_at,
+    ))
+}
+
+pub(crate) fn query_capture_insights_with_received_at(
+    snapshot: &RealtimeSnapshot,
+    window: InsightWindow,
+    lag_threshold_ms: u64,
+    received_at: u64,
+) -> Vec<Insight> {
     let Some(health) = snapshot.gateway_health.as_ref() else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     if health.observed_at < window.from || health.observed_at >= window.to {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     let observed_time = to_i64(health.observed_at);
     let mut items = Vec::new();
@@ -97,9 +114,6 @@ pub(crate) fn query_capture_insights(
             confidence: Some(1.0),
         });
     }
-    let received_at: Option<i64> =
-        connection.query_row("SELECT MAX(last_seen) FROM gateways", [], |row| row.get(0))?;
-    let received_at = received_at.map_or(snapshot.generated_at, to_u64);
     let lag_ms = received_at.saturating_sub(snapshot.generated_at);
     if lag_ms >= lag_threshold_ms {
         items.push(Insight {
@@ -130,7 +144,7 @@ pub(crate) fn query_capture_insights(
             confidence: Some(1.0),
         });
     }
-    Ok(items)
+    items
 }
 
 fn push_topology_insights(

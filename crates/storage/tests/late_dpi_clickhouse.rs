@@ -1,16 +1,30 @@
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use netqmon_protocol::v1::{DeviceObservation, FlowDelta, TelemetryBatch};
-use netqmon_storage::{ClickHouseConfig, ClickHouseStorage, FlowAttribution, Storage};
+use netqmon_storage::{
+    ClickHouseConfig, ClickHouseStorage, FlowAttribution, RetentionPolicy, Storage,
+};
 
-#[test]
-#[ignore = "requires a disposable ClickHouse server"]
-fn late_dpi_updates_only_matching_sessions_without_changing_counters() {
-    let backend = ClickHouseStorage::open(ClickHouseConfig {
+static CLICKHOUSE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn disposable_clickhouse() -> ClickHouseStorage {
+    ClickHouseStorage::open(ClickHouseConfig {
         url: std::env::var("NETQMON_TEST_CLICKHOUSE_URL").expect("disposable server URL"),
+        database: std::env::var("NETQMON_TEST_CLICKHOUSE_DATABASE")
+            .expect("disposable database name"),
+        user: std::env::var("NETQMON_TEST_CLICKHOUSE_USER").ok(),
+        password: std::env::var("NETQMON_TEST_CLICKHOUSE_PASSWORD").ok(),
         ..Default::default()
     })
-    .unwrap();
+    .unwrap()
+}
+
+#[test]
+#[ignore = "requires a disposable ClickHouse database"]
+fn late_dpi_updates_only_matching_sessions_without_changing_counters() {
+    let _guard = CLICKHOUSE_TEST_LOCK.lock().unwrap();
+    let backend = disposable_clickhouse();
     backend
         .client()
         .execute(
@@ -59,13 +73,10 @@ fn late_dpi_updates_only_matching_sessions_without_changing_counters() {
 }
 
 #[test]
-#[ignore = "requires a disposable ClickHouse server"]
+#[ignore = "requires a disposable ClickHouse database"]
 fn self_host_client_identity_is_single_application_per_ip() {
-    let backend = ClickHouseStorage::open(ClickHouseConfig {
-        url: std::env::var("NETQMON_TEST_CLICKHOUSE_URL").expect("disposable server URL"),
-        ..Default::default()
-    })
-    .unwrap();
+    let _guard = CLICKHOUSE_TEST_LOCK.lock().unwrap();
+    let backend = disposable_clickhouse();
     let mut storage = Storage::clickhouse(backend);
     let now = u64::try_from(
         SystemTime::now()
@@ -146,4 +157,97 @@ fn self_host_client_identity_is_single_application_per_ip() {
         .find(|client| client["hostname"] == "server")
         .unwrap();
     assert!(client["self_host_application"].is_null());
+}
+
+#[test]
+#[ignore = "requires a disposable ClickHouse database"]
+fn retention_removes_expired_incremental_rollup_metadata() {
+    let _guard = CLICKHOUSE_TEST_LOCK.lock().unwrap();
+    let backend = disposable_clickhouse();
+    let mut storage = Storage::clickhouse(backend);
+    let now = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let gateway_id = format!("rollup-retention-{}-{now}", std::process::id());
+    let day_ms = 24 * 60 * 60 * 1_000_i64;
+    let markers = [
+        ("minute", i64::try_from(now).unwrap() - 10 * day_ms),
+        ("minute", i64::try_from(now).unwrap() - day_ms),
+        ("hour", i64::try_from(now).unwrap() - 40 * day_ms),
+        ("hour", i64::try_from(now).unwrap() - 10 * day_ms),
+    ];
+    let dirty_rows = markers
+        .iter()
+        .map(|(period, timestamp)| {
+            serde_json::json!({
+                "gateway_id": gateway_id,
+                "dimension": "total",
+                "period": period,
+                "timestamp": timestamp,
+                "version": 1,
+            })
+        })
+        .collect::<Vec<_>>();
+    let progress_rows = markers
+        .iter()
+        .map(|(period, timestamp)| {
+            serde_json::json!({
+                "gateway_id": gateway_id,
+                "dimension": "total",
+                "period": period,
+                "timestamp": timestamp,
+                "processed_version": 1,
+            })
+        })
+        .collect::<Vec<_>>();
+    let client = storage.clickhouse_storage().unwrap().client();
+    client
+        .insert_json_each_row("traffic_rollup_dirty", &dirty_rows)
+        .unwrap();
+    client
+        .insert_json_each_row("traffic_rollup_progress", &progress_rows)
+        .unwrap();
+
+    storage
+        .run_retention(
+            now,
+            RetentionPolicy {
+                flow_sessions_days: 0,
+                dns_days: 0,
+                minute_days: 7,
+                hour_days: 30,
+                day_days: 0,
+            },
+        )
+        .unwrap();
+
+    let minute_cutoff = i64::try_from(now).unwrap() - 7 * day_ms;
+    let hour_cutoff = i64::try_from(now).unwrap() - 30 * day_ms;
+    for table in ["traffic_rollup_dirty", "traffic_rollup_progress"] {
+        let result = storage
+            .clickhouse_storage()
+            .unwrap()
+            .client()
+            .query_json(&format!(
+                "SELECT countIf(period = 'minute' AND timestamp < {minute_cutoff}) AS expired_minutes,
+                        countIf(period = 'hour' AND timestamp < {hour_cutoff}) AS expired_hours,
+                        count() AS retained
+                 FROM {table} WHERE gateway_id = '{gateway_id}' FORMAT JSON"
+            ))
+            .unwrap();
+        let row = &result["data"][0];
+        let count = |field: &str| {
+            row[field]
+                .as_u64()
+                .or_else(|| row[field].as_str().and_then(|value| value.parse().ok()))
+                .unwrap_or_default()
+        };
+        assert_eq!(count("expired_minutes"), 0, "{table}");
+        assert_eq!(count("expired_hours"), 0, "{table}");
+        assert_eq!(count("retained"), 2, "{table}");
+    }
 }
