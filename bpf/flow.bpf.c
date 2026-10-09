@@ -81,8 +81,15 @@ static __always_inline void sample_count(__u32 index, __u64 amount)
         __sync_fetch_and_add(counter, amount);
 }
 
-/* Global BPF subprogram: verify sampling once, independently of parser paths. */
-__attribute__((noinline)) int maybe_capture_sample(struct __sk_buff *skb,
+/* Kept out of line so the inlined parser stacks stay small, but deliberately
+   static rather than global. A global subprogram is verified on its own and its
+   arguments are matched through BTF, which needs the kernel's vmlinux BTF to
+   recognise `struct __sk_buff *` as the program context; kernels built without
+   CONFIG_DEBUG_INFO_BTF reject the call with "R1 type=ctx expected=fp". A
+   static subprogram is verified with the caller's register state instead, so it
+   needs no BTF. The HTTP helper below sidesteps the same trap by passing packet
+   metadata through a per-CPU map. */
+__attribute__((noinline)) static int maybe_capture_sample(struct __sk_buff *skb,
                                       struct flow_key *key, __u32 network_offset,
                                       __u32 original_length)
 {
