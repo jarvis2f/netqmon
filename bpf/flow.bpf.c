@@ -81,8 +81,9 @@ static __always_inline void sample_count(__u32 index, __u64 amount)
         __sync_fetch_and_add(counter, amount);
 }
 
-/* Global BPF subprogram: verify sampling once, independently of parser paths. */
-__attribute__((noinline)) int maybe_capture_sample(struct __sk_buff *skb,
+/* Keep this helper static so the verifier propagates the caller's skb context
+   without kernel BTF; retain noinline to limit the inlined parser stack. */
+static __attribute__((noinline)) int maybe_capture_sample(struct __sk_buff *skb,
                                       struct flow_key *key, __u32 network_offset,
                                       __u32 original_length)
 {
