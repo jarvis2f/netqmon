@@ -281,7 +281,21 @@ fn handle_client(stream: &mut TcpStream, db: &Arc<Mutex<MockClickHouseDb>>) {
         }
     } else if body_str.contains("FROM auth_sessions") {
         let mock = db.lock().unwrap();
-        if let Some(pos) = body_str.find("s.token_hash = '") {
+        if body_str.contains("count() AS count") {
+            let token_hash = body_str.find("token_hash = '").and_then(|pos| {
+                let start = pos + 14;
+                body_str[start..]
+                    .find('\'')
+                    .map(|end| &body_str[start..start + end])
+            });
+            let count = token_hash.map_or(0, |token_hash| {
+                mock.auth_sessions
+                    .iter()
+                    .filter(|session| session["token_hash"].as_str() == Some(token_hash))
+                    .count()
+            });
+            serde_json::to_string(&json!({ "data": [{ "count": count }] })).unwrap()
+        } else if let Some(pos) = body_str.find("s.token_hash = '") {
             let start = pos + 16;
             let end = body_str[start..].find('\'').unwrap_or(0);
             let token_hash = &body_str[start..start + end];
