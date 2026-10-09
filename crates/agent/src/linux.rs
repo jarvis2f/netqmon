@@ -41,6 +41,7 @@ use crate::topology::{TopologyContext, TopologyMode};
 use crate::transport::{self, SampleQueue, TelemetryQueue};
 
 mod capabilities;
+mod map_options;
 mod neighbor;
 mod network;
 mod tc;
@@ -1930,10 +1931,7 @@ fn resolve_interface(interface: &str) -> Result<i32, AgentError> {
 }
 
 fn probe_map_creation() -> Result<(), AgentError> {
-    let opts = libbpf_rs::libbpf_sys::bpf_map_create_opts {
-        sz: size_of::<libbpf_rs::libbpf_sys::bpf_map_create_opts>() as _,
-        ..Default::default()
-    };
+    let opts = map_options::map_create_options();
 
     // 1. Probe BPF syscall & Hash map support (observed_ifindexes, sample_budgets)
     MapHandle::create(
