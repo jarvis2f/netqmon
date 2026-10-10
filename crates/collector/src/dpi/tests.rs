@@ -104,6 +104,7 @@ fn batch(sequence: u64) -> FlowSampleBatch {
         protocol_version: 1,
         samples: vec![FlowSample {
             flow_id: "flow".into(),
+            policy_flow_id: String::new(),
             key: Some(FlowSampleKey {
                 ip_version: 4,
                 protocol: 17,
@@ -567,6 +568,7 @@ fn cached_result(
             source: "fixture".into(),
         }),
         signatures: Vec::new(),
+        policy_flow_ids: Vec::new(),
         expires,
     }
 }
@@ -918,6 +920,7 @@ fn flow_and_sequence_ttl_cleanup_removes_expired_index_entries() {
                 engine: None,
                 result: None,
                 signatures: Vec::new(),
+                policy_flow_ids: std::collections::BTreeSet::new(),
             },
         );
         flow_index.entry(identity.clone()).or_default().insert(id);

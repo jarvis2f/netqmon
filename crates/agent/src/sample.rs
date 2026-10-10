@@ -1,14 +1,14 @@
 //! Pure packet observation: no protocol detection or payload logging.
 use crate::{
     conntrack::ConntrackContext,
-    flow::{FLOW_KEY_SIZE, FlowKey},
+    flow::{FLOW_KEY_SIZE, FlowKey, policy_flow_id},
     normalization::{Direction, FlowScope, NetworkContext, normalize},
     telemetry::ip_bytes,
 };
 use netqmon_protocol::v1::{Direction as WireDirection, FlowSample, FlowSampleKey, SamplePacket};
 
-pub const SAMPLE_EVENT_SIZE: usize = 4168;
-const SAMPLE_EVENT_HEADER_SIZE: usize = 72;
+pub const SAMPLE_EVENT_SIZE: usize = 4176;
+const SAMPLE_EVENT_HEADER_SIZE: usize = 80;
 
 /// Decode metadata first; allocate/copy payload only for eligible observations.
 pub fn decode_sample(
@@ -18,6 +18,8 @@ pub fn decode_sample(
     enabled: bool,
     excluded: &[std::net::SocketAddr],
     conntrack: &ConntrackContext,
+    boot_id: &str,
+    policy_ids_enabled: bool,
 ) -> Option<FlowSample> {
     if !enabled || bytes.len() < SAMPLE_EVENT_HEADER_SIZE {
         return None;
@@ -41,7 +43,8 @@ pub fn decode_sample(
     let original_length = u32::from_ne_bytes(bytes[44..48].try_into().ok()?);
     let timestamp_ns = u64::from_ne_bytes(bytes[48..56].try_into().ok()?);
     let first_seen_ns = u64::from_ne_bytes(bytes[56..64].try_into().ok()?);
-    let captured_length = u32::from_ne_bytes(bytes[64..68].try_into().ok()?);
+    let flow_first_seen_ns = u64::from_ne_bytes(bytes[64..72].try_into().ok()?);
+    let captured_length = u32::from_ne_bytes(bytes[72..76].try_into().ok()?);
     let captured_length_usize = usize::try_from(captured_length).ok()?;
     if captured_length == 0
         || captured_length > 4096
@@ -56,6 +59,11 @@ pub fn decode_sample(
             "{}:{}-{}:{}-{}-{first_seen_ns}",
             flow.client_addr, flow.client_port, flow.remote_addr, flow.remote_port, key.protocol
         ),
+        policy_flow_id: if policy_ids_enabled {
+            policy_flow_id(boot_id, &key, flow_first_seen_ns)
+        } else {
+            String::new()
+        },
         key: Some(FlowSampleKey {
             ip_version: u32::from(key.ip_version),
             protocol: u32::from(key.protocol),
@@ -92,8 +100,9 @@ mod tests {
         bytes[44..48].copy_from_slice(&100u32.to_ne_bytes());
         bytes[48..56].copy_from_slice(&2_000_000u64.to_ne_bytes());
         bytes[56..64].copy_from_slice(&1_000_000u64.to_ne_bytes());
-        bytes[64..68].copy_from_slice(&64u32.to_ne_bytes());
-        bytes[72] = 0x45;
+        bytes[64..72].copy_from_slice(&1_000_000u64.to_ne_bytes());
+        bytes[72..76].copy_from_slice(&64u32.to_ne_bytes());
+        bytes[80] = 0x45;
         let mut network = NetworkContext::default();
         network
             .add_interface_address("192.168.1.1".parse().unwrap(), 24)
@@ -110,7 +119,9 @@ mod tests {
                 1000,
                 false,
                 &[],
-                &ConntrackContext::default()
+                &ConntrackContext::default(),
+                "test-boot",
+                false,
             )
             .is_none()
         );
@@ -121,7 +132,9 @@ mod tests {
                 1000,
                 true,
                 &["8.8.8.8:443".parse().unwrap()],
-                &ConntrackContext::default()
+                &ConntrackContext::default(),
+                "test-boot",
+                false,
             )
             .is_none()
         );
@@ -138,14 +151,17 @@ mod tests {
                 1000,
                 true,
                 &[],
-                &ConntrackContext::default()
+                &ConntrackContext::default(),
+                "test-boot",
+                false,
             )
             .is_none()
         );
     }
     #[test]
-    fn bidirectional_packets_share_lifetime_identity() {
+    fn sample_identity_uses_the_exact_flow_lifetime_key() {
         let (mut bytes, network) = event();
+        let upload_key = FlowKey::try_from(&bytes[..FLOW_KEY_SIZE]).unwrap();
         let upload = decode_sample(
             &bytes,
             &network,
@@ -153,6 +169,8 @@ mod tests {
             true,
             &[],
             &ConntrackContext::default(),
+            "test-boot",
+            true,
         )
         .unwrap();
         for i in 0..16 {
@@ -168,9 +186,22 @@ mod tests {
             true,
             &[],
             &ConntrackContext::default(),
+            "test-boot",
+            true,
         )
         .unwrap();
         assert_eq!(upload.flow_id, download.flow_id);
+        assert_ne!(upload.policy_flow_id, download.policy_flow_id);
+        let raw_key = FlowKey::try_from(&bytes[..FLOW_KEY_SIZE]).unwrap();
+        assert_eq!(
+            download.policy_flow_id,
+            policy_flow_id("test-boot", &raw_key, 1_000_000)
+        );
+        assert_eq!(
+            upload.policy_flow_id,
+            policy_flow_id("test-boot", &upload_key, 1_000_000)
+        );
+        assert_ne!(upload.policy_flow_id, download.policy_flow_id);
         assert_eq!(upload.key, download.key);
         assert_ne!(upload.packets[0].direction, download.packets[0].direction);
         assert_eq!(upload.packets[0].timestamp_unix_ms, 1002);
@@ -188,6 +219,8 @@ mod tests {
             true,
             &[],
             &ConntrackContext::default(),
+            "test-boot",
+            true,
         )
         .unwrap();
         assert_eq!(decoded.packets[0].payload.len(), 64);

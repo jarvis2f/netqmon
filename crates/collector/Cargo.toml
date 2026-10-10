@@ -10,7 +10,7 @@ repository.workspace = true
 
 [dependencies]
 argon2 = "0.5.3"
-axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 getrandom = "0.3.4"
 netqmon-classifier-client = { path = "../classifier-client" }
 netqmon-geo = { path = "../geo" }
@@ -22,6 +22,7 @@ rusqlite = "0.40.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "serde"] }
+chrono-tz = { version = "0.10.4", features = ["serde"] }
 uuid = { version = "1.19.0", features = ["serde", "v4"] }
 sha2 = "0.11.0"
 subtle = "2.6.1"
@@ -33,7 +34,9 @@ tracing = "0.1.44"
 tracing-subscriber = "0.3.22"
 
 [dev-dependencies]
+serde_yaml_ng = "0.10.0"
 tempfile = "3.27.0"
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect"] }
 tower = { version = "0.5.2", features = ["util"] }
 
 [lints]

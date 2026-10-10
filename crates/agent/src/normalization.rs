@@ -423,6 +423,7 @@ mod tests {
             ip_version,
             protocol,
             direction: 0,
+            hook: 0,
             ifindex: 1,
             source_address,
             destination_address,

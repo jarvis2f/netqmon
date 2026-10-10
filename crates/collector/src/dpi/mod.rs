@@ -135,8 +135,11 @@ pub struct CachedResult {
     pub last_packet_ms: u64,
     pub result: Option<DpiResult>,
     pub signatures: Vec<SignatureApplicationMatch>,
+    pub policy_flow_ids: Vec<String>,
     expires: Instant,
 }
+
+pub(crate) const MAX_POLICY_FLOW_IDENTITIES_PER_SAMPLE: usize = 4;
 
 #[cfg(test)]
 impl CachedResult {
@@ -154,6 +157,7 @@ impl CachedResult {
             last_packet_ms,
             result,
             signatures: Vec::new(),
+            policy_flow_ids: Vec::new(),
             expires: Instant::now(),
         }
     }
@@ -174,6 +178,7 @@ struct FlowState {
     engine: Option<Box<dyn DpiFlow>>,
     result: Option<DpiResult>,
     signatures: Vec<SignatureApplicationMatch>,
+    policy_flow_ids: BTreeSet<String>,
 }
 #[derive(Default)]
 struct MinuteStats {
@@ -515,6 +520,7 @@ fn finish_flows<F: Fn(CachedResult)>(
             last_packet_ms: entry.last_packet_ms,
             result: entry.result.clone(),
             signatures: entry.signatures.clone(),
+            policy_flow_ids: entry.policy_flow_ids.iter().cloned().collect(),
             expires: now + CACHE_TTL,
         };
         stats
@@ -680,6 +686,7 @@ impl SamplingService {
                     }
                     sequences.insert(sequence_key, (batch.sequence, now + CACHE_TTL));
                     for sample in batch.samples {
+                        let policy_flow_id = sample.policy_flow_id;
                         let id = (
                             batch.gateway_id.clone(),
                             batch.boot_id.clone(),
@@ -746,6 +753,7 @@ impl SamplingService {
                                     engine: detector,
                                     result: None,
                                     signatures: Vec::new(),
+                                    policy_flow_ids: BTreeSet::new(),
                                 },
                             );
                             flow_index
@@ -759,6 +767,13 @@ impl SamplingService {
                                 .attempted += 1;
                         }
                         let entry = flows.get_mut(&id).expect("flow inserted");
+                        if !policy_flow_id.is_empty()
+                            && (entry.policy_flow_ids.contains(&policy_flow_id)
+                                || entry.policy_flow_ids.len()
+                                    < MAX_POLICY_FLOW_IDENTITIES_PER_SAMPLE)
+                        {
+                            entry.policy_flow_ids.insert(policy_flow_id);
+                        }
                         dirty_flow_identities.insert(identity);
                         let mut counts = entry.packets;
                         for packet in &sample.packets {
@@ -850,6 +865,7 @@ impl SamplingService {
                                 last_packet_ms: entry.last_packet_ms,
                                 result: entry.result.clone(),
                                 signatures: entry.signatures.clone(),
+                                policy_flow_ids: entry.policy_flow_ids.iter().cloned().collect(),
                                 expires: entry.expires,
                             };
                             stats.insert_result(id.clone(), cached.clone(), now);
@@ -1096,6 +1112,7 @@ impl SamplingService {
                     metadata: std::collections::BTreeMap::new(),
                 }),
                 signatures: Vec::new(),
+                policy_flow_ids: Vec::new(),
                 expires: now + CACHE_TTL,
             },
             now,

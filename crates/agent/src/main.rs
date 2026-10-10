@@ -31,6 +31,7 @@ mod identity;
 mod lifecycle;
 #[cfg(any(target_os = "linux", test, target_family = "unix"))]
 mod normalization;
+mod policy;
 #[cfg(any(target_os = "linux", test, target_family = "unix"))]
 mod probe;
 #[cfg(any(target_os = "linux", test, target_family = "unix"))]
@@ -120,6 +121,19 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        config::Command::Policies(args) => {
+            let config = match config::AgentConfig::load(&cli) {
+                Ok(config) => config,
+                Err(error) => {
+                    eprintln!("configuration error: {error:#}");
+                    std::process::exit(2);
+                }
+            };
+            if let Err(error) = policy::handle_command(args, &config) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -130,6 +144,20 @@ fn main() {
     let cli = config::Cli::parse();
     if let Some(config::Command::Diagnostics(args)) = cli.command {
         diagnostics::handle_command(args);
+        return;
+    }
+    if let Some(config::Command::Policies(args)) = cli.command {
+        let config = match config::AgentConfig::load(&cli) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("configuration error: {error:#}");
+                std::process::exit(2);
+            }
+        };
+        if let Err(error) = policy::handle_command(args, &config) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
         return;
     }
     if let Err(error) = config::AgentConfig::load(&cli) {

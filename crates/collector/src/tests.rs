@@ -17,6 +17,57 @@ use super::*;
 
 const ENROLLMENT_TOKEN: &str = "test-enrollment-token";
 
+#[test]
+fn idle_without_new_evidence_keeps_a_flow_verdict_but_end_revokes_it() {
+    let service = policy::PolicyService::open_in_memory().unwrap();
+    let hub = PolicyHub::new();
+    let bundle = hub.refresh_gateway(&service, "gw-test", false).unwrap();
+    let epoch = bundle.frame.snapshot_identity().unwrap().1.to_owned();
+    let session = hub.register("gw-test").unwrap();
+    let now = policy::push::now_ms();
+    let flow_id = "00000000000000000000000000000001";
+    hub.queue_flow_command(PolicyWireFrame::FlowCommand {
+        wire_version: POLICY_WIRE_VERSION,
+        gateway_id: "gw-test".to_owned(),
+        boot_id: "boot-test".to_owned(),
+        controller_epoch: epoch,
+        config_revision: 0,
+        command_id: uuid::Uuid::new_v4().to_string(),
+        policy_flow_id: flow_id.to_owned(),
+        operation: FlowCommandOperation::Upsert,
+        verdict: Some(FlowVerdict::Block),
+        policy_ids: vec!["00000000-0000-4000-8000-000000000001".to_owned()],
+        issued_at_ms: now,
+        expires_at_ms: now + 120_000,
+    })
+    .unwrap();
+    assert!(hub.take_flow_command(&session, 0).is_some());
+    let mut batch = TelemetryBatch {
+        gateway_id: "gw-test".to_owned(),
+        boot_id: "boot-test".to_owned(),
+        flows: vec![FlowDelta {
+            policy_flow_id: flow_id.to_owned(),
+            lifecycle: FlowLifecycle::Idle as i32,
+            scope: FlowScope::Internet as i32,
+            client_mac: vec![2, 0, 0, 0, 1, 35],
+            protocol: 6,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    queue_policy_flow_decisions(&hub, &batch, &[FlowAttribution::default()]);
+    assert!(hub.take_flow_command(&session, 0).is_none());
+    batch.flows[0].lifecycle = FlowLifecycle::Ended as i32;
+    queue_policy_flow_decisions(&hub, &batch, &[FlowAttribution::default()]);
+    assert!(matches!(
+        hub.take_flow_command(&session, 0),
+        Some(PolicyWireFrame::FlowCommand {
+            operation: FlowCommandOperation::Revoke,
+            ..
+        })
+    ));
+}
+
 fn strong_self_host_attribution(application_id: &str) -> FlowAttribution {
     FlowAttribution {
         organization_id: "self_host_org".to_owned(),
@@ -2387,10 +2438,12 @@ fn default_mac_dataset_path_uses_database_directory() {
 
 #[test]
 fn default_geo_directory_uses_database_directory() {
-    assert_eq!(
-        default_geo_directory(Path::new("/var/lib/netqmon/netqmon.db")),
-        PathBuf::from("/var/lib/netqmon/geo")
-    );
+    let actual = default_geo_directory(Path::new("/var/lib/netqmon/netqmon.db"));
+    if Path::new(DEFAULT_GEO_DIRECTORY).is_dir() || Path::new("/data").is_dir() {
+        assert_eq!(actual, PathBuf::from(DEFAULT_GEO_DIRECTORY));
+    } else {
+        assert_eq!(actual, PathBuf::from("/var/lib/netqmon/geo"));
+    }
 }
 
 #[tokio::test]
@@ -3440,6 +3493,7 @@ async fn sample_endpoint_enforces_auth_gateway_and_limits() {
         protocol_version: 1,
         samples: vec![FlowSample {
             flow_id: "flow".into(),
+            policy_flow_id: String::new(),
             key: Some(FlowSampleKey {
                 ip_version: 4,
                 protocol: 17,
@@ -3608,6 +3662,7 @@ async fn real_sample_ingestion_updates_ended_flow_without_persisting_payload() {
         protocol_version: 1,
         samples: vec![FlowSample {
             flow_id: "flow".into(),
+            policy_flow_id: String::new(),
             key: Some(FlowSampleKey {
                 ip_version: 4,
                 protocol: 6,
@@ -3776,6 +3831,7 @@ async fn signature_sample_match_reclassifies_flow_without_dpi() {
         protocol_version: 1,
         samples: vec![FlowSample {
             flow_id: "flow".into(),
+            policy_flow_id: String::new(),
             key: Some(FlowSampleKey {
                 ip_version: 4,
                 protocol: 6,
@@ -3965,6 +4021,7 @@ fn hostname_domain_rules_fill_unknown_dns_without_overriding_dns_applications() 
                 dpi: Some(dpi),
                 signatures: Vec::new(),
             })],
+            false,
         )
         .unwrap();
         assert_eq!(result[0].application_id, expected);
@@ -4011,6 +4068,7 @@ fn local_hostname_does_not_identify_selfhost_or_bind_reverse_proxy_port() {
             dpi: Some(dpi),
             signatures: Vec::new(),
         })],
+        false,
     )
     .unwrap();
     assert_eq!(identified[0].application_id, "unknown");
@@ -4023,6 +4081,7 @@ fn local_hostname_does_not_identify_selfhost_or_bind_reverse_proxy_port() {
         &FaviconEndpointCache::default(),
         &batch,
         &[None],
+        false,
     )
     .unwrap();
     assert_eq!(without_hostname[0].application_id, "unknown");

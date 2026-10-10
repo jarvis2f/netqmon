@@ -3681,7 +3681,7 @@ where
     connection.query_row(sql, parameters, |row| row.get(0))
 }
 
-fn format_mac(bytes: &[u8]) -> String {
+pub(crate) fn format_mac(bytes: &[u8]) -> String {
     if bytes.len() != 6 {
         return "unknown".to_owned();
     }

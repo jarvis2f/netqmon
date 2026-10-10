@@ -3,7 +3,7 @@ use std::fmt;
 use std::str::FromStr;
 
 #[derive(Clone, Copy, Debug, Hash, Ord, PartialOrd, PartialEq, Eq)]
-pub(super) struct MacAddress([u8; 6]);
+pub(crate) struct MacAddress([u8; 6]);
 
 impl MacAddress {
     pub(super) fn from_bytes(bytes: &[u8]) -> Result<Self, MacAddressParseError> {

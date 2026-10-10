@@ -151,6 +151,7 @@ fn bittorrent_sample(batch: &TelemetryBatch) -> netqmon_protocol::v1::FlowSample
         protocol_version: PROTOCOL_VERSION,
         samples: vec![FlowSample {
             flow_id: format!("loadgen-bt-{}", batch.sequence),
+            policy_flow_id: String::new(),
             key: Some(FlowSampleKey {
                 ip_version: 4,
                 protocol: 6,

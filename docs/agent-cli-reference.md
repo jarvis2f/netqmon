@@ -61,7 +61,60 @@ netqmon-agent doctor
 
 ---
 
-### 2.3 `diagnostics` / `diag` (Runtime Diagnostics & Control)
+The report also includes policy enforcement eligibility. Client aggregate shaping
+is only reported as supported when the Agent verifies its LAN/WAN path, link
+capacity, qdisc ownership, packet-mark availability, and disabled flow offload.
+
+### 2.3 `policies` (Local Policy Status and Recovery)
+
+Inspect the policy revision and local enforcement capability, or manage the
+emergency disable marker without a Collector connection:
+
+```bash
+netqmon-agent policies status
+netqmon-agent policies status --json
+netqmon-agent policies unlock
+netqmon-agent policies resume
+```
+
+`unlock` disables future remote snapshots and removes only verified NetQmon
+rules and qdiscs. `resume` removes the local disable marker and reapplies the
+last valid policy snapshot. Snapshots containing application rules are restored
+by the running Agent on its next reconciliation tick, when its eBPF writer is
+available. `status --json` includes aggregate-limit capability,
+its reason, and the saved shaping interfaces and client-class count.
+
+For virtual interfaces without a reported link speed, configure the physical
+egress capacity explicitly (64000 through 1000000000 bits per second):
+
+```toml
+policy_one_arm_return_path_verified = true
+
+[policy_interface_capacity_bps]
+eth1 = 100000000
+eth2 = 100000000
+```
+
+The environment equivalents are `NETQMON_POLICY_ONE_ARM_RETURN_PATH_VERIFIED`
+and `NETQMON_POLICY_INTERFACE_CAPACITY_BPS='{"eth1":100000000,"eth2":100000000}'`.
+When both an explicit capacity and a measured link speed are available, the
+smaller value is used. `policies status --json` reports capacity and its source.
+
+Only enable the return-path declaration after configuring and verifying that
+both directions of every enabled address family traverse the Agent. One-arm
+shaping also requires disabled ICMP redirects and flow offload. The Agent does
+not configure NAT or upstream routes. A shared physical HTB root contains
+separate upload/download branches, client budgets and application subclasses.
+Application budgets aggregate connections per client, policy and direction;
+IPv4 and IPv6 share the same budget. Unknown applications use the default class
+and remain subject to any client budget. OpenWrt requires `tc-full`, HTB,
+fw classifiers and fq_codel support.
+
+For Router application shaping, include both LAN and WAN in `interfaces` so
+the Agent can mark the exact egress tuples in both directions. The capability
+check rejects application shaping when a shaping interface is not observed.
+
+### 2.4 `diagnostics` / `diag` (Runtime Diagnostics & Control)
 
 Connects to the running agent via its local Unix domain socket (default `/run/netqmon/agent.sock`) to inspect performance counters or adjust runtime collection.
 
@@ -95,6 +148,11 @@ interfaces = ["br-lan"]
 # Controller endpoint and security token
 controller_url = "http://192.168.1.100:8090"
 token = "your-enrollment-or-agent-token"
+
+# Optional policy stream override. Otherwise it is derived from controller_url.
+# Plain ws:// is enabled by default for loopback or RFC 1918/ULA IP addresses only.
+# policy_ws_url = "wss://controller.example.net:8090/v1/agent/policies/stream"
+allow_insecure_policy_ws = true
 
 # Polling and batching intervals
 poll_interval_ms = 1000       # Polling interval for reading BPF flow tables (milliseconds)
@@ -140,6 +198,8 @@ Every configuration option can be overridden via environment variables:
 | `NETQMON_INTERFACES` | `interfaces` | `br-lan,eth1` |
 | `NETQMON_CONTROLLER_URL`| `controller_url` | `http://192.168.1.100:8090` |
 | `NETQMON_TOKEN` | `token` | `secret-token` |
+| `NETQMON_POLICY_WS_URL` | `policy_ws_url` | `wss://controller.example.net:8090/v1/agent/policies/stream` |
+| `NETQMON_ALLOW_INSECURE_POLICY_WS` | `allow_insecure_policy_ws` | `true` (only loopback or RFC 1918/ULA IP hosts may use `ws://`) |
 | `NETQMON_POLL_INTERVAL_MS` | `poll_interval_ms` | `1000` |
 | `NETQMON_BATCH_INTERVAL_MS`| `batch_interval_ms` | `1000` |
 | `NETQMON_MAX_FLOWS` | `max_flows` | `65536` |
@@ -152,6 +212,8 @@ Every configuration option can be overridden via environment variables:
 ## 5. OpenWrt UCI Integration
 
 On OpenWrt, the agent integrates natively with the UCI configuration system (`/etc/config/netqmon`):
+
+`allow_insecure_policy_ws` defaults to `1`. Plain `ws://` is accepted only for loopback or RFC 1918/ULA IP addresses, and the policy stream is unencrypted. Prefer WSS on untrusted networks; set the option to `0` to disable plain WebSocket policy connections.
 
 ```bash
 # View active UCI configuration

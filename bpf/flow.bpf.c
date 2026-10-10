@@ -8,6 +8,23 @@ struct {
     __type(value, struct flow_value);
 } flow_map SEC(".maps");
 
+/* Exact on-wire verdicts only. The Agent updates this bounded map after the
+ * target kernel accepts the program and both observation hooks are attached. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_FLOW_VERDICT_ENTRIES);
+    __type(key, struct flow_key);
+    __type(value, struct flow_verdict);
+} flow_verdict_map SEC(".maps");
+
+/* Per-policy, per-client drop totals; LRU eviction can affect reporting only. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct policy_drop_key);
+    __type(value, struct policy_drop_value);
+} policy_drop_counters SEC(".maps");
+
 /* Observation points used to suppress a forwarded packet at its second hook. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -64,6 +81,81 @@ volatile const __u8 sample_enabled = 1;
 volatile const __u32 sample_max_packets_per_direction = 4;
 volatile const __u32 sample_max_bytes_per_packet = 1024;
 volatile const __u32 sample_max_bytes_per_flow = 4096;
+volatile struct flow_policy_state flow_policy_state = {};
+
+static __always_inline struct flow_verdict *active_flow_verdict(
+    const struct flow_key *key)
+{
+    struct flow_verdict *verdict;
+    __u64 now;
+
+    verdict = bpf_map_lookup_elem(&flow_verdict_map, key);
+    if (!verdict)
+        return 0;
+    now = bpf_ktime_get_ns();
+    if (verdict->expires_monotonic_ns <= now ||
+        (flow_policy_state.generation &&
+         verdict->policy_generation != flow_policy_state.generation)) {
+        bpf_map_delete_elem(&flow_verdict_map, key);
+        return 0;
+    }
+    return verdict;
+}
+
+static __always_inline __u64 record_flow(struct flow_key *key,
+                                         __u32 packet_length,
+                                         __u8 tcp_flags);
+
+static __always_inline void record_policy_drop(const __u8 policy_identity_hash[16],
+                                                const __u8 client_mac[6],
+                                                __u32 packet_length)
+{
+    struct policy_drop_key key = {};
+    struct policy_drop_value initial = {};
+    struct policy_drop_value *counter;
+
+    __builtin_memcpy(key.policy_identity_hash, policy_identity_hash,
+                     sizeof(key.policy_identity_hash));
+    __builtin_memcpy(key.client_mac, client_mac, sizeof(key.client_mac));
+    counter = bpf_map_lookup_elem(&policy_drop_counters, &key);
+    if (!counter) {
+        bpf_map_update_elem(&policy_drop_counters, &key, &initial, BPF_NOEXIST);
+        counter = bpf_map_lookup_elem(&policy_drop_counters, &key);
+    }
+    if (counter) {
+        __sync_fetch_and_add(&counter->packets, 1);
+        __sync_fetch_and_add(&counter->bytes, packet_length);
+    }
+}
+
+static __always_inline int apply_flow_policy(struct __sk_buff *skb,
+                                             struct flow_key *key)
+{
+    struct flow_verdict *verdict = active_flow_verdict(key);
+
+    if (!verdict)
+        return TC_ACT_OK;
+
+    if (verdict->verdict == NETQMON_VERDICT_SHAPE) {
+        if (key->hook == NETQMON_HOOK_EGRESS &&
+            verdict->policy_tag > 0 &&
+            verdict->policy_tag <= NETQMON_APPLICATION_MARK_MAX_TAG) {
+            skb->mark = (skb->mark & ~NETQMON_APPLICATION_MARK_MASK) |
+                        ((verdict->policy_tag << NETQMON_APPLICATION_MARK_SHIFT) &
+                         NETQMON_APPLICATION_MARK_MASK);
+        }
+        return TC_ACT_OK;
+    }
+    if (verdict->verdict != NETQMON_VERDICT_BLOCK)
+        return TC_ACT_OK;
+
+    /* Keep accounting blocked packets so the Agent can report continued flow
+     * activity and refresh the bounded verdict lease. Do not run the normal
+     * packet path, which can capture sample or discovery payloads. */
+    record_flow(key, skb->len, 0);
+    record_policy_drop(verdict->policy_identity_hash, verdict->policy_client_mac, skb->len);
+    return TC_ACT_SHOT;
+}
 
 static __always_inline void record_dns_drop(void)
 {
@@ -90,6 +182,7 @@ static __attribute__((noinline)) int maybe_capture_sample(struct __sk_buff *skb,
     struct flow_key canonical;
     struct sample_budget initial = {};
     struct sample_budget *budget;
+    struct flow_value *flow_value;
     struct sample_event *event;
     __u64 now;
     __u32 direction = 0;
@@ -174,6 +267,9 @@ static __attribute__((noinline)) int maybe_capture_sample(struct __sk_buff *skb,
     event->key = *key;
     event->timestamp_ns = now;
     event->first_seen_ns = budget->first_seen_ns;
+    flow_value = bpf_map_lookup_elem(&flow_map, key);
+    event->flow_first_seen_ns = flow_value ? flow_value->first_seen_ns
+                                            : budget->first_seen_ns;
     event->original_length = original_length;
     event->captured_length = length;
     event->reserved = 0;
@@ -198,18 +294,16 @@ static __attribute__((noinline)) int maybe_capture_sample(struct __sk_buff *skb,
     return 0;
 }
 
-static __always_inline void maybe_capture_dns(struct __sk_buff *skb,
-                                       struct udp_header *udp,
-                                       const __u8 *client_address,
-                                       __u8 ip_version)
+static __attribute__((noinline)) void maybe_capture_dns(struct __sk_buff *skb,
+                                                        struct udp_header *udp,
+                                                        const __u8 *client_address,
+                                                        __u8 ip_version,
+                                                        __u32 payload_offset)
 {
     struct dns_event *event;
-    __u8 *packet_start = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
-    __u8 *payload = (__u8 *)(udp + 1);
     __u32 available;
     __u64 capture_length;
-    __u32 payload_offset;
     __u16 udp_length;
     __u8 truncated = 0;
 
@@ -220,7 +314,7 @@ static __always_inline void maybe_capture_dns(struct __sk_buff *skb,
     if (udp_length < sizeof(struct udp_header))
         return;
     capture_length = udp_length - sizeof(struct udp_header);
-    available = (__u32)((__u8 *)data_end - payload);
+    available = (__u32)((__u8 *)data_end - (__u8 *)(udp + 1));
     if (capture_length > available) {
         capture_length = available;
         truncated = 1;
@@ -235,11 +329,6 @@ static __always_inline void maybe_capture_dns(struct __sk_buff *skb,
     /* Preserve 1..512 while making the range explicit to older verifiers. */
     capture_length = ((capture_length - 1) &
                       (DNS_MAX_PAYLOAD_LENGTH - 1)) + 1;
-
-    /* Do not keep a packet pointer live across the ring-buffer helper. Some
-     * LLVM/verifier combinations otherwise emit an invalid 32-bit spill for
-     * packet_start when register pressure is high. */
-    payload_offset = (__u32)(payload - packet_start);
 
     event = bpf_ringbuf_reserve(&dns_events, sizeof(*event), 0);
     if (!event) {
@@ -583,10 +672,11 @@ static __always_inline __u8 read_tcp_flags(__u8 *cursor, void *data_end)
     return tcp->flags;
 }
 
-static __always_inline void parse_ipv4(struct __sk_buff *skb, __u8 *cursor,
+static __always_inline int parse_ipv4(struct __sk_buff *skb, __u8 *cursor,
                                 void *data_end, __u32 ifindex,
                                 __u32 packet_length, __u32 network_offset,
-                                const __u8 *source_mac)
+                                __u8 hook,
+                                const __u8 *source_mac, int policy_only)
 {
     struct flow_key key = {};
     struct ipv4_header *ipv4 = (void *)cursor;
@@ -596,19 +686,20 @@ static __always_inline void parse_ipv4(struct __sk_buff *skb, __u8 *cursor,
     __u8 ihl;
 
     if ((void *)(ipv4 + 1) > data_end)
-        return;
+        return TC_ACT_OK;
     if ((ipv4->version_ihl >> 4) != 4)
-        return;
+        return TC_ACT_OK;
 
     ihl = (ipv4->version_ihl & 0x0F) * 4;
     if (ihl < sizeof(*ipv4) || cursor + ihl > (__u8 *)data_end)
-        return;
+        return TC_ACT_OK;
     if (ipv4->protocol != IPPROTO_TCP && ipv4->protocol != IPPROTO_UDP &&
         ipv4->protocol != IPPROTO_ESP && ipv4->protocol != IPPROTO_GRE)
-        return;
+        return TC_ACT_OK;
 
     key.ip_version = 4;
     key.protocol = ipv4->protocol;
+    key.hook = hook;
     key.ifindex = ifindex;
     __builtin_memcpy(key.source_address, &ipv4->source, sizeof(ipv4->source));
     __builtin_memcpy(key.destination_address, &ipv4->destination,
@@ -617,18 +708,28 @@ static __always_inline void parse_ipv4(struct __sk_buff *skb, __u8 *cursor,
     fragment_offset = netqmon_ntohs(ipv4->fragment_offset);
     if ((fragment_offset & IPV4_FRAGMENT_OFFSET_MASK) == 0) {
         if (key.protocol == IPPROTO_ESP || key.protocol == IPPROTO_GRE) {
+            if (policy_only)
+                return TC_ACT_OK;
             __u64 flow_packets = record_flow(&key, packet_length, 0);
             if (sample_enabled &&
                 flow_packets <= sample_max_packets_per_direction)
                 maybe_capture_sample(skb, &key, network_offset,
                                      netqmon_ntohs(ipv4->total_length));
-            return;
+            return TC_ACT_OK;
         }
         ports = (void *)(cursor + ihl);
         if ((void *)(ports + 1) > data_end)
-            return;
+            return TC_ACT_OK;
         key.source_port = ports->source;
         key.destination_port = ports->destination;
+        if (flow_policy_state.enabled) {
+            int action = apply_flow_policy(skb, &key);
+            if (action != TC_ACT_OK) {
+                return action;
+            }
+        }
+        if (policy_only)
+            return TC_ACT_OK;
         if (key.protocol == IPPROTO_TCP) {
             tcp_flags = read_tcp_flags(cursor + ihl, data_end);
             if (netqmon_ntohs(key.destination_port) == HTTP_PORT) {
@@ -651,7 +752,8 @@ static __always_inline void parse_ipv4(struct __sk_buff *skb, __u8 *cursor,
                                   : 0;
 
             maybe_capture_dns(skb, (struct udp_header *)(cursor + ihl),
-                              (__u8 *)&ipv4->destination, 4);
+                              (__u8 *)&ipv4->destination, 4,
+                              network_offset + ihl + sizeof(struct udp_header));
             maybe_capture_dhcp(skb, (struct udp_header *)(cursor + ihl),
                                payload_offset, available);
             maybe_capture_discovery(skb, (struct udp_header *)(cursor + ihl),
@@ -660,18 +762,23 @@ static __always_inline void parse_ipv4(struct __sk_buff *skb, __u8 *cursor,
         }
     }
 
+    if (policy_only)
+        return TC_ACT_OK;
+
     __u64 flow_packets = record_flow(&key, packet_length, tcp_flags);
     if (sample_enabled &&
         flow_packets <= sample_max_packets_per_direction &&
         (fragment_offset & IPV4_FRAGMENT_OFFSET_MASK) == 0 &&
         netqmon_ntohs(ipv4->total_length) >= ihl)
         maybe_capture_sample(skb, &key, network_offset, netqmon_ntohs(ipv4->total_length));
+    return TC_ACT_OK;
 }
 
-static __always_inline void parse_ipv6(struct __sk_buff *skb, __u8 *cursor,
+static __always_inline int parse_ipv6(struct __sk_buff *skb, __u8 *cursor,
                                 void *data_end, __u32 ifindex,
                                 __u32 packet_length, __u32 network_offset,
-                                const __u8 *source_mac)
+                                __u8 hook,
+                                const __u8 *source_mac, int policy_only)
 {
     struct flow_key key = {};
     struct ipv6_header *ipv6 = (void *)cursor;
@@ -680,11 +787,12 @@ static __always_inline void parse_ipv6(struct __sk_buff *skb, __u8 *cursor,
     __u32 transport_offset;
 
     if ((void *)(ipv6 + 1) > data_end)
-        return;
+        return TC_ACT_OK;
     if ((ipv6->version_traffic_class >> 4) != 6)
-        return;
+        return TC_ACT_OK;
 
     key.ip_version = 6;
+    key.hook = hook;
     key.ifindex = ifindex;
     __builtin_memcpy(key.source_address, ipv6->source, sizeof(ipv6->source));
     __builtin_memcpy(key.destination_address, ipv6->destination,
@@ -706,6 +814,14 @@ static __always_inline void parse_ipv6(struct __sk_buff *skb, __u8 *cursor,
             if ((void *)(ports + 1) <= data_end) {
                 key.source_port = ports->source;
                 key.destination_port = ports->destination;
+                if (flow_policy_state.enabled) {
+                    int action = apply_flow_policy(skb, &key);
+                    if (action != TC_ACT_OK) {
+                        return action;
+                    }
+                }
+                if (policy_only)
+                    return TC_ACT_OK;
             }
             if (next_header == IPPROTO_UDP) {
                 __u32 payload_offset = transport_offset +
@@ -715,7 +831,8 @@ static __always_inline void parse_ipv6(struct __sk_buff *skb, __u8 *cursor,
                                       : 0;
 
                 maybe_capture_dns(skb, (struct udp_header *)cursor,
-                                  ipv6->destination, 6);
+                                  ipv6->destination, 6,
+                                  transport_offset + sizeof(struct udp_header));
                 maybe_capture_discovery(skb, (struct udp_header *)cursor,
                                         payload_offset, available, ipv6->source,
                                         source_mac, 6);
@@ -740,7 +857,7 @@ static __always_inline void parse_ipv6(struct __sk_buff *skb, __u8 *cursor,
                 maybe_capture_sample(
                     skb, &key, network_offset,
                     sizeof(*ipv6) + netqmon_ntohs(ipv6->payload_length));
-            return;
+            return TC_ACT_OK;
         }
 
         extension = (void *)cursor;
@@ -780,6 +897,9 @@ static __always_inline void parse_ipv6(struct __sk_buff *skb, __u8 *cursor,
         transport_offset += extension_length;
     }
 
+    if (policy_only)
+        return TC_ACT_OK;
+
     key.protocol = next_header;
     if (can_parse_transport &&
         (next_header == IPPROTO_TCP || next_header == IPPROTO_UDP)) {
@@ -791,17 +911,20 @@ static __always_inline void parse_ipv6(struct __sk_buff *skb, __u8 *cursor,
         }
         if (next_header == IPPROTO_UDP)
             maybe_capture_dns(skb, (struct udp_header *)cursor,
-                              ipv6->destination, 6);
+                              ipv6->destination, 6,
+                              transport_offset + sizeof(struct udp_header));
     }
     record_flow(&key, packet_length,
                 can_parse_transport && next_header == IPPROTO_TCP
                     ? read_tcp_flags(cursor, data_end)
                     : 0);
+    return TC_ACT_OK;
 }
 
-static __always_inline void parse_packet(struct __sk_buff *skb, void *data,
+static __always_inline int parse_packet(struct __sk_buff *skb, void *data,
                                          void *data_end, __u32 ifindex,
-                                         __u32 packet_length)
+                                         __u32 packet_length, __u8 hook,
+                                         int policy_only)
 {
     struct ethernet_header *ethernet = data;
     __u8 *cursor;
@@ -809,7 +932,7 @@ static __always_inline void parse_packet(struct __sk_buff *skb, void *data,
     __u16 ethernet_protocol;
 
     if ((void *)(ethernet + 1) > data_end)
-        return;
+        return TC_ACT_OK;
 
     cursor = data + sizeof(*ethernet);
     cursor_offset = sizeof(*ethernet);
@@ -824,7 +947,7 @@ static __always_inline void parse_packet(struct __sk_buff *skb, void *data,
             break;
         vlan = (void *)cursor;
         if ((void *)(vlan + 1) > data_end)
-            return;
+            return TC_ACT_OK;
         ethernet_protocol = netqmon_ntohs(vlan->encapsulated_protocol);
         cursor += sizeof(*vlan);
         cursor_offset += sizeof(*vlan);
@@ -832,14 +955,15 @@ static __always_inline void parse_packet(struct __sk_buff *skb, void *data,
 
     if (ethernet_protocol == ETH_P_8021Q ||
         ethernet_protocol == ETH_P_8021AD)
-        return;
+        return TC_ACT_OK;
 
     if (ethernet_protocol == ETH_P_IP)
-        parse_ipv4(skb, cursor, data_end, ifindex, packet_length,
-                   cursor_offset, ethernet->source);
-    else if (ethernet_protocol == ETH_P_IPV6)
-        parse_ipv6(skb, cursor, data_end, ifindex, packet_length,
-                   cursor_offset, ethernet->source);
+        return parse_ipv4(skb, cursor, data_end, ifindex, packet_length,
+                          cursor_offset, hook, ethernet->source, policy_only);
+    if (ethernet_protocol == ETH_P_IPV6)
+        return parse_ipv6(skb, cursor, data_end, ifindex, packet_length,
+                          cursor_offset, hook, ethernet->source, policy_only);
+    return TC_ACT_OK;
 }
 
 SEC("tc")
@@ -848,27 +972,31 @@ int netqmon_ingress(struct __sk_buff *skb)
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
 
-    parse_packet(skb, data, data_end, skb->ifindex, skb->len);
-    return TC_ACT_OK;
+    return parse_packet(skb, data, data_end, skb->ifindex, skb->len,
+                        NETQMON_HOOK_INGRESS, 0);
 }
 
 SEC("tc")
 int netqmon_egress(struct __sk_buff *skb)
 {
     __u32 ingress_ifindex = skb->ingress_ifindex;
+    int policy_only = 0;
 
     /* If this packet already crossed a selected ingress hook, accounting it
-     * again at egress would double count selected-to-selected paths. A zero
-     * ingress_ifindex identifies host-originated traffic such as proxy replies. */
+     * again at egress would double count selected-to-selected paths. Still
+     * inspect the exact flow key when policy execution is active. */
     if (ingress_ifindex &&
-        bpf_map_lookup_elem(&observed_ifindexes, &ingress_ifindex))
-        return TC_ACT_OK;
+        bpf_map_lookup_elem(&observed_ifindexes, &ingress_ifindex)) {
+        if (!flow_policy_state.enabled)
+            return TC_ACT_OK;
+        policy_only = 1;
+    }
 
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
 
-    parse_packet(skb, data, data_end, skb->ifindex, skb->len);
-    return TC_ACT_OK;
+    return parse_packet(skb, data, data_end, skb->ifindex, skb->len,
+                        NETQMON_HOOK_EGRESS, policy_only);
 }
 
 SEC("tc")

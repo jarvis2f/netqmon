@@ -7,6 +7,7 @@ mod dpi;
 mod icons;
 pub mod insights;
 mod license;
+mod policy;
 mod query_api;
 mod realtime;
 mod recognition_diagnostics;
@@ -24,6 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Bytes;
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{DefaultBodyLimit, FromRef, FromRequestParts, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE};
 use axum::http::request::Parts;
@@ -31,16 +33,20 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use classifier::{ClassificationInput, ClassifierHandle, DpiEvidence};
+use classifier::{ClassificationInput, ClassificationResult, ClassifierHandle, DpiEvidence};
 use futures_util::stream;
 use getrandom::fill;
 #[cfg(test)]
 use netqmon_geo::DisabledGeoProvider;
 use netqmon_geo::{DEFAULT_GEO_DIRECTORY, GeoProvider, LocalDbProvider};
+use netqmon_protocol::policy::{
+    FlowCommandOperation, FlowVerdict, POLICY_WIRE_VERSION, PolicyWireFrame,
+};
 use netqmon_protocol::v1::probe_request::Target as ProbeTarget;
 use netqmon_protocol::v1::probe_result::Outcome as ProbeOutcome;
 use netqmon_protocol::v1::{
-    EnrollRequest, EnrollResponse, FaviconProbe, ProbeRequest, TelemetryBatch, TelemetryResponse,
+    EnrollRequest, EnrollResponse, FaviconProbe, FlowLifecycle, FlowScope, ProbeRequest,
+    TelemetryBatch, TelemetryResponse,
 };
 use netqmon_protocol::{
     ContentEncoding, DecodeError, PROTOCOL_VERSION, decode_telemetry_batch, validate_batch_metadata,
@@ -49,6 +55,7 @@ use netqmon_storage::{
     ClickHouseConfig, ClickHouseStorage, DEFAULT_DATABASE_PATH, FlowAttribution,
     PersistDisposition, SqliteStorage, Storage, StorageError,
 };
+use policy::PolicyHub;
 use prost::Message;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -58,6 +65,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
 use crate::icons::{IconCacheConfig, IconService};
+use crate::policy::PolicyService;
 use crate::realtime::{RealtimeEngine, RealtimeEvent, RealtimeSnapshot};
 use device_identification::{DeviceIdentifier, refresh_mac_dataset};
 
@@ -129,6 +137,10 @@ pub async fn run_from_env() -> Result<(), Box<dyn Error>> {
             .map_err(|err| ConfigError(format!("failed to open SQLite: {err}")))?;
         Storage::sqlite(sqlite)
     };
+    let policy_service =
+        Arc::new(PolicyService::open_from_env().map_err(|error| {
+            ConfigError(format!("failed to initialize policy storage: {error}"))
+        })?);
 
     let state = CollectorState::with_geo_provider(
         &config.enrollment_token,
@@ -138,6 +150,7 @@ pub async fn run_from_env() -> Result<(), Box<dyn Error>> {
         config.geo_directory.clone(),
         DeviceIdentifier::load(&config.mac_dataset_path),
         config.icon_cache_config,
+        policy_service,
     )
     .map_err(|err| ConfigError(format!("failed to initialize collector state: {err}")))?;
     state.license.ensure_identity().map_err(ConfigError)?;
@@ -154,6 +167,10 @@ pub async fn run_from_env() -> Result<(), Box<dyn Error>> {
     );
     license::spawn(Arc::clone(&state.license));
     spawn_classifier_probe(classifier, Arc::clone(&state.license));
+    policy::push::spawn_schedule_refresh(
+        Arc::clone(&state.policy_service),
+        state.policy_hub.clone(),
+    );
 
     tracing::info!(address = %config.public_addr, "public ingestion listener started");
     tracing::info!(address = %config.internal_addr, "internal listener started");
@@ -294,6 +311,8 @@ struct CollectorState {
     icon_service: Arc<IconService>,
     sampling: Arc<dpi::SamplingService>,
     license: Arc<license::LicenseCoordinator>,
+    policy_service: Arc<PolicyService>,
+    policy_hub: PolicyHub,
 }
 
 impl CollectorState {
@@ -322,6 +341,9 @@ impl CollectorState {
         storage: SqliteStorage,
         classifier: ClassifierHandle,
     ) -> Result<Self, rusqlite::Error> {
+        let policy_service = Arc::new(
+            PolicyService::open_in_memory().expect("in-memory test policy database must open"),
+        );
         Self::with_geo_provider(
             enrollment_token,
             Storage::sqlite(storage),
@@ -330,6 +352,7 @@ impl CollectorState {
             PathBuf::from(DEFAULT_GEO_DIRECTORY),
             DeviceIdentifier::load(Path::new("/missing/netqmon-test-mac-prefixes.json")),
             IconCacheConfig::default(),
+            policy_service,
         )
         .map_err(|e| match e {
             StorageError::Sqlite(err) => err,
@@ -346,6 +369,7 @@ impl CollectorState {
         geo_directory: PathBuf,
         device_identifier: DeviceIdentifier,
         icon_cache_config: IconCacheConfig,
+        policy_service: Arc<PolicyService>,
     ) -> Result<Self, StorageError> {
         let signature_matcher = Arc::new(classifier::ClassifierdSignatureMatcher::new(
             classifier.clone(),
@@ -370,7 +394,9 @@ impl CollectorState {
             dedupe_hits: 0,
             traffic_bytes: 0,
         }));
+        let policy_hub = PolicyHub::new();
         let weak = Arc::downgrade(&inner);
+        let callback_policy_hub = policy_hub.clone();
         let sampling = Arc::new(dpi::SamplingService::new(
             !cfg!(test) && dpi_enabled_from_env().unwrap_or(false),
             dpi::default_engine(),
@@ -380,8 +406,19 @@ impl CollectorState {
                     let mut inner = inner
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if let Err(error) = apply_sample_result(&mut inner, &cached) {
-                        tracing::warn!(%error, "sample classification update failed");
+                    let result = apply_sample_result(&mut inner, &cached);
+                    drop(inner);
+                    match result {
+                        Ok(decisions) => {
+                            for (batch, attribution) in decisions {
+                                queue_policy_flow_decisions(
+                                    &callback_policy_hub,
+                                    &batch,
+                                    std::slice::from_ref(&attribution),
+                                );
+                            }
+                        }
+                        Err(error) => tracing::warn!(%error, "sample classification update failed"),
                     }
                 }
             },
@@ -392,6 +429,8 @@ impl CollectorState {
             icon_service: Arc::new(IconService::new(icon_cache_config)),
             sampling,
             license,
+            policy_service,
+            policy_hub,
         })
     }
 
@@ -500,10 +539,6 @@ impl CollectorState {
         batch: &TelemetryBatch,
     ) -> Result<BatchDisposition, TelemetryIngestError> {
         let mut inner = self.lock();
-        inner
-            .classifier
-            .health()
-            .map_err(TelemetryIngestError::ClassifierUnavailable)?;
         let mut favicon_endpoints = std::mem::take(&mut inner.favicon_endpoints);
         favicon_endpoints.observe_results(&inner.classifier, batch);
         let dpi_results = self.sampling.lookup_batch(batch);
@@ -516,6 +551,7 @@ impl CollectorState {
             &favicon_endpoints,
             batch,
             &dpi_results,
+            true,
         );
         inner.service_bindings = service_bindings;
         // Restore probe state before any fallible storage work below. A rejected
@@ -591,7 +627,7 @@ impl CollectorState {
             &historical_evidence,
             &supplemental_evidence,
         );
-        match inner.storage.persist_classified_batch(
+        let result = match inner.storage.persist_classified_batch(
             &effective_batch,
             &attributions,
             &device_identities,
@@ -625,7 +661,12 @@ impl CollectorState {
                 inner.pending_probe_requests.extend(requests);
                 Ok(BatchDisposition::Accepted)
             }
+        };
+        if matches!(&result, Ok(BatchDisposition::Accepted)) {
+            drop(inner);
+            queue_policy_flow_decisions(&self.policy_hub, batch, &attributions);
         }
+        result
     }
 
     fn take_probe_requests(&self) -> Vec<ProbeRequest> {
@@ -1091,6 +1132,7 @@ fn classify_batch(
     favicon_endpoints: &FaviconEndpointCache,
     batch: &TelemetryBatch,
     analyses: &[Option<dpi::SampleAnalysis>],
+    fail_open_on_classifier_error: bool,
 ) -> Result<Vec<FlowAttribution>, TelemetryIngestError> {
     let remote_asns = lookup_batch_remote_asns(geo_provider, batch);
     batch
@@ -1153,12 +1195,20 @@ fn classify_batch(
                 }),
                 signatures: signature_matches,
             };
-            let mut classification = classifier
-                .classify(&input)
-                .map_err(TelemetryIngestError::ClassifierUnavailable)?;
+            let (mut classification, classifier_available) = match classifier.classify(&input) {
+                Ok(classification) => (classification, true),
+                Err(error) => {
+                    if !fail_open_on_classifier_error {
+                        return Err(TelemetryIngestError::ClassifierUnavailable(error));
+                    }
+                    tracing::debug!(%error, "classifier unavailable; flow attribution fails open");
+                    (ClassificationResult::default(), false)
+                }
+            };
             // A DNS attribution can be a generic CDN name. Still run SNI/Host through
             // the same domain rules, while retaining an already matched DNS application.
-            if !classification
+            if classifier_available
+                && !classification
                 .evidence
                 .iter()
                 .any(|e| e.evidence_type == "domain_application")
@@ -1171,9 +1221,16 @@ fn classify_batch(
                         domain: Some(hostname),
                         ..input.clone()
                     };
-                    let host_result = classifier
-                        .classify(&host_input)
-                        .map_err(TelemetryIngestError::ClassifierUnavailable)?;
+                    let host_result = match classifier.classify(&host_input) {
+                        Ok(classification) => classification,
+                        Err(error) => {
+                            if !fail_open_on_classifier_error {
+                                return Err(TelemetryIngestError::ClassifierUnavailable(error));
+                            }
+                            tracing::debug!(%error, "classifier unavailable for DPI hostname; flow attribution fails open");
+                            ClassificationResult::default()
+                        }
+                    };
                     if host_result
                         .evidence
                         .iter()
@@ -1389,7 +1446,8 @@ fn public_router(state: CollectorState) -> Router {
         .route("/v1/ingest/health", get(health))
         .route("/v1/ingest/enroll", post(enroll))
         .route("/v1/ingest/telemetry", post(telemetry))
-        .route("/v1/ingest/samples", post(samples));
+        .route("/v1/ingest/samples", post(samples))
+        .route("/v1/agent/policies/stream", get(agent_policy_stream));
     #[cfg(test)]
     let router = router.route("/test/slow", get(slow_test_handler));
     router
@@ -1402,12 +1460,46 @@ fn public_router(state: CollectorState) -> Router {
         .with_state(state)
 }
 
+async fn agent_policy_stream(
+    State(state): State<CollectorState>,
+    identity: AgentIdentity,
+    websocket: WebSocketUpgrade,
+) -> Response {
+    if let Err(error) =
+        state
+            .policy_hub
+            .refresh_gateway(&state.policy_service, &identity.gateway_id, false)
+    {
+        tracing::error!(gateway_id = identity.gateway_id, %error, "could not build initial policy snapshot");
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let session = match state.policy_hub.register(&identity.gateway_id) {
+        Ok(session) => session,
+        Err(error) => {
+            tracing::error!(gateway_id = identity.gateway_id, %error, "could not register policy stream");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    websocket
+        .max_message_size(netqmon_protocol::policy::POLICY_MAX_FRAME_BYTES)
+        .max_frame_size(netqmon_protocol::policy::POLICY_MAX_FRAME_BYTES)
+        .on_upgrade(move |socket| {
+            policy::push::run_socket(
+                socket,
+                Arc::clone(&state.policy_service),
+                state.policy_hub.clone(),
+                session,
+            )
+        })
+}
+
 fn internal_router(state: CollectorState) -> Router {
     Router::new()
         .route("/internal/health", get(health))
         .route("/internal/realtime/stream", get(realtime_stream))
         .merge(auth::router())
         .merge(icons::router())
+        .merge(policy::router())
         .merge(query_api::router())
         .with_state(state)
 }
@@ -1805,10 +1897,206 @@ async fn samples(
         )
     }
 }
+fn queue_policy_flow_decisions(
+    hub: &PolicyHub,
+    batch: &TelemetryBatch,
+    attributions: &[FlowAttribution],
+) {
+    let Some(bundle) = hub.current_bundle(&batch.gateway_id) else {
+        return;
+    };
+    let PolicyWireFrame::PolicySnapshot {
+        controller_epoch,
+        config_revision,
+        policies,
+        ..
+    } = &bundle.frame
+    else {
+        return;
+    };
+    let now = policy::push::now_ms();
+    let (application_block_supported, application_limit_supported) =
+        hub.flow_capabilities(&batch.gateway_id);
+    for (index, flow) in batch.flows.iter().enumerate() {
+        let Some(policy_flow_id) =
+            (!flow.policy_flow_id.is_empty()).then_some(flow.policy_flow_id.as_str())
+        else {
+            continue;
+        };
+        // Idle lifecycle notifications carry the observation time rather than
+        // the flow's original sampling interval. They have no new classifier
+        // evidence and must not revoke a still-leased exact verdict merely
+        // because the sample lookup cannot overlap that synthetic interval.
+        // End notifications, real packet deltas, and late classifier results
+        // continue through the normal evaluation/revocation path.
+        if flow.lifecycle == FlowLifecycle::Idle as i32
+            && flow.packets == 0
+            && flow.upload_bytes == 0
+            && flow.download_bytes == 0
+        {
+            continue;
+        }
+        let is_ended = flow.lifecycle == FlowLifecycle::Ended as i32;
+        let is_internet = flow.scope == FlowScope::Internet as i32;
+        let Some(client_mac) = canonical_mac(&flow.client_mac) else {
+            if is_ended || !is_internet {
+                let _ = hub.revoke_flow_if_active(
+                    &batch.gateway_id,
+                    &batch.boot_id,
+                    controller_epoch,
+                    *config_revision,
+                    policy_flow_id,
+                    now,
+                );
+            }
+            continue;
+        };
+        if is_ended || !is_internet {
+            let _ = hub.revoke_flow_if_active(
+                &batch.gateway_id,
+                &batch.boot_id,
+                controller_epoch,
+                *config_revision,
+                policy_flow_id,
+                now,
+            );
+            continue;
+        }
+        let Some(attribution) = attributions.get(index) else {
+            continue;
+        };
+        tracing::debug!(
+            target: "netqmon_collector::policy::flow_trace",
+            gateway_id = batch.gateway_id,
+            boot_id = batch.boot_id,
+            config_revision,
+            policy_flow_id,
+            client_port = flow.client_port,
+            ip_version = flow.ip_version,
+            protocol = flow.protocol,
+            direction = flow.direction,
+            application_id = attribution.application_id,
+            application_confidence = attribution.application_confidence,
+            "classified policy flow"
+        );
+        let request = policy::PolicyPreviewRequest {
+            gateway_id: batch.gateway_id.clone(),
+            client_mac,
+            application_id: attribution.application_id.clone(),
+            category_id: attribution.category_id.clone(),
+            application_confidence: attribution.application_confidence,
+            scope: "internet".to_owned(),
+            at_ms: now,
+        };
+        // This evaluation selects the intended rule. The Agent still verifies its
+        // runtime capability and policy revision before applying any command.
+        let evaluated = policy::evaluate_preview(
+            &request,
+            policies,
+            application_block_supported,
+            application_limit_supported,
+        );
+        let (verdict, policy_ids) = match evaluated.selected_block_verdict.as_str() {
+            "block" => (
+                Some(FlowVerdict::Block),
+                evaluated
+                    .matched_policies
+                    .iter()
+                    .find(|policy| policy.selected)
+                    .map(|policy| vec![policy.policy_id.clone()])
+                    .unwrap_or_default(),
+            ),
+            "allow" => (
+                Some(FlowVerdict::Allow),
+                evaluated
+                    .matched_policies
+                    .iter()
+                    .find(|policy| policy.selected)
+                    .map(|policy| vec![policy.policy_id.clone()])
+                    .unwrap_or_default(),
+            ),
+            _ => {
+                let policy_ids = evaluated
+                    .active_limits
+                    .iter()
+                    .filter(|limit| limit.status == "supported")
+                    .map(|limit| limit.policy_id.clone())
+                    .collect::<Vec<_>>();
+                if policy_ids.is_empty() {
+                    (None, Vec::new())
+                } else {
+                    (Some(FlowVerdict::Shape), policy_ids)
+                }
+            }
+        };
+        if let Some(verdict) = verdict.filter(|_| !policy_ids.is_empty() && policy_ids.len() <= 16)
+            && let Some(ttl_ms) = match flow.protocol {
+                17 => Some(30_000),
+                6 => Some(120_000),
+                _ => None,
+            }
+            && let Some(expires_at_ms) =
+                policy::flow_verdict_expiry(&bundle.frame, &policy_ids, now, ttl_ms)
+        {
+            let command_id = uuid::Uuid::new_v4().to_string();
+            tracing::debug!(
+                target: "netqmon_collector::policy::flow_trace",
+                command_id,
+                gateway_id = batch.gateway_id,
+                boot_id = batch.boot_id,
+                config_revision,
+                policy_flow_id,
+                client_port = flow.client_port,
+                ip_version = flow.ip_version,
+                protocol = flow.protocol,
+                direction = flow.direction,
+                ?verdict,
+                "evaluated application flow command"
+            );
+            let command = PolicyWireFrame::FlowCommand {
+                wire_version: POLICY_WIRE_VERSION,
+                gateway_id: batch.gateway_id.clone(),
+                boot_id: batch.boot_id.clone(),
+                controller_epoch: controller_epoch.clone(),
+                config_revision: *config_revision,
+                command_id,
+                policy_flow_id: policy_flow_id.to_owned(),
+                operation: FlowCommandOperation::Upsert,
+                verdict: Some(verdict),
+                policy_ids,
+                expires_at_ms,
+                issued_at_ms: now,
+            };
+            if let Err(error) = hub.queue_flow_command(command) {
+                tracing::warn!(gateway_id = batch.gateway_id, policy_flow_id, %error, "could not queue application flow command");
+            }
+        } else if let Err(error) = hub.revoke_flow_if_active(
+            &batch.gateway_id,
+            &batch.boot_id,
+            controller_epoch,
+            *config_revision,
+            policy_flow_id,
+            now,
+        ) {
+            tracing::warn!(gateway_id = batch.gateway_id, policy_flow_id, %error, "could not queue application flow revoke");
+        }
+    }
+}
+
+fn canonical_mac(value: &[u8]) -> Option<String> {
+    (value.len() == 6).then(|| {
+        value
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    })
+}
+
 fn apply_sample_result(
     inner: &mut CollectorInner,
     cached: &dpi::CachedResult,
-) -> Result<(), StorageError> {
+) -> Result<Vec<(TelemetryBatch, FlowAttribution)>, StorageError> {
     let key = &cached.key;
     let flow = netqmon_protocol::v1::FlowDelta {
         ip_version: key.ip_version,
@@ -1819,6 +2107,7 @@ fn apply_sample_result(
         remote_port: key.remote_port,
         first_seen_unix_ms: key.first_seen_unix_ms,
         last_seen_unix_ms: cached.last_packet_ms,
+        policy_flow_id: cached.policy_flow_ids.first().cloned().unwrap_or_default(),
         ..Default::default()
     };
     let batch = TelemetryBatch {
@@ -1840,17 +2129,30 @@ fn apply_sample_result(
             dpi: cached.result.clone(),
             signatures: cached.signatures.clone(),
         })],
+        false,
     );
     inner.service_bindings = service_bindings;
     let attributions = match classified {
         Ok(attributions) => attributions,
         Err(TelemetryIngestError::ClassifierUnavailable(classifier_error)) => {
             tracing::debug!(%classifier_error, "skipping late DPI update while classifier is unavailable");
-            return Ok(());
+            return Ok(Vec::new());
         }
         Err(TelemetryIngestError::Storage(error)) => return Err(error),
     };
     inner
         .storage
-        .reclassify_flow(&cached.gateway, &batch.flows[0], &attributions[0])
+        .reclassify_flow(&cached.gateway, &batch.flows[0], &attributions[0])?;
+    Ok(cached
+        .policy_flow_ids
+        .iter()
+        .take(dpi::MAX_POLICY_FLOW_IDENTITIES_PER_SAMPLE)
+        .map(|policy_flow_id| {
+            let mut decision_batch = batch.clone();
+            decision_batch.flows[0]
+                .policy_flow_id
+                .clone_from(policy_flow_id);
+            (decision_batch, attributions[0].clone())
+        })
+        .collect())
 }

@@ -45,7 +45,7 @@ test.describe("i18n internationalization", () => {
     expect(localeCookie?.value).toBe("zh-CN");
 
     // Navigate to another page (e.g. /traffic) without locale in path
-    await page.getByRole("link", { name: "流量" }).click();
+    await page.getByRole("link", { name: "流量", exact: true }).click();
     await expect(page).toHaveURL(/\/traffic$/);
     await expect(page.locator("html")).toHaveAttribute("lang", "zh-CN");
     await expect(

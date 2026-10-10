@@ -14,16 +14,17 @@ use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_ROUTE};
 use crate::identity::MacAddress;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct NeighborEntry {
-    pub(super) ip: IpAddr,
-    pub(super) mac: MacAddress,
+pub(crate) struct NeighborEntry {
+    pub(crate) ifindex: u32,
+    pub(crate) ip: IpAddr,
+    pub(crate) mac: MacAddress,
 }
 
 pub(super) fn discover(ifindex: u32) -> Result<Vec<NeighborEntry>, NeighborDiscoveryError> {
     discover_matching(Some(ifindex))
 }
 
-pub(super) fn discover_all() -> Result<Vec<NeighborEntry>, NeighborDiscoveryError> {
+pub(crate) fn discover_all() -> Result<Vec<NeighborEntry>, NeighborDiscoveryError> {
     discover_matching(None)
 }
 
@@ -117,7 +118,11 @@ fn parse_entry(message: &NeighbourMessage, ifindex: Option<u32>) -> Option<Neigh
     if !mac.is_unicast() {
         return None;
     }
-    Some(NeighborEntry { ip, mac })
+    Some(NeighborEntry {
+        ifindex: message.header.ifindex,
+        ip,
+        mac,
+    })
 }
 
 fn align_netlink(length: usize) -> usize {
@@ -125,7 +130,7 @@ fn align_netlink(length: usize) -> usize {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct NeighborDiscoveryError(String);
+pub(crate) struct NeighborDiscoveryError(String);
 
 impl NeighborDiscoveryError {
     fn io(error: std::io::Error) -> Self {

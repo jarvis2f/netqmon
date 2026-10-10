@@ -149,6 +149,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             samples: vec![FlowSample {
                 flow_id: "flow-1".into(),
+                policy_flow_id: String::new(),
                 key: Some(FlowSampleKey {
                     ip_version,
                     protocol: 17,

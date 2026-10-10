@@ -100,7 +100,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: clippy, rustfmt
 
       - name: Install eBPF build dependencies
         run: |
@@ -108,7 +108,7 @@ jobs:
           sudo apt-get install --no-install-recommends --yes \
             clang \
             autoconf automake libtool pkg-config \
-            iproute2 ripgrep \
+            bpftool iproute2 iperf3 jq netcat-openbsd nftables ripgrep \
             libelf-dev \
             linux-tools-generic \
             zlib1g-dev
@@ -124,6 +124,17 @@ jobs:
 
       - name: Build agent and eBPF object
         run: cargo build --package netqmon-agent
+
+      - name: Check Clippy
+        run: cargo clippy --workspace --all-targets --all-features
+
+      - name: Test shared egress application lifecycle on Linux
+        run: |
+          test_binary=$(cargo test -p netqmon-agent --no-run --message-format=json | jq -r 'select(.profile.test == true) | .executable // empty' | head -1)
+          test -n "$test_binary"
+          sudo unshare -n "$test_binary" --exact policy::qdisc::tests::live_shared_application_classes_update_replace_and_remove --ignored --nocapture
+          sudo unshare -n "$test_binary" --exact policy::qdisc::tests::live_router_client_to_application_migration_preserves_queues_and_rolls_back --ignored --nocapture
+          sudo unshare -n "$test_binary" --exact policy::qdisc::tests::live_shared_egress_updates_rolls_back_and_recovers_one_root --ignored --nocapture
 
       - name: Test bounded bidirectional packet sampling
         run: sudo bash tests/integration/flow_sample.sh target/debug/netqmon-agent
@@ -212,8 +223,17 @@ jobs:
       - name: Type-check
         run: pnpm typecheck
 
+      - name: Check UI translations
+        run: pnpm --filter @netqmon/controller-ui check:i18n
+
       - name: Build
         run: pnpm build
+
+      - name: Install Playwright browser
+        run: pnpm --filter @netqmon/controller-ui exec playwright install --with-deps chromium
+
+      - name: Run controller UI E2E tests
+        run: pnpm e2e
 
   clickhouse-dpi:
     name: ClickHouse late DPI

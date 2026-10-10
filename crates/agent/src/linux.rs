@@ -35,6 +35,7 @@ use crate::dns_parser::parse_response;
 use crate::flow::{FlowCounters, FlowKey, FlowRuntime};
 use crate::lifecycle::{FlowLifecycleEvent, FlowState};
 use crate::normalization::{NormalizedFlow, normalize_with_resolution};
+use crate::policy::flow_alias::{FlowAliasError, PolicyFlowAliasCache};
 use crate::sample;
 use crate::telemetry;
 use crate::topology::{TopologyContext, TopologyMode};
@@ -42,8 +43,8 @@ use crate::transport::{self, SampleQueue, TelemetryQueue};
 
 mod capabilities;
 mod map_options;
-mod neighbor;
-mod network;
+pub(crate) mod neighbor;
+pub(crate) mod network;
 mod tc;
 
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -53,7 +54,7 @@ const SAMPLE_CONNTRACK_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SAMPLE_BUDGET_GC_INTERVAL: Duration = Duration::from_secs(30);
 const SAMPLE_BUDGET_GC_MAX_ENTRIES: usize = 2048;
 const PENDING_SAMPLE_EVENT_CAPACITY: usize = 512;
-const SAMPLE_EVENT_HEADER_SIZE: usize = 72;
+const SAMPLE_EVENT_HEADER_SIZE: usize = 80;
 const SAMPLE_EVENT_MAX_PAYLOAD_SIZE: usize = 4096;
 const FIREWALL_CONFIG_PATH: &str = "/etc/config/firewall";
 
@@ -126,6 +127,7 @@ impl PendingSampleEvents {
 pub(super) fn doctor(config: &AgentConfig) -> bool {
     let report = capabilities::probe(config);
     print!("{report}");
+    print!("{}", crate::policy::doctor_text(config));
     report.is_healthy()
 }
 
@@ -171,13 +173,17 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
     signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown))
         .map_err(|error| AgentError::Runtime(error.to_string()))?;
     let session_boot_id = session_boot_id();
+    let flow_policy_boot_id = session_boot_id.clone();
+    let policy_flows_enabled = Arc::new(AtomicBool::new(false));
+    let flow_commands_enabled = Arc::new(AtomicBool::new(false));
+    let flow_alias_cache = Arc::new(Mutex::new(PolicyFlowAliasCache::default()));
     let controller_endpoints = transport::controller_endpoints(&config.controller_url);
     let telemetry_queue =
         TelemetryQueue::spawn(&config, Arc::clone(&shutdown), session_boot_id.clone());
     let sample_queue = Arc::new(SampleQueue::spawn(
         &config,
         Arc::clone(&shutdown),
-        session_boot_id,
+        session_boot_id.clone(),
     ));
     let sample_boot_epoch = boot_epoch_ms();
     let dns_observations = Arc::new(Mutex::new(Vec::new()));
@@ -197,13 +203,13 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
         .iter()
         .any(|candidate| candidate.name == interface && candidate.is_bridge);
     let (attach_ingress, attach_egress) = observation_hooks();
-    let observation_interfaces = observation_interfaces(
+    let mut observation_interfaces = resolve_observation_interfaces(
         &configured_interfaces,
         network.snapshot.mode,
         capture_is_bridge,
     )?;
     let observed_ingress_ifindices =
-        observed_ingress_ifindices(&config.interfaces, &observation_interfaces);
+        compute_observed_ingress_ifindices(&config.interfaces, &observation_interfaces);
     let builder = FlowSkelBuilder::default();
     let mut open_object = MaybeUninit::uninit();
     let mut open_skeleton = builder
@@ -246,8 +252,8 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
             .update(&key, &[1], MapFlags::ANY)
             .map_err(|error| AgentError::Runtime(error.to_string()))?;
     }
-    let attach_tcx = || {
-        observation_interfaces
+    let attach_tcx = |targets: &[(String, i32)]| {
+        targets
             .iter()
             .map(|(_, target_ifindex)| {
                 tc::TcxLinks::attach(
@@ -262,8 +268,8 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
             })
             .collect::<libbpf_rs::Result<Vec<_>>>()
     };
-    let attach_netlink = || {
-        observation_interfaces
+    let attach_netlink = |targets: &[(String, i32)]| {
+        targets
             .iter()
             .map(|(_, target_ifindex)| {
                 tc::NetlinkHooks::attach(
@@ -278,26 +284,84 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
             })
             .collect::<libbpf_rs::Result<Vec<_>>>()
     };
-    let mut hooks = match selected_backend {
-        tc::ActiveBackend::Tcx => match attach_tcx() {
-            Ok(links) => links,
+    let (mut active_backend, mut hooks) = match selected_backend {
+        tc::ActiveBackend::Tcx => match attach_tcx(&observation_interfaces) {
+            Ok(links) => (tc::ActiveBackend::Tcx, links),
             Err(error) if config.attach_backend == crate::config::AttachBackend::Auto => {
                 log_warn(
                     log_level,
                     format_args!("TCX attach failed ({error}); falling back to netlink TC"),
                 );
-                attach_netlink().map_err(|error| classify_tc_error(&interface, error))?
+                (
+                    tc::ActiveBackend::Netlink,
+                    attach_netlink(&observation_interfaces)
+                        .map_err(|error| classify_tc_error(&interface, error))?,
+                )
             }
             Err(error) => return Err(classify_tc_error(&interface, error)),
         },
-        tc::ActiveBackend::Netlink => {
-            attach_netlink().map_err(|error| classify_tc_error(&interface, error))?
+        tc::ActiveBackend::Netlink => (
+            tc::ActiveBackend::Netlink,
+            attach_netlink(&observation_interfaces)
+                .map_err(|error| classify_tc_error(&interface, error))?,
+        ),
+    };
+    let mut hooks_attached = hooks.len() == observation_interfaces.len()
+        && hooks.iter().all(tc::AttachLinks::covers_required_hooks);
+    let policy_drop_map = match MapHandle::try_from(&skeleton.maps.policy_drop_counters) {
+        Ok(map) => Some(map),
+        Err(error) => {
+            log_warn(
+                log_level,
+                format_args!("BPF policy drop counter map is unavailable: {error}"),
+            );
+            None
         }
     };
-    let active_backend = hooks
-        .first()
-        .map(tc::AttachLinks::backend)
-        .expect("at least one observation interface");
+    let flow_verdict_writer = match (
+        MapHandle::try_from(&skeleton.maps.flow_verdict_map),
+        MapHandle::try_from(&skeleton.maps.bss),
+    ) {
+        (Ok(verdict_map), Ok(policy_state_map)) => {
+            crate::policy::flow_verdict::FlowVerdictWriter::new(
+                verdict_map,
+                policy_state_map,
+                policy_drop_map,
+            )
+        }
+        (verdict_result, state_result) => {
+            log_warn(
+                log_level,
+                format_args!(
+                    "application flow verdict maps are unavailable: verdict_map={:?}; policy_state_map={:?}",
+                    verdict_result.err(),
+                    state_result.err()
+                ),
+            );
+            crate::policy::flow_verdict::FlowVerdictWriter::unavailable()
+        }
+    };
+    let flow_map_ready = flow_verdict_writer.ready();
+    let flow_bpf_ready = Arc::new(AtomicBool::new(flow_map_ready && hooks_attached));
+    if !flow_bpf_ready.load(Ordering::Acquire) {
+        log_warn(
+            log_level,
+            format_args!(
+                "application flow enforcement is unavailable; exact flow commands will fail open"
+            ),
+        );
+    }
+    let policy_receiver = crate::policy::receiver::PolicyReceiver::spawn(
+        config.clone(),
+        session_boot_id.clone(),
+        telemetry_queue.policy_credentials(),
+        Arc::clone(&policy_flows_enabled),
+        Arc::clone(&flow_commands_enabled),
+        Arc::clone(&flow_alias_cache),
+        flow_verdict_writer,
+        Arc::clone(&flow_bpf_ready),
+        Arc::clone(&shutdown),
+    );
     let observation_names = observation_interfaces
         .iter()
         .map(|(name, _)| name.as_str())
@@ -462,7 +526,8 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
     let ring_buffer = ring_buffer_builder
         .build()
         .map_err(|error| AgentError::Runtime(error.to_string()))?;
-    let mut flow_runtime = FlowRuntime::new(
+    let mut flow_runtime = FlowRuntime::new_for_boot(
+        flow_policy_boot_id.clone(),
         Duration::from_secs(config.tcp_idle_timeout_seconds),
         Duration::from_secs(config.udp_idle_timeout_seconds),
     );
@@ -472,6 +537,8 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
     let boot_epoch_ms = boot_epoch_ms();
     let mut next_poll = Instant::now() + poll_interval;
     let mut next_batch = Instant::now() + batch_interval;
+    let mut next_interface_reconcile = Instant::now() + Duration::from_secs(1);
+    let mut last_interface_reconcile_error = None::<String>;
     let mut next_neighbor_refresh = Instant::now();
     let mut next_dhcp_lease_refresh = Instant::now();
     let mut next_discovery_report = Instant::now() + Duration::from_secs(30);
@@ -481,6 +548,8 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
     let mut sample_budget_gc = SampleBudgetGc::default();
     let mut deferred_sample_events = VecDeque::new();
     let mut pending_flows = Vec::new();
+    let mut policy_flow_cache_full = 0_u64;
+    let mut policy_flow_partial_coverage = 0_u64;
     let mut asymmetry = AsymmetryDetector::default();
     let mut topology_warnings = network.snapshot.warnings.clone();
     let diagnostics_hub = Arc::new(crate::diagnostics::DiagnosticsHub::new(
@@ -542,6 +611,210 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
             );
         }
         let now = Instant::now();
+        if now >= next_interface_reconcile {
+            next_interface_reconcile = now + Duration::from_secs(1);
+            let refreshed_configured = config
+                .interfaces
+                .iter()
+                .map(|name| resolve_interface(name).map(|ifindex| (name.clone(), ifindex)))
+                .collect::<Result<Vec<_>, _>>();
+            let refreshed_capture_is_bridge = Path::new("/sys/class/net")
+                .join(&interface)
+                .join("bridge")
+                .exists();
+            let refreshed_observation = refreshed_configured.and_then(|configured| {
+                resolve_observation_interfaces(
+                    &configured,
+                    network.snapshot.mode,
+                    refreshed_capture_is_bridge,
+                )
+            });
+            match refreshed_observation {
+                Ok(refreshed_observation) => {
+                    let refreshed_is_empty = refreshed_observation.is_empty();
+                    let interfaces_changed = refreshed_observation != observation_interfaces;
+                    if interfaces_changed || !hooks_attached {
+                        flow_bpf_ready.store(false, Ordering::Release);
+                        if interfaces_changed {
+                            hooks.clear();
+                            hooks_attached = false;
+                            observation_interfaces = refreshed_observation.clone();
+                            if let Ok(mut aliases) = flow_alias_cache.lock() {
+                                aliases.clear();
+                            }
+                            let mut cleanup_errors = Vec::new();
+                            let flow_verdict_keys =
+                                skeleton.maps.flow_verdict_map.keys().collect::<Vec<_>>();
+                            for key in flow_verdict_keys {
+                                if let Err(error) = skeleton.maps.flow_verdict_map.delete(&key) {
+                                    cleanup_errors.push(error.to_string());
+                                }
+                            }
+                            let observed_ifindex_keys =
+                                skeleton.maps.observed_ifindexes.keys().collect::<Vec<_>>();
+                            for key in observed_ifindex_keys {
+                                if let Err(error) = skeleton.maps.observed_ifindexes.delete(&key) {
+                                    cleanup_errors.push(error.to_string());
+                                }
+                            }
+                            if !cleanup_errors.is_empty() {
+                                let detail = format!(
+                                    "could not clear interface-scoped BPF state: {}",
+                                    cleanup_errors.join("; ")
+                                );
+                                if last_interface_reconcile_error.as_ref() != Some(&detail) {
+                                    log_warn(log_level, format_args!("{detail}"));
+                                }
+                                last_interface_reconcile_error = Some(detail);
+                                continue;
+                            }
+                        }
+                        if !refreshed_observation.is_empty() {
+                            observation_interfaces = refreshed_observation;
+                            let mut observed_map_ready = true;
+                            for target_ifindex in compute_observed_ingress_ifindices(
+                                &config.interfaces,
+                                &observation_interfaces,
+                            ) {
+                                let key = u32::try_from(target_ifindex)
+                                    .map_err(|_| {
+                                        AgentError::Runtime("interface index overflow".to_owned())
+                                    })?
+                                    .to_ne_bytes();
+                                if let Err(error) = skeleton.maps.observed_ifindexes.update(
+                                    &key,
+                                    &[1],
+                                    MapFlags::ANY,
+                                ) {
+                                    observed_map_ready = false;
+                                    let detail = format!(
+                                        "could not refresh observed interface index {target_ifindex}: {error}"
+                                    );
+                                    if last_interface_reconcile_error.as_ref() != Some(&detail) {
+                                        log_warn(log_level, format_args!("{detail}"));
+                                    }
+                                    last_interface_reconcile_error = Some(detail);
+                                }
+                            }
+                            if observed_map_ready {
+                                let attached = match active_backend {
+                                    tc::ActiveBackend::Tcx => {
+                                        match attach_tcx(&observation_interfaces) {
+                                            Ok(links) => Ok((tc::ActiveBackend::Tcx, links)),
+                                            Err(error)
+                                                if config.attach_backend
+                                                    == crate::config::AttachBackend::Auto =>
+                                            {
+                                                log_warn(
+                                                    log_level,
+                                                    format_args!(
+                                                        "TCX reattach failed ({error}); falling back to netlink TC"
+                                                    ),
+                                                );
+                                                attach_netlink(&observation_interfaces).map(
+                                                    |links| (tc::ActiveBackend::Netlink, links),
+                                                )
+                                            }
+                                            Err(error) => Err(error),
+                                        }
+                                    }
+                                    tc::ActiveBackend::Netlink => {
+                                        attach_netlink(&observation_interfaces)
+                                            .map(|links| (tc::ActiveBackend::Netlink, links))
+                                    }
+                                };
+                                match attached {
+                                    Ok((backend, new_hooks)) => {
+                                        active_backend = backend;
+                                        hooks = new_hooks;
+                                        hooks_attached = hooks.len()
+                                            == observation_interfaces.len()
+                                            && hooks
+                                                .iter()
+                                                .all(tc::AttachLinks::covers_required_hooks);
+                                        let ready = flow_map_ready && hooks_attached;
+                                        flow_bpf_ready.store(ready, Ordering::Release);
+                                        if ready {
+                                            last_interface_reconcile_error = None;
+                                            let names = observation_interfaces
+                                                .iter()
+                                                .map(|(name, _)| name.as_str())
+                                                .collect::<Vec<_>>()
+                                                .join(", ");
+                                            log_info(
+                                                log_level,
+                                                format_args!(
+                                                    "reattached {active_backend} observation hooks to {names} after interface change"
+                                                ),
+                                            );
+                                        }
+                                    }
+                                    Err(error) => {
+                                        hooks_attached = false;
+                                        let detail = format!(
+                                            "could not reattach observation hooks: {error}"
+                                        );
+                                        if last_interface_reconcile_error.as_ref() != Some(&detail)
+                                        {
+                                            log_warn(log_level, format_args!("{detail}"));
+                                        }
+                                        last_interface_reconcile_error = Some(detail);
+                                    }
+                                }
+                            } else {
+                                hooks_attached = false;
+                            }
+                        }
+                    }
+                    if refreshed_is_empty {
+                        flow_bpf_ready.store(false, Ordering::Release);
+                    }
+                }
+                Err(error) => {
+                    flow_bpf_ready.store(false, Ordering::Release);
+                    if !observation_interfaces.is_empty() {
+                        hooks.clear();
+                        hooks_attached = false;
+                        observation_interfaces.clear();
+                        if let Ok(mut aliases) = flow_alias_cache.lock() {
+                            aliases.clear();
+                        }
+                        let mut cleanup_errors = Vec::new();
+                        let flow_verdict_keys =
+                            skeleton.maps.flow_verdict_map.keys().collect::<Vec<_>>();
+                        for key in flow_verdict_keys {
+                            if let Err(error) = skeleton.maps.flow_verdict_map.delete(&key) {
+                                cleanup_errors.push(error.to_string());
+                            }
+                        }
+                        if !cleanup_errors.is_empty() {
+                            log_warn(
+                                log_level,
+                                format_args!(
+                                    "could not clear interface-scoped BPF verdicts: {}",
+                                    cleanup_errors.join("; ")
+                                ),
+                            );
+                        }
+                    }
+                    let detail = error.to_string();
+                    if last_interface_reconcile_error.as_ref() != Some(&detail) {
+                        log_warn(
+                            log_level,
+                            format_args!(
+                                "configured observation interface is unavailable: {detail}"
+                            ),
+                        );
+                    }
+                    last_interface_reconcile_error = Some(detail);
+                }
+            }
+        }
+        if !policy_flows_enabled.load(Ordering::Acquire)
+            && let Ok(mut aliases) = flow_alias_cache.lock()
+        {
+            aliases.clear();
+        }
         let mut conntrack_refreshed_this_iteration = false;
         if now >= next_conntrack_refresh {
             let refresh_started = Instant::now();
@@ -569,6 +842,8 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                 &conntrack_stats,
                 &controller_endpoints,
                 sample_boot_epoch,
+                &flow_policy_boot_id,
+                policy_flows_enabled.load(Ordering::Acquire),
                 now,
                 &mut next_sample_conntrack_refresh,
                 &mut conntrack_refreshed_this_iteration,
@@ -673,7 +948,16 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                         .map(|devices| devices.resolver_snapshot())
                         .unwrap_or_default();
                     let lifecycle_now = started.elapsed();
-                    let runtime_update = flow_runtime.update(snapshot.flows, lifecycle_now);
+                    let runtime_update = flow_runtime.update_with_policy_ids(
+                        snapshot.flows,
+                        lifecycle_now,
+                        policy_flows_enabled.load(Ordering::Acquire),
+                    );
+                    if policy_flows_enabled.load(Ordering::Acquire)
+                        && let Ok(mut aliases) = flow_alias_cache.lock()
+                    {
+                        aliases.prune(now, Duration::from_secs(120), Duration::from_secs(30));
+                    }
                     let flows_changed = runtime_update.deltas.len() as u64;
                     let flows_idle = runtime_update
                         .lifecycle_events
@@ -685,7 +969,7 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                         .iter()
                         .filter(|event| event.state == FlowState::End)
                         .count() as u64;
-                    for delta in runtime_update.deltas {
+                    for mut delta in runtime_update.deltas {
                         if let Some(flow) = normalize_with_current_conntrack(
                             &delta.key,
                             &network,
@@ -720,6 +1004,71 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                                 ),
                             );
                             if !is_controller_transport(&flow, &controller_endpoints) {
+                                if let Some(policy_flow_id) = delta.policy_flow_id.as_deref()
+                                    && let Ok(mut aliases) = flow_alias_cache.lock()
+                                    && let was_partial = aliases.is_partial(policy_flow_id)
+                                    && let Err(error) = aliases.observe_with_client(
+                                        policy_flow_id,
+                                        delta.key.clone(),
+                                        resolved_mac.map(|mac| mac.to_string()).as_deref(),
+                                        now,
+                                    )
+                                {
+                                    match error {
+                                        FlowAliasError::CapacityFull => {
+                                            policy_flow_cache_full =
+                                                policy_flow_cache_full.saturating_add(1);
+                                            delta.policy_flow_id = None;
+                                        }
+                                        FlowAliasError::AliasLimitReached => {
+                                            if !was_partial {
+                                                policy_flow_partial_coverage =
+                                                    policy_flow_partial_coverage.saturating_add(1);
+                                            }
+                                        }
+                                        FlowAliasError::FlowEnded => {
+                                            delta.policy_flow_id = None;
+                                        }
+                                    }
+                                }
+                                if let Some(id) = delta.policy_flow_id.as_deref()
+                                    && let Ok(mut aliases) = flow_alias_cache.lock()
+                                {
+                                    aliases.observe_direction(
+                                        id,
+                                        &delta.key,
+                                        flow.direction,
+                                        if flow.path_type
+                                            == crate::normalization::PathType::Forwarded
+                                        {
+                                            network
+                                                .snapshot
+                                                .routes
+                                                .iter()
+                                                .find(|route| {
+                                                    route.destination.prefix_length == 0
+                                                        && route.destination.network.is_ipv4()
+                                                            == (delta.key.ip_version == 4)
+                                                })
+                                                .and_then(|route| {
+                                                    let upload = observation_interfaces
+                                                        .iter()
+                                                        .find(|(name, _)| name == &route.interface)?
+                                                        .1;
+                                                    let download = observation_interfaces
+                                                        .iter()
+                                                        .find(|(name, _)| {
+                                                            name == &config.interface
+                                                        })?
+                                                        .1;
+                                                    Some((upload as u32, download as u32))
+                                                })
+                                        } else {
+                                            None
+                                        },
+                                        conntrack_snapshot.resolve(&delta.key),
+                                    );
+                                }
                                 pending_flows.push(telemetry::flow_delta(
                                     &delta,
                                     &flow,
@@ -730,6 +1079,12 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                         }
                     }
                     for event in runtime_update.lifecycle_events {
+                        if event.state == FlowState::End
+                            && let Some(policy_flow_id) = event.policy_flow_id.as_deref()
+                            && let Ok(mut aliases) = flow_alias_cache.lock()
+                        {
+                            aliases.mark_ended(policy_flow_id);
+                        }
                         print_lifecycle_event(
                             &event,
                             &network,
@@ -763,6 +1118,7 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                                         FlowState::End => WireFlowLifecycle::Ended,
                                     },
                                     telemetry::unix_ms(SystemTime::now()),
+                                    event.policy_flow_id.as_deref(),
                                 ));
                             }
                         }
@@ -897,13 +1253,15 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                         config.attach_order,
                         &topology_warnings,
                     )),
+                    policy_flow_cache_full,
+                    policy_flow_partial_coverage,
                 }),
                 ..TelemetryBatch::default()
             };
             telemetry_queue.submit(batch);
             next_batch = now + batch_interval;
         }
-        let next_wakeup = next_poll.min(next_batch);
+        let next_wakeup = next_poll.min(next_batch).min(next_interface_reconcile);
         thread::sleep(SHUTDOWN_POLL_INTERVAL.min(next_wakeup.saturating_duration_since(now)));
     }
 
@@ -919,6 +1277,7 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
         ),
     );
     drop(ring_buffer);
+    policy_receiver.stop();
     if let Ok(queue) = Arc::try_unwrap(sample_queue) {
         queue.stop();
     }
@@ -932,7 +1291,7 @@ fn observation_hooks() -> (bool, bool) {
     (true, true)
 }
 
-fn observation_interfaces(
+fn resolve_observation_interfaces(
     configured: &[(String, i32)],
     mode: TopologyMode,
     capture_is_bridge: bool,
@@ -967,7 +1326,10 @@ fn observation_interfaces(
     Ok(targets)
 }
 
-fn observed_ingress_ifindices(configured: &[String], targets: &[(String, i32)]) -> Vec<i32> {
+fn compute_observed_ingress_ifindices(
+    configured: &[String],
+    targets: &[(String, i32)],
+) -> Vec<i32> {
     let mut ifindices = targets
         .iter()
         .map(|(_, ifindex)| *ifindex)
@@ -1140,7 +1502,7 @@ fn boot_epoch_ms() -> u64 {
     telemetry::unix_ms(SystemTime::now()).saturating_sub(monotonic_ns() / 1_000_000)
 }
 
-fn monotonic_ns() -> u64 {
+pub(crate) fn monotonic_ns() -> u64 {
     // Same clock as bpf_ktime_get_ns; NTP adjustments must not reset active budgets.
     nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)
         .map(|time| {
@@ -1257,6 +1619,8 @@ fn process_pending_sample_events(
     stats: &ConntrackStats,
     excluded: &[std::net::SocketAddr],
     boot_epoch_ms: u64,
+    policy_flow_boot_id: &str,
+    policy_ids_enabled: bool,
     now: Instant,
     next_refresh: &mut Instant,
     refreshed_this_iteration: &mut bool,
@@ -1273,7 +1637,16 @@ fn process_pending_sample_events(
         if sample_needs_conntrack_refresh(&bytes, network, &current) {
             event_buffer.defer(deferred, bytes);
         } else {
-            decode_and_submit_sample(&bytes, sender, network, excluded, boot_epoch_ms, &current);
+            decode_and_submit_sample(
+                &bytes,
+                sender,
+                network,
+                excluded,
+                boot_epoch_ms,
+                policy_flow_boot_id,
+                policy_ids_enabled,
+                &current,
+            );
         }
     }
 
@@ -1305,7 +1678,16 @@ fn process_pending_sample_events(
     };
 
     while let Some(bytes) = deferred.pop_front() {
-        decode_and_submit_sample(&bytes, sender, network, excluded, boot_epoch_ms, &refreshed);
+        decode_and_submit_sample(
+            &bytes,
+            sender,
+            network,
+            excluded,
+            boot_epoch_ms,
+            policy_flow_boot_id,
+            policy_ids_enabled,
+            &refreshed,
+        );
     }
 }
 
@@ -1332,18 +1714,27 @@ fn decode_and_submit_sample(
     network: &crate::normalization::NetworkContext,
     excluded: &[std::net::SocketAddr],
     boot_epoch_ms: u64,
+    policy_flow_boot_id: &str,
+    policy_ids_enabled: bool,
     conntrack: &ConntrackContext,
 ) {
-    if let Some(sample) =
-        sample::decode_sample(bytes, network, boot_epoch_ms, true, excluded, conntrack)
-    {
+    if let Some(sample) = sample::decode_sample(
+        bytes,
+        network,
+        boot_epoch_ms,
+        true,
+        excluded,
+        conntrack,
+        policy_flow_boot_id,
+        policy_ids_enabled,
+    ) {
         sender.submit(sample);
     }
 }
 
 fn sample_event_captured_length(bytes: &[u8]) -> u64 {
     bytes
-        .get(64..68)
+        .get(72..76)
         .and_then(|value| value.try_into().ok())
         .map(u32::from_ne_bytes)
         .map(u64::from)
@@ -2144,6 +2535,7 @@ config defaults
             ip_version: 4,
             protocol: 6,
             direction: 0,
+            hook: 0,
             ifindex: 1,
             source_address: [0; 16],
             destination_address: [0; 16],
@@ -2169,8 +2561,8 @@ config defaults
     #[test]
     fn bounds_pending_sample_events_and_records_drops() {
         let events = PendingSampleEvents::new(1);
-        let mut sample = vec![0; 68];
-        sample[64..68].copy_from_slice(&42_u32.to_ne_bytes());
+        let mut sample = vec![0; 80];
+        sample[72..76].copy_from_slice(&42_u32.to_ne_bytes());
 
         events.push(&sample);
         events.push(&sample);
@@ -2183,7 +2575,7 @@ config defaults
     fn pending_sample_events_copy_only_the_captured_payload() {
         let events = PendingSampleEvents::new(1);
         let mut sample = vec![0; SAMPLE_EVENT_HEADER_SIZE + SAMPLE_EVENT_MAX_PAYLOAD_SIZE];
-        sample[64..68].copy_from_slice(&100_u32.to_ne_bytes());
+        sample[72..76].copy_from_slice(&100_u32.to_ne_bytes());
 
         events.push(&sample);
 

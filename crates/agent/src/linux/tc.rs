@@ -30,10 +30,10 @@ pub(super) enum AttachLinks {
 }
 
 impl AttachLinks {
-    pub(super) fn backend(&self) -> ActiveBackend {
+    pub(super) fn covers_required_hooks(&self) -> bool {
         match self {
-            Self::Tcx(_) => ActiveBackend::Tcx,
-            Self::Netlink(_) => ActiveBackend::Netlink,
+            Self::Tcx(links) => links.ingress.is_some() && links.egress.is_some(),
+            Self::Netlink(hooks) => hooks.ingress_attached && hooks.egress_attached,
         }
     }
 

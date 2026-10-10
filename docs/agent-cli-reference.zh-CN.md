@@ -96,6 +96,11 @@ interfaces = ["br-lan"]
 controller_url = "http://192.168.1.100:8090"
 token = "your-enrollment-or-agent-token"
 
+# 可选策略 WebSocket 地址；默认根据 controller_url 推导。
+# 明文 ws:// 默认允许连接回环或 RFC 1918/ULA IP 地址。
+# policy_ws_url = "wss://controller.example.net:8090/v1/agent/policies/stream"
+allow_insecure_policy_ws = true
+
 # 采集与上报周期
 poll_interval_ms = 1000       # 从 eBPF Map 读取活跃流的轮询周期（毫秒）
 batch_interval_ms = 1000      # 向 Controller 批量推送遥测的间隔（毫秒）
@@ -140,6 +145,8 @@ tcx_order = "first"           # TCX 挂载顺序: "first", "last"
 | `NETQMON_INTERFACES` | `interfaces` | `br-lan,eth1` |
 | `NETQMON_CONTROLLER_URL`| `controller_url` | `http://192.168.1.100:8090` |
 | `NETQMON_TOKEN` | `token` | `secret-token` |
+| `NETQMON_POLICY_WS_URL` | `policy_ws_url` | `wss://controller.example.net:8090/v1/agent/policies/stream` |
+| `NETQMON_ALLOW_INSECURE_POLICY_WS` | `allow_insecure_policy_ws` | `true`（仅回环或 RFC 1918/ULA IP 地址允许使用 `ws://`） |
 | `NETQMON_POLL_INTERVAL_MS` | `poll_interval_ms` | `1000` |
 | `NETQMON_BATCH_INTERVAL_MS`| `batch_interval_ms` | `1000` |
 | `NETQMON_MAX_FLOWS` | `max_flows` | `65536` |
@@ -152,6 +159,8 @@ tcx_order = "first"           # TCX 挂载顺序: "first", "last"
 ## 5. OpenWrt UCI 配置集成
 
 在标准 OpenWrt 系统上，`netqmon-agent` 还可以通过 UCI 系统统一管理（由 `/etc/init.d/netqmon` 转换为启动参数）：
+
+`allow_insecure_policy_ws` 默认值为 `1`。明文 `ws://` 仅允许连接回环或 RFC 1918/ULA IP 地址，且策略通道不加密；不可信网络应优先使用 WSS。设置为 `0` 可禁用明文 WebSocket 策略连接。
 
 ```bash
 # 查看当前 UCI 配置
