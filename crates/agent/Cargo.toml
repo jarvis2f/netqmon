@@ -7,6 +7,14 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Isolated compatibility experiments only; absent from ordinary release builds.
+qos-compatibility-poc = []
+# Stage 2 read-only packet-path evidence, never a policy capability.
+qos-client-path-probe = []
+# Opt-in client backend; runtime activation requires an explicit runtime config.
+qos-client-priority = ["qos-client-path-probe"]
+
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.0", features = ["derive"] }
@@ -20,6 +28,11 @@ reqwest = { version = "0.12.24", default-features = false, features = ["blocking
 sha2 = "0.11.0"
 toml = "1.0.3"
 portable-atomic = "1.15"
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+getrandom = "0.3.4"
+tracing = "0.1.41"
 
 [dev-dependencies]
 tempfile = "3.27.0"
@@ -29,7 +42,7 @@ libbpf-rs = "0.27.0"
 netlink-packet-core = "0.9.0"
 netlink-packet-route = "0.33.0"
 netlink-sys = "0.8.8"
-nix = { version = "0.31.3", features = ["net", "time"] }
+nix = { version = "0.31.3", features = ["net", "time", "user"] }
 signal-hook = "0.3.18"
 
 [target.'cfg(target_os = "linux")'.build-dependencies]

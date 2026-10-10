@@ -105,6 +105,7 @@ fn batch(sequence: u64) -> FlowSampleBatch {
         protocol_version: 1,
         samples: vec![FlowSample {
             flow_id: "flow".into(),
+            policy_flow_id: String::new(),
             key: Some(FlowSampleKey {
                 ip_version: 4,
                 protocol: 17,
@@ -568,6 +569,7 @@ fn cached_result(
             source: "fixture".into(),
         }),
         signatures: Vec::new(),
+        policy_flow_ids: Vec::new(),
         expires,
     }
 }
@@ -769,6 +771,69 @@ fn lookup_index_keeps_multiple_time_windows_for_one_flow_identity() {
 }
 
 #[test]
+fn nat_reply_protocol_only_result_preserves_client_sni_and_signatures() {
+    let service = SamplingService::new(
+        false,
+        Arc::new(SilentEngine),
+        Arc::new(FixtureMatcher::default()),
+        |_| {},
+    );
+    let now = Instant::now();
+    let mut upload = cached_result("a", "boot", 1_000, 1_100, now + CACHE_TTL);
+    upload
+        .result
+        .as_mut()
+        .unwrap()
+        .metadata
+        .insert("hostname".into(), "www.baidu.com".into());
+    upload.policy_flow_ids = vec!["upload".into()];
+    let mut reply = cached_result("a", "boot", 1_020, 1_100, now + CACHE_TTL);
+    reply.policy_flow_ids = vec!["reply".into()];
+    reply.signatures.push(SignatureApplicationMatch {
+        application_id: "fixture".into(),
+        confidence: 0.95,
+        signature_hits: 1,
+    });
+    {
+        let mut stats = service.stats.lock().unwrap();
+        stats.insert_result(("a".into(), "boot".into(), "upload".into()), upload, now);
+        stats.insert_result(("a".into(), "boot".into(), "reply".into()), reply, now);
+        // Both ordinary telemetry lookup and late completion use this merge.
+        let combined = stats
+            .combined_result(
+                &FlowIdentity::from_delta("a", "boot", &wire_flow()),
+                1_020,
+                1_100,
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            combined.result.unwrap().metadata["hostname"],
+            "www.baidu.com"
+        );
+        assert_eq!(combined.policy_flow_ids, ["reply", "upload"]);
+    }
+    let mut flow = wire_flow();
+    flow.last_seen_unix_ms = 1_200;
+    let result = service.lookup("a", "boot", &flow).unwrap();
+    assert_eq!(result.dpi.unwrap().metadata["hostname"], "www.baidu.com");
+    assert_eq!(result.signatures[0].application_id, "fixture");
+    {
+        let mut stats = service.stats.lock().unwrap();
+        stats.insert_result(
+            ("a".into(), "boot".into(), "reused".into()),
+            cached_result("a", "boot", 2_000, 2_100, now + CACHE_TTL),
+            now,
+        );
+    }
+    // Even a broad telemetry interval selects the newest disjoint lifetime.
+    flow.last_seen_unix_ms = 2_200;
+    let reused = service.lookup("a", "boot", &flow).unwrap();
+    assert!(!reused.dpi.unwrap().metadata.contains_key("hostname"));
+    assert!(reused.signatures.is_empty());
+}
+
+#[test]
 fn bounded_ending_and_result_indexes_preserve_capacity_and_ttl_cleanup() {
     let now = Instant::now();
     let mut stats = Stats::default();
@@ -919,6 +984,7 @@ fn flow_and_sequence_ttl_cleanup_removes_expired_index_entries() {
                 engine: None,
                 result: None,
                 signatures: Vec::new(),
+                policy_flow_ids: std::collections::BTreeSet::new(),
             },
         );
         flow_index.entry(identity.clone()).or_default().insert(id);

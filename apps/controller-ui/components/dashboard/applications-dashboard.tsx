@@ -300,7 +300,6 @@ export function ApplicationsDashboard({
       title={tNav("applications")}
       subtitle={t("subtitle")}
       username={username}
-      isLive={false}
       toolbar={toolbar}
     >
       {error ? (

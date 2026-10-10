@@ -15,7 +15,7 @@ define Package/netqmon-agent
   CATEGORY:=Network
   TITLE:=NetQMon eBPF network telemetry agent
   URL:=https://github.com/jarvis2f/netqmon
-  DEPENDS:=+kmod-sched-core +kmod-sched-bpf +libelf +zlib
+  DEPENDS:=+kmod-sched-core +kmod-sched-bpf +kmod-sched +tc-full +nftables-json +libelf +zlib
 endef
 
 define Package/netqmon-agent/description

@@ -14,7 +14,8 @@ if ! cargo fmt --all --check; then
 fi
 
 echo "Checking Web staged formatting..."
-staged_web_files=$(git diff --cached --name-only --diff-filter=d | grep -E '\.(ts|tsx|js|jsx|json|mjs)$' || true)
+# Evidence JSON is a byte-for-byte capture; do not rewrite or lint it as Web source.
+staged_web_files=$(git diff --cached --name-only --diff-filter=d | grep -E '\.(ts|tsx|js|jsx|json|mjs)$' | grep -v '^docs/evidence/' || true)
 if [ -n "$staged_web_files" ]; then
     echo "Running prettier check on staged Web files..."
     if ! echo "$staged_web_files" | xargs npx prettier --check; then

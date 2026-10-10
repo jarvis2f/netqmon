@@ -603,7 +603,7 @@ fn device_upsert_keeps_identity_when_ip_changes() {
 #[test]
 fn batch_is_deduplicated_and_rollup_matches_raw_delta() {
     let mut storage = setup();
-    let batch = batch(1, FlowLifecycle::Active);
+    let batch = batch(1, FlowLifecycle::Ended);
     assert_eq!(
         storage.persist_batch(&batch, NOW).unwrap(),
         PersistDisposition::Accepted
@@ -904,6 +904,31 @@ fn active_flow_count_and_unknown_ratio() {
         .persist_batch(&batch(1, FlowLifecycle::Active), NOW)
         .unwrap();
     assert!(storage.active_flow_count().unwrap() >= 0); // checkpoint may or may not have written
+}
+
+#[test]
+fn late_application_dpi_upgrades_an_unknown_flow_identity() {
+    let mut current = FlowAttribution::default();
+    super::apply_late_protocol(
+        &mut current,
+        &FlowAttribution {
+            domain: Some("v11-hcd.douyinvod.com".into()),
+            organization_id: "bytedance".into(),
+            organization_confidence: 0.96,
+            application_id: "douyin".into(),
+            application_confidence: 0.96,
+            category_id: "streaming".into(),
+            confidence: 0.96,
+            reason: "domain_suffix:v11-hcd.douyinvod.com".into(),
+            evidence_json: "[]".into(),
+            ..Default::default()
+        },
+    );
+    assert_eq!(current.application_id, "douyin");
+    assert_eq!(current.organization_id, "bytedance");
+    assert_eq!(current.domain.as_deref(), Some("v11-hcd.douyinvod.com"));
+    assert_eq!(current.category_id, "streaming");
+    assert!((current.application_confidence - 0.96).abs() < f64::EPSILON);
 }
 
 #[test]

@@ -24,7 +24,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 
 use crate::bpf::FlowSkelBuilder;
 use crate::config::{AgentConfig, AttachOrder, LogLevel, TcxOrder};
-use crate::conntrack::{ConntrackContext, ConntrackStats};
+use crate::conntrack::{ConntrackContext, ConntrackStats, SharedConntrack};
 use crate::device::DeviceObservationCache;
 use crate::dhcp::{DEFAULT_LEASE_PATH, parse_packet, read_leases};
 use crate::dhcp_event::DhcpEvent;
@@ -35,15 +35,24 @@ use crate::dns_parser::parse_response;
 use crate::flow::{FlowCounters, FlowKey, FlowRuntime};
 use crate::lifecycle::{FlowLifecycleEvent, FlowState};
 use crate::normalization::{NormalizedFlow, normalize_with_resolution};
+use crate::policy::flow_alias::{FlowAliasError, PolicyFlowAliasCache};
 use crate::sample;
 use crate::telemetry;
-use crate::topology::{TopologyContext, TopologyMode};
+use crate::topology::TopologyContext;
 use crate::transport::{self, SampleQueue, TelemetryQueue};
 
 mod capabilities;
 mod map_options;
-mod neighbor;
-mod network;
+pub(crate) mod neighbor;
+pub(crate) mod network;
+#[cfg(feature = "qos-client-path-probe")]
+mod qos_path_probe;
+#[cfg(feature = "qos-compatibility-poc")]
+mod qos_poc;
+#[cfg(feature = "qos-client-priority")]
+mod qos_priority_maps;
+#[cfg(feature = "qos-client-priority")]
+pub(crate) mod qos_priority_runtime;
 mod tc;
 
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -53,11 +62,9 @@ const SAMPLE_CONNTRACK_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SAMPLE_BUDGET_GC_INTERVAL: Duration = Duration::from_secs(30);
 const SAMPLE_BUDGET_GC_MAX_ENTRIES: usize = 2048;
 const PENDING_SAMPLE_EVENT_CAPACITY: usize = 512;
-const SAMPLE_EVENT_HEADER_SIZE: usize = 72;
+const SAMPLE_EVENT_HEADER_SIZE: usize = 80;
 const SAMPLE_EVENT_MAX_PAYLOAD_SIZE: usize = 4096;
 const FIREWALL_CONFIG_PATH: &str = "/etc/config/firewall";
-
-type SharedConntrack = Arc<RwLock<Arc<ConntrackContext>>>;
 
 struct PendingSampleEvents {
     events: Mutex<VecDeque<Vec<u8>>>,
@@ -126,6 +133,7 @@ impl PendingSampleEvents {
 pub(super) fn doctor(config: &AgentConfig) -> bool {
     let report = capabilities::probe(config);
     print!("{report}");
+    print!("{}", crate::policy::doctor_text(config));
     report.is_healthy()
 }
 
@@ -171,13 +179,19 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
     signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown))
         .map_err(|error| AgentError::Runtime(error.to_string()))?;
     let session_boot_id = session_boot_id();
+    let flow_policy_boot_id = session_boot_id.clone();
+    // Track exact Flow IDs as soon as the BPF path is ready so the Collector can
+    // identify applications before it has an application policy to enforce.
+    let policy_flows_enabled = Arc::new(AtomicBool::new(false));
+    let flow_commands_enabled = Arc::new(AtomicBool::new(false));
+    let flow_alias_cache = Arc::new(Mutex::new(PolicyFlowAliasCache::default()));
     let controller_endpoints = transport::controller_endpoints(&config.controller_url);
     let telemetry_queue =
         TelemetryQueue::spawn(&config, Arc::clone(&shutdown), session_boot_id.clone());
     let sample_queue = Arc::new(SampleQueue::spawn(
         &config,
         Arc::clone(&shutdown),
-        session_boot_id,
+        session_boot_id.clone(),
     ));
     let sample_boot_epoch = boot_epoch_ms();
     let dns_observations = Arc::new(Mutex::new(Vec::new()));
@@ -185,7 +199,19 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
     let devices = Arc::new(Mutex::new(DeviceObservationCache::default()));
     let conntrack = Arc::new(RwLock::new(Arc::new(ConntrackContext::discover())));
     let conntrack_stats = Arc::new(ConntrackStats::default());
-    let tcx_supported = if config.attach_backend == crate::config::AttachBackend::Netlink {
+    let priority_config_requested = {
+        #[cfg(feature = "qos-client-priority")]
+        {
+            std::env::var_os("NETQMON_QOS_PRIORITY_CONFIG").is_some_and(|value| !value.is_empty())
+        }
+        #[cfg(not(feature = "qos-client-priority"))]
+        {
+            false
+        }
+    };
+    let tcx_supported = if config.attach_backend == crate::config::AttachBackend::Netlink
+        || priority_config_requested
+    {
         false
     } else {
         capabilities::probe_tcx_backend(&config).is_ok()
@@ -197,13 +223,10 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
         .iter()
         .any(|candidate| candidate.name == interface && candidate.is_bridge);
     let (attach_ingress, attach_egress) = observation_hooks();
-    let observation_interfaces = observation_interfaces(
-        &configured_interfaces,
-        network.snapshot.mode,
-        capture_is_bridge,
-    )?;
+    let mut observation_interfaces =
+        resolve_observation_interfaces(&configured_interfaces, capture_is_bridge)?;
     let observed_ingress_ifindices =
-        observed_ingress_ifindices(&config.interfaces, &observation_interfaces);
+        compute_observed_ingress_ifindices(&config.interfaces, &observation_interfaces);
     let builder = FlowSkelBuilder::default();
     let mut open_object = MaybeUninit::uninit();
     let mut open_skeleton = builder
@@ -236,6 +259,63 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
     let skeleton = open_skeleton
         .load()
         .map_err(|error| classify_bpf_error(BpfStage::Load, error))?;
+    #[cfg(feature = "qos-client-priority")]
+    let priority_maps = Arc::new(Mutex::new(
+        (|| -> anyhow::Result<_> {
+            qos_priority_maps::PriorityMaps::new(
+                MapHandle::try_from(&skeleton.maps.qos_clients_active)?,
+                MapHandle::try_from(&skeleton.maps.qos_clients_empty)?,
+                MapHandle::try_from(&skeleton.maps.qos_priority_ifb)?,
+                MapHandle::try_from(&skeleton.maps.qos_priority_ingress_ports)?,
+                MapHandle::try_from(&skeleton.maps.qos_priority_roots)?,
+                MapHandle::try_from(&skeleton.maps.qos_priority_counters)?,
+                MapHandle::try_from(&skeleton.maps.qos_internal_v4)?,
+                MapHandle::try_from(&skeleton.maps.qos_internal_v6)?,
+            )
+        })()
+        .map_err(|error| AgentError::Runtime(format!("QoS priority map gate: {error:#}")))?,
+    ));
+    #[cfg(feature = "qos-client-priority")]
+    let qos_priority_runtime = crate::linux::qos_priority_runtime::PriorityRuntime::prepare(
+        &config,
+        &observation_interfaces,
+        Arc::clone(&priority_maps),
+    )
+    .map_err(|error| AgentError::Runtime(format!("QoS priority runtime gate: {error:#}")))?
+    .map(|runtime| Arc::new(Mutex::new(runtime)));
+    #[cfg(feature = "qos-client-priority")]
+    eprintln!("QoS priority BPF maps verified");
+    #[cfg(feature = "qos-client-path-probe")]
+    let mut qos_path_probe = (|| -> anyhow::Result<_> {
+        qos_path_probe::prepare(
+            &config,
+            &observation_interfaces,
+            MapHandle::try_from(&skeleton.maps.qos_path_control)?,
+            MapHandle::try_from(&skeleton.maps.qos_path_frames)?,
+            MapHandle::try_from(&skeleton.maps.qos_path_overflow)?,
+        )
+    })()
+    .map_err(|error| AgentError::Runtime(format!("QoS client path probe: {error:#}")))?;
+    #[cfg(feature = "qos-client-priority")]
+    if let Some(probe) = &qos_path_probe {
+        priority_maps
+            .lock()
+            .map_err(|_| AgentError::Runtime("QoS priority map lock poisoned".to_owned()))?
+            .verify_idle_publication()
+            .and_then(|evidence| probe.record_idle_priority_maps(&evidence))
+            .map_err(|error| AgentError::Runtime(format!("QoS idle map publication: {error:#}")))?;
+    }
+    #[cfg(feature = "qos-compatibility-poc")]
+    let mut qos_poc = (|| -> anyhow::Result<_> {
+        qos_poc::prepare(
+            &config,
+            &observation_interfaces,
+            MapHandle::try_from(&skeleton.maps.qos_poc_config_map)?,
+            MapHandle::try_from(&skeleton.maps.qos_poc_observations)?,
+            MapHandle::try_from(&skeleton.maps.observed_ifindexes)?,
+        )
+    })()
+    .map_err(|error| AgentError::Runtime(format!("QoS compatibility gate: {error:#}")))?;
     for target_ifindex in &observed_ingress_ifindices {
         let key = u32::try_from(*target_ifindex)
             .map_err(|_| AgentError::Runtime("interface index overflow".to_owned()))?
@@ -246,8 +326,8 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
             .update(&key, &[1], MapFlags::ANY)
             .map_err(|error| AgentError::Runtime(error.to_string()))?;
     }
-    let attach_tcx = || {
-        observation_interfaces
+    let attach_tcx = |targets: &[(String, i32)]| {
+        targets
             .iter()
             .map(|(_, target_ifindex)| {
                 tc::TcxLinks::attach(
@@ -262,8 +342,8 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
             })
             .collect::<libbpf_rs::Result<Vec<_>>>()
     };
-    let attach_netlink = || {
-        observation_interfaces
+    let attach_netlink = |targets: &[(String, i32)]| {
+        targets
             .iter()
             .map(|(_, target_ifindex)| {
                 tc::NetlinkHooks::attach(
@@ -278,26 +358,135 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
             })
             .collect::<libbpf_rs::Result<Vec<_>>>()
     };
-    let mut hooks = match selected_backend {
-        tc::ActiveBackend::Tcx => match attach_tcx() {
-            Ok(links) => links,
+    let (mut active_backend, mut hooks) = match selected_backend {
+        tc::ActiveBackend::Tcx => match attach_tcx(&observation_interfaces) {
+            Ok(links) => (tc::ActiveBackend::Tcx, links),
             Err(error) if config.attach_backend == crate::config::AttachBackend::Auto => {
                 log_warn(
                     log_level,
                     format_args!("TCX attach failed ({error}); falling back to netlink TC"),
                 );
-                attach_netlink().map_err(|error| classify_tc_error(&interface, error))?
+                (
+                    tc::ActiveBackend::Netlink,
+                    attach_netlink(&observation_interfaces)
+                        .map_err(|error| classify_tc_error(&interface, error))?,
+                )
             }
             Err(error) => return Err(classify_tc_error(&interface, error)),
         },
-        tc::ActiveBackend::Netlink => {
-            attach_netlink().map_err(|error| classify_tc_error(&interface, error))?
+        tc::ActiveBackend::Netlink => (
+            tc::ActiveBackend::Netlink,
+            attach_netlink(&observation_interfaces)
+                .map_err(|error| classify_tc_error(&interface, error))?,
+        ),
+    };
+    let mut hooks_attached = hooks.len() == observation_interfaces.len()
+        && hooks.iter().all(tc::AttachLinks::covers_required_hooks);
+    #[cfg(feature = "qos-compatibility-poc")]
+    if let Some(poc) = &mut qos_poc {
+        poc.activate(
+            &skeleton.progs.netqmon_qos_poc_match,
+            &skeleton.progs.netqmon_qos_poc_ifb,
+            &skeleton.progs.netqmon_qos_poc_lan_egress,
+        )
+        .map_err(|error| AgentError::Runtime(format!("QoS compatibility gate: {error:#}")))?;
+    }
+    #[cfg(feature = "qos-client-priority")]
+    if let Some(runtime) = &qos_priority_runtime {
+        let activation = runtime
+            .lock()
+            .map_err(|_| AgentError::Runtime("QoS priority runtime lock poisoned".to_owned()))?
+            .activate(
+                &skeleton.progs.netqmon_qos_priority_match,
+                &skeleton.progs.netqmon_qos_priority_ifb,
+                &skeleton.maps.observed_ifindexes,
+            );
+        if let Err(error) = activation {
+            if let Ok(mut runtime) = runtime.lock() {
+                let _ = runtime.shutdown(&skeleton.maps.observed_ifindexes);
+            }
+            return Err(AgentError::Runtime(format!(
+                "QoS priority activation: {error:#}"
+            )));
+        }
+    }
+    #[cfg(feature = "qos-client-path-probe")]
+    if let Some(probe) = &mut qos_path_probe {
+        if let Err(error) = probe.activate(&skeleton.progs.netqmon_qos_path_egress) {
+            #[cfg(feature = "qos-client-priority")]
+            if let Some(runtime) = &qos_priority_runtime
+                && let Ok(mut runtime) = runtime.lock()
+            {
+                let _ = runtime.shutdown(&skeleton.maps.observed_ifindexes);
+            }
+            return Err(AgentError::Runtime(format!(
+                "QoS client path probe: {error:#}"
+            )));
+        }
+    }
+    let policy_drop_map = match MapHandle::try_from(&skeleton.maps.policy_drop_counters) {
+        Ok(map) => Some(map),
+        Err(error) => {
+            log_warn(
+                log_level,
+                format_args!("BPF policy drop counter map is unavailable: {error}"),
+            );
+            None
         }
     };
-    let active_backend = hooks
-        .first()
-        .map(tc::AttachLinks::backend)
-        .expect("at least one observation interface");
+    let flow_verdict_writer = match (
+        MapHandle::try_from(&skeleton.maps.flow_verdict_map),
+        MapHandle::try_from(&skeleton.maps.bss),
+    ) {
+        (Ok(verdict_map), Ok(policy_state_map)) => {
+            crate::policy::flow_verdict::FlowVerdictWriter::new(
+                verdict_map,
+                policy_state_map,
+                policy_drop_map,
+            )
+        }
+        (verdict_result, state_result) => {
+            log_warn(
+                log_level,
+                format_args!(
+                    "application flow verdict maps are unavailable: verdict_map={:?}; policy_state_map={:?}",
+                    verdict_result.err(),
+                    state_result.err()
+                ),
+            );
+            crate::policy::flow_verdict::FlowVerdictWriter::unavailable()
+        }
+    };
+    let flow_map_ready = flow_verdict_writer.ready();
+    let flow_bpf_ready = Arc::new(AtomicBool::new(flow_map_ready && hooks_attached));
+    policy_flows_enabled.store(
+        flow_bpf_ready.load(Ordering::Acquire)
+            && !std::path::Path::new(&config.policy_disabled_path).exists(),
+        Ordering::Release,
+    );
+    if !flow_bpf_ready.load(Ordering::Acquire) {
+        log_warn(
+            log_level,
+            format_args!(
+                "application flow enforcement is unavailable; exact flow commands will fail open"
+            ),
+        );
+    }
+    let policy_receiver = crate::policy::receiver::PolicyReceiver::spawn(
+        config.clone(),
+        session_boot_id.clone(),
+        telemetry_queue.policy_credentials(),
+        Arc::clone(&policy_flows_enabled),
+        Arc::clone(&flow_commands_enabled),
+        Arc::clone(&flow_alias_cache),
+        Arc::clone(&conntrack),
+        Arc::new(network.clone()),
+        flow_verdict_writer,
+        Arc::clone(&flow_bpf_ready),
+        Arc::clone(&shutdown),
+        #[cfg(feature = "qos-client-priority")]
+        qos_priority_runtime.clone(),
+    );
     let observation_names = observation_interfaces
         .iter()
         .map(|(name, _)| name.as_str())
@@ -462,7 +651,8 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
     let ring_buffer = ring_buffer_builder
         .build()
         .map_err(|error| AgentError::Runtime(error.to_string()))?;
-    let mut flow_runtime = FlowRuntime::new(
+    let mut flow_runtime = FlowRuntime::new_for_boot(
+        flow_policy_boot_id.clone(),
         Duration::from_secs(config.tcp_idle_timeout_seconds),
         Duration::from_secs(config.udp_idle_timeout_seconds),
     );
@@ -472,6 +662,8 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
     let boot_epoch_ms = boot_epoch_ms();
     let mut next_poll = Instant::now() + poll_interval;
     let mut next_batch = Instant::now() + batch_interval;
+    let mut next_interface_reconcile = Instant::now() + Duration::from_secs(1);
+    let mut last_interface_reconcile_error = None::<String>;
     let mut next_neighbor_refresh = Instant::now();
     let mut next_dhcp_lease_refresh = Instant::now();
     let mut next_discovery_report = Instant::now() + Duration::from_secs(30);
@@ -481,6 +673,8 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
     let mut sample_budget_gc = SampleBudgetGc::default();
     let mut deferred_sample_events = VecDeque::new();
     let mut pending_flows = Vec::new();
+    let mut policy_flow_cache_full = 0_u64;
+    let mut policy_flow_partial_coverage = 0_u64;
     let mut asymmetry = AsymmetryDetector::default();
     let mut topology_warnings = network.snapshot.warnings.clone();
     let diagnostics_hub = Arc::new(crate::diagnostics::DiagnosticsHub::new(
@@ -542,6 +736,212 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
             );
         }
         let now = Instant::now();
+        if now >= next_interface_reconcile {
+            next_interface_reconcile = now + Duration::from_secs(1);
+            let refreshed_configured = config
+                .interfaces
+                .iter()
+                .map(|name| resolve_interface(name).map(|ifindex| (name.clone(), ifindex)))
+                .collect::<Result<Vec<_>, _>>();
+            let refreshed_capture_is_bridge = Path::new("/sys/class/net")
+                .join(&interface)
+                .join("bridge")
+                .exists();
+            let refreshed_observation = refreshed_configured.and_then(|configured| {
+                resolve_observation_interfaces(&configured, refreshed_capture_is_bridge)
+            });
+            match refreshed_observation {
+                Ok(refreshed_observation) => {
+                    let refreshed_is_empty = refreshed_observation.is_empty();
+                    let interfaces_changed = refreshed_observation != observation_interfaces;
+                    if interfaces_changed || !hooks_attached {
+                        #[cfg(feature = "qos-client-path-probe")]
+                        if let Some(probe) = &mut qos_path_probe {
+                            probe
+                                .disable("observation interfaces or hooks changed")
+                                .map_err(|error| AgentError::Runtime(error.to_string()))?;
+                        }
+                        flow_bpf_ready.store(false, Ordering::Release);
+                        if interfaces_changed {
+                            hooks.clear();
+                            hooks_attached = false;
+                            observation_interfaces = refreshed_observation.clone();
+                            if let Ok(mut aliases) = flow_alias_cache.lock() {
+                                aliases.clear();
+                            }
+                            let mut cleanup_errors = Vec::new();
+                            let flow_verdict_keys =
+                                skeleton.maps.flow_verdict_map.keys().collect::<Vec<_>>();
+                            for key in flow_verdict_keys {
+                                if let Err(error) = skeleton.maps.flow_verdict_map.delete(&key) {
+                                    cleanup_errors.push(error.to_string());
+                                }
+                            }
+                            let observed_ifindex_keys =
+                                skeleton.maps.observed_ifindexes.keys().collect::<Vec<_>>();
+                            for key in observed_ifindex_keys {
+                                if let Err(error) = skeleton.maps.observed_ifindexes.delete(&key) {
+                                    cleanup_errors.push(error.to_string());
+                                }
+                            }
+                            if !cleanup_errors.is_empty() {
+                                let detail = format!(
+                                    "could not clear interface-scoped BPF state: {}",
+                                    cleanup_errors.join("; ")
+                                );
+                                if last_interface_reconcile_error.as_ref() != Some(&detail) {
+                                    log_warn(log_level, format_args!("{detail}"));
+                                }
+                                last_interface_reconcile_error = Some(detail);
+                                continue;
+                            }
+                        }
+                        if !refreshed_observation.is_empty() {
+                            observation_interfaces = refreshed_observation;
+                            let mut observed_map_ready = true;
+                            for target_ifindex in compute_observed_ingress_ifindices(
+                                &config.interfaces,
+                                &observation_interfaces,
+                            ) {
+                                let key = u32::try_from(target_ifindex)
+                                    .map_err(|_| {
+                                        AgentError::Runtime("interface index overflow".to_owned())
+                                    })?
+                                    .to_ne_bytes();
+                                if let Err(error) = skeleton.maps.observed_ifindexes.update(
+                                    &key,
+                                    &[1],
+                                    MapFlags::ANY,
+                                ) {
+                                    observed_map_ready = false;
+                                    let detail = format!(
+                                        "could not refresh observed interface index {target_ifindex}: {error}"
+                                    );
+                                    if last_interface_reconcile_error.as_ref() != Some(&detail) {
+                                        log_warn(log_level, format_args!("{detail}"));
+                                    }
+                                    last_interface_reconcile_error = Some(detail);
+                                }
+                            }
+                            if observed_map_ready {
+                                let attached = match active_backend {
+                                    tc::ActiveBackend::Tcx => {
+                                        match attach_tcx(&observation_interfaces) {
+                                            Ok(links) => Ok((tc::ActiveBackend::Tcx, links)),
+                                            Err(error)
+                                                if config.attach_backend
+                                                    == crate::config::AttachBackend::Auto =>
+                                            {
+                                                log_warn(
+                                                    log_level,
+                                                    format_args!(
+                                                        "TCX reattach failed ({error}); falling back to netlink TC"
+                                                    ),
+                                                );
+                                                attach_netlink(&observation_interfaces).map(
+                                                    |links| (tc::ActiveBackend::Netlink, links),
+                                                )
+                                            }
+                                            Err(error) => Err(error),
+                                        }
+                                    }
+                                    tc::ActiveBackend::Netlink => {
+                                        attach_netlink(&observation_interfaces)
+                                            .map(|links| (tc::ActiveBackend::Netlink, links))
+                                    }
+                                };
+                                match attached {
+                                    Ok((backend, new_hooks)) => {
+                                        active_backend = backend;
+                                        hooks = new_hooks;
+                                        hooks_attached = hooks.len()
+                                            == observation_interfaces.len()
+                                            && hooks
+                                                .iter()
+                                                .all(tc::AttachLinks::covers_required_hooks);
+                                        let ready = flow_map_ready && hooks_attached;
+                                        flow_bpf_ready.store(ready, Ordering::Release);
+                                        if ready {
+                                            last_interface_reconcile_error = None;
+                                            let names = observation_interfaces
+                                                .iter()
+                                                .map(|(name, _)| name.as_str())
+                                                .collect::<Vec<_>>()
+                                                .join(", ");
+                                            log_info(
+                                                log_level,
+                                                format_args!(
+                                                    "reattached {active_backend} observation hooks to {names} after interface change"
+                                                ),
+                                            );
+                                        }
+                                    }
+                                    Err(error) => {
+                                        hooks_attached = false;
+                                        let detail = format!(
+                                            "could not reattach observation hooks: {error}"
+                                        );
+                                        if last_interface_reconcile_error.as_ref() != Some(&detail)
+                                        {
+                                            log_warn(log_level, format_args!("{detail}"));
+                                        }
+                                        last_interface_reconcile_error = Some(detail);
+                                    }
+                                }
+                            } else {
+                                hooks_attached = false;
+                            }
+                        }
+                    }
+                    if refreshed_is_empty {
+                        flow_bpf_ready.store(false, Ordering::Release);
+                    }
+                }
+                Err(error) => {
+                    flow_bpf_ready.store(false, Ordering::Release);
+                    if !observation_interfaces.is_empty() {
+                        hooks.clear();
+                        hooks_attached = false;
+                        observation_interfaces.clear();
+                        if let Ok(mut aliases) = flow_alias_cache.lock() {
+                            aliases.clear();
+                        }
+                        let mut cleanup_errors = Vec::new();
+                        let flow_verdict_keys =
+                            skeleton.maps.flow_verdict_map.keys().collect::<Vec<_>>();
+                        for key in flow_verdict_keys {
+                            if let Err(error) = skeleton.maps.flow_verdict_map.delete(&key) {
+                                cleanup_errors.push(error.to_string());
+                            }
+                        }
+                        if !cleanup_errors.is_empty() {
+                            log_warn(
+                                log_level,
+                                format_args!(
+                                    "could not clear interface-scoped BPF verdicts: {}",
+                                    cleanup_errors.join("; ")
+                                ),
+                            );
+                        }
+                    }
+                    let detail = error.to_string();
+                    if last_interface_reconcile_error.as_ref() != Some(&detail) {
+                        log_warn(
+                            log_level,
+                            format_args!(
+                                "configured observation interface is unavailable: {detail}"
+                            ),
+                        );
+                    }
+                    last_interface_reconcile_error = Some(detail);
+                }
+            }
+        }
+        if !policy_flows_enabled.load(Ordering::Acquire)
+            && let Ok(mut aliases) = flow_alias_cache.lock()
+        {
+            aliases.clear();
+        }
         let mut conntrack_refreshed_this_iteration = false;
         if now >= next_conntrack_refresh {
             let refresh_started = Instant::now();
@@ -569,6 +969,8 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                 &conntrack_stats,
                 &controller_endpoints,
                 sample_boot_epoch,
+                &flow_policy_boot_id,
+                policy_flows_enabled.load(Ordering::Acquire),
                 now,
                 &mut next_sample_conntrack_refresh,
                 &mut conntrack_refreshed_this_iteration,
@@ -615,10 +1017,16 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
         if now >= next_neighbor_refresh {
             let refresh_started = Instant::now();
             if let Ok(mut devices) = devices.lock() {
-                for (_, target_ifindex) in &observation_interfaces {
+                // One-arm sampling runs on bridge members, while L3 ARP/NDP
+                // neighbors belong to the configured bridge master. Include
+                // both identities so real devices can be registered and used
+                // by Controller policies; member-only discovery is empty.
+                for target_ifindex in
+                    compute_observed_ingress_ifindices(&config.interfaces, &observation_interfaces)
+                {
                     refresh_neighbors(
                         &mut devices,
-                        u32::try_from(*target_ifindex).unwrap_or_default(),
+                        u32::try_from(target_ifindex).unwrap_or_default(),
                         log_level,
                     );
                 }
@@ -664,8 +1072,10 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                 Ok(snapshot) => {
                     last_keys_scanned = snapshot.keys_scanned;
                     let retained_entries = snapshot.retained_entries;
+                    let budget_already_used =
+                        conntrack_refreshed_this_iteration || now < next_sample_conntrack_refresh;
                     let mut conntrack_refresh_budget = ConntrackRefreshBudget {
-                        attempted: conntrack_refreshed_this_iteration,
+                        attempted: budget_already_used,
                     };
                     let mut conntrack_snapshot = current_conntrack_snapshot(&conntrack);
                     let device_snapshot = devices
@@ -673,7 +1083,16 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                         .map(|devices| devices.resolver_snapshot())
                         .unwrap_or_default();
                     let lifecycle_now = started.elapsed();
-                    let runtime_update = flow_runtime.update(snapshot.flows, lifecycle_now);
+                    let runtime_update = flow_runtime.update_with_policy_ids(
+                        snapshot.flows,
+                        lifecycle_now,
+                        policy_flows_enabled.load(Ordering::Acquire),
+                    );
+                    if policy_flows_enabled.load(Ordering::Acquire)
+                        && let Ok(mut aliases) = flow_alias_cache.lock()
+                    {
+                        aliases.prune(now, Duration::from_secs(120), Duration::from_secs(30));
+                    }
                     let flows_changed = runtime_update.deltas.len() as u64;
                     let flows_idle = runtime_update
                         .lifecycle_events
@@ -685,7 +1104,12 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                         .iter()
                         .filter(|event| event.state == FlowState::End)
                         .count() as u64;
-                    for delta in runtime_update.deltas {
+                    #[cfg(feature = "qos-client-priority")]
+                    let priority_delivery_snapshot = qos_priority_runtime
+                        .as_ref()
+                        .and_then(|runtime| runtime.lock().ok())
+                        .map(|runtime| runtime.client_delivery_map());
+                    for mut delta in runtime_update.deltas {
                         if let Some(flow) = normalize_with_current_conntrack(
                             &delta.key,
                             &network,
@@ -703,10 +1127,19 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                             let resolved_mac = device_snapshot.get(&flow.client_addr).copied();
                             let client_mac = resolved_mac
                                 .map_or_else(|| "unknown".to_owned(), |mac| mac.to_string());
+                            #[cfg(feature = "qos-client-priority")]
+                            let priority_delivery_ifindex = priority_delivery_snapshot
+                                .as_ref()
+                                .and_then(|(map, fallback)| {
+                                    map.get(&client_mac).copied().or(*fallback)
+                                })
+                                .map(|ifindex| ifindex as i32);
+                            #[cfg(not(feature = "qos-client-priority"))]
+                            let priority_delivery_ifindex: Option<i32> = None;
                             log_debug(
                                 log_level,
                                 format_args!(
-                                    "flow delta ip={} protocol={} client={}:{} remote={}:{} direction={} packets={} bytes={} client_mac={}",
+                                    "flow delta ip={} protocol={} client={}:{} remote={}:{} direction={} packets={} bytes={} client_mac={} policy_flow_id={} raw_hook={} raw_ifindex={} first_seen_ns={} path_type={:?} conntrack_resolved={}",
                                     delta.key.ip_version,
                                     delta.key.protocol,
                                     flow.client_addr,
@@ -716,10 +1149,113 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                                     flow.direction,
                                     delta.packets,
                                     delta.bytes,
-                                    client_mac
+                                    client_mac,
+                                    delta.policy_flow_id.as_deref().unwrap_or("unavailable"),
+                                    delta.key.hook,
+                                    delta.key.ifindex,
+                                    delta.counters.first_seen_ns,
+                                    flow.path_type,
+                                    conntrack_snapshot.resolve(&delta.key).is_some()
                                 ),
                             );
                             if !is_controller_transport(&flow, &controller_endpoints) {
+                                if delta.policy_flow_id.is_some()
+                                    && let Ok(mut aliases) = flow_alias_cache.lock()
+                                {
+                                    if let Some(policy_flow_id) = delta.policy_flow_id.as_deref() {
+                                        let was_partial = aliases.is_partial(policy_flow_id);
+                                        if let Err(error) = aliases.observe_with_client(
+                                            policy_flow_id,
+                                            delta.key.clone(),
+                                            resolved_mac.map(|mac| mac.to_string()).as_deref(),
+                                            now,
+                                        ) {
+                                            match error {
+                                                FlowAliasError::CapacityFull => {
+                                                    policy_flow_cache_full =
+                                                        policy_flow_cache_full.saturating_add(1);
+                                                    delta.policy_flow_id = None;
+                                                }
+                                                FlowAliasError::AliasLimitReached => {
+                                                    if !was_partial {
+                                                        policy_flow_partial_coverage =
+                                                            policy_flow_partial_coverage
+                                                                .saturating_add(1);
+                                                    }
+                                                }
+                                                FlowAliasError::FlowEnded => {
+                                                    delta.policy_flow_id = None;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if let Some(id) = delta.policy_flow_id.as_deref() {
+                                        // Legacy (non-priority) Agents also need the
+                                        // client-facing ifindex to verify download
+                                        // aliases. Fall back to the configured LAN
+                                        // interface when the priority runtime is absent.
+                                        let client_delivery_ifindex = priority_delivery_ifindex
+                                            .or_else(|| {
+                                                observation_interfaces
+                                                    .iter()
+                                                    .find(|(name, _)| name == &config.interface)
+                                                    .map(|(_, ifindex)| *ifindex)
+                                            });
+                                        let egress_ifindexes = client_delivery_ifindex
+                                            .map(|ifindex| (ifindex as u32, ifindex as u32))
+                                            .or_else(|| {
+                                                if flow.path_type
+                                                    == crate::normalization::PathType::Forwarded
+                                                {
+                                                    network
+                                                        .snapshot
+                                                        .routes
+                                                        .iter()
+                                                        .find(|route| {
+                                                            route.destination.prefix_length == 0
+                                                                && route
+                                                                    .destination
+                                                                    .network
+                                                                    .is_ipv4()
+                                                                    == (delta.key.ip_version == 4)
+                                                        })
+                                                        .and_then(|route| {
+                                                            let upload = observation_interfaces
+                                                                .iter()
+                                                                .find(|(name, _)| {
+                                                                    name == &route.interface
+                                                                })?
+                                                                .1;
+                                                            let download =
+                                                                priority_delivery_ifindex.or_else(
+                                                                    || {
+                                                                        observation_interfaces
+                                                                            .iter()
+                                                                            .find(|(name, _)| {
+                                                                                name == &config
+                                                                                    .interface
+                                                                            })
+                                                                            .map(|(_, ifindex)| {
+                                                                                *ifindex
+                                                                            })
+                                                                    },
+                                                                )?;
+                                                            Some((upload as u32, download as u32))
+                                                        })
+                                                } else {
+                                                    None
+                                                }
+                                            });
+                                        aliases.observe_direction(
+                                            id,
+                                            &delta.key,
+                                            flow.direction,
+                                            Some(flow.client_addr),
+                                            egress_ifindexes,
+                                            conntrack_snapshot.resolve(&delta.key),
+                                        );
+                                    }
+                                }
                                 pending_flows.push(telemetry::flow_delta(
                                     &delta,
                                     &flow,
@@ -729,7 +1265,16 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                             }
                         }
                     }
+                    if !budget_already_used && conntrack_refresh_budget.attempted {
+                        next_sample_conntrack_refresh = now + SAMPLE_CONNTRACK_REFRESH_INTERVAL;
+                    }
                     for event in runtime_update.lifecycle_events {
+                        if event.state == FlowState::End
+                            && let Some(policy_flow_id) = event.policy_flow_id.as_deref()
+                            && let Ok(mut aliases) = flow_alias_cache.lock()
+                        {
+                            aliases.mark_ended(policy_flow_id);
+                        }
                         print_lifecycle_event(
                             &event,
                             &network,
@@ -763,6 +1308,7 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                                         FlowState::End => WireFlowLifecycle::Ended,
                                     },
                                     telemetry::unix_ms(SystemTime::now()),
+                                    event.policy_flow_id.as_deref(),
                                 ));
                             }
                         }
@@ -897,16 +1443,49 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                         config.attach_order,
                         &topology_warnings,
                     )),
+                    policy_flow_cache_full,
+                    policy_flow_partial_coverage,
                 }),
                 ..TelemetryBatch::default()
             };
             telemetry_queue.submit(batch);
             next_batch = now + batch_interval;
         }
-        let next_wakeup = next_poll.min(next_batch);
+        let next_wakeup = next_poll.min(next_batch).min(next_interface_reconcile);
         thread::sleep(SHUTDOWN_POLL_INTERVAL.min(next_wakeup.saturating_duration_since(now)));
     }
 
+    // Join snapshot/reconciliation work before exporting final map state or
+    // detaching classification and deleting owned queues. A pending policy
+    // command must not recreate resources while the data path is torn down.
+    policy_receiver.stop();
+    #[cfg(feature = "qos-client-priority")]
+    let priority_shutdown_error = qos_priority_runtime.as_ref().and_then(|runtime| {
+        runtime
+            .lock()
+            .map_err(|_| "QoS priority runtime lock poisoned".to_owned())
+            .and_then(|mut runtime| {
+                runtime
+                    .shutdown(&skeleton.maps.observed_ifindexes)
+                    .map_err(|error| format!("{error:#}"))
+            })
+            .err()
+    });
+    #[cfg(feature = "qos-client-priority")]
+    if let Some(probe) = &qos_path_probe {
+        priority_maps
+            .lock()
+            .map_err(|_| AgentError::Runtime("QoS priority map lock poisoned".to_owned()))?
+            .idle_snapshot()
+            .and_then(|evidence| probe.record_final_priority_maps(&evidence))
+            .map_err(|error| {
+                AgentError::Runtime(format!("QoS idle map final evidence: {error:#}"))
+            })?;
+    }
+    #[cfg(feature = "qos-client-path-probe")]
+    drop(qos_path_probe);
+    #[cfg(feature = "qos-compatibility-poc")]
+    drop(qos_poc);
     for hook in &mut hooks {
         hook.detach()
             .map_err(|error| AgentError::Runtime(error.to_string()))?;
@@ -923,6 +1502,12 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
         queue.stop();
     }
     telemetry_queue.stop();
+    #[cfg(feature = "qos-client-priority")]
+    if let Some(error) = priority_shutdown_error {
+        return Err(AgentError::Runtime(format!(
+            "QoS priority cleanup incomplete: {error}"
+        )));
+    }
     Ok(())
 }
 
@@ -932,14 +1517,16 @@ fn observation_hooks() -> (bool, bool) {
     (true, true)
 }
 
-fn observation_interfaces(
+fn resolve_observation_interfaces(
     configured: &[(String, i32)],
-    mode: TopologyMode,
     capture_is_bridge: bool,
 ) -> Result<Vec<(String, i32)>, AgentError> {
-    if mode != TopologyMode::OneArmRouter || !capture_is_bridge {
+    if !capture_is_bridge {
         return Ok(configured.to_vec());
     }
+    // QoS queues and client MACs live on actual bridge ports, including on a
+    // routed LAN. Keep the bridge master in the observation set as well: a
+    // routed packet can acquire the bridge as skb_iif after member ingress.
     let primary = &configured[0].0;
     let directory = Path::new("/sys/class/net").join(primary).join("brif");
     let mut members = fs::read_dir(&directory)
@@ -967,12 +1554,23 @@ fn observation_interfaces(
     Ok(targets)
 }
 
-fn observed_ingress_ifindices(configured: &[String], targets: &[(String, i32)]) -> Vec<i32> {
+fn compute_observed_ingress_ifindices(
+    configured: &[String],
+    targets: &[(String, i32)],
+) -> Vec<i32> {
     let mut ifindices = targets
         .iter()
         .map(|(_, ifindex)| *ifindex)
         .collect::<Vec<_>>();
     for interface in configured {
+        // A routed bridge packet can acquire the bridge's skb_iif after its
+        // member ingress was sampled. One-arm capture observes members, but
+        // must also recognize their configured bridge at the egress dedup
+        // guard; otherwise conntrack normalizes both observations to the
+        // same client Flow and doubles its bytes.
+        if let Ok(ifindex) = resolve_interface(interface) {
+            ifindices.push(ifindex);
+        }
         let directory = Path::new("/sys/class/net").join(interface).join("brif");
         let Ok(entries) = fs::read_dir(directory) else {
             continue;
@@ -1140,7 +1738,7 @@ fn boot_epoch_ms() -> u64 {
     telemetry::unix_ms(SystemTime::now()).saturating_sub(monotonic_ns() / 1_000_000)
 }
 
-fn monotonic_ns() -> u64 {
+pub(crate) fn monotonic_ns() -> u64 {
     // Same clock as bpf_ktime_get_ns; NTP adjustments must not reset active budgets.
     nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)
         .map(|time| {
@@ -1257,6 +1855,8 @@ fn process_pending_sample_events(
     stats: &ConntrackStats,
     excluded: &[std::net::SocketAddr],
     boot_epoch_ms: u64,
+    policy_flow_boot_id: &str,
+    policy_ids_enabled: bool,
     now: Instant,
     next_refresh: &mut Instant,
     refreshed_this_iteration: &mut bool,
@@ -1273,7 +1873,16 @@ fn process_pending_sample_events(
         if sample_needs_conntrack_refresh(&bytes, network, &current) {
             event_buffer.defer(deferred, bytes);
         } else {
-            decode_and_submit_sample(&bytes, sender, network, excluded, boot_epoch_ms, &current);
+            decode_and_submit_sample(
+                &bytes,
+                sender,
+                network,
+                excluded,
+                boot_epoch_ms,
+                policy_flow_boot_id,
+                policy_ids_enabled,
+                &current,
+            );
         }
     }
 
@@ -1305,7 +1914,16 @@ fn process_pending_sample_events(
     };
 
     while let Some(bytes) = deferred.pop_front() {
-        decode_and_submit_sample(&bytes, sender, network, excluded, boot_epoch_ms, &refreshed);
+        decode_and_submit_sample(
+            &bytes,
+            sender,
+            network,
+            excluded,
+            boot_epoch_ms,
+            policy_flow_boot_id,
+            policy_ids_enabled,
+            &refreshed,
+        );
     }
 }
 
@@ -1332,18 +1950,27 @@ fn decode_and_submit_sample(
     network: &crate::normalization::NetworkContext,
     excluded: &[std::net::SocketAddr],
     boot_epoch_ms: u64,
+    policy_flow_boot_id: &str,
+    policy_ids_enabled: bool,
     conntrack: &ConntrackContext,
 ) {
-    if let Some(sample) =
-        sample::decode_sample(bytes, network, boot_epoch_ms, true, excluded, conntrack)
-    {
+    if let Some(sample) = sample::decode_sample(
+        bytes,
+        network,
+        boot_epoch_ms,
+        true,
+        excluded,
+        conntrack,
+        policy_flow_boot_id,
+        policy_ids_enabled,
+    ) {
         sender.submit(sample);
     }
 }
 
 fn sample_event_captured_length(bytes: &[u8]) -> u64 {
     bytes
-        .get(64..68)
+        .get(72..76)
         .and_then(|value| value.try_into().ok())
         .map(u32::from_ne_bytes)
         .map(u64::from)
@@ -2144,6 +2771,7 @@ config defaults
             ip_version: 4,
             protocol: 6,
             direction: 0,
+            hook: 0,
             ifindex: 1,
             source_address: [0; 16],
             destination_address: [0; 16],
@@ -2169,8 +2797,8 @@ config defaults
     #[test]
     fn bounds_pending_sample_events_and_records_drops() {
         let events = PendingSampleEvents::new(1);
-        let mut sample = vec![0; 68];
-        sample[64..68].copy_from_slice(&42_u32.to_ne_bytes());
+        let mut sample = vec![0; 80];
+        sample[72..76].copy_from_slice(&42_u32.to_ne_bytes());
 
         events.push(&sample);
         events.push(&sample);
@@ -2183,7 +2811,7 @@ config defaults
     fn pending_sample_events_copy_only_the_captured_payload() {
         let events = PendingSampleEvents::new(1);
         let mut sample = vec![0; SAMPLE_EVENT_HEADER_SIZE + SAMPLE_EVENT_MAX_PAYLOAD_SIZE];
-        sample[64..68].copy_from_slice(&100_u32.to_ne_bytes());
+        sample[72..76].copy_from_slice(&100_u32.to_ne_bytes());
 
         events.push(&sample);
 

@@ -650,7 +650,6 @@ export function ClientDetailDashboard({
           : t("detail.fallbackSubtitle")
       }
       username={username}
-      isLive={streamConnected}
       headerActions={
         <div className="flex items-center gap-2">
           {client && (

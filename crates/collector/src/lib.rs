@@ -7,6 +7,7 @@ mod dpi;
 mod icons;
 pub mod insights;
 mod license;
+mod policy;
 mod query_api;
 mod realtime;
 mod recognition_diagnostics;
@@ -24,6 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Bytes;
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{DefaultBodyLimit, FromRef, FromRequestParts, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE};
 use axum::http::request::Parts;
@@ -31,16 +33,18 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use classifier::{ClassificationInput, ClassifierHandle, DpiEvidence};
+use classifier::{ClassificationInput, ClassificationResult, ClassifierHandle, DpiEvidence};
 use futures_util::stream;
 use getrandom::fill;
 #[cfg(test)]
 use netqmon_geo::DisabledGeoProvider;
 use netqmon_geo::{DEFAULT_GEO_DIRECTORY, GeoProvider, LocalDbProvider};
+use netqmon_protocol::policy::{FlowCommandOperation, POLICY_WIRE_VERSION, PolicyWireFrame};
 use netqmon_protocol::v1::probe_request::Target as ProbeTarget;
 use netqmon_protocol::v1::probe_result::Outcome as ProbeOutcome;
 use netqmon_protocol::v1::{
-    EnrollRequest, EnrollResponse, FaviconProbe, ProbeRequest, TelemetryBatch, TelemetryResponse,
+    EnrollRequest, EnrollResponse, FaviconProbe, FlowLifecycle, FlowScope, ProbeRequest,
+    TelemetryBatch, TelemetryResponse,
 };
 use netqmon_protocol::{
     ContentEncoding, DecodeError, PROTOCOL_VERSION, decode_telemetry_batch, validate_batch_metadata,
@@ -49,6 +53,7 @@ use netqmon_storage::{
     ClickHouseConfig, ClickHouseStorage, DEFAULT_DATABASE_PATH, FlowAttribution,
     PersistDisposition, SqliteStorage, Storage, StorageError,
 };
+use policy::PolicyHub;
 use prost::Message;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -58,6 +63,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
 use crate::icons::{IconCacheConfig, IconService};
+use crate::policy::PolicyService;
 use crate::realtime::{RealtimeEngine, RealtimeEvent, RealtimeSnapshot};
 use device_identification::{DeviceIdentifier, refresh_mac_dataset};
 
@@ -73,6 +79,7 @@ const MAX_FLOWS_PER_BATCH: usize = 10_000;
 const MAX_DISCOVERY_OBSERVATIONS_PER_BATCH: usize = 10_000;
 const MAX_PROBE_RESULTS_PER_BATCH: usize = 64;
 const MAX_HASHES_PER_FAVICON_RESULT: usize = 8;
+const MIN_UNAMBIGUOUS_SIGNATURE_CONFIDENCE: f64 = 0.80;
 const GATEWAY_REPLACEMENT_STALE_AFTER_MS: u64 = 5 * 60 * 1_000;
 const ROLLUP_INTERVAL: Duration = Duration::from_secs(60);
 const RETENTION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -93,6 +100,7 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 pub async fn run_from_env() -> Result<(), Box<dyn Error>> {
     let config = CollectorConfig::from_env()?;
     let dpi_enabled = dpi_enabled_from_env()?;
+    let flow_sample_matching_enabled = flow_sample_matching_enabled_from_env(dpi_enabled)?;
     if dpi_enabled && !dpi::native_available() {
         return Err(ConfigError("DPI enabled but nDPI 4.14 is unavailable; install libndpi and rebuild or set NETQMON_DPI_ENABLED=false".into()).into());
     }
@@ -129,6 +137,10 @@ pub async fn run_from_env() -> Result<(), Box<dyn Error>> {
             .map_err(|err| ConfigError(format!("failed to open SQLite: {err}")))?;
         Storage::sqlite(sqlite)
     };
+    let policy_service =
+        Arc::new(PolicyService::open_from_env().map_err(|error| {
+            ConfigError(format!("failed to initialize policy storage: {error}"))
+        })?);
 
     let state = CollectorState::with_geo_provider(
         &config.enrollment_token,
@@ -138,6 +150,8 @@ pub async fn run_from_env() -> Result<(), Box<dyn Error>> {
         config.geo_directory.clone(),
         DeviceIdentifier::load(&config.mac_dataset_path),
         config.icon_cache_config,
+        policy_service,
+        flow_sample_matching_enabled,
     )
     .map_err(|err| ConfigError(format!("failed to initialize collector state: {err}")))?;
     state.license.ensure_identity().map_err(ConfigError)?;
@@ -154,6 +168,10 @@ pub async fn run_from_env() -> Result<(), Box<dyn Error>> {
     );
     license::spawn(Arc::clone(&state.license));
     spawn_classifier_probe(classifier, Arc::clone(&state.license));
+    policy::push::spawn_schedule_refresh(
+        Arc::clone(&state.policy_service),
+        state.policy_hub.clone(),
+    );
 
     tracing::info!(address = %config.public_addr, "public ingestion listener started");
     tracing::info!(address = %config.internal_addr, "internal listener started");
@@ -294,6 +312,8 @@ struct CollectorState {
     icon_service: Arc<IconService>,
     sampling: Arc<dpi::SamplingService>,
     license: Arc<license::LicenseCoordinator>,
+    policy_service: Arc<PolicyService>,
+    policy_hub: PolicyHub,
 }
 
 impl CollectorState {
@@ -322,6 +342,9 @@ impl CollectorState {
         storage: SqliteStorage,
         classifier: ClassifierHandle,
     ) -> Result<Self, rusqlite::Error> {
+        let policy_service = Arc::new(
+            PolicyService::open_in_memory().expect("in-memory test policy database must open"),
+        );
         Self::with_geo_provider(
             enrollment_token,
             Storage::sqlite(storage),
@@ -330,6 +353,8 @@ impl CollectorState {
             PathBuf::from(DEFAULT_GEO_DIRECTORY),
             DeviceIdentifier::load(Path::new("/missing/netqmon-test-mac-prefixes.json")),
             IconCacheConfig::default(),
+            policy_service,
+            false,
         )
         .map_err(|e| match e {
             StorageError::Sqlite(err) => err,
@@ -346,6 +371,8 @@ impl CollectorState {
         geo_directory: PathBuf,
         device_identifier: DeviceIdentifier,
         icon_cache_config: IconCacheConfig,
+        policy_service: Arc<PolicyService>,
+        flow_sample_matching_enabled: bool,
     ) -> Result<Self, StorageError> {
         let signature_matcher = Arc::new(classifier::ClassifierdSignatureMatcher::new(
             classifier.clone(),
@@ -363,16 +390,21 @@ impl CollectorState {
             geo_directory,
             device_identifier,
             service_bindings: ServiceBindingCache::default(),
+            dns_domains: DnsDomainCache::default(),
             favicon_endpoints: FaviconEndpointCache::default(),
             pending_probe_requests: Vec::new(),
+            policy_flow_contexts: policy::FlowContextCache::default(),
+            pending_flow_samples: policy::PendingFlowSamples::default(),
             realtime: RealtimeEngine::default(),
             accepted_batches: 0,
             dedupe_hits: 0,
             traffic_bytes: 0,
         }));
+        let policy_hub = PolicyHub::new();
         let weak = Arc::downgrade(&inner);
+        let callback_policy_hub = policy_hub.clone();
         let sampling = Arc::new(dpi::SamplingService::new(
-            !cfg!(test) && dpi_enabled_from_env().unwrap_or(false),
+            !cfg!(test) && flow_sample_matching_enabled,
             dpi::default_engine(),
             signature_matcher,
             move |cached| {
@@ -380,8 +412,24 @@ impl CollectorState {
                     let mut inner = inner
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if let Err(error) = apply_sample_result(&mut inner, &cached) {
-                        tracing::warn!(%error, "sample classification update failed");
+                    let result = apply_sample_result(&mut inner, &cached);
+                    if result.as_ref().is_ok_and(|decisions| decisions.is_empty()) {
+                        inner
+                            .pending_flow_samples
+                            .defer(cached, std::time::Instant::now());
+                    }
+                    drop(inner);
+                    match result {
+                        Ok(decisions) => {
+                            for (batch, attribution) in decisions {
+                                queue_policy_flow_decisions(
+                                    &callback_policy_hub,
+                                    &batch,
+                                    std::slice::from_ref(&attribution),
+                                );
+                            }
+                        }
+                        Err(error) => tracing::warn!(%error, "sample classification update failed"),
                     }
                 }
             },
@@ -392,6 +440,8 @@ impl CollectorState {
             icon_service: Arc::new(IconService::new(icon_cache_config)),
             sampling,
             license,
+            policy_service,
+            policy_hub,
         })
     }
 
@@ -500,12 +550,9 @@ impl CollectorState {
         batch: &TelemetryBatch,
     ) -> Result<BatchDisposition, TelemetryIngestError> {
         let mut inner = self.lock();
-        inner
-            .classifier
-            .health()
-            .map_err(TelemetryIngestError::ClassifierUnavailable)?;
         let mut favicon_endpoints = std::mem::take(&mut inner.favicon_endpoints);
         favicon_endpoints.observe_results(&inner.classifier, batch);
+        inner.dns_domains.observe(batch);
         let dpi_results = self.sampling.lookup_batch(batch);
         let mut service_bindings = std::mem::take(&mut inner.service_bindings);
         let classified = classify_batch(
@@ -513,9 +560,11 @@ impl CollectorState {
             &inner.classifier,
             inner.geo_provider.as_ref(),
             &mut service_bindings,
+            &inner.dns_domains,
             &favicon_endpoints,
             batch,
             &dpi_results,
+            false,
         );
         inner.service_bindings = service_bindings;
         // Restore probe state before any fallible storage work below. A rejected
@@ -591,7 +640,8 @@ impl CollectorState {
             &historical_evidence,
             &supplemental_evidence,
         );
-        match inner.storage.persist_classified_batch(
+        let mut late_sample_decisions = Vec::new();
+        let result = match inner.storage.persist_classified_batch(
             &effective_batch,
             &attributions,
             &device_identities,
@@ -602,6 +652,28 @@ impl CollectorState {
                 Ok(BatchDisposition::Duplicate)
             }
             PersistDisposition::Accepted => {
+                inner
+                    .policy_flow_contexts
+                    .observe(batch, std::time::Instant::now());
+                let ready_samples = {
+                    let CollectorInner {
+                        policy_flow_contexts,
+                        pending_flow_samples,
+                        ..
+                    } = &mut *inner;
+                    pending_flow_samples.take_ready(policy_flow_contexts, std::time::Instant::now())
+                };
+                for sample in ready_samples {
+                    match apply_sample_result(&mut inner, &sample) {
+                        Ok(mut decisions) => late_sample_decisions.append(&mut decisions),
+                        Err(error) => {
+                            tracing::warn!(%error, "deferred sample classification update failed");
+                            inner
+                                .pending_flow_samples
+                                .defer(sample, std::time::Instant::now());
+                        }
+                    }
+                }
                 self.sampling.observe_telemetry(batch);
                 let observed_at = if batch.sent_at == 0 {
                     unix_time_ms()
@@ -625,7 +697,19 @@ impl CollectorState {
                 inner.pending_probe_requests.extend(requests);
                 Ok(BatchDisposition::Accepted)
             }
+        };
+        if matches!(&result, Ok(BatchDisposition::Accepted)) {
+            drop(inner);
+            queue_policy_flow_decisions(&self.policy_hub, batch, &attributions);
+            for (late_batch, attribution) in late_sample_decisions {
+                queue_policy_flow_decisions(
+                    &self.policy_hub,
+                    &late_batch,
+                    std::slice::from_ref(&attribution),
+                );
+            }
         }
+        result
     }
 
     fn take_probe_requests(&self) -> Vec<ProbeRequest> {
@@ -704,8 +788,11 @@ struct CollectorInner {
     realtime: RealtimeEngine,
     device_identifier: DeviceIdentifier,
     service_bindings: ServiceBindingCache,
+    dns_domains: DnsDomainCache,
     favicon_endpoints: FaviconEndpointCache,
     pending_probe_requests: Vec<ProbeRequest>,
+    policy_flow_contexts: policy::FlowContextCache,
+    pending_flow_samples: policy::PendingFlowSamples,
     accepted_batches: u64,
     dedupe_hits: u64,
     traffic_bytes: u64,
@@ -923,6 +1010,92 @@ struct ServiceBindingCache {
     max_entries: usize,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct DnsDomainKey {
+    gateway_id: String,
+    client_ip: Vec<u8>,
+    answer_ip: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct DnsDomainValue {
+    domain: String,
+    observed_at: u64,
+}
+
+/// Short-lived DNS history used only when an encrypted flow has no usable SNI.
+///
+/// A DNS answer may expire while a QUIC/TLS connection keeps its endpoint
+/// alive. Keeping the exact client/answer pair briefly gives the classifier a
+/// real domain without falling back to an IP-prefix or CDN-wide guess.
+#[derive(Debug)]
+struct DnsDomainCache {
+    entries: HashMap<DnsDomainKey, DnsDomainValue>,
+    ttl_ms: u64,
+}
+
+impl Default for DnsDomainCache {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            ttl_ms: 6 * 60 * 60 * 1_000,
+        }
+    }
+}
+
+impl DnsDomainCache {
+    fn observe(&mut self, batch: &TelemetryBatch) {
+        for observation in &batch.dns_observations {
+            if observation.domain.is_empty() || observation.answer_ip.is_empty() {
+                continue;
+            }
+            let key = DnsDomainKey {
+                gateway_id: batch.gateway_id.clone(),
+                client_ip: observation.client_ip.clone(),
+                answer_ip: observation.answer_ip.clone(),
+            };
+            let observed_at = observation.observed_at_unix_ms;
+            match self.entries.get_mut(&key) {
+                Some(value) if value.observed_at <= observed_at => {
+                    value.domain.clone_from(&observation.domain);
+                    value.observed_at = observed_at;
+                }
+                Some(_) => {}
+                None => {
+                    self.entries.insert(
+                        key,
+                        DnsDomainValue {
+                            domain: observation.domain.clone(),
+                            observed_at,
+                        },
+                    );
+                }
+            }
+        }
+        let oldest = batch.sent_at.saturating_sub(self.ttl_ms);
+        self.entries.retain(|_, value| value.observed_at >= oldest);
+    }
+
+    fn resolve(
+        &self,
+        gateway_id: &str,
+        client_ip: &[u8],
+        answer_ip: &[u8],
+        at_ms: u64,
+    ) -> Option<&str> {
+        self.entries
+            .get(&DnsDomainKey {
+                gateway_id: gateway_id.to_owned(),
+                client_ip: client_ip.to_vec(),
+                answer_ip: answer_ip.to_vec(),
+            })
+            .filter(|value| {
+                value.observed_at <= at_ms && at_ms.saturating_sub(value.observed_at) <= self.ttl_ms
+            })
+            .map(|value| value.domain.as_str())
+    }
+}
+
 impl Default for ServiceBindingCache {
     fn default() -> Self {
         let ttl_seconds = env::var("NETQMON_SERVICE_BINDING_TTL_SECONDS")
@@ -1088,9 +1261,11 @@ fn classify_batch(
     classifier: &ClassifierHandle,
     geo_provider: &dyn GeoProvider,
     service_bindings: &mut ServiceBindingCache,
+    dns_domains: &DnsDomainCache,
     favicon_endpoints: &FaviconEndpointCache,
     batch: &TelemetryBatch,
     analyses: &[Option<dpi::SampleAnalysis>],
+    fail_open_on_classifier_error: bool,
 ) -> Result<Vec<FlowAttribution>, TelemetryIngestError> {
     let remote_asns = lookup_batch_remote_asns(geo_provider, batch);
     batch
@@ -1112,6 +1287,9 @@ fn classify_batch(
                 .and_then(Option::as_ref)
                 .map(|analysis| analysis.signatures.clone())
                 .unwrap_or_default();
+            let ambiguous_signature_ids =
+                ambiguous_signature_application_ids(&signature_matches);
+            let ambiguous_signatures = !ambiguous_signature_ids.is_empty();
             let mut domain =
                 resolve_batch_domain(batch, &flow.client_ip, &flow.remote_ip, observed_at)
                     .map(str::to_owned);
@@ -1128,6 +1306,21 @@ fn classify_batch(
                     .and_then(|r| r.metadata.get("hostname"))
                     .filter(|host| !host.is_empty())
                     .cloned();
+            }
+            if domain.is_none() {
+                let encrypted = dpi_result.is_some_and(|result| {
+                    matches!(result.protocol.as_str(), "tls" | "quic")
+                }) || (flow.protocol == 17 && flow.remote_port == 443);
+                if encrypted {
+                    domain = dns_domains
+                        .resolve(
+                            &batch.gateway_id,
+                            &flow.client_ip,
+                            &flow.remote_ip,
+                            observed_at,
+                        )
+                        .map(str::to_owned);
+                }
             }
             let Some(remote_ip) = decode_ip(&flow.remote_ip) else {
                 return Ok(FlowAttribution {
@@ -1155,37 +1348,67 @@ fn classify_batch(
                 }),
                 signatures: signature_matches,
             };
-            let mut classification = classifier
-                .classify(&input)
-                .map_err(TelemetryIngestError::ClassifierUnavailable)?;
+            let (mut classification, classifier_available) = match classifier.classify(&input) {
+                Ok(classification) => (classification, true),
+                Err(error) => {
+                    if !fail_open_on_classifier_error {
+                        return Err(TelemetryIngestError::ClassifierUnavailable(error));
+                    }
+                    tracing::debug!(%error, "classifier unavailable; flow attribution fails open");
+                    (ClassificationResult::default(), false)
+                }
+            };
             // A DNS attribution can be a generic CDN name. Still run SNI/Host through
             // the same domain rules, while retaining an already matched DNS application.
             if let Some(hostname) = dpi_result
                 .and_then(|r| r.metadata.get("hostname"))
-                .filter(|h| !h.is_empty() && domain.as_ref() != Some(h))
+                .filter(|h| classifier_available && !h.is_empty() && domain.as_ref() != Some(h))
             {
                 // Ask for domain-only identities: domain evidence can describe
                 // an organization while the application came from unrelated DPI.
                 // This also avoids depending on private evidence type names.
-                let dns_identity = classifier
-                    .classify_domain(domain.as_deref().unwrap_or_default())
-                    .map_err(TelemetryIngestError::ClassifierUnavailable)?;
-                if dns_identity.application.is_none() {
+                let host_result = (|| -> Result<Option<ClassificationResult>, String> {
+                    let dns_identity =
+                        classifier.classify_domain(domain.as_deref().unwrap_or_default())?;
+                    if dns_identity.application.is_some() {
+                        return Ok(None);
+                    }
                     let host_input = ClassificationInput {
                         domain: Some(hostname),
                         ..input.clone()
                     };
-                    let host_result = classifier
-                        .classify(&host_input)
-                        .map_err(TelemetryIngestError::ClassifierUnavailable)?;
-                    let host_identity = classifier
-                        .classify_domain(hostname)
-                        .map_err(TelemetryIngestError::ClassifierUnavailable)?;
-                    if host_identity.application.is_some() {
+                    let host_result = classifier.classify(&host_input)?;
+                    let host_identity = classifier.classify_domain(hostname)?;
+                    Ok(host_identity.application.is_some().then_some(host_result))
+                })();
+                match host_result {
+                    Ok(Some(host_result)) => {
                         classification = host_result;
                         domain = Some(hostname.clone());
                     }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if !fail_open_on_classifier_error {
+                            return Err(TelemetryIngestError::ClassifierUnavailable(error));
+                        }
+                        tracing::debug!(%error, "classifier unavailable for DPI hostname; flow attribution fails open");
+                    }
                 }
+            }
+            // A single flow can contain multiplexed or colliding application
+            // signatures. Choosing the classifier's highest-ranked match would
+            // guess which application owns the whole flow, so leave it on the
+            // client's default budget and avoid endpoint-cache attribution too.
+            if ambiguous_signatures {
+                classification.application = None;
+                classification.traffic_class = None;
+                classification.traffic_role = None;
+                classification.evidence.retain(|evidence| {
+                    !matches!(
+                        evidence.evidence_type.as_str(),
+                        "payload_signature" | "domain_application"
+                    )
+                });
             }
             let organization_id = classification
                 .organization
@@ -1252,18 +1475,36 @@ fn classify_batch(
                 application_confidence,
                 protocol_confidence,
                 confidence,
-                reason: classification.evidence.first().map_or_else(
-                    || "no matching rule".to_owned(),
-                    |value| format!("{}:{}", value.evidence_type, value.value),
-                ),
+                reason: if ambiguous_signatures {
+                    format!(
+                        "ambiguous_application_signatures:{}",
+                        ambiguous_signature_ids.join(",")
+                    )
+                } else {
+                    classification.evidence.first().map_or_else(
+                        || "no matching rule".to_owned(),
+                        |value| format!("{}:{}", value.evidence_type, value.value),
+                    )
+                },
                 evidence_json,
             };
+            if ambiguous_signatures {
+                attribution.evidence_json = append_evidence(
+                    &attribution.evidence_json,
+                    json!({
+                        "type": "ambiguous_application_signatures",
+                        "value": ambiguous_signature_ids,
+                        "source": "payload_signature",
+                        "weight": 0.0
+                    }),
+                );
+            }
             let endpoint_key = ServiceBindingKey {
                 ip: remote_ip,
                 protocol: u8::try_from(flow.protocol).unwrap_or(0),
                 port: u16::try_from(flow.remote_port).unwrap_or(0),
             };
-            if attribution.application_id == "unknown" {
+            if attribution.application_id == "unknown" && !ambiguous_signatures {
                 if let Some(identity) = favicon_endpoints.identity(&endpoint_key, observed_at) {
                     attribution
                         .organization_id
@@ -1282,15 +1523,35 @@ fn classify_batch(
                         .clone_from(&identity.evidence_json);
                 }
             }
-            service_bindings.apply(
-                endpoint_key,
-                decode_ip(&flow.client_ip),
-                observed_at,
-                &mut attribution,
-            );
+            if !ambiguous_signatures {
+                service_bindings.apply(
+                    endpoint_key,
+                    decode_ip(&flow.client_ip),
+                    observed_at,
+                    &mut attribution,
+                );
+            }
             Ok(attribution)
         })
         .collect()
+}
+
+fn ambiguous_signature_application_ids(
+    signatures: &[dpi::SignatureApplicationMatch],
+) -> Vec<String> {
+    let mut ids = signatures
+        .iter()
+        .filter(|matched| {
+            matched.confidence.is_finite()
+                && matched.confidence >= MIN_UNAMBIGUOUS_SIGNATURE_CONFIDENCE
+                && !matched.application_id.is_empty()
+        })
+        .map(|matched| matched.application_id.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    if ids.len() > 1 { ids } else { Vec::new() }
 }
 
 /// Result of one Geo ASN lookup retained only for a single classification batch.
@@ -1422,7 +1683,8 @@ fn public_router(state: CollectorState) -> Router {
         .route("/v1/ingest/health", get(health))
         .route("/v1/ingest/enroll", post(enroll))
         .route("/v1/ingest/telemetry", post(telemetry))
-        .route("/v1/ingest/samples", post(samples));
+        .route("/v1/ingest/samples", post(samples))
+        .route("/v1/agent/policies/stream", get(agent_policy_stream));
     #[cfg(test)]
     let router = router.route("/test/slow", get(slow_test_handler));
     router
@@ -1435,12 +1697,57 @@ fn public_router(state: CollectorState) -> Router {
         .with_state(state)
 }
 
+async fn agent_policy_stream(
+    State(state): State<CollectorState>,
+    identity: AgentIdentity,
+    websocket: WebSocketUpgrade,
+) -> Response {
+    if let Err(error) =
+        state
+            .policy_hub
+            .refresh_gateway(&state.policy_service, &identity.gateway_id, false)
+    {
+        tracing::error!(gateway_id = identity.gateway_id, %error, "could not build initial policy snapshot");
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    websocket
+        .max_message_size(netqmon_protocol::policy::POLICY_MAX_FRAME_BYTES)
+        .max_frame_size(netqmon_protocol::policy::POLICY_MAX_FRAME_BYTES)
+        .on_upgrade(move |mut socket| async move {
+            // Register only after the upgrade actually succeeded; a rejected or
+            // dropped handshake must not replace a live agent session.
+            let session = match state.policy_hub.register(&identity.gateway_id) {
+                Ok(session) => session,
+                Err(error) => {
+                    tracing::error!(gateway_id = identity.gateway_id, %error, "could not register policy stream");
+                    let _ = socket
+                        .send(axum::extract::ws::Message::Close(Some(
+                            axum::extract::ws::CloseFrame {
+                                code: 1011,
+                                reason: "policy hub unavailable".into(),
+                            },
+                        )))
+                        .await;
+                    return;
+                }
+            };
+            policy::push::run_socket(
+                socket,
+                Arc::clone(&state.policy_service),
+                state.policy_hub.clone(),
+                session,
+            )
+            .await;
+        })
+}
+
 fn internal_router(state: CollectorState) -> Router {
     Router::new()
         .route("/internal/health", get(health))
         .route("/internal/realtime/stream", get(realtime_stream))
         .merge(auth::router())
         .merge(icons::router())
+        .merge(policy::router())
         .merge(query_api::router())
         .with_state(state)
 }
@@ -1796,6 +2103,22 @@ fn dpi_enabled_from_env() -> Result<bool, ConfigError> {
         )),
     }
 }
+
+fn flow_sample_matching_enabled_from_env(dpi_enabled: bool) -> Result<bool, ConfigError> {
+    match env::var("NETQMON_FLOW_SAMPLE_MATCHING_ENABLED") {
+        Ok(value) => match value.as_str() {
+            "true" | "1" => Ok(true),
+            "false" | "0" => Ok(false),
+            _ => Err(ConfigError(
+                "NETQMON_FLOW_SAMPLE_MATCHING_ENABLED must be true or false".into(),
+            )),
+        },
+        Err(env::VarError::NotPresent) => Ok(dpi_enabled),
+        Err(_) => Err(ConfigError(
+            "NETQMON_FLOW_SAMPLE_MATCHING_ENABLED is not valid Unicode".into(),
+        )),
+    }
+}
 async fn samples(
     State(state): State<CollectorState>,
     identity: AgentIdentity,
@@ -1838,10 +2161,207 @@ async fn samples(
         )
     }
 }
+fn queue_policy_flow_decisions(
+    hub: &PolicyHub,
+    batch: &TelemetryBatch,
+    attributions: &[FlowAttribution],
+) {
+    let Some(bundle) = hub.current_bundle(&batch.gateway_id) else {
+        return;
+    };
+    let PolicyWireFrame::PolicySnapshot {
+        controller_epoch,
+        config_revision,
+        policies,
+        ..
+    } = &bundle.frame
+    else {
+        return;
+    };
+    let now = policy::push::now_ms();
+    let (application_block_supported, application_limit_supported) =
+        hub.flow_capabilities(&batch.gateway_id);
+    for (index, flow) in batch.flows.iter().enumerate() {
+        tracing::debug!(
+            target: "netqmon_collector::policy::flow_trace",
+            gateway_id = batch.gateway_id,
+            flow_scope = flow.scope,
+            flow_lifecycle = flow.lifecycle,
+            flow_packets = flow.packets,
+            flow_upload_bytes = flow.upload_bytes,
+            flow_download_bytes = flow.download_bytes,
+            policy_flow_id = %flow.policy_flow_id,
+            client_mac_bytes = flow.client_mac.len(),
+            "received policy flow context"
+        );
+        let Some(policy_flow_id) =
+            (!flow.policy_flow_id.is_empty()).then_some(flow.policy_flow_id.as_str())
+        else {
+            continue;
+        };
+        // Active/idle lifecycle notifications carry the observation time rather than
+        // the flow's original sampling interval. They have no new classifier
+        // evidence and must not revoke a still-leased exact verdict merely
+        // because the sample lookup cannot overlap that synthetic interval.
+        // End notifications, real packet deltas, and late classifier results
+        // continue through the normal evaluation/revocation path.
+        if matches!(
+            FlowLifecycle::try_from(flow.lifecycle),
+            Ok(FlowLifecycle::Active | FlowLifecycle::Idle)
+        ) && flow.packets == 0
+            && flow.upload_bytes == 0
+            && flow.download_bytes == 0
+        {
+            continue;
+        }
+        let is_ended = flow.lifecycle == FlowLifecycle::Ended as i32;
+        let is_internet = flow.scope == FlowScope::Internet as i32;
+        let Some(client_mac) = canonical_mac(&flow.client_mac) else {
+            hub.forget_flow_context(&batch.gateway_id, &batch.boot_id, policy_flow_id);
+            if is_ended || !is_internet {
+                let _ = hub.revoke_flow_if_active(
+                    &batch.gateway_id,
+                    &batch.boot_id,
+                    controller_epoch,
+                    *config_revision,
+                    policy_flow_id,
+                    now,
+                );
+            }
+            continue;
+        };
+        if is_ended || !is_internet {
+            hub.forget_flow_context(&batch.gateway_id, &batch.boot_id, policy_flow_id);
+            let _ = hub.revoke_flow_if_active(
+                &batch.gateway_id,
+                &batch.boot_id,
+                controller_epoch,
+                *config_revision,
+                policy_flow_id,
+                now,
+            );
+            continue;
+        }
+        let Some(attribution) = attributions.get(index) else {
+            continue;
+        };
+        tracing::debug!(
+            target: "netqmon_collector::policy::flow_trace",
+            gateway_id = batch.gateway_id,
+            boot_id = batch.boot_id,
+            config_revision,
+            policy_flow_id,
+            classification_at_ms = now,
+            client_port = flow.client_port,
+            ip_version = flow.ip_version,
+            protocol = flow.protocol,
+            direction = flow.direction,
+            application_id = attribution.application_id,
+            application_confidence = attribution.application_confidence,
+            "classified policy flow"
+        );
+        let request = policy::PolicyPreviewRequest {
+            gateway_id: batch.gateway_id.clone(),
+            client_mac,
+            application_id: attribution.application_id.clone(),
+            category_id: attribution.category_id.clone(),
+            application_confidence: attribution.application_confidence,
+            scope: "internet".to_owned(),
+            at_ms: now,
+        };
+        let context_generation = hub.remember_flow_context(
+            &batch.gateway_id,
+            &batch.boot_id,
+            policy_flow_id,
+            flow.protocol,
+            request.clone(),
+            now,
+        );
+        // This evaluation selects the intended rule. The Agent still verifies its
+        // runtime capability and policy revision before applying any command.
+        let evaluated = policy::evaluate_preview(
+            &request,
+            policies,
+            application_block_supported,
+            application_limit_supported,
+        );
+        let (verdict, policy_ids) = policy::flow_command_decision(&evaluated);
+        if let Some(verdict) = verdict.filter(|_| !policy_ids.is_empty() && policy_ids.len() <= 16)
+            && let Some(ttl_ms) = match flow.protocol {
+                17 => Some(30_000),
+                6 => Some(120_000),
+                _ => None,
+            }
+            && let Some(expires_at_ms) =
+                policy::flow_verdict_expiry(&bundle.frame, &policy_ids, now, ttl_ms)
+        {
+            let command_id = uuid::Uuid::new_v4().to_string();
+            tracing::debug!(
+                target: "netqmon_collector::policy::flow_trace",
+                command_id,
+                gateway_id = batch.gateway_id,
+                boot_id = batch.boot_id,
+                config_revision,
+                policy_flow_id,
+                classification_at_ms = now,
+                command_issued_at_ms = now,
+                client_port = flow.client_port,
+                ip_version = flow.ip_version,
+                protocol = flow.protocol,
+                direction = flow.direction,
+                ?verdict,
+                operation = "Upsert",
+                policy_ids = ?policy_ids,
+                "evaluated application flow command"
+            );
+            let command = PolicyWireFrame::FlowCommand {
+                wire_version: POLICY_WIRE_VERSION,
+                gateway_id: batch.gateway_id.clone(),
+                boot_id: batch.boot_id.clone(),
+                controller_epoch: controller_epoch.clone(),
+                config_revision: *config_revision,
+                command_id,
+                policy_flow_id: policy_flow_id.to_owned(),
+                operation: FlowCommandOperation::Upsert,
+                verdict: Some(verdict),
+                policy_ids,
+                expires_at_ms,
+                issued_at_ms: now,
+            };
+            let queued = context_generation.map_or_else(
+                || Err("flow evaluation context backpressure".to_owned()),
+                |generation| hub.queue_flow_command_for_context(command, generation),
+            );
+            if let Err(error) = queued {
+                tracing::warn!(gateway_id = batch.gateway_id, policy_flow_id, %error, "could not queue application flow command");
+            }
+        } else if let Err(error) = hub.revoke_flow_if_active(
+            &batch.gateway_id,
+            &batch.boot_id,
+            controller_epoch,
+            *config_revision,
+            policy_flow_id,
+            now,
+        ) {
+            tracing::warn!(gateway_id = batch.gateway_id, policy_flow_id, %error, "could not queue application flow revoke");
+        }
+    }
+}
+
+fn canonical_mac(value: &[u8]) -> Option<String> {
+    (value.len() == 6).then(|| {
+        value
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    })
+}
+
 fn apply_sample_result(
     inner: &mut CollectorInner,
     cached: &dpi::CachedResult,
-) -> Result<(), StorageError> {
+) -> Result<Vec<(TelemetryBatch, FlowAttribution)>, StorageError> {
     let key = &cached.key;
     let flow = netqmon_protocol::v1::FlowDelta {
         ip_version: key.ip_version,
@@ -1852,6 +2372,7 @@ fn apply_sample_result(
         remote_port: key.remote_port,
         first_seen_unix_ms: key.first_seen_unix_ms,
         last_seen_unix_ms: cached.last_packet_ms,
+        policy_flow_id: cached.policy_flow_ids.first().cloned().unwrap_or_default(),
         ..Default::default()
     };
     let batch = TelemetryBatch {
@@ -1867,23 +2388,60 @@ fn apply_sample_result(
         &inner.classifier,
         inner.geo_provider.as_ref(),
         &mut service_bindings,
+        &inner.dns_domains,
         &inner.favicon_endpoints,
         &batch,
         &[Some(dpi::SampleAnalysis {
             dpi: cached.result.clone(),
             signatures: cached.signatures.clone(),
         })],
+        false,
     );
     inner.service_bindings = service_bindings;
     let attributions = match classified {
         Ok(attributions) => attributions,
         Err(TelemetryIngestError::ClassifierUnavailable(classifier_error)) => {
             tracing::debug!(%classifier_error, "skipping late DPI update while classifier is unavailable");
-            return Ok(());
+            return Ok(Vec::new());
         }
         Err(TelemetryIngestError::Storage(error)) => return Err(error),
     };
     inner
         .storage
-        .reclassify_flow(&cached.gateway, &batch.flows[0], &attributions[0])
+        .reclassify_flow(&cached.gateway, &batch.flows[0], &attributions[0])?;
+    let contexts = inner
+        .policy_flow_contexts
+        .matching(cached, std::time::Instant::now())
+        .into_iter()
+        .map(|context| {
+            let mut decision_batch = batch.clone();
+            decision_batch.flows[0] = context;
+            (decision_batch, attributions[0].clone())
+        })
+        .collect::<Vec<_>>();
+    let context_flow_ids = contexts
+        .iter()
+        .flat_map(|(batch, _)| batch.flows.iter().map(|flow| flow.policy_flow_id.clone()))
+        .collect::<Vec<_>>();
+    tracing::debug!(
+        target: "netqmon_collector::policy::flow_trace",
+        gateway_id = cached.gateway,
+        boot_id = cached.boot,
+        flow_ids = ?cached.policy_flow_ids,
+        context_flow_ids = ?context_flow_ids,
+        sample_ip_version = cached.key.ip_version,
+        sample_protocol = cached.key.protocol,
+        sample_client_ip = ?cached.key.client_ip,
+        sample_client_port = cached.key.client_port,
+        sample_remote_ip = ?cached.key.remote_ip,
+        sample_remote_port = cached.key.remote_port,
+        sample_first_seen_unix_ms = cached.key.first_seen_unix_ms,
+        sample_last_packet_ms = cached.last_packet_ms,
+        context_count = contexts.len(),
+        application_id = %attributions[0].application_id,
+        application_confidence = attributions[0].application_confidence,
+        classification_reason = %attributions[0].reason,
+        "completed asynchronous flow sample classification"
+    );
+    Ok(contexts)
 }

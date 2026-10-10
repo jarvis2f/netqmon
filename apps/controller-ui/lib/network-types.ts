@@ -219,6 +219,186 @@ export interface LicenseStatus {
   last_error?: string | null;
 }
 
+export type PolicyActionKind = "block" | "allow" | "limit";
+export type PolicyWeekday =
+  "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
+
+export interface PolicyScheduleWindow {
+  days: PolicyWeekday[];
+  start: string;
+  end: string;
+}
+
+export interface PolicySpecV1 {
+  schema_version: 1;
+  gateway_id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  priority: number;
+  selectors: {
+    clients: string[];
+    applications: string[];
+    categories: string[];
+    min_application_confidence: number;
+  };
+  network: { scope: "internet"; direction: "both" };
+  action: {
+    type: PolicyActionKind;
+    download_bps: number | null;
+    upload_bps: number | null;
+  };
+  schedule: null | { timezone: string; windows: PolicyScheduleWindow[] };
+}
+
+export interface PolicyRecord {
+  id: string;
+  created_at_ms: number;
+  updated_at_ms: number;
+  version: number;
+  spec: PolicySpecV1;
+  execution_status: "unsupported" | "not_deployed" | string;
+  execution_reason_code: string | null;
+  execution_message: string | null;
+  execution_details?: PolicyResultDetails | null;
+}
+
+export interface PolicyResultDetails {
+  clients: Array<{
+    mac: string;
+    effective_upload_bps: number | null;
+    effective_download_bps: number | null;
+  }>;
+  controlled_interfaces: string[];
+  qdisc: string | null;
+  mark_conflict_code: string | null;
+}
+
+export interface PolicyTrafficDirectionMetrics {
+  interface: string;
+  bytes: number | null;
+  packets: number | null;
+  drops: number | null;
+  overlimits: number | null;
+}
+
+export interface PolicyTrafficMetrics {
+  policy_id: string;
+  mac: string;
+  upload: PolicyTrafficDirectionMetrics | null;
+  download: PolicyTrafficDirectionMetrics | null;
+}
+
+export interface PolicyEvent {
+  event_id: number;
+  action: string;
+  actor_user_id: string;
+  before: PolicySpecV1 | null;
+  after: PolicySpecV1 | null;
+  revision: number;
+  created_at_ms: number;
+}
+
+export interface PolicyOption {
+  id: string;
+  name: string;
+  mac?: string;
+  gateway_id?: string;
+}
+
+export interface PolicyPage {
+  items: PolicyRecord[];
+  total: number;
+  desired_revision: number;
+  applied_revision: number;
+  capabilities: PolicyCapabilities;
+}
+
+export interface PolicyDetail {
+  policy: PolicyRecord;
+  events: PolicyEvent[];
+  desired_revision: number;
+  applied_revision: number;
+}
+
+export interface PolicyDeployment {
+  gateway_id: string;
+  desired_revision: number;
+  delivered_revision?: number;
+  delivery_status?: string;
+  delivered_at_ms?: number | null;
+  acknowledged_revision?: number;
+  acknowledged_status?: string | null;
+  applied_revision: number;
+  status: string;
+  capabilities: PolicyCapabilities;
+  policies: Array<{
+    policy_id: string;
+    status: string;
+    reason_code: string | null;
+    message: string | null;
+    details?: PolicyResultDetails | null;
+    traffic_metrics?: PolicyTrafficMetrics[];
+  }>;
+  last_error_code: string | null;
+  last_error_message: string | null;
+  last_reported_at_ms: number | null;
+  last_heartbeat_at_ms: number | null;
+  agent_connected: boolean;
+}
+
+export interface PolicyCapabilities {
+  enforcement_supported: boolean;
+  status: string;
+  reason: string;
+  client_block: string;
+  client_limit: string;
+  application_block: string;
+  application_limit: string;
+}
+
+export interface PolicyPreviewRequest {
+  gateway_id: string;
+  client_mac: string;
+  application_id: string;
+  category_id: string;
+  application_confidence: number;
+  scope: "internet";
+  at_ms: number;
+}
+
+export interface PolicyPreviewMatch {
+  policy_id: string;
+  name: string;
+  action: PolicyActionKind;
+  priority: number;
+  selected: boolean;
+}
+
+export interface PolicyPreviewLimit {
+  policy_id: string;
+  name: string;
+  download_bps: number | null;
+  upload_bps: number | null;
+  status: string;
+  reason_code: string | null;
+}
+
+export interface PolicyPreviewResult {
+  matched_policies: PolicyPreviewMatch[];
+  selected_block_verdict: string;
+  active_limits: PolicyPreviewLimit[];
+  explanation: string;
+  unsupported_reasons: string[];
+}
+
+export interface PolicyValidation {
+  normalized_spec: PolicySpecV1 | null;
+  errors: Array<{ path: string; code: string; message: string }>;
+  warnings: string[];
+  valid: boolean;
+}
+
 export interface RetentionPolicy {
   flow_sessions_days: number;
   dns_days: number;

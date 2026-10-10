@@ -5,6 +5,7 @@ import { NextIntlClientProvider } from "next-intl";
 import { getLocale, getMessages, getTranslations } from "next-intl/server";
 import { ThemeProvider } from "@/components/theme-provider";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { GatewayStatusProvider } from "@/components/app-shell/gateway-status-provider";
 import "flag-icons/css/flag-icons.min.css";
 import "./globals.css";
 
@@ -42,7 +43,9 @@ export default async function RootLayout({
       <body className="min-h-screen bg-background text-foreground antialiased selection:bg-accent/20 selection:text-accent">
         <NextIntlClientProvider locale={locale} messages={messages}>
           <ThemeProvider defaultTheme="system">
-            <TooltipProvider delay={200}>{children}</TooltipProvider>
+            <TooltipProvider delay={200}>
+              <GatewayStatusProvider>{children}</GatewayStatusProvider>
+            </TooltipProvider>
           </ThemeProvider>
         </NextIntlClientProvider>
       </body>

@@ -2738,11 +2738,24 @@ fn apply_late_protocol(current: &mut FlowAttribution, incoming: &FlowAttribution
     // dimension-aware path in attribution::reclassify_sqlite instead.
     current.protocol_id.clone_from(&incoming.protocol_id);
     current.protocol_confidence = incoming.protocol_confidence;
+    if incoming.application_id != "unknown"
+        && incoming.application_confidence >= current.application_confidence
+    {
+        current
+            .organization_id
+            .clone_from(&incoming.organization_id);
+        current.organization_confidence = incoming.organization_confidence;
+        current.application_id.clone_from(&incoming.application_id);
+        current.application_confidence = incoming.application_confidence;
+    }
     if incoming.category_id != "unknown" {
         current.category_id.clone_from(&incoming.category_id);
     }
     if incoming.traffic_role != "unknown" {
         current.traffic_role.clone_from(&incoming.traffic_role);
+    }
+    if incoming.domain.is_some() {
+        current.domain.clone_from(&incoming.domain);
     }
     current.confidence = current.confidence.max(incoming.confidence);
     current.reason.clone_from(&incoming.reason);

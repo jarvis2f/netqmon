@@ -45,12 +45,18 @@ RUN ARCH=$(uname -m) && \
 
 WORKDIR /usr/src/netqmon
 
+ARG NETQMON_AGENT_FEATURES=""
+
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY bpf ./bpf
 
 # Native build without --target flag
-RUN cargo build --release --package netqmon-agent && \
+RUN if [ -n "$NETQMON_AGENT_FEATURES" ]; then \
+        cargo build --release --package netqmon-agent --features "$NETQMON_AGENT_FEATURES"; \
+    else \
+        cargo build --release --package netqmon-agent; \
+    fi && \
     cp /tmp/target/release/netqmon-agent /netqmon-agent && \
     file /netqmon-agent
 

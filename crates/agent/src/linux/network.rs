@@ -9,15 +9,12 @@ use super::neighbor;
 use crate::config::AgentConfig;
 use crate::topology::{
     InterfaceInfo, NatStatus, NetworkPrefix, NetworkSegment, RouteInfo, SegmentRole, SegmentSource,
-    TopologyContext, TopologySnapshot,
+    TopologyContext, TopologyMode, TopologySnapshot,
 };
 
-pub(super) fn discover(config: &AgentConfig) -> Result<TopologyContext, String> {
+pub(crate) fn discover(config: &AgentConfig) -> Result<TopologyContext, String> {
     let interfaces = discover_interfaces()?;
-    let mut routes = parse_ipv4_routes(&fs::read_to_string("/proc/net/route").unwrap_or_default());
-    routes.extend(parse_ipv6_routes(
-        &fs::read_to_string("/proc/net/ipv6_route").unwrap_or_default(),
-    ));
+    let routes = discover_routes();
     let local_addresses = interfaces
         .iter()
         .flat_map(|interface| interface.addresses.iter().map(|(address, _)| *address))
@@ -71,6 +68,14 @@ pub(super) fn discover(config: &AgentConfig) -> Result<TopologyContext, String> 
     Ok(TopologyContext { snapshot })
 }
 
+pub(crate) fn discover_routes() -> Vec<RouteInfo> {
+    let mut routes = parse_ipv4_routes(&fs::read_to_string("/proc/net/route").unwrap_or_default());
+    routes.extend(parse_ipv6_routes(
+        &fs::read_to_string("/proc/net/ipv6_route").unwrap_or_default(),
+    ));
+    routes
+}
+
 fn discover_interfaces() -> Result<Vec<InterfaceInfo>, String> {
     let mut interfaces = BTreeMap::<String, Vec<(IpAddr, u8)>>::new();
     for entry in getifaddrs().map_err(|error| error.to_string())? {
@@ -120,6 +125,12 @@ fn infer_segments(
         .map(|route| route.interface.as_str())
         .collect::<Vec<_>>();
     let mut segments = Vec::new();
+    // Capture selection does not make a default-route interface a LAN. A
+    // One-arm router is the exception: its capture interface serves both roles.
+    let is_wan = |name: &str| {
+        default_interfaces.contains(&name)
+            && !(snapshot.mode == TopologyMode::OneArmRouter && name == config.interface)
+    };
     for interface in &snapshot.interfaces {
         for (address, prefix) in &interface.addresses {
             if address.is_loopback() || address.is_unspecified() || is_link_local(*address) {
@@ -127,10 +138,10 @@ fn infer_segments(
             }
             let role = if interface.is_tunnel {
                 SegmentRole::Tunnel
+            } else if is_wan(&interface.name) {
+                SegmentRole::Wan
             } else if config.interfaces.iter().any(|name| name == &interface.name) {
                 SegmentRole::Lan
-            } else if default_interfaces.contains(&interface.name.as_str()) {
-                SegmentRole::Wan
             } else {
                 SegmentRole::Unknown
             };
@@ -161,6 +172,8 @@ fn infer_segments(
             .find(|interface| interface.name == route.interface);
         let role = if interface.is_some_and(|interface| interface.is_tunnel) {
             SegmentRole::Tunnel
+        } else if is_wan(&route.interface) && route.gateway.is_none() {
+            SegmentRole::Wan
         } else if config
             .interfaces
             .iter()
@@ -385,25 +398,45 @@ fn prefix_length(netmask: IpAddr) -> Option<u8> {
 }
 
 fn read_bool(path: &str) -> Option<bool> {
-    fs::read_to_string(path)
-        .ok()
-        .map(|value| value.trim() == "1")
+    match fs::read_to_string(path).ok()?.trim() {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    }
 }
 
 fn read_redirects(interface: &str) -> Option<bool> {
-    [
-        format!("/proc/sys/net/ipv4/conf/{interface}/send_redirects"),
-        "/proc/sys/net/ipv4/conf/all/send_redirects".into(),
-    ]
-    .into_iter()
-    .find_map(|path| read_bool(&path))
+    effective_send_redirects(
+        read_bool("/proc/sys/net/ipv4/conf/all/send_redirects"),
+        read_bool(&format!(
+            "/proc/sys/net/ipv4/conf/{interface}/send_redirects"
+        )),
+    )
+}
+
+fn effective_send_redirects(all: Option<bool>, interface: Option<bool>) -> Option<bool> {
+    match (all, interface) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    }
 }
 
 fn parse_offloading(contents: &str) -> (Option<bool>, Option<bool>) {
     (
-        option_value(contents, "flow_offloading"),
-        option_value(contents, "flow_offloading_hw"),
+        openwrt_boolean_option_or_default(contents, "flow_offloading"),
+        openwrt_boolean_option_or_default(contents, "flow_offloading_hw"),
     )
+}
+
+fn openwrt_boolean_option_or_default(contents: &str, name: &str) -> Option<bool> {
+    match option_value(contents, name) {
+        Some(value) => Some(value),
+        None if has_option(contents, name) => None,
+        // OpenWrt firewall4 defaults both flow-offload options to disabled.
+        // Policy capability discovery separately rejects an active nft flowtable.
+        None => Some(false),
+    }
 }
 
 fn contains_enabled_option(contents: &str, name: &str) -> bool {
@@ -417,15 +450,29 @@ fn option_value(contents: &str, name: &str) -> Option<bool> {
         .filter(|line| !line.starts_with('#'))
         .find_map(|line| {
             let fields = line.split_whitespace().collect::<Vec<_>>();
-            (fields.len() >= 3 && fields[0] == "option" && fields[1] == name).then(|| {
-                matches!(
-                    fields[2]
-                        .trim_matches(['\'', '"'])
-                        .to_ascii_lowercase()
-                        .as_str(),
-                    "1" | "on" | "true" | "yes" | "enabled"
-                )
-            })
+            if fields.len() < 3 || fields[0] != "option" || fields[1] != name {
+                return None;
+            }
+            match fields[2]
+                .trim_matches(['\'', '"'])
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "1" | "on" | "true" | "yes" | "enabled" => Some(true),
+                "0" | "off" | "false" | "no" | "disabled" => Some(false),
+                _ => None,
+            }
+        })
+}
+
+fn has_option(contents: &str, name: &str) -> bool {
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .any(|line| {
+            let mut fields = line.split_whitespace();
+            matches!((fields.next(), fields.next()), (Some("option"), Some(key)) if key == name)
         })
 }
 
@@ -457,6 +504,90 @@ mod tests {
     use super::*;
 
     #[test]
+    fn capturing_wan_keeps_router_connected_networks_external() {
+        let config = AgentConfig {
+            interface: "lan0".to_owned(),
+            interfaces: vec!["lan0".to_owned(), "wan0".to_owned()],
+            ..AgentConfig::default()
+        };
+        for (address, prefix, default) in [
+            ("198.18.1.254", 24, "0.0.0.0/0"),
+            ("fd70:1020:121::254", 64, "::/0"),
+        ] {
+            let subnet = NetworkPrefix::new(address.parse().unwrap(), prefix).unwrap();
+            let snapshot = TopologySnapshot {
+                mode: TopologyMode::Router,
+                interfaces: vec![InterfaceInfo {
+                    name: "wan0".to_owned(),
+                    addresses: vec![(address.parse().unwrap(), prefix)],
+                    is_bridge: false,
+                    is_tunnel: false,
+                }],
+                routes: vec![
+                    RouteInfo {
+                        destination: default.parse().unwrap(),
+                        gateway: None,
+                        interface: "wan0".to_owned(),
+                    },
+                    RouteInfo {
+                        destination: subnet,
+                        gateway: None,
+                        interface: "wan0".to_owned(),
+                    },
+                ],
+                ..TopologySnapshot::default()
+            };
+            let segments = infer_segments(&config, &snapshot).unwrap();
+            let segment = segments
+                .iter()
+                .find(|segment| segment.subnet == subnet)
+                .unwrap();
+            assert_eq!(segment.role, SegmentRole::Wan);
+            assert!(!segment.role.is_internal());
+        }
+    }
+
+    #[test]
+    fn one_arm_default_interface_keeps_connected_lan() {
+        let config = AgentConfig {
+            interface: "one0".to_owned(),
+            interfaces: vec!["one0".to_owned()],
+            ..AgentConfig::default()
+        };
+        for (subnet, default) in [
+            ("198.18.0.0/24", "0.0.0.0/0"),
+            ("fd70:1020:120::/64", "::/0"),
+        ] {
+            let subnet = subnet.parse().unwrap();
+            let snapshot = TopologySnapshot {
+                mode: TopologyMode::OneArmRouter,
+                routes: vec![
+                    RouteInfo {
+                        destination: default.parse().unwrap(),
+                        gateway: None,
+                        interface: "one0".to_owned(),
+                    },
+                    RouteInfo {
+                        destination: subnet,
+                        gateway: None,
+                        interface: "one0".to_owned(),
+                    },
+                ],
+                ..TopologySnapshot::default()
+            };
+            let segments = infer_segments(&config, &snapshot).unwrap();
+            assert_eq!(
+                segments
+                    .iter()
+                    .find(|segment| segment.subnet == subnet)
+                    .unwrap()
+                    .role,
+                SegmentRole::Lan
+            );
+        }
+    }
+
+    #[test]
     fn parses_ipv4_and_ipv6_default_and_routed_subnets() {
         let v4 = parse_ipv4_routes(
             "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\nbr-lan 00000000 0102A8C0 0003 0 0 0 00000000 0 0 0\nbr-lan 000AA8C0 00000000 0001 0 0 0 00FFFFFF 0 0 0",
@@ -474,6 +605,41 @@ mod tests {
         assert_eq!(
             parse_offloading("option flow_offloading '1'\noption flow_offloading_hw '0'"),
             (Some(true), Some(false))
+        );
+    }
+
+    #[test]
+    fn effective_redirects_follow_linux_all_or_interface_semantics() {
+        assert_eq!(
+            effective_send_redirects(Some(true), Some(false)),
+            Some(true)
+        );
+        assert_eq!(
+            effective_send_redirects(Some(false), Some(true)),
+            Some(true)
+        );
+        assert_eq!(
+            effective_send_redirects(Some(false), Some(false)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn effective_redirects_are_unknown_when_a_false_input_is_missing() {
+        assert_eq!(effective_send_redirects(Some(false), None), None);
+        assert_eq!(effective_send_redirects(None, Some(false)), None);
+        assert_eq!(effective_send_redirects(None, None), None);
+    }
+
+    #[test]
+    fn missing_openwrt_offload_switches_use_firewall4_disabled_defaults() {
+        assert_eq!(
+            parse_offloading("config defaults\n"),
+            (Some(false), Some(false))
+        );
+        assert_eq!(
+            parse_offloading("config defaults\noption flow_offloading 'unknown'\n"),
+            (None, Some(false))
         );
     }
 

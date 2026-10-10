@@ -361,7 +361,6 @@ export function InsightsDashboard({ username }: { username: string }) {
       title={tNav("insights")}
       subtitle={t("subtitle")}
       username={username}
-      isLive={false}
       warningBanner={
         captureWarnings.length
           ? t("captureWarningBanner", { count: captureWarnings.length })

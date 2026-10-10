@@ -411,7 +411,6 @@ export function DestinationsDashboard({
       title={tNav("destinations")}
       subtitle={t("subtitle")}
       username={username}
-      isLive={false}
       toolbar={toolbar}
     >
       {error ? (

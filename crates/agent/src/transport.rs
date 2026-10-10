@@ -20,6 +20,7 @@ use netqmon_protocol::v1::{
 use netqmon_protocol::{PROTOCOL_VERSION, encode_telemetry_batch};
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 use crate::config::AgentConfig;
 
@@ -34,6 +35,7 @@ pub(super) struct TelemetryQueue {
     buffer: Option<Arc<TelemetryBuffer>>,
     stats: Arc<TransportStats>,
     worker: Option<JoinHandle<()>>,
+    policy_credentials: watch::Receiver<Option<Credentials>>,
 }
 
 /// Cumulative transport-level statistics shared between producer and sender.
@@ -192,6 +194,7 @@ impl TelemetryQueue {
         ));
         let worker_buffer = Arc::clone(&buffer);
         let worker_stats = Arc::clone(&stats);
+        let (credentials_tx, policy_credentials) = watch::channel(None);
         let settings = SenderSettings {
             controller_url: config.controller_url.clone(),
             enrollment_token: config.token.clone(),
@@ -201,12 +204,21 @@ impl TelemetryQueue {
         };
         let worker = thread::Builder::new()
             .name("netqmon-telemetry".into())
-            .spawn(move || sender_loop(settings, worker_buffer, shutdown, worker_stats))
+            .spawn(move || {
+                sender_loop(
+                    settings,
+                    worker_buffer,
+                    shutdown,
+                    worker_stats,
+                    credentials_tx,
+                );
+            })
             .expect("telemetry sender thread must start");
         Self {
             buffer: Some(buffer),
             stats,
             worker: Some(worker),
+            policy_credentials,
         }
     }
 
@@ -223,6 +235,10 @@ impl TelemetryQueue {
 
     pub(super) fn transport_stats(&self) -> &Arc<TransportStats> {
         &self.stats
+    }
+
+    pub(super) fn policy_credentials(&self) -> watch::Receiver<Option<Credentials>> {
+        self.policy_credentials.clone()
     }
 
     pub(super) fn stop(mut self) {
@@ -264,9 +280,9 @@ struct SenderSettings {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-struct Credentials {
-    gateway_id: String,
-    agent_token: String,
+pub(crate) struct Credentials {
+    pub(crate) gateway_id: String,
+    pub(crate) agent_token: String,
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -275,12 +291,14 @@ fn sender_loop(
     buffer: Arc<TelemetryBuffer>,
     shutdown: Arc<AtomicBool>,
     stats: Arc<TransportStats>,
+    credentials_events: watch::Sender<Option<Credentials>>,
 ) {
     let mut credentials = load_credentials(&settings.credential_path).unwrap_or_else(|error| {
         eprintln!("telemetry credentials could not be loaded: {error:#}");
         None
     });
     let mut sequence = 0_u64;
+    credentials_events.send_replace(credentials.clone());
     let mut probe_results = Vec::<ProbeResult>::new();
     let mut enroll_retry_delay = RETRY_DELAY;
     loop {
@@ -307,6 +325,7 @@ fn sender_loop(
                         if let Err(error) = save_credentials(&settings.credential_path, &enrolled) {
                             eprintln!("telemetry credentials could not be persisted: {error:#}");
                         }
+                        credentials_events.send_replace(Some(enrolled.clone()));
                         credentials = Some(enrolled);
                         enroll_retry_delay = RETRY_DELAY;
                     }
@@ -338,6 +357,7 @@ fn sender_loop(
                 Err(SendError::Unauthorized) => {
                     eprintln!("telemetry credential was rejected; attempting enrollment again");
                     credentials = None;
+                    credentials_events.send_replace(None);
                     enroll_retry_delay = RETRY_DELAY;
                 }
                 Err(SendError::Other(error)) => {
@@ -801,6 +821,7 @@ mod sample_queue_tests {
             buffer: Some(buffer),
             stats,
             worker: None,
+            policy_credentials: watch::channel(None).1,
         };
         telemetry.submit(TelemetryBatch::default());
         assert_eq!(telemetry.stats.queue_depth.load(Ordering::Relaxed), 1);
