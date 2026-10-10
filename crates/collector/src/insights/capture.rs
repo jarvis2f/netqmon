@@ -114,7 +114,7 @@ pub(crate) fn query_capture_insights_with_received_at(
             confidence: Some(1.0),
         });
     }
-    let lag_ms = received_at.saturating_sub(snapshot.generated_at);
+    let lag_ms = received_at.saturating_sub(snapshot.agent_batch_time);
     if lag_ms >= lag_threshold_ms {
         items.push(Insight {
             id: format!("capture-collector-lag-{}", health.observed_at),
@@ -132,7 +132,7 @@ pub(crate) fn query_capture_insights_with_received_at(
                 "condition": "collector_lag",
                 "lag_ms": lag_ms,
                 "threshold_ms": lag_threshold_ms,
-                "agent_batch_time": snapshot.generated_at,
+                "agent_batch_time": snapshot.agent_batch_time,
                 "collector_received_time": received_at,
                 "action": "warning_only",
             }),

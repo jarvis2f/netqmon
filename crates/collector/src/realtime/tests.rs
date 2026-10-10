@@ -67,6 +67,8 @@ fn tracks_one_second_rates_and_active_flow_lifecycle() {
     let first = engine.snapshot();
     assert_eq!(first.total.upload_bytes_per_second, 100);
     assert_eq!(first.total.download_bytes_per_second, 200);
+    assert_eq!(first.generated_at, 2_000);
+    assert_eq!(first.agent_batch_time, 2_000);
     assert_eq!(first.internet.download_bytes_per_second, 200);
     assert_eq!(first.internal.download_bytes_per_second, 0);
     assert_eq!(
@@ -183,6 +185,7 @@ fn snapshot_time_and_active_clients_follow_received_telemetry() {
     realtime.update(&batch, &[FlowAttribution::default()], 1_000, 50_000);
 
     assert_eq!(realtime.snapshot.generated_at, 50_000);
+    assert_eq!(realtime.snapshot.agent_batch_time, 1_000);
     assert_eq!(realtime.snapshot.clients.len(), 1);
 
     realtime.update(&TelemetryBatch::default(), &[], 2_000, 55_000);

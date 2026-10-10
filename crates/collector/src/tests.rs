@@ -1449,6 +1449,18 @@ async fn insights_explain_each_capture_quality_warning() {
     assert!(codes.contains("capture.dns_event_drops"));
     assert!(codes.contains("capture.telemetry_queue_drops"));
     assert!(codes.contains("capture.collector_lag"));
+    let collector_lag = items
+        .iter()
+        .find(|item| item["code"] == "capture.collector_lag")
+        .unwrap();
+    assert_eq!(
+        collector_lag["evidence"]["agent_batch_time"],
+        1_700_000_000_000_u64
+    );
+    assert!(
+        collector_lag["params"]["lag_ms"].as_u64().unwrap()
+            >= crate::insights::collector_lag_threshold_ms()
+    );
     for item in items {
         assert!(item.get("title").is_none());
         assert!(item.get("reason").is_none());

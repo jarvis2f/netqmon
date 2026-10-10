@@ -118,6 +118,8 @@ pub(crate) struct ActiveFlowSnapshot {
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub(crate) struct RealtimeSnapshot {
     pub(crate) generated_at: u64,
+    #[serde(skip)]
+    pub(crate) agent_batch_time: u64,
     pub(crate) total: Throughput,
     pub(crate) internet: Throughput,
     pub(crate) internal: Throughput,
@@ -349,6 +351,7 @@ impl RealtimeEngine {
         );
         self.snapshot = RealtimeSnapshot {
             generated_at: received_at,
+            agent_batch_time: observed_at,
             total,
             internet,
             internal,
