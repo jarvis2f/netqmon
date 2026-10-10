@@ -187,6 +187,8 @@ export function ApplicationsDashboard({
           name={row.name}
           category={row.category_id}
           icon={row.icon}
+          showProtocolDescription={false}
+          hideUnknownCategory
         />
       ),
     },
@@ -328,7 +330,7 @@ export function ApplicationsDashboard({
         }
         subtitle={
           selected?.application_id?.startsWith("protocol:")
-            ? t("protocolApplicationDescription")
+            ? undefined
             : selected?.category_id
               ? `${t("columns.trafficClass")}: ${selected.category_id}`
               : undefined

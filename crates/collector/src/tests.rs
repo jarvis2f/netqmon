@@ -359,7 +359,7 @@ async fn public_and_internal_health_routes_are_available() {
 }
 
 #[tokio::test]
-async fn unavailable_classifier_keeps_ingestion_healthy_and_strict_apis_return_503() {
+async fn unavailable_classifier_defers_ingestion_and_strict_apis_return_503() {
     let state = unavailable_classifier_state();
     let enrollment = state
         .enroll(&EnrollRequest {
@@ -389,10 +389,11 @@ async fn unavailable_classifier_keeps_ingestion_healthy_and_strict_apis_return_5
         ..Default::default()
     };
 
-    assert_eq!(
-        state.accept_batch(&batch).unwrap(),
-        BatchDisposition::Accepted
-    );
+    assert!(matches!(
+        state.accept_batch(&batch),
+        Err(TelemetryIngestError::ClassifierUnavailable(_))
+    ));
+    assert_eq!(state.lock().accepted_batches, 0);
 
     let health = public_router(state.clone())
         .oneshot(
@@ -1701,68 +1702,88 @@ fn spawn_asn_classifier_server(
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
         let mut observed = Vec::new();
+        let mut classification_requests = 0;
 
-        for _ in 0..expected_requests {
+        while classification_requests < expected_requests {
             let mut line = String::new();
             assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-            let netqmon_classifier_client::ClientRequest::ClassifyBatch {
-                request_id,
-                request,
-            } = serde_json::from_str(&line).unwrap()
-            else {
-                panic!("collector must use classify_batch IPC");
-            };
-            let entries = request
-                .entries
-                .into_iter()
-                .map(|entry| {
-                    observed.push(AsnClassifierRequest {
-                        domain: entry.domain.clone(),
-                        remote_ip: entry.remote_ip.clone(),
-                        remote_asn: entry.remote_asn,
-                        has_dpi: entry.dpi_evidence.is_some(),
-                    });
-                    let asn = entry.remote_asn;
-                    let suffix = asn.unwrap_or_default();
-                    netqmon_classifier_client::ClassificationResult {
-                        entry_id: entry.entry_id,
-                        organization: asn.map(|_| netqmon_classifier_client::ClassifiedEntity {
-                            id: format!("asn-org-{suffix}"),
-                            confidence: 0.91,
-                        }),
-                        application: asn.map(|_| netqmon_classifier_client::ClassifiedEntity {
-                            id: format!("asn-app-{suffix}"),
-                            confidence: 0.92,
-                        }),
-                        traffic_class: asn.map(|_| netqmon_classifier_client::ClassifiedEntity {
-                            id: "test-asn".to_owned(),
-                            confidence: 0.9,
-                        }),
-                        traffic_role: None,
-                        protocol: entry.dpi_evidence.as_ref().map(|_| {
-                            netqmon_classifier_client::ClassifiedEntity {
-                                id: "late-dpi".to_owned(),
-                                confidence: 0.95,
-                            }
-                        }),
-                        evidence: asn
-                            .map(|value| {
-                                vec![netqmon_classifier_client::ClassificationEvidence {
-                                    evidence_type: "remote_asn".to_owned(),
-                                    value: value.to_string(),
-                                    source: "test-geo".to_owned(),
-                                    weight: 0.92,
-                                }]
-                            })
-                            .unwrap_or_default(),
-                        device_evidence: Vec::new(),
-                        error: None,
+            let request: netqmon_classifier_client::ClientRequest =
+                serde_json::from_str(&line).unwrap();
+            let response = match request {
+                netqmon_classifier_client::ClientRequest::Health { request_id } => {
+                    netqmon_classifier_client::ServerResponse::Health {
+                        request_id,
+                        health: netqmon_classifier_client::ClassifierHealth {
+                            ready: true,
+                            detail: None,
+                        },
                     }
-                })
-                .collect();
-            let response = netqmon_classifier_client::ServerResponse::ClassificationBatch {
-                request_id,
-                result: netqmon_classifier_client::ClassificationBatchResult { entries },
+                }
+                netqmon_classifier_client::ClientRequest::ClassifyBatch {
+                    request_id,
+                    request,
+                } => {
+                    classification_requests += 1;
+                    let entries = request
+                        .entries
+                        .into_iter()
+                        .map(|entry| {
+                            observed.push(AsnClassifierRequest {
+                                domain: entry.domain.clone(),
+                                remote_ip: entry.remote_ip.clone(),
+                                remote_asn: entry.remote_asn,
+                                has_dpi: entry.dpi_evidence.is_some(),
+                            });
+                            let asn = entry.remote_asn;
+                            let suffix = asn.unwrap_or_default();
+                            netqmon_classifier_client::ClassificationResult {
+                                entry_id: entry.entry_id,
+                                organization: asn.map(|_| {
+                                    netqmon_classifier_client::ClassifiedEntity {
+                                        id: format!("asn-org-{suffix}"),
+                                        confidence: 0.91,
+                                    }
+                                }),
+                                application: asn.map(|_| {
+                                    netqmon_classifier_client::ClassifiedEntity {
+                                        id: format!("asn-app-{suffix}"),
+                                        confidence: 0.92,
+                                    }
+                                }),
+                                traffic_class: asn.map(|_| {
+                                    netqmon_classifier_client::ClassifiedEntity {
+                                        id: "test-asn".to_owned(),
+                                        confidence: 0.9,
+                                    }
+                                }),
+                                traffic_role: None,
+                                protocol: entry.dpi_evidence.as_ref().map(|_| {
+                                    netqmon_classifier_client::ClassifiedEntity {
+                                        id: "late-dpi".to_owned(),
+                                        confidence: 0.95,
+                                    }
+                                }),
+                                evidence: asn
+                                    .map(|value| {
+                                        vec![netqmon_classifier_client::ClassificationEvidence {
+                                            evidence_type: "remote_asn".to_owned(),
+                                            value: value.to_string(),
+                                            source: "test-geo".to_owned(),
+                                            weight: 0.92,
+                                        }]
+                                    })
+                                    .unwrap_or_default(),
+                                device_evidence: Vec::new(),
+                                error: None,
+                            }
+                        })
+                        .collect();
+                    netqmon_classifier_client::ServerResponse::ClassificationBatch {
+                        request_id,
+                        result: netqmon_classifier_client::ClassificationBatchResult { entries },
+                    }
+                }
+                other => panic!("unexpected classifier request: {other:?}"),
             };
             writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).unwrap();
             writer.flush().unwrap();

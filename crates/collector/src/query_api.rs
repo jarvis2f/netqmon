@@ -1514,7 +1514,7 @@ async fn application_detail(
     }))) {
         return *response;
     }
-    if !valid_identifier(&id) {
+    if !valid_application_identifier(&id) {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_application_id",
@@ -1697,7 +1697,7 @@ async fn application_related(
     Path((id, relation)): Path<(String, String)>,
     query: Result<Query<RelatedQuery>, QueryRejection>,
 ) -> Response {
-    if !valid_identifier(&id) {
+    if !valid_application_identifier(&id) {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_application_id",
@@ -3784,6 +3784,13 @@ fn valid_identifier(value: &str) -> bool {
         && value.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
         })
+}
+
+fn valid_application_identifier(value: &str) -> bool {
+    value
+        .strip_prefix(PROTOCOL_APPLICATION_PREFIX)
+        .is_some_and(valid_identifier)
+        || valid_identifier(value)
 }
 
 fn now_ms() -> u64 {

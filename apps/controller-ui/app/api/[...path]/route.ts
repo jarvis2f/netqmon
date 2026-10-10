@@ -24,7 +24,13 @@ function validatePath(path: string[]): boolean {
   return (
     path.length > 0 &&
     RESOURCES.has(path[0]) &&
-    path.every((part: string) => /^[a-zA-Z0-9._-]+$/.test(part))
+    path.every(
+      (part: string, index: number) =>
+        /^[a-zA-Z0-9._-]+$/.test(part) ||
+        (path[0] === "applications" &&
+          index === 1 &&
+          /^protocol:[a-zA-Z0-9._-]+$/.test(part)),
+    )
   );
 }
 

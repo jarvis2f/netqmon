@@ -13,15 +13,26 @@ export function ApplicationIdentity({
   name,
   category,
   icon,
+  showProtocolDescription = true,
+  hideUnknownCategory = false,
 }: {
   id: string;
   name?: string | null;
   category?: string;
   icon?: IconMetadata | null;
+  showProtocolDescription?: boolean;
+  hideUnknownCategory?: boolean;
 }) {
   const t = useTranslations("applications");
   const unknown = id === "unknown";
   const protocol = protocolFromApplicationId(id);
+  const secondaryLabel = protocol
+    ? showProtocolDescription
+      ? t("protocolApplicationDescription")
+      : null
+    : hideUnknownCategory && category === "unknown"
+      ? null
+      : category || "Unknown category";
   return (
     <div className="flex min-w-0 items-center gap-2.5">
       {protocol ? (
@@ -42,11 +53,11 @@ export function ApplicationIdentity({
               ? "Unknown"
               : name || formatIdentifier(id)}
         </div>
-        <div className="truncate text-[10px] text-foreground-muted">
-          {protocol
-            ? t("protocolApplicationDescription")
-            : category || "Unknown category"}
-        </div>
+        {secondaryLabel && (
+          <div className="truncate text-[10px] text-foreground-muted">
+            {secondaryLabel}
+          </div>
+        )}
       </div>
     </div>
   );
