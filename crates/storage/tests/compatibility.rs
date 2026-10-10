@@ -353,11 +353,22 @@ fn handle_client(stream: &mut TcpStream, db: &Arc<Mutex<MockClickHouseDb>>) {
         let rows: Vec<Value> = mock
             .dns_observations
             .iter()
+            .filter(|observation| {
+                ["gateway_id", "client_ip", "answer_ip"]
+                    .into_iter()
+                    .all(|column| {
+                        let Some(expected) = sql_string_filter(&body_str, column) else {
+                            return false;
+                        };
+                        observation[column].as_str() == Some(expected)
+                    })
+            })
             .map(|d| {
                 json!({
+                    "id": d["id"],
                     "domain": d["domain"],
-                    "ttl_seconds": d["ttl_seconds"],
-                    "observed_at": d["observed_at"]
+                    "observed_at": d["observed_at"],
+                    "expires_at": d["expires_at"]
                 })
             })
             .collect();
@@ -405,6 +416,15 @@ fn handle_client(stream: &mut TcpStream, db: &Arc<Mutex<MockClickHouseDb>>) {
         response_body
     );
     stream.write_all(response.as_bytes()).ok();
+}
+
+fn sql_string_filter<'a>(query: &'a str, column: &str) -> Option<&'a str> {
+    let prefix = format!("{column} = '");
+    query
+        .split_once(&prefix)?
+        .1
+        .split_once('\'')
+        .map(|(value, _)| value)
 }
 
 #[test]
