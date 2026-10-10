@@ -104,7 +104,13 @@ fn summarize(devices: &[Value], flows: &[Value], since: u64) -> Value {
         if app {
             apps += count;
         }
-        if app && has("domain_application") {
+        let has_domain_application = entries.iter().any(|entry| {
+            matches!(
+                entry["type"].as_str(),
+                Some("domain_application" | "domain_exact" | "domain_suffix")
+            )
+        });
+        if app && has_domain_application {
             domains += count;
         }
         if app && has("ndpi_application") {
@@ -154,6 +160,8 @@ mod tests {
         ];
         let flows = vec![
             json!({"application_id":"youtube","protocol_id":"tls","count":2,"classification_evidence_json":"[{\"type\":\"domain_application\"}]"}),
+            json!({"application_id":"baidu-services","protocol_id":"unknown","count":1,"classification_evidence_json":"[{\"type\":\"domain_exact\"}]"}),
+            json!({"application_id":"xiaomi-services","protocol_id":"unknown","count":1,"classification_evidence_json":"[{\"type\":\"domain_suffix\"}]"}),
             json!({"protocol_id":"quic","domain":"unmatched.test","count":2,"classification_evidence_json":"[{\"type\":\"unmatched_ndpi_application\",\"value\":\"MissingApp\"}]"}),
         ];
         let value = summarize(&devices, &flows, 0);
@@ -163,8 +171,8 @@ mod tests {
             1
         );
         assert_eq!(value["device"]["evidence_source_coverage"]["mdns"], 2);
-        assert_eq!(value["traffic"]["domain_application_hit_rate"], 0.5);
-        assert_eq!(value["traffic"]["tls_quic_only_rate"], 0.5);
+        assert_eq!(value["traffic"]["domain_application_hit_rate"], 2.0 / 3.0);
+        assert_eq!(value["traffic"]["tls_quic_only_rate"], 1.0 / 3.0);
         assert_eq!(
             value["traffic"]["top_unmatched_ndpi_application"][0]["flows"],
             2
