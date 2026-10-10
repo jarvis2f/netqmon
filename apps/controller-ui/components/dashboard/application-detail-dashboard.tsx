@@ -17,6 +17,11 @@ import { AppLayout } from "@/components/app-shell/app-layout";
 import { ClientDeviceIcon } from "@/components/icons/client-device-icon";
 import { DataTable, type ColumnDef } from "@/components/data/data-table";
 import { MetricCard } from "@/components/data/metric-card";
+import {
+  TimeRangePicker,
+  type CustomDateRange,
+  type TimeRangeValue,
+} from "@/components/data/time-range-picker";
 import { ApplicationIdentity } from "@/components/network/application-identity";
 import { protocolApplicationName } from "@/lib/application-identity";
 import { FlowPanel } from "@/components/overlays/flow-panel";
@@ -47,6 +52,22 @@ import type {
   FlowSummary,
 } from "@/lib/network-types";
 
+const RANGE_MS: Record<Exclude<TimeRangeValue, "custom" | "15m">, number> = {
+  "1h": 60 * 60 * 1_000,
+  "24h": 24 * 60 * 60 * 1_000,
+  "7d": 7 * 24 * 60 * 60 * 1_000,
+  "30d": 30 * 24 * 60 * 60 * 1_000,
+};
+
+function rangeBounds(range: TimeRangeValue, from?: string, to?: string) {
+  const end = range === "custom" && to ? Date.parse(to) : Date.now();
+  const start =
+    range === "custom" && from
+      ? Date.parse(from)
+      : end - RANGE_MS[range as keyof typeof RANGE_MS];
+  return { from: start, to: end };
+}
+
 type Tab = "overview" | "clients" | "domains" | "destinations" | "flows";
 
 interface TrafficPayload {
@@ -71,15 +92,22 @@ export function ApplicationDetailDashboard({
   username,
   applicationId,
   categoryId,
+  initialRange,
+  initialFrom,
+  initialTo,
   initialTab,
 }: {
   username: string;
   applicationId: string;
   categoryId?: string;
+  initialRange: TimeRangeValue;
+  initialFrom?: string;
+  initialTo?: string;
   initialTab: Tab;
 }) {
   const t = useTranslations("applications");
   const tNav = useTranslations("navigation");
+  const tTime = useTranslations("common.timeRange");
   const tFlows = useTranslations("flows.columns");
   const tStatus = useTranslations("common.status");
   const router = useRouter();
@@ -127,18 +155,24 @@ export function ApplicationDetailDashboard({
       setLoading(true);
       try {
         const encoded = encodeURIComponent(applicationId);
+        const bounds = rangeBounds(initialRange, initialFrom, initialTo);
         const query = new URLSearchParams({
           limit: "100",
-          from: "0",
-          to: String(Date.now()),
+          from: String(bounds.from),
+          to: String(bounds.to),
         });
         if (categoryId) query.set("category", categoryId);
         const relationQuery = query.toString();
+        const applicationQuery = new URLSearchParams({
+          from: String(bounds.from),
+          to: String(bounds.to),
+        });
+        if (categoryId) applicationQuery.set("category", categoryId);
         const responses = await Promise.all([
-          fetch(
-            `/api/applications/${encoded}${categoryId ? `?category=${encodeURIComponent(categoryId)}` : ""}`,
-            { cache: "no-store", signal: controller.signal },
-          ),
+          fetch(`/api/applications/${encoded}?${applicationQuery.toString()}`, {
+            cache: "no-store",
+            signal: controller.signal,
+          }),
           fetch(`/api/applications/${encoded}/traffic?${relationQuery}`, {
             cache: "no-store",
             signal: controller.signal,
@@ -189,16 +223,61 @@ export function ApplicationDetailDashboard({
     }
     void load();
     return () => controller.abort();
-  }, [applicationId, categoryId, reloadKey, t]);
+  }, [
+    applicationId,
+    categoryId,
+    initialFrom,
+    initialRange,
+    initialTo,
+    reloadKey,
+    t,
+  ]);
 
   const setTab = (tab: Tab) => {
-    const query = new URLSearchParams({ tab });
+    const query = new URLSearchParams({ tab, range: initialRange });
     if (categoryId) query.set("category", categoryId);
+    if (initialRange === "custom" && initialFrom && initialTo) {
+      query.set("from", initialFrom);
+      query.set("to", initialTo);
+    }
     router.replace(
       `/applications/${encodeURIComponent(applicationId)}?${query}`,
       { scroll: false },
     );
   };
+  const handleRange = (range: TimeRangeValue, custom?: CustomDateRange) => {
+    const query = new URLSearchParams({ range });
+    if (categoryId) query.set("category", categoryId);
+    if (initialTab !== "overview") query.set("tab", initialTab);
+    if (range === "custom" && custom) {
+      query.set("from", custom.from);
+      query.set("to", custom.to);
+    }
+    router.replace(
+      `/applications/${encodeURIComponent(applicationId)}?${query.toString()}`,
+      { scroll: false },
+    );
+  };
+  const formatRangeLabel = () => {
+    if (initialRange === "custom") return tTime("customRange");
+    const rangeLabel =
+      initialRange === "1h"
+        ? tTime("range1h")
+        : initialRange === "7d"
+          ? tTime("range7d")
+          : initialRange === "30d"
+            ? tTime("range30d")
+            : tTime("range24h");
+    return tTime("lastRange", { range: rangeLabel });
+  };
+  const applicationsHref = (() => {
+    const query = new URLSearchParams({ range: initialRange });
+    if (initialRange === "custom" && initialFrom && initialTo) {
+      query.set("from", initialFrom);
+      query.set("to", initialTo);
+    }
+    return `/applications?${query.toString()}`;
+  })();
   const chartData = useMemo<TrafficDataPoint[]>(
     () =>
       (data?.traffic.points ?? []).map((point) => ({
@@ -523,42 +602,54 @@ export function ApplicationDetailDashboard({
       isLive={false}
       headerActions={
         <Link
-          href="/applications"
+          href={applicationsHref}
           className={buttonVariants({ variant: "outline", size: "sm" })}
         >
           <ArrowLeft /> {tNav("applications")}
         </Link>
       }
       toolbar={
-        <nav
-          className="flex min-w-max items-center gap-1"
-          aria-label={t("detail.fallbackSubtitle")}
-        >
-          <ApplicationIdentity
-            id={applicationId}
-            name={app?.name}
-            category={app?.category_id}
-            icon={app?.icon}
-          />
-          <div className="mx-2 h-5 w-px bg-border" />
-          <Tabs
-            value={initialTab}
-            onValueChange={(val) => setTab(val as Tab)}
-            variant="pill"
+        <div className="flex min-w-max flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <nav
+            className="flex min-w-max items-center gap-1"
+            aria-label={t("detail.fallbackSubtitle")}
           >
-            <TabsList className="h-8 p-0.5 bg-surface-subtle/80">
-              {tabs.map((tab) => (
-                <TabsTrigger
-                  key={tab.id}
-                  value={tab.id}
-                  className="h-7 px-2.5 text-xs"
-                >
-                  {tab.label}
-                </TabsTrigger>
-              ))}
-            </TabsList>
-          </Tabs>
-        </nav>
+            <ApplicationIdentity
+              id={applicationId}
+              name={app?.name}
+              category={app?.category_id}
+              icon={app?.icon}
+            />
+            <div className="mx-2 h-5 w-px bg-border" />
+            <Tabs
+              value={initialTab}
+              onValueChange={(val) => setTab(val as Tab)}
+              variant="pill"
+            >
+              <TabsList className="h-8 p-0.5 bg-surface-subtle/80">
+                {tabs.map((tab) => (
+                  <TabsTrigger
+                    key={tab.id}
+                    value={tab.id}
+                    className="h-7 px-2.5 text-xs"
+                  >
+                    {tab.label}
+                  </TabsTrigger>
+                ))}
+              </TabsList>
+            </Tabs>
+          </nav>
+          <TimeRangePicker
+            value={initialRange}
+            onChange={handleRange}
+            customRange={
+              initialFrom && initialTo
+                ? { from: initialFrom, to: initialTo }
+                : undefined
+            }
+            className="shrink-0 self-start sm:self-auto"
+          />
+        </div>
       }
     >
       <section
@@ -592,14 +683,14 @@ export function ApplicationDetailDashboard({
               value={formatBytes(app?.download_bytes ?? 0)}
               icon={ArrowDown}
               loading={loading}
-              subtext={t("detail.allRecordedTraffic")}
+              subtext={formatRangeLabel()}
             />
             <MetricCard
               label={t("columns.upload")}
               value={formatBytes(app?.upload_bytes ?? 0)}
               icon={ArrowUp}
               loading={loading}
-              subtext={t("detail.allRecordedTraffic")}
+              subtext={formatRangeLabel()}
             />
             <MetricCard
               label={t("columns.clients")}
@@ -685,7 +776,7 @@ export function ApplicationDetailDashboard({
           )}
           <TrafficChart
             data={chartData}
-            title={t("detail.trafficRecorded")}
+            title={`${t("detail.trafficRecorded")} · ${formatRangeLabel()}`}
             height={300}
             loading={loading}
             maxPoints={200}

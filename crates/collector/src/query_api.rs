@@ -146,6 +146,8 @@ struct ApplicationDetailQuery {
     limit: Option<u32>,
     offset: Option<u64>,
     category: Option<String>,
+    from: Option<u64>,
+    to: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1514,6 +1516,10 @@ async fn application_detail(
     }))) {
         return *response;
     }
+    let window = match query_window(query.from, query.to) {
+        Ok(window) => window,
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_time_range", message),
+    };
     if !valid_application_identifier(&id) {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -1535,7 +1541,7 @@ async fn application_detail(
     let category = query.category.as_deref();
     let inner = state.lock();
     if let Some(clickhouse) = inner.storage.clickhouse_storage() {
-        return match clickhouse.query_application_detail(&id, category) {
+        return match clickhouse.query_application_detail(&id, category, window) {
             Ok(Some(mut value)) => {
                 let organization_id = value["organization_id"].as_str().unwrap_or("unknown");
                 let organization = (organization_id != "unknown")
@@ -1567,13 +1573,21 @@ async fn application_detail(
                               SUM(packets), SUM(flow_count), MAX(timestamp)
                        FROM traffic_application_minute
                        WHERE application_id = ?1 AND (?2 IS NULL OR category_id = ?2)
+                         AND (?3 IS NULL OR timestamp >= ?3) AND (?4 IS NULL OR timestamp < ?4)
                        GROUP BY application_id, category_id";
     let result = inner
         .storage
         .connection()
-        .query_row(summary_sql, params![id, category], |row| {
-            summary_row(row, &["application_id", "category_id"])
-        })
+        .query_row(
+            summary_sql,
+            params![
+                id,
+                category,
+                window.map(|(from, _)| from),
+                window.map(|(_, to)| to)
+            ],
+            |row| summary_row(row, &["application_id", "category_id"]),
+        )
         .optional();
     match result {
         Ok(Some(mut value)) => {
@@ -1589,10 +1603,16 @@ async fn application_detail(
                         END), 'unknown')
                  FROM flow_sessions
                  WHERE {flow_filter}
+                   AND (?3 IS NULL OR last_seen_at >= ?3) AND (?4 IS NULL OR last_seen_at < ?4)
                    AND (?1 LIKE '{PROTOCOL_APPLICATION_PREFIX}%' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)",
                     flow_filter = sqlite_application_flow_filter("?1", "")
                 ),
-                params![id, category],
+                params![
+                    id,
+                    category,
+                    window.map(|(from, _)| from),
+                    window.map(|(_, to)| to)
+                ],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
@@ -1611,8 +1631,14 @@ async fn application_detail(
                     } else {
                         organization
                     };
-                    let observed_protocols = query_application_protocols(connection, &id, category)
-                        .unwrap_or_else(|_| Vec::new());
+                    let observed_protocols = query_application_protocols(
+                        connection,
+                        &id,
+                        category,
+                        window.map(|(from, _)| from),
+                        window.map(|(_, to)| to),
+                    )
+                    .unwrap_or_else(|_| Vec::new());
                     let application_metadata = inner.classifier.application_metadata(&id);
                     let organization_metadata = (organization != "unknown")
                         .then(|| inner.classifier.organization_metadata(&organization))
@@ -1648,6 +1674,22 @@ async fn application_detail(
                 Err(error) => storage_error(error),
             }
         }
+        Ok(None) if window.is_some() => api_ok(json!({
+            "application_id": id,
+            "category_id": category.unwrap_or("unknown"),
+            "upload_bytes": 0,
+            "download_bytes": 0,
+            "packets": 0,
+            "flow_count": 0,
+            "last_seen": 0,
+            "client_count": 0,
+            "domain_count": 0,
+            "destination_count": 0,
+            "confidence": 0.0,
+            "classifier_reason": "no matching rule",
+            "organization_id": "unknown",
+            "observed_protocols": [],
+        })),
         Ok(None) => api_error(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -1661,18 +1703,21 @@ fn query_application_protocols(
     connection: &Connection,
     id: &str,
     category: Option<&str>,
+    from: Option<i64>,
+    to: Option<i64>,
 ) -> rusqlite::Result<Vec<Value>> {
     let mut statement = connection.prepare(&format!(
         "SELECT COALESCE(protocol_id, 'unknown'), COUNT(*)
          FROM flow_sessions
          WHERE {flow_filter}
+           AND (?3 IS NULL OR last_seen_at >= ?3) AND (?4 IS NULL OR last_seen_at < ?4)
            AND (?1 LIKE '{PROTOCOL_APPLICATION_PREFIX}%' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)
          GROUP BY COALESCE(protocol_id, 'unknown')
          ORDER BY COUNT(*) DESC, COALESCE(protocol_id, 'unknown')",
         flow_filter = sqlite_application_flow_filter("?1", "")
     ))?;
     statement
-        .query_map(params![id, category], |row| {
+        .query_map(params![id, category, from, to], |row| {
             Ok(json!({
                 "id": row.get::<_, String>(0)?,
                 "flows": row.get::<_, i64>(1)?,

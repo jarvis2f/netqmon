@@ -1785,8 +1785,15 @@ impl ClickHouseStorage {
         &self,
         application_id: &str,
         category: Option<&str>,
+        window: Option<(i64, i64)>,
     ) -> StorageResult<Option<Value>> {
         let app = escape_sql(application_id);
+        let time_filter = window.map_or_else(String::new, |(from, to)| {
+            format!(" AND timestamp >= {from} AND timestamp < {to}")
+        });
+        let flow_time_filter = window.map_or_else(String::new, |(from, to)| {
+            format!(" AND last_seen_at >= {from} AND last_seen_at < {to}")
+        });
         let category_predicate = category.map_or_else(String::new, |value| {
             format!(" AND category_id = '{}'", escape_sql(value))
         });
@@ -1801,7 +1808,7 @@ impl ClickHouseStorage {
                     sum(packets) AS packets, sum(flow_count) AS flow_count,
                     max(timestamp) AS last_seen
              FROM traffic_application_minute
-             WHERE application_id = '{app}'{category_predicate}
+             WHERE application_id = '{app}'{category_predicate}{time_filter}
              GROUP BY application_id FORMAT JSON"
         );
         let summary_result = self.client.query_json(&summary_sql)?;
@@ -1809,17 +1816,35 @@ impl ClickHouseStorage {
             .as_array()
             .and_then(|rows| rows.first())
         else {
-            return Ok(None);
+            return Ok(window.map(|_| {
+                json!({
+                    "application_id": application_id,
+                    "category_id": category.unwrap_or("unknown"),
+                    "upload_bytes": 0,
+                    "download_bytes": 0,
+                    "packets": 0,
+                    "flow_count": 0,
+                    "last_seen": 0,
+                    "client_count": 0,
+                    "domain_count": 0,
+                    "destination_count": 0,
+                    "confidence": 0.0,
+                    "classifier_reason": "no matching rule",
+                    "organization_id": "unknown",
+                    "observed_protocols": [],
+                })
+            }));
         };
         let flow_filter = format!(
-            "{}{}",
+            "{}{}{}",
             application_flow_filter(application_id, ""),
             category
                 .filter(|_| !is_protocol_application_id(application_id))
                 .map_or_else(String::new, |value| format!(
                     " AND coalesce(category_id, 'unknown') = '{}'",
                     escape_sql(value)
-                ))
+                )),
+            flow_time_filter
         );
         let stats_sql = format!(
             "SELECT uniqExact(device_id) AS clients, uniqExact(domain) AS domains,

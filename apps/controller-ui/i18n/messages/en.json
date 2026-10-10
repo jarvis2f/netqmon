@@ -325,7 +325,7 @@
       "unknownApp": "Unknown application",
       "subtitle": "Traffic Class: {category} · {confidence} classifier confidence",
       "fallbackSubtitle": "Application traffic and related activity",
-      "allRecordedTraffic": "All recorded traffic",
+      "allRecordedTraffic": "Selected time range",
       "distinctClients": "Distinct classified clients",
       "persistedObservations": "Persisted observations",
       "classification": "Classification",
@@ -335,17 +335,17 @@
       "observedProtocols": "Observed Protocols",
       "noMatchingRule": "No matching rule",
       "rulesSource": "rules",
-      "trafficRecorded": "Traffic — All recorded",
+      "trafficRecorded": "Traffic",
       "topClients": "Top clients",
       "topDomains": "Top domains",
       "scope": {
         "title": "Statistics scope",
         "tabs": {
-          "overview": "Summary cards, chart, and top lists use all recorded application traffic and persisted observations.",
-          "clients": "Groups all recorded flow observations by LAN client and sums upload, download, and flow count. Shows up to 100 clients.",
-          "domains": "Groups all recorded flow observations by observed domain and sums upload, download, packets, and flows. Shows up to 100 domains.",
-          "destinations": "Groups all recorded flow observations by remote IP, with the latest associated domain when available. Shows up to 100 destinations.",
-          "flows": "Lists all recorded flow sessions associated with this application, ordered by most recently seen. Shows up to 100 flows."
+          "overview": "Summary cards, chart, and top lists use the selected time range.",
+          "clients": "Groups flow observations in the selected time range by LAN client and sums upload, download, and flow count. Shows up to 100 clients.",
+          "domains": "Groups flow observations in the selected time range by observed domain and sums upload, download, packets, and flows. Shows up to 100 domains.",
+          "destinations": "Groups flow observations in the selected time range by remote IP, with the latest associated domain when available. Shows up to 100 destinations.",
+          "flows": "Lists flow sessions in the selected time range associated with this application, ordered by most recently seen. Shows up to 100 flows."
         }
       },
       "tabs": {

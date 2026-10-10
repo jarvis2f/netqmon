@@ -164,6 +164,18 @@ export function ApplicationsDashboard({
     router.replace(`/applications?${params.toString()}`, { scroll: false });
   };
 
+  const fullDetailsHref = (application: ApplicationSummary) => {
+    const params = new URLSearchParams({
+      category: application.category_id,
+      range: initialRange,
+    });
+    if (initialRange === "custom" && initialFrom && initialTo) {
+      params.set("from", initialFrom);
+      params.set("to", initialTo);
+    }
+    return `/applications/${encodeURIComponent(application.application_id)}?${params.toString()}`;
+  };
+
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase();
     if (!query) return items;
@@ -339,7 +351,7 @@ export function ApplicationsDashboard({
           selected && (
             <div className="ml-auto">
               <Link
-                href={`/applications/${encodeURIComponent(selected.application_id)}?category=${encodeURIComponent(selected.category_id)}`}
+                href={fullDetailsHref(selected)}
                 className={buttonVariants({ size: "sm" })}
               >
                 {t("openFullDetails")}
