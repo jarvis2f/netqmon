@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=netqmon-agent
-PKG_VERSION:=1.0.2-beta.9
+PKG_VERSION:=1.0.2-beta.10
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=netqmon Authors
