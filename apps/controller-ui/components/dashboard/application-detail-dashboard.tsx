@@ -502,15 +502,20 @@ export function ApplicationDetailDashboard({
       title={
         app?.application_id === "unknown"
           ? t("detail.unknownApp")
-          : app?.name || formatIdentifier(app?.application_id ?? applicationId)
+          : app?.application_id === "protocol-only"
+            ? t("protocolOnlyApp")
+            : app?.name ||
+              formatIdentifier(app?.application_id ?? applicationId)
       }
       subtitle={
-        app
-          ? t("detail.subtitle", {
-              category: app.category_id,
-              confidence: formatPercent(app.confidence ?? 0),
-            })
-          : t("detail.fallbackSubtitle")
+        app?.application_id === "protocol-only"
+          ? t("protocolOnlyDetailSubtitle")
+          : app
+            ? t("detail.subtitle", {
+                category: app.category_id,
+                confidence: formatPercent(app.confidence ?? 0),
+              })
+            : t("detail.fallbackSubtitle")
       }
       username={username}
       isLive={false}

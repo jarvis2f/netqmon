@@ -319,15 +319,19 @@ export function ApplicationsDashboard({
         title={
           selected?.application_id === "unknown"
             ? tStatus("unknown")
-            : selected?.name ||
-              (selected?.application_id
-                ? formatIdentifier(selected.application_id)
-                : t("columns.application"))
+            : selected?.application_id === "protocol-only"
+              ? t("protocolOnlyApp")
+              : selected?.name ||
+                (selected?.application_id
+                  ? formatIdentifier(selected.application_id)
+                  : t("columns.application"))
         }
         subtitle={
-          selected?.category_id
-            ? `${t("columns.trafficClass")}: ${selected.category_id}`
-            : undefined
+          selected?.application_id === "protocol-only"
+            ? t("protocolOnlyDescription")
+            : selected?.category_id
+              ? `${t("columns.trafficClass")}: ${selected.category_id}`
+              : undefined
         }
         footerActions={
           selected && (

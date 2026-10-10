@@ -297,6 +297,9 @@
     "notFound": "未找到应用",
     "notFoundSearch": "没有应用匹配当前搜索条件。",
     "notFoundEmpty": "尚未记录到分类流量。",
+    "protocolOnlyApp": "协议已识别",
+    "protocolOnlyDescription": "具体应用未知",
+    "protocolOnlyDetailSubtitle": "按已识别协议汇总；尚未识别到具体应用。",
     "openFullDetails": "查看完整详情",
     "columns": {
       "application": "应用",

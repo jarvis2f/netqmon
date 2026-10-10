@@ -29,6 +29,7 @@ const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_GATEWAY_OFFLINE_AFTER_MS: u64 = 30_000;
 const DEFAULT_INSIGHT_WINDOW_MS: u64 = DAY_MS;
 const MAX_INSIGHT_WINDOW_MS: u64 = 30 * DAY_MS;
+const PROTOCOL_ONLY_APPLICATION_ID: &str = "protocol-only";
 
 pub(crate) fn router() -> Router<CollectorState> {
     Router::new()
@@ -1257,7 +1258,7 @@ async fn applications(
             scalar(
                 connection,
                 "SELECT COUNT(*) FROM (
-                    SELECT 1 FROM traffic_application_minute
+                    SELECT application_id, category_id FROM traffic_application_minute
                     WHERE timestamp >= ?1 AND timestamp < ?2
                     GROUP BY application_id, category_id
                  )",
@@ -1267,44 +1268,67 @@ async fn applications(
             scalar(
                 connection,
                 "SELECT COUNT(*) FROM (
-                    SELECT 1 FROM traffic_application_minute
+                    SELECT application_id, category_id FROM traffic_application_minute
                     GROUP BY application_id, category_id
                  )",
                 [],
             )?
         };
         let query_sql = if window.is_some() {
-            "SELECT t.application_id, t.category_id, SUM(t.upload_bytes), SUM(t.download_bytes),
-                    SUM(t.packets), SUM(t.flow_count), MAX(t.timestamp),
-                    (SELECT COUNT(DISTINCT f.device_id) FROM flow_sessions f
-                     WHERE f.application_id = t.application_id AND f.device_id IS NOT NULL
-                       AND f.last_seen_at >= ?1 AND f.last_seen_at < ?2),
+            "WITH app_totals AS (
+                 SELECT application_id, category_id, SUM(upload_bytes) AS upload_bytes,
+                        SUM(download_bytes) AS download_bytes, SUM(packets) AS packets,
+                        SUM(flow_count) AS flow_count, MAX(timestamp) AS last_seen
+                 FROM traffic_application_minute
+                 WHERE timestamp >= ?1 AND timestamp < ?2
+                 GROUP BY application_id, category_id
+             ), client_counts AS (
+                 SELECT CASE WHEN COALESCE(application_id, 'unknown') = 'unknown' AND COALESCE(NULLIF(protocol_id, ''), 'unknown') != 'unknown'
+                             THEN 'protocol-only' ELSE COALESCE(application_id, 'unknown') END AS application_id,
+                        COUNT(DISTINCT device_id) AS client_count
+                 FROM flow_sessions
+                 WHERE device_id IS NOT NULL AND last_seen_at >= ?1 AND last_seen_at < ?2
+                 GROUP BY CASE WHEN COALESCE(application_id, 'unknown') = 'unknown' AND COALESCE(NULLIF(protocol_id, ''), 'unknown') != 'unknown'
+                               THEN 'protocol-only' ELSE COALESCE(application_id, 'unknown') END
+             )
+             SELECT t.application_id, t.category_id, t.upload_bytes, t.download_bytes,
+                    t.packets, t.flow_count, t.last_seen, COALESCE(c.client_count, 0),
                     CASE
-                        WHEN t.application_id = 'unknown' THEN NULL
+                        WHEN t.application_id IN ('unknown', 'protocol-only') THEN NULL
                         ELSE (SELECT f.organization_id FROM flow_sessions f
                               WHERE f.application_id = t.application_id
                                 AND f.organization_id IS NOT NULL AND f.organization_id != 'unknown'
                               LIMIT 1)
                     END
-             FROM traffic_application_minute t
-             WHERE t.timestamp >= ?1 AND t.timestamp < ?2
-             GROUP BY t.application_id, t.category_id
-             ORDER BY SUM(t.upload_bytes + t.download_bytes) DESC, t.application_id
+             FROM app_totals t LEFT JOIN client_counts c ON c.application_id = t.application_id
+             ORDER BY t.upload_bytes + t.download_bytes DESC, t.application_id
              LIMIT ?3 OFFSET ?4"
         } else {
-            "SELECT t.application_id, t.category_id, SUM(t.upload_bytes), SUM(t.download_bytes),
-                    SUM(t.packets), SUM(t.flow_count), MAX(t.timestamp),
-                    (SELECT COUNT(DISTINCT f.device_id) FROM flow_sessions f
-                     WHERE f.application_id = t.application_id AND f.device_id IS NOT NULL),
+            "WITH app_totals AS (
+                 SELECT application_id, category_id, SUM(upload_bytes) AS upload_bytes,
+                        SUM(download_bytes) AS download_bytes, SUM(packets) AS packets,
+                        SUM(flow_count) AS flow_count, MAX(timestamp) AS last_seen
+                 FROM traffic_application_minute
+                 GROUP BY application_id, category_id
+             ), client_counts AS (
+                 SELECT CASE WHEN COALESCE(application_id, 'unknown') = 'unknown' AND COALESCE(NULLIF(protocol_id, ''), 'unknown') != 'unknown'
+                             THEN 'protocol-only' ELSE COALESCE(application_id, 'unknown') END AS application_id,
+                        COUNT(DISTINCT device_id) AS client_count
+                 FROM flow_sessions WHERE device_id IS NOT NULL
+                 GROUP BY CASE WHEN COALESCE(application_id, 'unknown') = 'unknown' AND COALESCE(NULLIF(protocol_id, ''), 'unknown') != 'unknown'
+                               THEN 'protocol-only' ELSE COALESCE(application_id, 'unknown') END
+             )
+             SELECT t.application_id, t.category_id, t.upload_bytes, t.download_bytes,
+                    t.packets, t.flow_count, t.last_seen, COALESCE(c.client_count, 0),
                     CASE
-                        WHEN t.application_id = 'unknown' THEN NULL
+                        WHEN t.application_id IN ('unknown', 'protocol-only') THEN NULL
                         ELSE (SELECT f.organization_id FROM flow_sessions f
                               WHERE f.application_id = t.application_id
                                 AND f.organization_id IS NOT NULL AND f.organization_id != 'unknown'
                               LIMIT 1)
                     END
-             FROM traffic_application_minute t GROUP BY t.application_id, t.category_id
-             ORDER BY SUM(t.upload_bytes + t.download_bytes) DESC, t.application_id
+             FROM app_totals t LEFT JOIN client_counts c ON c.application_id = t.application_id
+             ORDER BY t.upload_bytes + t.download_bytes DESC, t.application_id
              LIMIT ?1 OFFSET ?2"
         };
         let mut statement = connection.prepare(query_sql)?;
@@ -1328,7 +1352,10 @@ async fn applications(
 fn map_application_row(row: &Row<'_>, inner: &crate::CollectorInner) -> rusqlite::Result<Value> {
     let application_id = row.get::<_, String>(0)?;
     let application_metadata = inner.classifier.application_metadata(&application_id);
-    let organization_id = if application_id == "unknown" {
+    let organization_id = if matches!(
+        application_id.as_str(),
+        "unknown" | PROTOCOL_ONLY_APPLICATION_ID
+    ) {
         None
     } else {
         row.get::<_, Option<String>>(8)?
@@ -1353,6 +1380,16 @@ fn map_application_row(row: &Row<'_>, inner: &crate::CollectorInner) -> rusqlite
         "organization_name": organization_metadata.as_ref().map(|metadata| metadata.name.clone()),
         "icon": icon_json(application_metadata),
     }))
+}
+
+fn sqlite_application_flow_filter(id_parameter: &str, prefix: &str) -> String {
+    let application = format!("COALESCE({prefix}application_id, 'unknown')");
+    let protocol = format!("COALESCE(NULLIF({prefix}protocol_id, ''), 'unknown')");
+    format!(
+        "(({id_parameter} = '{PROTOCOL_ONLY_APPLICATION_ID}' AND {application} = 'unknown' AND {protocol} != 'unknown') \
+         OR ({id_parameter} = 'unknown' AND {application} = 'unknown' AND {protocol} = 'unknown') \
+         OR ({id_parameter} NOT IN ('unknown', '{PROTOCOL_ONLY_APPLICATION_ID}') AND {application} = {id_parameter}))"
+    )
 }
 
 async fn organizations(
@@ -1527,33 +1564,35 @@ async fn application_detail(
             Err(error) => storage_error(error),
         };
     }
+    let summary_sql = "SELECT application_id, category_id, SUM(upload_bytes), SUM(download_bytes),
+                              SUM(packets), SUM(flow_count), MAX(timestamp)
+                       FROM traffic_application_minute
+                       WHERE application_id = ?1 AND (?2 IS NULL OR category_id = ?2)
+                       GROUP BY application_id, category_id";
     let result = inner
         .storage
         .connection()
-        .query_row(
-            "SELECT application_id, category_id, SUM(upload_bytes), SUM(download_bytes),
-                    SUM(packets), SUM(flow_count), MAX(timestamp)
-             FROM traffic_application_minute
-             WHERE application_id = ?1 AND (?2 IS NULL OR category_id = ?2)
-             GROUP BY application_id, category_id",
-            params![id, category],
-            |row| summary_row(row, &["application_id", "category_id"]),
-        )
+        .query_row(summary_sql, params![id, category], |row| {
+            summary_row(row, &["application_id", "category_id"])
+        })
         .optional();
     match result {
         Ok(Some(mut value)) => {
             let connection = inner.storage.connection();
             let classifier = connection.query_row(
-                "SELECT COUNT(DISTINCT device_id), COUNT(DISTINCT domain),
+                &format!("SELECT COUNT(DISTINCT device_id), COUNT(DISTINCT domain),
                         COUNT(DISTINCT hex(remote_ip)), AVG(COALESCE(classification_confidence, 0)),
                         COALESCE(MAX(classification_reason), 'no matching rule'),
                         COALESCE(MAX(CASE
-                            WHEN ?1 != 'unknown' AND organization_id IS NOT NULL AND organization_id != 'unknown'
+                            WHEN ?1 NOT IN ('unknown', '{PROTOCOL_ONLY_APPLICATION_ID}')
+                             AND organization_id IS NOT NULL AND organization_id != 'unknown'
                             THEN organization_id
                         END), 'unknown')
                  FROM flow_sessions
-                 WHERE application_id = ?1
-                   AND (?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)",
+                 WHERE {flow_filter}
+                   AND (?1 = '{PROTOCOL_ONLY_APPLICATION_ID}' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)",
+                    flow_filter = sqlite_application_flow_filter("?1", "")
+                ),
                 params![id, category],
                 |row| {
                     Ok((
@@ -1624,14 +1663,15 @@ fn query_application_protocols(
     id: &str,
     category: Option<&str>,
 ) -> rusqlite::Result<Vec<Value>> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(&format!(
         "SELECT COALESCE(protocol_id, 'unknown'), COUNT(*)
          FROM flow_sessions
-         WHERE application_id = ?1
-           AND (?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)
+         WHERE {flow_filter}
+           AND (?1 = '{PROTOCOL_ONLY_APPLICATION_ID}' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)
          GROUP BY COALESCE(protocol_id, 'unknown')
          ORDER BY COUNT(*) DESC, COALESCE(protocol_id, 'unknown')",
-    )?;
+        flow_filter = sqlite_application_flow_filter("?1", "")
+    ))?;
     statement
         .query_map(params![id, category], |row| {
             Ok(json!({
@@ -1761,14 +1801,15 @@ fn query_application_traffic(
 ) -> rusqlite::Result<Value> {
     let duration = to.saturating_sub(from);
     let bucket_ms = duration.div_ceil(180).max(60_000).div_ceil(60_000) * 60_000;
-    let mut statement = connection.prepare(
+    let table = "traffic_application_minute";
+    let mut statement = connection.prepare(&format!(
         "SELECT (timestamp / ?1) * ?1 AS bucket, SUM(upload_bytes), SUM(download_bytes),
                 SUM(packets), SUM(flow_count)
-         FROM traffic_application_minute
+         FROM {table}
          WHERE application_id = ?2 AND (?3 IS NULL OR category_id = ?3)
            AND timestamp >= ?4 AND timestamp < ?5
-         GROUP BY bucket ORDER BY bucket",
-    )?;
+         GROUP BY bucket ORDER BY bucket"
+    ))?;
     let points = statement
         .query_map(
             params![to_i64(bucket_ms), id, category, to_i64(from), to_i64(to)],
@@ -1794,7 +1835,12 @@ fn query_application_clients(
     from: u64,
     to: u64,
 ) -> rusqlite::Result<Value> {
-    let mut statement = connection.prepare(
+    let category_filter = if id == PROTOCOL_ONLY_APPLICATION_ID {
+        "?1 = 'protocol-only' OR ?2 IS NULL OR COALESCE(f.category_id, 'unknown') = ?2"
+    } else {
+        "?2 IS NULL OR COALESCE(f.category_id, 'unknown') = ?2"
+    };
+    let mut statement = connection.prepare(&format!(
         "SELECT d.id, d.mac, COALESCE(d.display_name, d.hostname, ''), d.vendor,
                 d.device_type, d.os_family, d.model, d.identity_confidence,
                 COALESCE((SELECT json_group_array(json_object(
@@ -1807,12 +1853,13 @@ fn query_application_clients(
                 d.model_confidence, d.private_mac, d.last_seen,
                 SUM(f.upload_bytes), SUM(f.download_bytes), COUNT(*)
          FROM flow_sessions f JOIN devices d ON d.id = f.device_id
-         WHERE f.application_id = ?1
-           AND (?2 IS NULL OR COALESCE(f.category_id, 'unknown') = ?2)
+         WHERE {application_filter}
+           AND ({category_filter})
            AND f.last_seen_at >= ?3 AND f.last_seen_at < ?4
          GROUP BY d.id ORDER BY SUM(f.upload_bytes + f.download_bytes) DESC
          LIMIT ?5 OFFSET ?6",
-    )?;
+        application_filter = sqlite_application_flow_filter("?1", "f.")
+    ))?;
     let items = statement
         .query_map(
             params![
@@ -1846,13 +1893,19 @@ fn query_application_domains(
     from: u64,
     to: u64,
 ) -> rusqlite::Result<Value> {
-    let mut statement = connection.prepare(
+    let category_filter = if id == PROTOCOL_ONLY_APPLICATION_ID {
+        "?1 = 'protocol-only' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
+    } else {
+        "?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
+    };
+    let mut statement = connection.prepare(&format!(
         "SELECT domain, SUM(upload_bytes), SUM(download_bytes), SUM(packets), COUNT(*), MAX(last_seen_at)
-         FROM flow_sessions WHERE application_id = ?1 AND domain IS NOT NULL
-           AND (?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)
+         FROM flow_sessions WHERE {application_filter} AND domain IS NOT NULL
+           AND ({category_filter})
            AND last_seen_at >= ?3 AND last_seen_at < ?4
          GROUP BY domain ORDER BY SUM(upload_bytes + download_bytes) DESC LIMIT ?5 OFFSET ?6",
-    )?;
+        application_filter = sqlite_application_flow_filter("?1", "")
+    ))?;
     let items = statement
         .query_map(
             params![
@@ -1883,14 +1936,20 @@ fn query_application_destinations(
     from: u64,
     to: u64,
 ) -> rusqlite::Result<Value> {
-    let mut statement = connection.prepare(
+    let category_filter = if id == PROTOCOL_ONLY_APPLICATION_ID {
+        "?1 = 'protocol-only' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
+    } else {
+        "?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
+    };
+    let mut statement = connection.prepare(&format!(
         "SELECT remote_ip, MAX(domain), SUM(upload_bytes), SUM(download_bytes), SUM(packets),
                 COUNT(*), MAX(last_seen_at)
-         FROM flow_sessions WHERE application_id = ?1
-           AND (?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)
+         FROM flow_sessions WHERE {application_filter}
+           AND ({category_filter})
            AND last_seen_at >= ?3 AND last_seen_at < ?4
          GROUP BY remote_ip ORDER BY SUM(upload_bytes + download_bytes) DESC LIMIT ?5 OFFSET ?6",
-    )?;
+        application_filter = sqlite_application_flow_filter("?1", "")
+    ))?;
     let items = statement
         .query_map(
             params![
@@ -1928,16 +1987,22 @@ fn query_application_flows(
         .application_metadata(id)
         .as_ref()
         .map(|metadata| metadata.name.clone());
-    let mut statement = connection.prepare(
+    let category_filter = if id == PROTOCOL_ONLY_APPLICATION_ID {
+        "?1 = 'protocol-only' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
+    } else {
+        "?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
+    };
+    let mut statement = connection.prepare(&format!(
         "SELECT id, client_ip, client_port, remote_ip, remote_port, protocol, direction,
                 domain, category_id, classification_confidence, classification_reason,
                 upload_bytes, download_bytes, packets, started_at, last_seen_at, ended_at,
                 scope, path_type, nat, source_segment, destination_segment
-         FROM flow_sessions WHERE application_id = ?1
-           AND (?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)
+         FROM flow_sessions WHERE {application_filter}
+           AND ({category_filter})
            AND last_seen_at >= ?3 AND last_seen_at < ?4
          ORDER BY last_seen_at DESC LIMIT ?5 OFFSET ?6",
-    )?;
+        application_filter = sqlite_application_flow_filter("?1", "")
+    ))?;
     let items = statement.query_map(
         params![id, category, to_i64(from), to_i64(to), i64::from(page.limit), to_i64(page.offset)],
         |row| {

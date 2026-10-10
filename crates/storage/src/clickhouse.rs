@@ -65,18 +65,22 @@ const INCREMENTAL_ROLLUPS_MIGRATION: &str =
     include_str!("../../../migrations/clickhouse/0004_incremental_rollups.sql");
 const QUERY_AND_ACTIVITY_MIGRATION: &str =
     include_str!("../../../migrations/clickhouse/0005_query_and_activity_indexes.sql");
-const MIGRATIONS: [(u32, &str); 5] = [
+const PROTOCOL_ONLY_APPLICATION_MIGRATION: &str =
+    include_str!("../../../migrations/clickhouse/0006_protocol_only_app_rollup.sql");
+const MIGRATIONS: [(u32, &str); 6] = [
     (1, INITIAL_MIGRATION),
     (2, PROTOCOL_MIGRATION),
     (3, BATCH_DEDUPLICATION_MIGRATION),
     (4, INCREMENTAL_ROLLUPS_MIGRATION),
     (5, QUERY_AND_ACTIVITY_MIGRATION),
+    (6, PROTOCOL_ONLY_APPLICATION_MIGRATION),
 ];
 const MINUTE_MS: i64 = 60 * 1_000;
 const HOUR_MS: i64 = 60 * MINUTE_MS;
 const DAY_MS: i64 = 24 * HOUR_MS;
 const FLOW_CHECKPOINT_MS: i64 = 5 * MINUTE_MS;
 const MAX_DNS_CACHE_KEYS: usize = 16_384;
+const PROTOCOL_ONLY_APPLICATION_ID: &str = "protocol-only";
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct DnsLookupKey {
@@ -812,8 +816,10 @@ impl ClickHouseStorage {
             })
             .unwrap_or(0);
 
-        let app_count_sql = "SELECT count(distinct application_id) AS c FROM traffic_application_minute FORMAT JSON";
-        let app_res = self.client.query_json(app_count_sql)?;
+        let app_count_sql = "SELECT count() AS c FROM (
+                 SELECT DISTINCT application_id FROM traffic_application_minute
+             ) FORMAT JSON";
+        let app_res = self.client.query_json(&app_count_sql)?;
         let applications = app_res["data"]
             .as_array()
             .and_then(|a| a.first())
@@ -1634,10 +1640,11 @@ impl ClickHouseStorage {
             format!(" AND timestamp >= {from} AND timestamp < {to}")
         });
         let count_sql = format!(
-            "SELECT count() AS c FROM (SELECT application_id, category_id
-             FROM traffic_application_minute
-             WHERE 1 = 1{time_filter}
-             GROUP BY application_id, category_id) FORMAT JSON"
+            "SELECT count() AS c FROM (
+                 SELECT application_id, category_id FROM traffic_application_minute
+                 WHERE 1 = 1{time_filter}
+                 GROUP BY application_id, category_id
+             ) FORMAT JSON"
         );
         let count_result = self.client.query_json(&count_sql)?;
         let total = count_result["data"]
@@ -1652,23 +1659,27 @@ impl ClickHouseStorage {
                 format!("device_id IS NOT NULL AND last_seen_at >= {from} AND last_seen_at < {to}")
             },
         );
+        let flow_application = application_group_expression("application_id", "protocol_id");
         let sql = format!(
-            "SELECT a.application_id, a.category_id, sum(a.upload_bytes) AS upload_bytes,
-                    sum(a.download_bytes) AS download_bytes, sum(a.packets) AS packets,
-                    sum(a.flow_count) AS flow_count, max(a.timestamp) AS last_seen,
-                    coalesce(c.client_count, 0) AS client_count,
-                    if(a.application_id = 'unknown', '', ifNull(nullIf(c.organization_id, ''), '')) AS organization_id
-             FROM traffic_application_minute AS a
-             LEFT JOIN (
-                 SELECT application_id,
+            "WITH app_totals AS (
+                 SELECT application_id, category_id, sum(upload_bytes) AS upload_bytes,
+                        sum(download_bytes) AS download_bytes, sum(packets) AS packets,
+                        sum(flow_count) AS flow_count, max(timestamp) AS last_seen
+                 FROM traffic_application_minute
+                 WHERE 1 = 1{time_filter}
+                 GROUP BY application_id, category_id
+             ), client_counts AS (
+                 SELECT {flow_application} AS application_id,
                         uniqExactIf(device_id, {client_filter}) AS client_count,
                         anyIf(organization_id, organization_id IS NOT NULL AND organization_id != 'unknown') AS organization_id
-                 FROM flow_sessions FINAL
-                 GROUP BY application_id
-             ) AS c ON c.application_id = a.application_id
-             WHERE 1 = 1{time_filter}
-             GROUP BY a.application_id, a.category_id, c.client_count, c.organization_id
-             ORDER BY upload_bytes + download_bytes DESC, a.application_id, a.category_id
+                 FROM flow_sessions FINAL GROUP BY {flow_application}
+             )
+             SELECT a.application_id, a.category_id, a.upload_bytes, a.download_bytes,
+                    a.packets, a.flow_count, a.last_seen, coalesce(c.client_count, 0) AS client_count,
+                    if(a.application_id IN ('unknown', '{PROTOCOL_ONLY_APPLICATION_ID}'), '', ifNull(nullIf(c.organization_id, ''), '')) AS organization_id
+             FROM app_totals AS a
+             LEFT JOIN client_counts AS c ON c.application_id = a.application_id
+             ORDER BY a.upload_bytes + a.download_bytes DESC, a.application_id, a.category_id
              LIMIT {limit} OFFSET {offset} FORMAT JSON"
         );
         let result = self.client.query_json(&sql)?;
@@ -1782,9 +1793,9 @@ impl ClickHouseStorage {
                     sum(upload_bytes) AS upload_bytes, sum(download_bytes) AS download_bytes,
                     sum(packets) AS packets, sum(flow_count) AS flow_count,
                     max(timestamp) AS last_seen
-            FROM traffic_application_minute
+             FROM traffic_application_minute
              WHERE application_id = '{app}'{category_predicate}
-             GROUP BY application_id FORMAT JSON",
+             GROUP BY application_id FORMAT JSON"
         );
         let summary_result = self.client.query_json(&summary_sql)?;
         let Some(summary) = summary_result["data"]
@@ -1794,13 +1805,14 @@ impl ClickHouseStorage {
             return Ok(None);
         };
         let flow_filter = format!(
-            "application_id = '{app}'{}",
-            category.map_or_else(String::new, |value| {
-                format!(
+            "{}{}",
+            application_flow_filter(application_id, ""),
+            category
+                .filter(|_| application_id != PROTOCOL_ONLY_APPLICATION_ID)
+                .map_or_else(String::new, |value| format!(
                     " AND coalesce(category_id, 'unknown') = '{}'",
                     escape_sql(value)
-                )
-            })
+                ))
         );
         let stats_sql = format!(
             "SELECT uniqExact(device_id) AS clients, uniqExact(domain) AS domains,
@@ -1826,7 +1838,7 @@ impl ClickHouseStorage {
             .map(|row| json!({ "id": row["id"].as_str().unwrap_or("unknown"), "flows": json_u64(&row["flows"]) }))
             .collect::<Vec<_>>();
         let stats = stats.unwrap_or(&Value::Null);
-        let organization = if application_id == "unknown" {
+        let organization = if matches!(application_id, "unknown" | PROTOCOL_ONLY_APPLICATION_ID) {
             "unknown"
         } else {
             stats["organization_id"]
@@ -1870,12 +1882,20 @@ impl ClickHouseStorage {
         let app = escape_sql(application_id);
         let from = to_i64(from_ms);
         let to = to_i64(to_ms);
-        let category_filter = category.map_or_else(String::new, |value| {
+        let traffic_category_filter = category.map_or_else(String::new, |value| {
             format!(
                 " AND coalesce(category_id, 'unknown') = '{}'",
                 escape_sql(value)
             )
         });
+        let category_filter = category
+            .filter(|_| application_id != PROTOCOL_ONLY_APPLICATION_ID)
+            .map_or_else(String::new, |value| {
+                format!(
+                    " AND coalesce(category_id, 'unknown') = '{}'",
+                    escape_sql(value)
+                )
+            });
         let page = format!(" LIMIT {limit} OFFSET {offset}");
         if relation == "traffic" {
             let duration = to_ms.saturating_sub(from_ms);
@@ -1886,7 +1906,7 @@ impl ClickHouseStorage {
                         sum(upload_bytes) AS upload_bytes, sum(download_bytes) AS download_bytes,
                         sum(packets) AS packets, sum(flow_count) AS flow_count
                  FROM traffic_application_minute
-                 WHERE application_id = '{app}'{category_filter}
+                 WHERE application_id = '{app}'{traffic_category_filter}
                    AND timestamp >= {from} AND timestamp < {to}
                  GROUP BY timestamp ORDER BY timestamp FORMAT JSON"
             );
@@ -1908,6 +1928,17 @@ impl ClickHouseStorage {
             return Ok(json!({ "bucket_ms": bucket_ms, "points": points }));
         }
 
+        let application_filter = application_flow_filter(application_id, "");
+        let flow_application_filter = application_flow_filter(application_id, "f.");
+        let flow_category_filter = category
+            .filter(|_| application_id != PROTOCOL_ONLY_APPLICATION_ID)
+            .map_or_else(String::new, |value| {
+                format!(
+                    " AND coalesce(f.category_id, 'unknown') = '{}'",
+                    escape_sql(value)
+                )
+            });
+
         let sql = match relation {
             "clients" => format!(
                 "SELECT d.id, d.mac, coalesce(d.display_name, d.hostname, '') AS name,
@@ -1917,7 +1948,7 @@ impl ClickHouseStorage {
                         d.private_mac, d.last_seen, sum(f.upload_bytes) AS upload_bytes,
                         sum(f.download_bytes) AS download_bytes, count() AS flow_count
                  FROM flow_sessions AS f FINAL INNER JOIN devices AS d FINAL ON d.id = f.device_id
-                 WHERE f.application_id = '{app}'{category_filter}
+                 WHERE {flow_application_filter}{flow_category_filter}
                    AND f.last_seen_at >= {from} AND f.last_seen_at < {to}
                  GROUP BY d.id, d.mac, name, d.gateway_id, d.vendor, d.device_type,
                           d.os_family, d.model, d.identity_confidence, d.vendor_confidence,
@@ -1930,7 +1961,7 @@ impl ClickHouseStorage {
                         sum(download_bytes) AS download_bytes, sum(packets) AS packets,
                         count() AS flow_count, max(last_seen_at) AS last_seen
                  FROM flow_sessions FINAL
-                 WHERE application_id = '{app}' AND domain IS NOT NULL{category_filter}
+                 WHERE {application_filter} AND domain IS NOT NULL{category_filter}
                    AND last_seen_at >= {from} AND last_seen_at < {to}
                  GROUP BY domain ORDER BY upload_bytes + download_bytes DESC{page} FORMAT JSON"
             ),
@@ -1939,7 +1970,7 @@ impl ClickHouseStorage {
                         sum(download_bytes) AS download_bytes, sum(packets) AS packets,
                         count() AS flow_count, max(last_seen_at) AS last_seen
                  FROM flow_sessions FINAL
-                 WHERE application_id = '{app}'{category_filter}
+                 WHERE {application_filter}{category_filter}
                    AND last_seen_at >= {from} AND last_seen_at < {to}
                  GROUP BY remote_ip ORDER BY upload_bytes + download_bytes DESC{page} FORMAT JSON"
             ),
@@ -1950,7 +1981,7 @@ impl ClickHouseStorage {
                         upload_bytes, download_bytes, packets, started_at, last_seen_at, ended_at,
                         scope, path_type, nat, source_segment, destination_segment
                  FROM flow_sessions FINAL
-                 WHERE application_id = '{app}'{category_filter}
+                 WHERE {application_filter}{category_filter}
                    AND last_seen_at >= {from} AND last_seen_at < {to}
                  ORDER BY last_seen_at DESC{page} FORMAT JSON"
             ),
@@ -3326,6 +3357,14 @@ impl StorageBackend for ClickHouseStorage {
             let upload = to_i64(flow.upload_bytes);
             let download = to_i64(flow.download_bytes);
             let packets = to_i64(flow.packets);
+            let (application_id, category_id) = if attr.application_id == "unknown"
+                && !attr.protocol_id.is_empty()
+                && attr.protocol_id != "unknown"
+            {
+                (PROTOCOL_ONLY_APPLICATION_ID, "unknown")
+            } else {
+                (attr.application_id.as_str(), attr.category_id.as_str())
+            };
 
             total_rows.push(json!({
                 "timestamp": timestamp,
@@ -3356,8 +3395,8 @@ impl StorageBackend for ClickHouseStorage {
             app_rows.push(json!({
                 "timestamp": timestamp,
                 "gateway_id": batch.gateway_id,
-                "application_id": attr.application_id,
-                "category_id": attr.category_id,
+                "application_id": application_id,
+                "category_id": category_id,
                 "upload_bytes": upload,
                 "download_bytes": download,
                 "packets": packets,
@@ -3755,6 +3794,26 @@ fn url_encode(input: &str) -> String {
         }
     }
     out
+}
+
+fn application_group_expression(application_column: &str, protocol_column: &str) -> String {
+    format!(
+        "if(coalesce({application_column}, 'unknown') = 'unknown' AND coalesce(nullIf({protocol_column}, ''), 'unknown') != 'unknown', '{PROTOCOL_ONLY_APPLICATION_ID}', coalesce({application_column}, 'unknown'))"
+    )
+}
+
+fn application_flow_filter(application_id: &str, prefix: &str) -> String {
+    let application = format!("{prefix}application_id");
+    let protocol = format!("coalesce(nullIf({prefix}protocol_id, ''), 'unknown')");
+    match application_id {
+        "unknown" => format!(
+            "coalesce({application}, 'unknown') = 'unknown' AND coalesce({protocol}, 'unknown') = 'unknown'"
+        ),
+        PROTOCOL_ONLY_APPLICATION_ID => format!(
+            "coalesce({application}, 'unknown') = 'unknown' AND coalesce({protocol}, 'unknown') != 'unknown'"
+        ),
+        value => format!("{application} = '{}'", escape_sql(value)),
+    }
 }
 
 fn escape_sql(input: &str) -> String {

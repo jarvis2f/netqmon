@@ -16,11 +16,15 @@ const PROTOCOL_MIGRATION: &str =
     include_str!("../../../migrations/sqlite/0002_traffic_scope_protocol.sql");
 const SCOPE_TIMESTAMP_MIGRATION: &str =
     include_str!("../../../migrations/sqlite/0003_traffic_scope_timestamp.sql");
-const MIGRATIONS: [(i64, &str); 3] = [
+const PROTOCOL_ONLY_APPLICATION_MIGRATION: &str =
+    include_str!("../../../migrations/sqlite/0004_protocol_only_app_rollup.sql");
+const MIGRATIONS: [(i64, &str); 4] = [
     (1, INITIAL_MIGRATION),
     (2, PROTOCOL_MIGRATION),
     (3, SCOPE_TIMESTAMP_MIGRATION),
+    (4, PROTOCOL_ONLY_APPLICATION_MIGRATION),
 ];
+pub(crate) const PROTOCOL_ONLY_APPLICATION_ID: &str = "protocol-only";
 const MINUTE_MS: i64 = 60 * 1_000;
 const HOUR_MS: i64 = 60 * MINUTE_MS;
 const DAY_MS: i64 = 24 * HOUR_MS;
@@ -2048,6 +2052,17 @@ fn persist_minute_rollups(
         let upload = to_i64(flow.upload_bytes);
         let download = to_i64(flow.download_bytes);
         let packets = to_i64(flow.packets);
+        let (application_id, category_id) = if attribution.application_id == "unknown"
+            && !attribution.protocol_id.is_empty()
+            && attribution.protocol_id != "unknown"
+        {
+            (PROTOCOL_ONLY_APPLICATION_ID, "unknown")
+        } else {
+            (
+                attribution.application_id.as_str(),
+                attribution.category_id.as_str(),
+            )
+        };
         upsert_rollup(
             tx,
             "traffic_total_minute",
@@ -2079,8 +2094,8 @@ fn persist_minute_rollups(
             &[
                 timestamp.into(),
                 batch.gateway_id.clone().into(),
-                attribution.application_id.clone().into(),
-                attribution.category_id.clone().into(),
+                application_id.to_owned().into(),
+                category_id.to_owned().into(),
             ],
             upload,
             download,
