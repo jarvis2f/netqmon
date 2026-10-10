@@ -87,7 +87,7 @@ fn late_dpi_updates_only_matching_sessions_without_changing_counters() {
 fn protocol_only_application_is_listed_from_clickhouse() {
     let _guard = CLICKHOUSE_TEST_LOCK.lock().unwrap();
     let backend = disposable_clickhouse();
-    let mut storage = Storage::clickhouse(backend);
+    let storage = Storage::clickhouse(backend);
     let now = u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -96,11 +96,6 @@ fn protocol_only_application_is_listed_from_clickhouse() {
     )
     .unwrap();
     let gateway_id = format!("protocol-only-{}-{now}", std::process::id());
-    assert!(
-        storage
-            .save_gateway(&gateway_id, "protocol-only-test", "test", &[42; 32], now)
-            .unwrap()
-    );
     let (before_applications, _) = storage
         .clickhouse_storage()
         .unwrap()
@@ -119,34 +114,33 @@ fn protocol_only_application_is_listed_from_clickhouse() {
         .and_then(|app| app["flow_count"].as_i64())
         .unwrap_or_default();
 
-    let batch = TelemetryBatch {
-        gateway_id,
-        boot_id: "protocol-only-test".into(),
-        sequence: 1,
-        sent_at: now,
-        flows: vec![FlowDelta {
-            client_ip: vec![192, 0, 2, 2],
-            client_port: 50000,
-            remote_ip: vec![198, 51, 100, 1],
-            remote_port: 443,
-            protocol: 6,
-            first_seen_unix_ms: now,
-            last_seen_unix_ms: now,
-            upload_bytes: 123,
-            download_bytes: 456,
-            packets: 8,
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-    let attribution = FlowAttribution {
-        protocol_id: "tls".into(),
-        protocol_confidence: 1.0,
-        confidence: 1.0,
-        ..Default::default()
-    };
-    storage
-        .persist_classified_batch(&batch, &[attribution], &[], now)
+    let timestamp = i64::try_from(now).unwrap() / 60_000 * 60_000;
+    let flow_id = format!("{gateway_id}:4:6:c0000202:50000:c6336401:443:0");
+    let client = storage.clickhouse_storage().unwrap().client();
+    client
+        .execute(&format!(
+            "INSERT INTO flow_sessions
+             (id,gateway_id,ip_version,protocol,client_ip,client_port,remote_ip,remote_port,direction,
+              application_id,category_id,traffic_role,protocol_id,upload_bytes,download_bytes,
+              packets,started_at,last_seen_at,ended_at,checkpointed_at,classification_evidence_json)
+             VALUES ('{flow_id}','{gateway_id}',4,6,'c0000202',50000,'c6336401',443,0,
+               'unknown','unknown','unknown','tls',123,456,8,{now},{now},NULL,{now},'[]')"
+        ))
+        .unwrap();
+    client
+        .insert_json_each_row(
+            "traffic_application_minute",
+            &[serde_json::json!({
+                "timestamp": timestamp,
+                "gateway_id": gateway_id,
+                "application_id": "protocol-only",
+                "category_id": "unknown",
+                "upload_bytes": 123,
+                "download_bytes": 456,
+                "packets": 8,
+                "flow_count": 1,
+            })],
+        )
         .unwrap();
 
     let (applications, total) = storage
