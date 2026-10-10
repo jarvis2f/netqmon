@@ -84,7 +84,7 @@ fn late_dpi_updates_only_matching_sessions_without_changing_counters() {
 
 #[test]
 #[ignore = "requires a disposable ClickHouse database"]
-fn protocol_only_application_is_listed_from_clickhouse() {
+fn protocol_applications_are_listed_separately_from_clickhouse() {
     let _guard = CLICKHOUSE_TEST_LOCK.lock().unwrap();
     let backend = disposable_clickhouse();
     let storage = Storage::clickhouse(backend);
@@ -95,22 +95,22 @@ fn protocol_only_application_is_listed_from_clickhouse() {
             .as_millis(),
     )
     .unwrap();
-    let gateway_id = format!("protocol-only-{}-{now}", std::process::id());
+    let gateway_id = format!("protocol-app-{}-{now}", std::process::id());
     let (before_applications, _) = storage
         .clickhouse_storage()
         .unwrap()
         .query_applications_for_window(100, 0, None)
         .unwrap();
-    let previous_protocol_only = before_applications
+    let previous_tls = before_applications
         .iter()
-        .find(|app| app["application_id"] == "protocol-only");
-    let previous_upload_bytes = previous_protocol_only
+        .find(|app| app["application_id"] == "protocol:tls");
+    let previous_upload_bytes = previous_tls
         .and_then(|app| app["upload_bytes"].as_i64())
         .unwrap_or_default();
-    let previous_download_bytes = previous_protocol_only
+    let previous_download_bytes = previous_tls
         .and_then(|app| app["download_bytes"].as_i64())
         .unwrap_or_default();
-    let previous_flow_count = previous_protocol_only
+    let previous_flow_count = previous_tls
         .and_then(|app| app["flow_count"].as_i64())
         .unwrap_or_default();
 
@@ -133,7 +133,7 @@ fn protocol_only_application_is_listed_from_clickhouse() {
             &[serde_json::json!({
                 "timestamp": timestamp,
                 "gateway_id": gateway_id,
-                "application_id": "protocol-only",
+                "application_id": "protocol:tls",
                 "category_id": "unknown",
                 "upload_bytes": 123,
                 "download_bytes": 456,
@@ -150,8 +150,8 @@ fn protocol_only_application_is_listed_from_clickhouse() {
         .unwrap();
     let app = applications
         .iter()
-        .find(|app| app["application_id"] == "protocol-only")
-        .expect("protocol-only traffic should be returned by the application index");
+        .find(|app| app["application_id"] == "protocol:tls")
+        .expect("TLS-only traffic should be returned as a separate application item");
     assert!(total >= 1);
     assert_eq!(app["category_id"], "unknown");
     assert_eq!(

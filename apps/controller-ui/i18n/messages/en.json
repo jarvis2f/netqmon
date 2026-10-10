@@ -297,9 +297,8 @@
     "notFound": "No applications found",
     "notFoundSearch": "No application matches the current search.",
     "notFoundEmpty": "No classified traffic has been recorded yet.",
-    "protocolOnlyApp": "Protocol identified",
-    "protocolOnlyDescription": "Specific application unknown",
-    "protocolOnlyDetailSubtitle": "Traffic grouped by detected protocol; no specific application was identified.",
+    "protocolApplicationDescription": "Protocol identified; specific application unknown",
+    "protocolApplicationDetailSubtitle": "Traffic grouped by this protocol; no specific application was identified.",
     "openFullDetails": "Open full details",
     "columns": {
       "application": "Application",

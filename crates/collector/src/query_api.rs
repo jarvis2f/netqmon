@@ -29,7 +29,7 @@ const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_GATEWAY_OFFLINE_AFTER_MS: u64 = 30_000;
 const DEFAULT_INSIGHT_WINDOW_MS: u64 = DAY_MS;
 const MAX_INSIGHT_WINDOW_MS: u64 = 30 * DAY_MS;
-const PROTOCOL_ONLY_APPLICATION_ID: &str = "protocol-only";
+const PROTOCOL_APPLICATION_PREFIX: &str = "protocol:";
 
 pub(crate) fn router() -> Router<CollectorState> {
     Router::new()
@@ -1284,17 +1284,17 @@ async fn applications(
                  GROUP BY application_id, category_id
              ), client_counts AS (
                  SELECT CASE WHEN COALESCE(application_id, 'unknown') = 'unknown' AND COALESCE(NULLIF(protocol_id, ''), 'unknown') != 'unknown'
-                             THEN 'protocol-only' ELSE COALESCE(application_id, 'unknown') END AS application_id,
+                             THEN 'protocol:' || COALESCE(NULLIF(protocol_id, ''), 'unknown') ELSE COALESCE(application_id, 'unknown') END AS application_id,
                         COUNT(DISTINCT device_id) AS client_count
                  FROM flow_sessions
                  WHERE device_id IS NOT NULL AND last_seen_at >= ?1 AND last_seen_at < ?2
                  GROUP BY CASE WHEN COALESCE(application_id, 'unknown') = 'unknown' AND COALESCE(NULLIF(protocol_id, ''), 'unknown') != 'unknown'
-                               THEN 'protocol-only' ELSE COALESCE(application_id, 'unknown') END
+                               THEN 'protocol:' || COALESCE(NULLIF(protocol_id, ''), 'unknown') ELSE COALESCE(application_id, 'unknown') END
              )
              SELECT t.application_id, t.category_id, t.upload_bytes, t.download_bytes,
                     t.packets, t.flow_count, t.last_seen, COALESCE(c.client_count, 0),
                     CASE
-                        WHEN t.application_id IN ('unknown', 'protocol-only') THEN NULL
+                            WHEN t.application_id IN ('unknown', 'protocol-only') OR t.application_id LIKE 'protocol:%' THEN NULL
                         ELSE (SELECT f.organization_id FROM flow_sessions f
                               WHERE f.application_id = t.application_id
                                 AND f.organization_id IS NOT NULL AND f.organization_id != 'unknown'
@@ -1312,16 +1312,16 @@ async fn applications(
                  GROUP BY application_id, category_id
              ), client_counts AS (
                  SELECT CASE WHEN COALESCE(application_id, 'unknown') = 'unknown' AND COALESCE(NULLIF(protocol_id, ''), 'unknown') != 'unknown'
-                             THEN 'protocol-only' ELSE COALESCE(application_id, 'unknown') END AS application_id,
+                             THEN 'protocol:' || COALESCE(NULLIF(protocol_id, ''), 'unknown') ELSE COALESCE(application_id, 'unknown') END AS application_id,
                         COUNT(DISTINCT device_id) AS client_count
                  FROM flow_sessions WHERE device_id IS NOT NULL
                  GROUP BY CASE WHEN COALESCE(application_id, 'unknown') = 'unknown' AND COALESCE(NULLIF(protocol_id, ''), 'unknown') != 'unknown'
-                               THEN 'protocol-only' ELSE COALESCE(application_id, 'unknown') END
+                               THEN 'protocol:' || COALESCE(NULLIF(protocol_id, ''), 'unknown') ELSE COALESCE(application_id, 'unknown') END
              )
              SELECT t.application_id, t.category_id, t.upload_bytes, t.download_bytes,
                     t.packets, t.flow_count, t.last_seen, COALESCE(c.client_count, 0),
                     CASE
-                        WHEN t.application_id IN ('unknown', 'protocol-only') THEN NULL
+                            WHEN t.application_id IN ('unknown', 'protocol-only') OR t.application_id LIKE 'protocol:%' THEN NULL
                         ELSE (SELECT f.organization_id FROM flow_sessions f
                               WHERE f.application_id = t.application_id
                                 AND f.organization_id IS NOT NULL AND f.organization_id != 'unknown'
@@ -1352,10 +1352,9 @@ async fn applications(
 fn map_application_row(row: &Row<'_>, inner: &crate::CollectorInner) -> rusqlite::Result<Value> {
     let application_id = row.get::<_, String>(0)?;
     let application_metadata = inner.classifier.application_metadata(&application_id);
-    let organization_id = if matches!(
-        application_id.as_str(),
-        "unknown" | PROTOCOL_ONLY_APPLICATION_ID
-    ) {
+    let organization_id = if matches!(application_id.as_str(), "unknown" | "protocol-only") {
+        None
+    } else if application_id.starts_with(PROTOCOL_APPLICATION_PREFIX) {
         None
     } else {
         row.get::<_, Option<String>>(8)?
@@ -1386,9 +1385,9 @@ fn sqlite_application_flow_filter(id_parameter: &str, prefix: &str) -> String {
     let application = format!("COALESCE({prefix}application_id, 'unknown')");
     let protocol = format!("COALESCE(NULLIF({prefix}protocol_id, ''), 'unknown')");
     format!(
-        "(({id_parameter} = '{PROTOCOL_ONLY_APPLICATION_ID}' AND {application} = 'unknown' AND {protocol} != 'unknown') \
+        "(({id_parameter} LIKE '{PROTOCOL_APPLICATION_PREFIX}%' AND {application} = 'unknown' AND {protocol} = substr({id_parameter}, 10)) \
          OR ({id_parameter} = 'unknown' AND {application} = 'unknown' AND {protocol} = 'unknown') \
-         OR ({id_parameter} NOT IN ('unknown', '{PROTOCOL_ONLY_APPLICATION_ID}') AND {application} = {id_parameter}))"
+         OR ({id_parameter} NOT IN ('unknown', 'protocol-only') AND {id_parameter} NOT LIKE '{PROTOCOL_APPLICATION_PREFIX}%' AND {application} = {id_parameter}))"
     )
 }
 
@@ -1584,13 +1583,13 @@ async fn application_detail(
                         COUNT(DISTINCT hex(remote_ip)), AVG(COALESCE(classification_confidence, 0)),
                         COALESCE(MAX(classification_reason), 'no matching rule'),
                         COALESCE(MAX(CASE
-                            WHEN ?1 NOT IN ('unknown', '{PROTOCOL_ONLY_APPLICATION_ID}')
+                            WHEN ?1 NOT IN ('unknown', 'protocol-only') AND ?1 NOT LIKE '{PROTOCOL_APPLICATION_PREFIX}%'
                              AND organization_id IS NOT NULL AND organization_id != 'unknown'
                             THEN organization_id
                         END), 'unknown')
                  FROM flow_sessions
                  WHERE {flow_filter}
-                   AND (?1 = '{PROTOCOL_ONLY_APPLICATION_ID}' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)",
+                   AND (?1 LIKE '{PROTOCOL_APPLICATION_PREFIX}%' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)",
                     flow_filter = sqlite_application_flow_filter("?1", "")
                 ),
                 params![id, category],
@@ -1667,7 +1666,7 @@ fn query_application_protocols(
         "SELECT COALESCE(protocol_id, 'unknown'), COUNT(*)
          FROM flow_sessions
          WHERE {flow_filter}
-           AND (?1 = '{PROTOCOL_ONLY_APPLICATION_ID}' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)
+           AND (?1 LIKE '{PROTOCOL_APPLICATION_PREFIX}%' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)
          GROUP BY COALESCE(protocol_id, 'unknown')
          ORDER BY COUNT(*) DESC, COALESCE(protocol_id, 'unknown')",
         flow_filter = sqlite_application_flow_filter("?1", "")
@@ -1835,8 +1834,8 @@ fn query_application_clients(
     from: u64,
     to: u64,
 ) -> rusqlite::Result<Value> {
-    let category_filter = if id == PROTOCOL_ONLY_APPLICATION_ID {
-        "?1 = 'protocol-only' OR ?2 IS NULL OR COALESCE(f.category_id, 'unknown') = ?2"
+    let category_filter = if id.starts_with(PROTOCOL_APPLICATION_PREFIX) {
+        "?1 LIKE 'protocol:%' OR ?2 IS NULL OR COALESCE(f.category_id, 'unknown') = ?2"
     } else {
         "?2 IS NULL OR COALESCE(f.category_id, 'unknown') = ?2"
     };
@@ -1893,8 +1892,8 @@ fn query_application_domains(
     from: u64,
     to: u64,
 ) -> rusqlite::Result<Value> {
-    let category_filter = if id == PROTOCOL_ONLY_APPLICATION_ID {
-        "?1 = 'protocol-only' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
+    let category_filter = if id.starts_with(PROTOCOL_APPLICATION_PREFIX) {
+        "?1 LIKE 'protocol:%' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
     } else {
         "?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
     };
@@ -1936,8 +1935,8 @@ fn query_application_destinations(
     from: u64,
     to: u64,
 ) -> rusqlite::Result<Value> {
-    let category_filter = if id == PROTOCOL_ONLY_APPLICATION_ID {
-        "?1 = 'protocol-only' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
+    let category_filter = if id.starts_with(PROTOCOL_APPLICATION_PREFIX) {
+        "?1 LIKE 'protocol:%' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
     } else {
         "?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
     };
@@ -1987,8 +1986,8 @@ fn query_application_flows(
         .application_metadata(id)
         .as_ref()
         .map(|metadata| metadata.name.clone());
-    let category_filter = if id == PROTOCOL_ONLY_APPLICATION_ID {
-        "?1 = 'protocol-only' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
+    let category_filter = if id.starts_with(PROTOCOL_APPLICATION_PREFIX) {
+        "?1 LIKE 'protocol:%' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
     } else {
         "?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
     };

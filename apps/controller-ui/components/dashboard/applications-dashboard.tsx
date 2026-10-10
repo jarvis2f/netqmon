@@ -13,6 +13,7 @@ import {
   type TimeRangeValue,
 } from "@/components/data/time-range-picker";
 import { ApplicationIdentity } from "@/components/network/application-identity";
+import { protocolApplicationName } from "@/lib/application-identity";
 import { PropertyRow, SidePanel } from "@/components/overlays/side-panel";
 import { EmptyState } from "@/components/states/empty-state";
 import { ErrorState } from "@/components/states/error-state";
@@ -319,16 +320,15 @@ export function ApplicationsDashboard({
         title={
           selected?.application_id === "unknown"
             ? tStatus("unknown")
-            : selected?.application_id === "protocol-only"
-              ? t("protocolOnlyApp")
-              : selected?.name ||
-                (selected?.application_id
-                  ? formatIdentifier(selected.application_id)
-                  : t("columns.application"))
+            : selected?.application_id
+              ? protocolApplicationName(selected.application_id) ||
+                selected.name ||
+                formatIdentifier(selected.application_id)
+              : selected?.name || t("columns.application")
         }
         subtitle={
-          selected?.application_id === "protocol-only"
-            ? t("protocolOnlyDescription")
+          selected?.application_id?.startsWith("protocol:")
+            ? t("protocolApplicationDescription")
             : selected?.category_id
               ? `${t("columns.trafficClass")}: ${selected.category_id}`
               : undefined

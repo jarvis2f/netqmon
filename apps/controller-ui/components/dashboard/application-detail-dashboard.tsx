@@ -18,6 +18,7 @@ import { ClientDeviceIcon } from "@/components/icons/client-device-icon";
 import { DataTable, type ColumnDef } from "@/components/data/data-table";
 import { MetricCard } from "@/components/data/metric-card";
 import { ApplicationIdentity } from "@/components/network/application-identity";
+import { protocolApplicationName } from "@/lib/application-identity";
 import { FlowPanel } from "@/components/overlays/flow-panel";
 import { EmptyState } from "@/components/states/empty-state";
 import { ErrorState } from "@/components/states/error-state";
@@ -502,14 +503,15 @@ export function ApplicationDetailDashboard({
       title={
         app?.application_id === "unknown"
           ? t("detail.unknownApp")
-          : app?.application_id === "protocol-only"
-            ? t("protocolOnlyApp")
-            : app?.name ||
-              formatIdentifier(app?.application_id ?? applicationId)
+          : app?.application_id
+            ? protocolApplicationName(app.application_id) ||
+              app.name ||
+              formatIdentifier(app.application_id)
+            : app?.name || formatIdentifier(applicationId)
       }
       subtitle={
-        app?.application_id === "protocol-only"
-          ? t("protocolOnlyDetailSubtitle")
+        app?.application_id?.startsWith("protocol:")
+          ? t("protocolApplicationDetailSubtitle")
           : app
             ? t("detail.subtitle", {
                 category: app.category_id,

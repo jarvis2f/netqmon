@@ -67,20 +67,23 @@ const QUERY_AND_ACTIVITY_MIGRATION: &str =
     include_str!("../../../migrations/clickhouse/0005_query_and_activity_indexes.sql");
 const PROTOCOL_ONLY_APPLICATION_MIGRATION: &str =
     include_str!("../../../migrations/clickhouse/0006_protocol_only_app_rollup.sql");
-const MIGRATIONS: [(u32, &str); 6] = [
+const PROTOCOL_APPLICATION_ROLLUP_MIGRATION: &str =
+    include_str!("../../../migrations/clickhouse/0007_protocol_application_rollup.sql");
+const MIGRATIONS: [(u32, &str); 7] = [
     (1, INITIAL_MIGRATION),
     (2, PROTOCOL_MIGRATION),
     (3, BATCH_DEDUPLICATION_MIGRATION),
     (4, INCREMENTAL_ROLLUPS_MIGRATION),
     (5, QUERY_AND_ACTIVITY_MIGRATION),
     (6, PROTOCOL_ONLY_APPLICATION_MIGRATION),
+    (7, PROTOCOL_APPLICATION_ROLLUP_MIGRATION),
 ];
 const MINUTE_MS: i64 = 60 * 1_000;
 const HOUR_MS: i64 = 60 * MINUTE_MS;
 const DAY_MS: i64 = 24 * HOUR_MS;
 const FLOW_CHECKPOINT_MS: i64 = 5 * MINUTE_MS;
 const MAX_DNS_CACHE_KEYS: usize = 16_384;
-const PROTOCOL_ONLY_APPLICATION_ID: &str = "protocol-only";
+const PROTOCOL_APPLICATION_PREFIX: &str = "protocol:";
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct DnsLookupKey {
@@ -1680,7 +1683,7 @@ impl ClickHouseStorage {
              )
              SELECT a.application_id, a.category_id, a.upload_bytes, a.download_bytes,
                     a.packets, a.flow_count, a.last_seen, coalesce(c.client_count, 0) AS client_count,
-                    if(a.application_id IN ('unknown', '{PROTOCOL_ONLY_APPLICATION_ID}'), '', ifNull(nullIf(c.organization_id, ''), '')) AS organization_id
+                    if(a.application_id IN ('unknown', 'protocol-only') OR startsWith(a.application_id, '{PROTOCOL_APPLICATION_PREFIX}'), '', ifNull(nullIf(c.organization_id, ''), '')) AS organization_id
              FROM app_totals AS a
              LEFT JOIN client_counts AS c ON c.application_id = a.application_id
              ORDER BY a.upload_bytes + a.download_bytes DESC, a.application_id, a.category_id
@@ -1812,7 +1815,7 @@ impl ClickHouseStorage {
             "{}{}",
             application_flow_filter(application_id, ""),
             category
-                .filter(|_| application_id != PROTOCOL_ONLY_APPLICATION_ID)
+                .filter(|_| !is_protocol_application_id(application_id))
                 .map_or_else(String::new, |value| format!(
                     " AND coalesce(category_id, 'unknown') = '{}'",
                     escape_sql(value)
@@ -1842,14 +1845,15 @@ impl ClickHouseStorage {
             .map(|row| json!({ "id": row["id"].as_str().unwrap_or("unknown"), "flows": json_u64(&row["flows"]) }))
             .collect::<Vec<_>>();
         let stats = stats.unwrap_or(&Value::Null);
-        let organization = if matches!(application_id, "unknown" | PROTOCOL_ONLY_APPLICATION_ID) {
-            "unknown"
-        } else {
-            stats["organization_id"]
-                .as_str()
-                .filter(|value| !value.is_empty())
-                .unwrap_or("unknown")
-        };
+        let organization =
+            if application_id == "unknown" || is_protocol_application_id(application_id) {
+                "unknown"
+            } else {
+                stats["organization_id"]
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("unknown")
+            };
         Ok(Some(json!({
             "application_id": summary["application_id"].as_str().unwrap_or(application_id),
             "category_id": summary["category_id"].as_str().unwrap_or("unknown"),
@@ -1893,7 +1897,7 @@ impl ClickHouseStorage {
             )
         });
         let category_filter = category
-            .filter(|_| application_id != PROTOCOL_ONLY_APPLICATION_ID)
+            .filter(|_| !is_protocol_application_id(application_id))
             .map_or_else(String::new, |value| {
                 format!(
                     " AND coalesce(category_id, 'unknown') = '{}'",
@@ -1935,7 +1939,7 @@ impl ClickHouseStorage {
         let application_filter = application_flow_filter(application_id, "");
         let flow_application_filter = application_flow_filter(application_id, "f.");
         let flow_category_filter = category
-            .filter(|_| application_id != PROTOCOL_ONLY_APPLICATION_ID)
+            .filter(|_| !is_protocol_application_id(application_id))
             .map_or_else(String::new, |value| {
                 format!(
                     " AND coalesce(f.category_id, 'unknown') = '{}'",
@@ -3361,14 +3365,14 @@ impl StorageBackend for ClickHouseStorage {
             let upload = to_i64(flow.upload_bytes);
             let download = to_i64(flow.download_bytes);
             let packets = to_i64(flow.packets);
-            let (application_id, category_id) = if attr.application_id == "unknown"
+            let protocol_application_id = (attr.application_id == "unknown"
                 && !attr.protocol_id.is_empty()
-                && attr.protocol_id != "unknown"
-            {
-                (PROTOCOL_ONLY_APPLICATION_ID, "unknown")
-            } else {
-                (attr.application_id.as_str(), attr.category_id.as_str())
-            };
+                && attr.protocol_id != "unknown")
+                .then(|| format!("{PROTOCOL_APPLICATION_PREFIX}{}", attr.protocol_id));
+            let (application_id, category_id) = protocol_application_id.as_deref().map_or_else(
+                || (attr.application_id.as_str(), attr.category_id.as_str()),
+                |id| (id, "unknown"),
+            );
 
             total_rows.push(json!({
                 "timestamp": timestamp,
@@ -3802,21 +3806,28 @@ fn url_encode(input: &str) -> String {
 
 fn application_group_expression(application_column: &str, protocol_column: &str) -> String {
     format!(
-        "if(coalesce({application_column}, 'unknown') = 'unknown' AND coalesce(nullIf({protocol_column}, ''), 'unknown') != 'unknown', '{PROTOCOL_ONLY_APPLICATION_ID}', coalesce({application_column}, 'unknown'))"
+        "if(coalesce({application_column}, 'unknown') = 'unknown' AND coalesce(nullIf({protocol_column}, ''), 'unknown') != 'unknown', concat('{PROTOCOL_APPLICATION_PREFIX}', coalesce(nullIf({protocol_column}, ''), 'unknown')), coalesce({application_column}, 'unknown'))"
     )
+}
+
+fn is_protocol_application_id(application_id: &str) -> bool {
+    application_id.starts_with(PROTOCOL_APPLICATION_PREFIX)
 }
 
 fn application_flow_filter(application_id: &str, prefix: &str) -> String {
     let application = format!("{prefix}application_id");
     let protocol = format!("coalesce(nullIf({prefix}protocol_id, ''), 'unknown')");
-    match application_id {
-        "unknown" => format!(
+    if application_id == "unknown" {
+        format!(
             "coalesce({application}, 'unknown') = 'unknown' AND coalesce({protocol}, 'unknown') = 'unknown'"
-        ),
-        PROTOCOL_ONLY_APPLICATION_ID => format!(
-            "coalesce({application}, 'unknown') = 'unknown' AND coalesce({protocol}, 'unknown') != 'unknown'"
-        ),
-        value => format!("{application} = '{}'", escape_sql(value)),
+        )
+    } else if let Some(protocol_id) = application_id.strip_prefix(PROTOCOL_APPLICATION_PREFIX) {
+        format!(
+            "coalesce({application}, 'unknown') = 'unknown' AND {protocol} = '{}'",
+            escape_sql(protocol_id)
+        )
+    } else {
+        format!("{application} = '{}'", escape_sql(application_id))
     }
 }
 

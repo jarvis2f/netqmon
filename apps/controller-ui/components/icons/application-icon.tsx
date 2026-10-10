@@ -10,6 +10,8 @@ import {
   type IconSize,
 } from "./icon-fallback";
 import { LazyRemoteIcon } from "./lazy-remote-icon";
+import { protocolFromApplicationId } from "@/lib/application-identity";
+import { ProtocolIcon } from "./protocol-icon";
 
 export function ApplicationIcon({
   applicationId,
@@ -22,6 +24,9 @@ export function ApplicationIcon({
   icon?: IconMetadata | null;
   size?: IconSize;
 }) {
+  const protocol = protocolFromApplicationId(applicationId);
+  if (protocol) return <ProtocolIcon protocol={protocol} size={size} />;
+
   if (!applicationId || applicationId === "unknown") {
     if (category && category !== "unknown") {
       return <IconFallback icon={getCategoryIcon(category)} size={size} />;
