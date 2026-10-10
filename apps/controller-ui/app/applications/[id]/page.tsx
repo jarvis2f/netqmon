@@ -20,6 +20,7 @@ export default async function ApplicationDetailPage({
   const session = await verifySession();
   if (!session) redirect("/login");
   const { id } = await params;
+  const applicationId = decodeURIComponent(id);
   const query = await searchParams;
   const rawTab = Array.isArray(query.tab) ? query.tab[0] : query.tab;
   const rawCategory = Array.isArray(query.category)
@@ -29,7 +30,7 @@ export default async function ApplicationDetailPage({
   return (
     <ApplicationDetailDashboard
       username={session.username}
-      applicationId={id}
+      applicationId={applicationId}
       categoryId={rawCategory}
       initialTab={
         tab as "overview" | "clients" | "domains" | "destinations" | "flows"
