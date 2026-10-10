@@ -121,7 +121,7 @@ fn migration_and_gateway_survive_reopen() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(migrations, 3);
+    assert_eq!(migrations, i64::try_from(MIGRATIONS.len()).unwrap());
     let index_exists: bool = storage
         .connection()
         .query_row(
@@ -340,6 +340,15 @@ fn initial_database_persists_and_queries_application_rollups() {
                     timestamp, gateway_id, application_id, category_id, upload_bytes, download_bytes,
                     packets, flow_count
                  ) VALUES (?1, 'gateway-1', 'unknown', 'unknown', 10, 20, 1, 1)",
+                [to_i64(NOW) / MINUTE_MS * MINUTE_MS],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO traffic_scope_minute(
+                    timestamp, gateway_id, scope, direction, device_id, application_id,
+                    category_id, domain, remote_ip, upload_bytes, download_bytes, packets, flow_count
+                 ) VALUES (?1, 'gateway-1', 0, 0, 0, 'unknown', 'unknown', '', X'', 10, 20, 1, 1)",
                 [to_i64(NOW) / MINUTE_MS * MINUTE_MS],
             )
             .unwrap();
