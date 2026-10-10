@@ -601,7 +601,10 @@ impl CollectorState {
                 } else {
                     batch.sent_at
                 };
-                inner.realtime.update(batch, &attributions, observed_at);
+                let received_at = unix_time_ms();
+                inner
+                    .realtime
+                    .update(batch, &attributions, observed_at, received_at);
                 inner.accepted_batches = inner.accepted_batches.saturating_add(1);
                 inner.traffic_bytes =
                     batch.flows.iter().fold(inner.traffic_bytes, |total, flow| {

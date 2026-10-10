@@ -25,18 +25,28 @@ fn disposable_clickhouse() -> ClickHouseStorage {
 fn late_dpi_updates_only_matching_sessions_without_changing_counters() {
     let _guard = CLICKHOUSE_TEST_LOCK.lock().unwrap();
     let backend = disposable_clickhouse();
+    let one_flow_id = format!(
+        "one:4:6:{:x?}:50000:{:x?}:443:2",
+        [192, 0, 2, 2],
+        [198, 51, 100, 1]
+    );
+    let two_flow_id = format!(
+        "two:4:6:{:x?}:50000:{:x?}:443:0",
+        [192, 0, 2, 2],
+        [198, 51, 100, 1]
+    );
     backend
         .client()
-        .execute(
+        .execute(&format!(
             "INSERT INTO flow_sessions
-        (id,gateway_id,ip_version,protocol,client_ip,client_port,remote_ip,remote_port,
+        (id,gateway_id,ip_version,protocol,client_ip,client_port,remote_ip,remote_port,direction,
          application_id,category_id,traffic_role,protocol_id,upload_bytes,download_bytes,
          packets,started_at,last_seen_at,ended_at,checkpointed_at,classification_evidence_json)
-        VALUES ('dpi-test','one',4,6,'c0000202',50000,'c6336401',443,
+        VALUES ('{one_flow_id}','one',4,6,'c0000202',50000,'c6336401',443,2,
           'tracker','p2p','tracker_service','unknown',123,456,8,1000,2000,2000,2000,'[]'),
-        ('dpi-test','two',4,6,'c0000202',50000,'c6336401',443,
+        ('{two_flow_id}','two',4,6,'c0000202',50000,'c6336401',443,0,
           'tracker','p2p','tracker_service','unknown',123,456,8,1000,2000,2000,2000,'[]')",
-        )
+        ))
         .unwrap();
     let mut storage = Storage::clickhouse(backend);
     let flow = FlowDelta {
@@ -58,8 +68,8 @@ fn late_dpi_updates_only_matching_sessions_without_changing_counters() {
     };
     storage.reclassify_flow("one", &flow, &attribution).unwrap();
     let rows = storage.clickhouse_storage().unwrap().client().query_json(
-        "SELECT gateway_id,protocol_id,application_id,category_id,traffic_role,upload_bytes,download_bytes,packets
-         FROM flow_sessions FINAL WHERE id='dpi-test' ORDER BY gateway_id").unwrap();
+        &format!("SELECT gateway_id,protocol_id,application_id,category_id,traffic_role,upload_bytes,download_bytes,packets
+         FROM flow_sessions FINAL WHERE id IN ('{one_flow_id}', '{two_flow_id}') ORDER BY gateway_id")).unwrap();
     let rows = rows["data"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["protocol_id"], "tls");

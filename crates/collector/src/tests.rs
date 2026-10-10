@@ -2249,6 +2249,7 @@ async fn overview_reports_interface_counter_sanity_warning() {
             },
             &[],
             1_700_000_001_000,
+            1_700_000_001_000,
         );
     }
     let response = internal_router(state)

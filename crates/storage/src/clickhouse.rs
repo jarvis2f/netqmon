@@ -15,6 +15,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use netqmon_protocol::v1::{FlowLifecycle, TelemetryBatch};
@@ -62,16 +63,35 @@ const BATCH_DEDUPLICATION_MIGRATION: &str =
     include_str!("../../../migrations/clickhouse/0003_batch_deduplication.sql");
 const INCREMENTAL_ROLLUPS_MIGRATION: &str =
     include_str!("../../../migrations/clickhouse/0004_incremental_rollups.sql");
-const MIGRATIONS: [(u32, &str); 4] = [
+const QUERY_AND_ACTIVITY_MIGRATION: &str =
+    include_str!("../../../migrations/clickhouse/0005_query_and_activity_indexes.sql");
+const MIGRATIONS: [(u32, &str); 5] = [
     (1, INITIAL_MIGRATION),
     (2, PROTOCOL_MIGRATION),
     (3, BATCH_DEDUPLICATION_MIGRATION),
     (4, INCREMENTAL_ROLLUPS_MIGRATION),
+    (5, QUERY_AND_ACTIVITY_MIGRATION),
 ];
 const MINUTE_MS: i64 = 60 * 1_000;
 const HOUR_MS: i64 = 60 * MINUTE_MS;
 const DAY_MS: i64 = 24 * HOUR_MS;
 const FLOW_CHECKPOINT_MS: i64 = 5 * MINUTE_MS;
+const MAX_DNS_CACHE_KEYS: usize = 16_384;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct DnsLookupKey {
+    gateway_id: String,
+    client_ip: String,
+    answer_ip: String,
+}
+
+#[derive(Clone, Debug)]
+struct CachedDnsObservation {
+    id: i64,
+    domain: String,
+    observed_at: i64,
+    expires_at: i64,
+}
 
 /// ClickHouse client configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -317,6 +337,7 @@ impl ClickHouseClient {
 pub struct ClickHouseStorage {
     client: ClickHouseClient,
     active_flows: HashMap<FlowKey, ActiveFlow>,
+    dns_cache: Arc<Mutex<HashMap<DnsLookupKey, Vec<CachedDnsObservation>>>>,
 }
 
 impl ClickHouseStorage {
@@ -326,23 +347,49 @@ impl ClickHouseStorage {
         flow: &netqmon_protocol::v1::FlowDelta,
         attribution: &FlowAttribution,
     ) -> StorageResult<()> {
+        let mut matched_active_flow = false;
+        let mut attribution_changed = false;
         for (key, current) in &mut self.active_flows {
-            if crate::sample_matches(key, current, gateway, flow)
-                && attribution.protocol_confidence >= current.attribution.protocol_confidence
-            {
+            if !crate::sample_matches(key, current, gateway, flow) {
+                continue;
+            }
+            matched_active_flow = true;
+            if attribution.protocol_confidence >= current.attribution.protocol_confidence {
+                let previous = current.attribution.clone();
                 crate::apply_late_protocol(&mut current.attribution, attribution);
+                attribution_changed |= current.attribution != previous;
             }
         }
+        // Late DPI can emit the same attribution more than once for an active
+        // sample. ClickHouse persists this as an INSERT ... SELECT rewrite, so
+        // avoid reading and rewriting the row when the in-memory latest value
+        // already matches the incoming result.
+        if matched_active_flow && !attribution_changed {
+            return Ok(());
+        }
+        // DPI samples identify the bidirectional 5-tuple but do not carry the
+        // telemetry direction. SQLite's late-DPI update intentionally matches
+        // all directions, so include every protocol direction in the exact
+        // ClickHouse primary-key lookup as well.
+        let flow_ids = [0, 1, 2]
+            .into_iter()
+            .map(|direction| {
+                let mut key = FlowKey::from_batch(gateway, flow);
+                key.direction = direction;
+                format!("'{}'", escape_sql(&key.id()))
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         let sql=format!("INSERT INTO flow_sessions SELECT * REPLACE ('{protocol_id}' AS protocol_id,{protocol_confidence} AS protocol_confidence,
             if('{category}'='unknown',category_id,'{category}') AS category_id,if('{role}'='unknown',traffic_role,'{role}') AS traffic_role,greatest(classification_confidence,{confidence}) AS classification_confidence,
             '{reason}' AS classification_reason,'{evidence}' AS classification_evidence_json,
             greatest(checkpointed_at+1,toUnixTimestamp64Milli(now64(3))) AS checkpointed_at)
-            FROM flow_sessions FINAL WHERE gateway_id='{gateway}' AND ip_version={ip_version} AND protocol={protocol}
+            FROM flow_sessions FINAL WHERE gateway_id='{gateway}' AND id IN ({flow_ids}) AND ip_version={ip_version} AND protocol={protocol}
             AND client_ip='{client_ip}' AND client_port={client_port} AND remote_ip='{remote_ip}' AND remote_port={remote_port}
             AND started_at<={last} AND last_seen_at>={first} AND protocol_confidence<={protocol_confidence}",
             protocol_id=escape_sql(&attribution.protocol_id),protocol_confidence=attribution.protocol_confidence,
             category=escape_sql(&attribution.category_id),role=escape_sql(&attribution.traffic_role),confidence=attribution.confidence,
-            reason=escape_sql(&attribution.reason),evidence=escape_sql(&attribution.evidence_json),gateway=escape_sql(gateway),
+            reason=escape_sql(&attribution.reason),evidence=escape_sql(&attribution.evidence_json),gateway=escape_sql(gateway),flow_ids=flow_ids,
             ip_version=flow.ip_version,protocol=flow.protocol,client_ip=to_hex(&flow.client_ip),client_port=flow.client_port,
             remote_ip=to_hex(&flow.remote_ip),remote_port=flow.remote_port,last=flow.last_seen_unix_ms.saturating_add(1),first=flow.first_seen_unix_ms.saturating_sub(1));
         self.client.execute(&sql)?;
@@ -359,6 +406,7 @@ impl ClickHouseStorage {
         let mut storage = Self {
             client,
             active_flows: HashMap::new(),
+            dns_cache: Arc::new(Mutex::new(HashMap::new())),
         };
         storage.migrate()?;
         storage.active_flows = storage.load_active_flows()?;
@@ -512,20 +560,73 @@ impl ClickHouseStorage {
         answer_ip: &[u8],
         at_ms: u64,
     ) -> StorageResult<Option<String>> {
-        let client_ip_hex = to_hex(client_ip);
-        let answer_ip_hex = to_hex(answer_ip);
+        let key = DnsLookupKey {
+            gateway_id: gateway_id.to_owned(),
+            client_ip: to_hex(client_ip),
+            answer_ip: to_hex(answer_ip),
+        };
         let at = to_i64(at_ms);
+        {
+            let cache = self
+                .dns_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(observations) = cache.get(&key) {
+                return Ok(resolve_cached_dns(observations, at));
+            }
+        }
+
         let sql = format!(
-            "SELECT domain FROM dns_observations WHERE gateway_id = '{gateway}' AND client_ip = '{client_ip_hex}' AND answer_ip = '{answer_ip_hex}' AND observed_at <= {at} AND expires_at > {at} ORDER BY observed_at DESC, id DESC LIMIT 1 FORMAT JSON",
-            gateway = escape_sql(gateway_id),
+            "SELECT id, domain, observed_at, expires_at FROM dns_observations
+             WHERE gateway_id = '{}' AND client_ip = '{}' AND answer_ip = '{}'
+             FORMAT JSON",
+            escape_sql(&key.gateway_id),
+            key.client_ip,
+            key.answer_ip,
         );
         let result = self.client.query_json(&sql)?;
-        let domain = result["data"]
+        let observations = result["data"]
             .as_array()
-            .and_then(|rows| rows.first())
-            .and_then(|row| row["domain"].as_str())
-            .map(ToOwned::to_owned);
-        Ok(domain)
+            .into_iter()
+            .flatten()
+            .filter_map(|row| {
+                Some(CachedDnsObservation {
+                    id: json_i64(&row["id"]),
+                    domain: row["domain"].as_str()?.to_owned(),
+                    observed_at: json_i64(&row["observed_at"]),
+                    expires_at: json_i64(&row["expires_at"]),
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut cache = self
+            .dns_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= MAX_DNS_CACHE_KEYS
+            && !cache.contains_key(&key)
+            && let Some(evicted) = cache.keys().next().cloned()
+        {
+            cache.remove(&evicted);
+        }
+        let cached = cache.entry(key).or_insert(observations);
+        Ok(resolve_cached_dns(cached, at))
+    }
+
+    fn invalidate_dns_cache(&self, batch: &TelemetryBatch) {
+        if batch.dns_observations.is_empty() {
+            return;
+        }
+        let mut cache = self
+            .dns_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for observation in &batch.dns_observations {
+            cache.remove(&DnsLookupKey {
+                gateway_id: batch.gateway_id.clone(),
+                client_ip: to_hex(&observation.client_ip),
+                answer_ip: to_hex(&observation.answer_ip),
+            });
+        }
     }
 
     pub fn device_evidence_ch(
@@ -593,6 +694,51 @@ impl ClickHouseStorage {
             })
             .collect::<Vec<_>>();
         Ok(json!(evidence))
+    }
+
+    fn device_identity_evidence_by_keys(
+        &self,
+        device_keys: &HashSet<(String, String)>,
+    ) -> StorageResult<HashMap<(String, String), Vec<Value>>> {
+        if device_keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let key_list = device_keys
+            .iter()
+            .map(|(gateway, mac)| format!("('{}', '{}')", escape_sql(gateway), escape_sql(mac)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT gateway_id, mac, source, field, value, confidence, first_seen,
+                    last_seen, hit_count, metadata_json
+             FROM device_evidence FINAL
+             WHERE (gateway_id, mac) IN ({key_list})
+             ORDER BY gateway_id, mac, field, source, value FORMAT JSON"
+        );
+        let result = self.client.query_json(&sql)?;
+        let mut evidence_by_device = HashMap::<(String, String), Vec<Value>>::new();
+        if let Some(rows) = result["data"].as_array() {
+            for evidence in rows {
+                let key = (
+                    evidence["gateway_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    evidence["mac"].as_str().unwrap_or_default().to_owned(),
+                );
+                evidence_by_device.entry(key).or_default().push(json!({
+                    "source": evidence["source"].as_str().unwrap_or_default(),
+                    "field": evidence["field"].as_str().unwrap_or_default(),
+                    "value": evidence["value"].as_str().unwrap_or_default(),
+                    "confidence": json_f64(&evidence["confidence"]),
+                    "first_seen": json_u64(&evidence["first_seen"]),
+                    "last_seen": json_u64(&evidence["last_seen"]),
+                    "hit_count": json_u64(&evidence["hit_count"]),
+                    "metadata_json": evidence["metadata_json"].as_str().unwrap_or("{}"),
+                }));
+            }
+        }
+        Ok(evidence_by_device)
     }
 
     /// Queries total traffic over a half-open time range.
@@ -1004,22 +1150,42 @@ impl ClickHouseStorage {
             .unwrap_or(0);
 
         let traffic_table = window.map_or_else(
-            || "traffic_device_minute AS t".to_owned(),
+            || {
+                "(SELECT gateway_id, device_id, sum(upload_bytes) AS upload_bytes,
+                         sum(download_bytes) AS download_bytes, sum(flow_count) AS flow_count
+                  FROM traffic_device_minute GROUP BY gateway_id, device_id) AS t"
+                    .to_owned()
+            },
             |(from_ms, to_ms)| {
                 format!(
-                    "(SELECT device_id, sum(upload_bytes) AS upload_bytes,
+                    "(SELECT gateway_id, device_id, sum(upload_bytes) AS upload_bytes,
                             sum(download_bytes) AS download_bytes, sum(flow_count) AS flow_count,
                             max(timestamp) AS timestamp
                      FROM traffic_device_minute
                      WHERE timestamp >= {from_ms} AND timestamp < {to_ms}
-                     GROUP BY device_id) AS t"
+                     GROUP BY gateway_id, device_id) AS t"
                 )
             },
         );
-        let session_window = window.map_or_else(String::new, |(from_ms, to_ms)| {
-            format!(" AND last_seen_at >= {from_ms} AND last_seen_at < {to_ms}")
-        });
         let order_by = "sum(t.upload_bytes + t.download_bytes) DESC, d.id";
+        let activity_join = window.map_or_else(
+            || {
+                "(SELECT gateway_id, device_id, max(last_traffic_seen) AS last_traffic_seen
+                  FROM device_traffic_activity GROUP BY gateway_id, device_id) AS f
+                    ON d.gateway_id = f.gateway_id AND d.id = f.device_id"
+                    .to_owned()
+            },
+            |(from_ms, to_ms)| {
+                format!(
+                    "(SELECT gateway_id, device_id, max(last_seen_at) AS last_traffic_seen
+                     FROM flow_sessions FINAL
+                     WHERE (upload_bytes > 0 OR download_bytes > 0 OR packets > 0)
+                       AND last_seen_at >= {from_ms} AND last_seen_at < {to_ms}
+                     GROUP BY gateway_id, device_id) AS f
+                       ON d.gateway_id = f.gateway_id AND d.id = f.device_id"
+                )
+            },
+        );
         let sql = format!(
             "SELECT d.id AS id, d.gateway_id AS gateway_id, d.mac AS mac,
                     d.hostname AS hostname, d.display_name AS display_name, d.vendor AS vendor,
@@ -1036,13 +1202,8 @@ impl ClickHouseStorage {
                     coalesce(sum(t.download_bytes), 0) AS down,
                     coalesce(sum(t.flow_count), 0) AS flow_count
              FROM devices AS d FINAL
-             LEFT JOIN {traffic_table} ON d.id = t.device_id
-             LEFT JOIN (
-                 SELECT device_id, max(last_seen_at) AS last_traffic_seen
-                 FROM flow_sessions FINAL
-                 WHERE (upload_bytes > 0 OR download_bytes > 0 OR packets > 0){session_window}
-                 GROUP BY device_id
-             ) AS f ON d.id = f.device_id
+             LEFT JOIN {traffic_table} ON d.gateway_id = t.gateway_id AND d.id = t.device_id
+             LEFT JOIN {activity_join}
              GROUP BY d.id, d.gateway_id, d.mac, d.hostname, d.display_name, d.vendor,
                       d.device_type, d.os_family, d.model, d.identity_confidence,
                       d.identity_evidence_json, d.vendor_confidence, d.device_type_confidence,
@@ -1052,58 +1213,85 @@ impl ClickHouseStorage {
         );
         let res = self.client.query_json(&sql)?;
         let mut items = Vec::new();
-        if let Some(rows) = res["data"].as_array() {
-            for r in rows {
-                let id = r["id"]
-                    .as_i64()
-                    .or_else(|| r["id"].as_str().and_then(|s| s.parse().ok()))
-                    .unwrap_or(0);
-                let mac_hex = r["mac"].as_str().unwrap_or("");
-                let mac_bytes = from_hex(mac_hex).unwrap_or_default();
-                let mac_str = format_mac_bytes(&mac_bytes);
-                let evidence = self.device_identity_evidence_json(
-                    r["gateway_id"].as_str().unwrap_or_default(),
-                    mac_hex,
-                )?;
-
-                let ip_sql = format!(
-                    "SELECT ip, application_id, application_confidence, application_source
-                     FROM device_addresses FINAL WHERE device_id = {id}
-                     ORDER BY last_seen DESC, ip_version FORMAT JSON"
-                );
-                let mut ips = Vec::new();
-                let mut address_rows = Vec::new();
-                let ip_res = self.client.query_json(&ip_sql)?;
-                if let Some(ip_rows) = ip_res["data"].as_array() {
-                    for ir in ip_rows {
-                        if let Some(ip_hex) = ir["ip"].as_str() {
-                            if let Ok(ip_b) = from_hex(ip_hex) {
-                                ips.push(format_ip_bytes(&ip_b));
-                                address_rows.push(ir);
-                            }
-                        }
-                    }
+        let rows = res["data"].as_array().cloned().unwrap_or_default();
+        let device_keys = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["gateway_id"].as_str().unwrap_or_default().to_owned(),
+                    row["mac"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect::<HashSet<_>>();
+        let evidence_by_device = self.device_identity_evidence_by_keys(&device_keys)?;
+        let device_ids = rows
+            .iter()
+            .map(|row| json_i64(&row["id"]))
+            .collect::<HashSet<_>>();
+        let mut addresses_by_device = HashMap::<i64, Vec<Value>>::new();
+        if !device_ids.is_empty() {
+            let id_list = device_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let addresses_sql = format!(
+                "SELECT device_id, ip, ip_version, application_id, application_confidence,
+                        application_source
+                 FROM device_addresses FINAL WHERE device_id IN ({id_list})
+                 ORDER BY device_id, last_seen DESC, ip_version FORMAT JSON"
+            );
+            let addresses_result = self.client.query_json(&addresses_sql)?;
+            if let Some(address_rows) = addresses_result["data"].as_array() {
+                for address in address_rows {
+                    addresses_by_device
+                        .entry(json_i64(&address["device_id"]))
+                        .or_default()
+                        .push(address.clone());
                 }
-
-                let self_host_application = address_rows
-                    .first()
-                    .filter(|_| address_rows.len() == 1)
-                    .and_then(|address| {
-                        address["application_id"]
-                            .as_str()
-                            .filter(|value| !value.is_empty())
-                            .map(|application_id| {
-                                json!({
-                                    "application_id": application_id,
-                                    "confidence": json_f64(&address["application_confidence"]),
-                                    "source": address["application_source"]
-                                        .as_str()
-                                        .filter(|value| !value.is_empty()),
-                                    "role": "server",
-                                })
+            }
+        }
+        for r in &rows {
+            let id = r["id"]
+                .as_i64()
+                .or_else(|| r["id"].as_str().and_then(|s| s.parse().ok()))
+                .unwrap_or(0);
+            let mac_hex = r["mac"].as_str().unwrap_or("");
+            let mac_bytes = from_hex(mac_hex).unwrap_or_default();
+            let mac_str = format_mac_bytes(&mac_bytes);
+            let evidence = evidence_by_device
+                .get(&(
+                    r["gateway_id"].as_str().unwrap_or_default().to_owned(),
+                    mac_hex.to_owned(),
+                ))
+                .cloned()
+                .unwrap_or_default();
+            let address_rows = addresses_by_device.get(&id).cloned().unwrap_or_default();
+            let ips = address_rows
+                .iter()
+                .filter_map(|address| address["ip"].as_str())
+                .filter_map(|ip_hex| from_hex(ip_hex).ok())
+                .map(|ip| format_ip_bytes(&ip))
+                .collect::<Vec<_>>();
+            let self_host_application = address_rows
+                .first()
+                .filter(|_| address_rows.len() == 1)
+                .and_then(|address| {
+                    address["application_id"]
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .map(|application_id| {
+                            json!({
+                                "application_id": application_id,
+                                "confidence": json_f64(&address["application_confidence"]),
+                                "source": address["application_source"]
+                                    .as_str()
+                                    .filter(|value| !value.is_empty()),
+                                "role": "server",
                             })
-                    });
-                items.push(json!({
+                        })
+                });
+            items.push(json!({
                     "id": id,
                     "mac": mac_str,
                     "ip": ips.first().cloned(),
@@ -1116,21 +1304,20 @@ impl ClickHouseStorage {
                         "os_family": r["os_family"].as_str(),
                         "model": r["model"].as_str(),
                         "confidence": r["identity_confidence"].as_str().unwrap_or("unknown"),
-                        "vendor_confidence": r["vendor_confidence"].as_f64().or_else(|| r["vendor_confidence"].as_str().and_then(|value| value.parse().ok())).unwrap_or(0.0),
-                        "device_type_confidence": r["device_type_confidence"].as_f64().or_else(|| r["device_type_confidence"].as_str().and_then(|value| value.parse().ok())).unwrap_or(0.0),
-                        "os_confidence": r["os_confidence"].as_f64().or_else(|| r["os_confidence"].as_str().and_then(|value| value.parse().ok())).unwrap_or(0.0),
-                        "model_confidence": r["model_confidence"].as_f64().or_else(|| r["model_confidence"].as_str().and_then(|value| value.parse().ok())).unwrap_or(0.0),
+                        "vendor_confidence": json_f64(&r["vendor_confidence"]),
+                        "device_type_confidence": json_f64(&r["device_type_confidence"]),
+                        "os_confidence": json_f64(&r["os_confidence"]),
+                        "model_confidence": json_f64(&r["model_confidence"]),
                         "private_mac": json_u64(&r["private_mac"]) != 0,
                         "evidence": evidence,
                     },
-                    "last_seen": r["last_seen"].as_i64().or_else(|| r["last_seen"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0),
+                    "last_seen": json_i64(&r["last_seen"]),
                     "last_traffic_seen": r["last_traffic_seen"].as_i64().or_else(|| r["last_traffic_seen"].as_str().and_then(|s| s.parse().ok())),
-                    "upload_bytes": r["up"].as_i64().or_else(|| r["up"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0),
-                    "download_bytes": r["down"].as_i64().or_else(|| r["down"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0),
+                    "upload_bytes": json_i64(&r["up"]),
+                    "download_bytes": json_i64(&r["down"]),
                     "flow_count": json_i64(&r["flow_count"]),
                     "self_host_application": self_host_application,
                 }));
-            }
         }
         Ok((items, total))
     }
@@ -1151,7 +1338,10 @@ impl ClickHouseStorage {
         let res = self.client.query_json(&sql)?;
         if let Some(row) = res["data"].as_array().and_then(|a| a.first()) {
             let traffic_sql = format!(
-                "SELECT maxOrNull(last_seen_at) AS last_traffic_seen FROM flow_sessions FINAL WHERE device_id = {id} AND (upload_bytes > 0 OR download_bytes > 0 OR packets > 0) FORMAT JSON"
+                "SELECT maxOrNull(last_traffic_seen) AS last_traffic_seen
+                 FROM device_traffic_activity
+                 WHERE gateway_id = '{}' AND device_id = {id} FORMAT JSON",
+                escape_sql(row["gateway_id"].as_str().unwrap_or_default())
             );
             let traffic_res = self.client.query_json(&traffic_sql)?;
             let last_traffic_seen = traffic_res["data"]
@@ -1442,11 +1632,12 @@ impl ClickHouseStorage {
         window: Option<(i64, i64)>,
     ) -> StorageResult<(Vec<Value>, u64)> {
         let time_filter = window.map_or_else(String::new, |(from, to)| {
-            format!(" WHERE timestamp >= {from} AND timestamp < {to}")
+            format!(" AND timestamp >= {from} AND timestamp < {to}")
         });
         let count_sql = format!(
             "SELECT count() AS c FROM (SELECT application_id, category_id
-             FROM traffic_application_minute{time_filter}
+             FROM traffic_application_minute
+             WHERE 1 = 1{time_filter}
              GROUP BY application_id, category_id) FORMAT JSON"
         );
         let count_result = self.client.query_json(&count_sql)?;
@@ -1456,28 +1647,28 @@ impl ClickHouseStorage {
             .map(|row| json_u64(&row["c"]))
             .unwrap_or(0);
 
-        let client_flow_filter = window.map_or_else(String::new, |(from, to)| {
-            format!(" WHERE last_seen_at >= {from} AND last_seen_at < {to}")
-        });
+        let client_filter = window.map_or_else(
+            || "device_id IS NOT NULL".to_owned(),
+            |(from, to)| {
+                format!("device_id IS NOT NULL AND last_seen_at >= {from} AND last_seen_at < {to}")
+            },
+        );
         let sql = format!(
             "SELECT a.application_id, a.category_id, sum(a.upload_bytes) AS upload_bytes,
                     sum(a.download_bytes) AS download_bytes, sum(a.packets) AS packets,
                     sum(a.flow_count) AS flow_count, max(a.timestamp) AS last_seen,
                     coalesce(c.client_count, 0) AS client_count,
-                    if(a.application_id = 'unknown', '', ifNull(nullIf(o.organization_id, ''), '')) AS organization_id
+                    if(a.application_id = 'unknown', '', ifNull(nullIf(c.organization_id, ''), '')) AS organization_id
              FROM traffic_application_minute AS a
              LEFT JOIN (
-                 SELECT application_id, uniqExactIf(device_id, device_id IS NOT NULL) AS client_count
-                 FROM flow_sessions FINAL{client_flow_filter}
+                 SELECT application_id,
+                        uniqExactIf(device_id, {client_filter}) AS client_count,
+                        anyIf(organization_id, organization_id IS NOT NULL AND organization_id != 'unknown') AS organization_id
+                 FROM flow_sessions FINAL
                  GROUP BY application_id
              ) AS c ON c.application_id = a.application_id
-             LEFT JOIN (
-                 SELECT application_id,
-                        anyIf(organization_id, organization_id IS NOT NULL AND organization_id != 'unknown') AS organization_id
-                 FROM flow_sessions FINAL GROUP BY application_id
-             ) AS o ON o.application_id = a.application_id
-             {time_filter}
-             GROUP BY a.application_id, a.category_id, c.client_count, o.organization_id
+             WHERE 1 = 1{time_filter}
+             GROUP BY a.application_id, a.category_id, c.client_count, c.organization_id
              ORDER BY upload_bytes + download_bytes DESC, a.application_id, a.category_id
              LIMIT {limit} OFFSET {offset} FORMAT JSON"
         );
@@ -1768,105 +1959,118 @@ impl ClickHouseStorage {
         };
         let result = self.client.query_json(&sql)?;
         let mut items = Vec::new();
-        if let Some(rows) = result["data"].as_array() {
-            for row in rows {
-                let item = match relation {
-                    "clients" => {
-                        let mac_hex = row["mac"].as_str().unwrap_or_default();
-                        let mac_bytes = from_hex(mac_hex).unwrap_or_default();
-                        let confidence = |field: &str| {
-                            row[field]
-                                .as_f64()
-                                .or_else(|| {
-                                    row[field].as_str().and_then(|value| value.parse().ok())
-                                })
-                                .unwrap_or(0.0)
-                        };
-                        let private_mac = json_u64(&row["private_mac"]) != 0;
-                        let evidence = self.device_identity_evidence_json(
-                            row["gateway_id"].as_str().unwrap_or_default(),
-                            mac_hex,
-                        )?;
-                        json!({
-                            "id": json_i64(&row["id"]),
-                            "mac": format_mac_bytes(&mac_bytes),
-                            "name": row["name"].as_str().unwrap_or_default(),
+        let rows = result["data"].as_array().cloned().unwrap_or_default();
+        let device_keys = if relation == "clients" {
+            rows.iter()
+                .map(|row| {
+                    (
+                        row["gateway_id"].as_str().unwrap_or_default().to_owned(),
+                        row["mac"].as_str().unwrap_or_default().to_owned(),
+                    )
+                })
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
+        let evidence_by_device = self.device_identity_evidence_by_keys(&device_keys)?;
+        for row in &rows {
+            let item = match relation {
+                "clients" => {
+                    let mac_hex = row["mac"].as_str().unwrap_or_default();
+                    let mac_bytes = from_hex(mac_hex).unwrap_or_default();
+                    let confidence = |field: &str| {
+                        row[field]
+                            .as_f64()
+                            .or_else(|| row[field].as_str().and_then(|value| value.parse().ok()))
+                            .unwrap_or(0.0)
+                    };
+                    let private_mac = json_u64(&row["private_mac"]) != 0;
+                    let evidence = evidence_by_device
+                        .get(&(
+                            row["gateway_id"].as_str().unwrap_or_default().to_owned(),
+                            mac_hex.to_owned(),
+                        ))
+                        .cloned()
+                        .unwrap_or_default();
+                    json!({
+                        "id": json_i64(&row["id"]),
+                        "mac": format_mac_bytes(&mac_bytes),
+                        "name": row["name"].as_str().unwrap_or_default(),
+                        "vendor": row["vendor"].as_str(),
+                        "identity": {
                             "vendor": row["vendor"].as_str(),
-                            "identity": {
-                                "vendor": row["vendor"].as_str(),
-                                "device_type": row["device_type"].as_str(),
-                                "os_family": row["os_family"].as_str(),
-                                "model": row["model"].as_str(),
-                                "confidence": row["identity_confidence"].as_str().unwrap_or("unknown"),
-                                "vendor_confidence": confidence("vendor_confidence"),
-                                "device_type_confidence": confidence("device_type_confidence"),
-                                "os_confidence": confidence("os_confidence"),
-                                "model_confidence": confidence("model_confidence"),
-                                "private_mac": private_mac,
-                                "evidence": evidence,
-                            },
-                            "last_seen": json_i64(&row["last_seen"]),
-                            "upload_bytes": json_i64(&row["upload_bytes"]),
-                            "download_bytes": json_i64(&row["download_bytes"]),
-                            "flow_count": json_u64(&row["flow_count"]),
-                        })
-                    }
-                    "domains" => json!({
-                        "domain": row["domain"].as_str().unwrap_or_default(),
+                            "device_type": row["device_type"].as_str(),
+                            "os_family": row["os_family"].as_str(),
+                            "model": row["model"].as_str(),
+                            "confidence": row["identity_confidence"].as_str().unwrap_or("unknown"),
+                            "vendor_confidence": confidence("vendor_confidence"),
+                            "device_type_confidence": confidence("device_type_confidence"),
+                            "os_confidence": confidence("os_confidence"),
+                            "model_confidence": confidence("model_confidence"),
+                            "private_mac": private_mac,
+                            "evidence": evidence,
+                        },
+                        "last_seen": json_i64(&row["last_seen"]),
+                        "upload_bytes": json_i64(&row["upload_bytes"]),
+                        "download_bytes": json_i64(&row["download_bytes"]),
+                        "flow_count": json_u64(&row["flow_count"]),
+                    })
+                }
+                "domains" => json!({
+                    "domain": row["domain"].as_str().unwrap_or_default(),
+                    "upload_bytes": json_i64(&row["upload_bytes"]),
+                    "download_bytes": json_i64(&row["download_bytes"]),
+                    "packets": json_i64(&row["packets"]),
+                    "flow_count": json_u64(&row["flow_count"]),
+                    "last_seen": json_i64(&row["last_seen"]),
+                }),
+                "destinations" => {
+                    let bytes =
+                        from_hex(row["remote_ip"].as_str().unwrap_or_default()).unwrap_or_default();
+                    json!({
+                        "remote_ip": format_ip_bytes(&bytes),
+                        "domain": row["domain"].as_str(),
                         "upload_bytes": json_i64(&row["upload_bytes"]),
                         "download_bytes": json_i64(&row["download_bytes"]),
                         "packets": json_i64(&row["packets"]),
                         "flow_count": json_u64(&row["flow_count"]),
                         "last_seen": json_i64(&row["last_seen"]),
-                    }),
-                    "destinations" => {
-                        let bytes = from_hex(row["remote_ip"].as_str().unwrap_or_default())
-                            .unwrap_or_default();
-                        json!({
-                            "remote_ip": format_ip_bytes(&bytes),
-                            "domain": row["domain"].as_str(),
-                            "upload_bytes": json_i64(&row["upload_bytes"]),
-                            "download_bytes": json_i64(&row["download_bytes"]),
-                            "packets": json_i64(&row["packets"]),
-                            "flow_count": json_u64(&row["flow_count"]),
-                            "last_seen": json_i64(&row["last_seen"]),
-                        })
-                    }
-                    "flows" => {
-                        let client_ip = from_hex(row["client_ip"].as_str().unwrap_or_default())
-                            .unwrap_or_default();
-                        let remote_ip = from_hex(row["remote_ip"].as_str().unwrap_or_default())
-                            .unwrap_or_default();
-                        json!({
-                            "id": row["id"].as_str().unwrap_or_default(),
-                            "client_ip": format_ip_bytes(&client_ip),
-                            "client_port": json_i64(&row["client_port"]),
-                            "remote_ip": format_ip_bytes(&remote_ip),
-                            "remote_port": json_i64(&row["remote_port"]),
-                            "protocol": json_i64(&row["protocol"]),
-                            "direction": json_i64(&row["direction"]),
-                            "domain": row["domain"].as_str(),
-                            "application": application_id,
-                            "category": row["category_id"].as_str().unwrap_or("unknown"),
-                            "confidence": row["classification_confidence"].as_f64().or_else(|| row["classification_confidence"].as_str().and_then(|v| v.parse().ok())).unwrap_or(0.0),
-                            "reason": row["classification_reason"].as_str().unwrap_or("no matching rule"),
-                            "upload_bytes": json_i64(&row["upload_bytes"]),
-                            "download_bytes": json_i64(&row["download_bytes"]),
-                            "packets": json_i64(&row["packets"]),
-                            "started_at": json_i64(&row["started_at"]),
-                            "last_seen": json_i64(&row["last_seen_at"]),
-                            "ended_at": row.get("ended_at").filter(|v| !v.is_null()).map(json_i64),
-                            "scope": flow_scope_name(json_i64(&row["scope"]) as i32),
-                            "path_type": flow_path_name(json_i64(&row["path_type"]) as i32),
-                            "nat": flow_nat_name(json_i64(&row["nat"]) as i32),
-                            "source_segment": row["source_segment"].as_str().unwrap_or_default(),
-                            "destination_segment": row["destination_segment"].as_str().unwrap_or_default(),
-                        })
-                    }
-                    _ => Value::Null,
-                };
-                items.push(item);
-            }
+                    })
+                }
+                "flows" => {
+                    let client_ip =
+                        from_hex(row["client_ip"].as_str().unwrap_or_default()).unwrap_or_default();
+                    let remote_ip =
+                        from_hex(row["remote_ip"].as_str().unwrap_or_default()).unwrap_or_default();
+                    json!({
+                        "id": row["id"].as_str().unwrap_or_default(),
+                        "client_ip": format_ip_bytes(&client_ip),
+                        "client_port": json_i64(&row["client_port"]),
+                        "remote_ip": format_ip_bytes(&remote_ip),
+                        "remote_port": json_i64(&row["remote_port"]),
+                        "protocol": json_i64(&row["protocol"]),
+                        "direction": json_i64(&row["direction"]),
+                        "domain": row["domain"].as_str(),
+                        "application": application_id,
+                        "category": row["category_id"].as_str().unwrap_or("unknown"),
+                        "confidence": row["classification_confidence"].as_f64().or_else(|| row["classification_confidence"].as_str().and_then(|v| v.parse().ok())).unwrap_or(0.0),
+                        "reason": row["classification_reason"].as_str().unwrap_or("no matching rule"),
+                        "upload_bytes": json_i64(&row["upload_bytes"]),
+                        "download_bytes": json_i64(&row["download_bytes"]),
+                        "packets": json_i64(&row["packets"]),
+                        "started_at": json_i64(&row["started_at"]),
+                        "last_seen": json_i64(&row["last_seen_at"]),
+                        "ended_at": row.get("ended_at").filter(|v| !v.is_null()).map(json_i64),
+                        "scope": flow_scope_name(json_i64(&row["scope"]) as i32),
+                        "path_type": flow_path_name(json_i64(&row["path_type"]) as i32),
+                        "nat": flow_nat_name(json_i64(&row["nat"]) as i32),
+                        "source_segment": row["source_segment"].as_str().unwrap_or_default(),
+                        "destination_segment": row["destination_segment"].as_str().unwrap_or_default(),
+                    })
+                }
+                _ => Value::Null,
+            };
+            items.push(item);
         }
         Ok(json!(items))
     }
@@ -3067,6 +3271,7 @@ impl StorageBackend for ClickHouseStorage {
             }));
         }
         self.insert_batch_rows(batch, "dns_observations", &dns_rows)?;
+        self.invalidate_dns_cache(batch);
 
         // 5. Batch insert into traffic rollup minute tables
         let timestamp = to_i64(batch.sent_at) / MINUTE_MS * MINUTE_MS;
@@ -3305,6 +3510,42 @@ impl StorageBackend for ClickHouseStorage {
             self.insert_batch_rows(batch, "flow_sessions", &session_rows)?;
         }
 
+        let mut active_device_ids = HashSet::new();
+        for flow in &batch.flows {
+            if flow.upload_bytes == 0 && flow.download_bytes == 0 && flow.packets == 0 {
+                continue;
+            }
+            let Some(mac) = flow
+                .client_mac
+                .get(..6)
+                .filter(|_| flow.client_mac.len() == 6)
+            else {
+                continue;
+            };
+            let mac_hex = to_hex(mac);
+            active_device_ids.insert(
+                resolved_device_ids
+                    .get(&mac_hex)
+                    .copied()
+                    .unwrap_or_else(|| device_id_from_mac(mac)),
+            );
+        }
+        if !active_device_ids.is_empty() {
+            let mut active_device_ids = active_device_ids.into_iter().collect::<Vec<_>>();
+            active_device_ids.sort_unstable();
+            let activity_rows = active_device_ids
+                .into_iter()
+                .map(|device_id| {
+                    json!({
+                        "gateway_id": batch.gateway_id,
+                        "device_id": device_id,
+                        "last_traffic_seen": received_at,
+                    })
+                })
+                .collect::<Vec<_>>();
+            self.insert_batch_rows(batch, "device_traffic_activity", &activity_rows)?;
+        }
+
         // Record acceptance last so a failed write can be replayed. Per-table
         // insert tokens make those replays idempotent while their dedup windows
         // retain the token.
@@ -3368,6 +3609,10 @@ impl StorageBackend for ClickHouseStorage {
                 "ALTER TABLE dns_observations DELETE WHERE expires_at < {now}"
             ))?;
         }
+        self.dns_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         if policy.minute_days > 0 {
             let cutoff = now.saturating_sub(i64::from(policy.minute_days) * DAY_MS);
             self.execute_mutation(&format!(
@@ -3517,6 +3762,14 @@ fn escape_sql(input: &str) -> String {
     input.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
+fn resolve_cached_dns(observations: &[CachedDnsObservation], at: i64) -> Option<String> {
+    observations
+        .iter()
+        .filter(|observation| observation.observed_at <= at && observation.expires_at > at)
+        .max_by_key(|observation| (observation.observed_at, observation.id))
+        .map(|observation| observation.domain.clone())
+}
+
 fn split_sql_statements(script: &str) -> Vec<&str> {
     script.split(';').collect()
 }
@@ -3596,13 +3849,6 @@ fn json_f64(value: &Value) -> f64 {
         .unwrap_or(0.0)
 }
 
-fn json_optional_i64(value: &Value) -> Option<i64> {
-    value
-        .as_i64()
-        .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
-        .or_else(|| value.as_str().and_then(|number| number.parse().ok()))
-}
-
 fn unix_now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -3631,4 +3877,37 @@ fn format_mac_bytes(bytes: &[u8]) -> String {
         .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .join(":")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CachedDnsObservation, resolve_cached_dns};
+
+    #[test]
+    fn cached_dns_resolution_respects_expiry_and_newest_valid_observation() {
+        let observations = vec![
+            CachedDnsObservation {
+                id: 1,
+                domain: "old.example".to_owned(),
+                observed_at: 100,
+                expires_at: 400,
+            },
+            CachedDnsObservation {
+                id: 2,
+                domain: "new.example".to_owned(),
+                observed_at: 200,
+                expires_at: 250,
+            },
+        ];
+
+        assert_eq!(
+            resolve_cached_dns(&observations, 225).as_deref(),
+            Some("new.example")
+        );
+        assert_eq!(
+            resolve_cached_dns(&observations, 300).as_deref(),
+            Some("old.example")
+        );
+        assert_eq!(resolve_cached_dns(&observations, 400), None);
+    }
 }

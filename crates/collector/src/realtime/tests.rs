@@ -58,7 +58,12 @@ fn attribution() -> FlowAttribution {
 #[test]
 fn tracks_one_second_rates_and_active_flow_lifecycle() {
     let mut engine = RealtimeEngine::default();
-    engine.update(&batch(1, FlowLifecycle::Active), &[attribution()], 2_000);
+    engine.update(
+        &batch(1, FlowLifecycle::Active),
+        &[attribution()],
+        2_000,
+        2_000,
+    );
     let first = engine.snapshot();
     assert_eq!(first.total.upload_bytes_per_second, 100);
     assert_eq!(first.total.download_bytes_per_second, 200);
@@ -82,10 +87,20 @@ fn tracks_one_second_rates_and_active_flow_lifecycle() {
     assert_eq!(health.kernel_version, "6.6.73");
     assert_eq!(health.openwrt_version, "24.10.0");
 
-    engine.update(&batch(2, FlowLifecycle::Active), &[attribution()], 3_000);
+    engine.update(
+        &batch(2, FlowLifecycle::Active),
+        &[attribution()],
+        3_000,
+        3_000,
+    );
     assert_eq!(engine.snapshot().active_flows[0].upload_bytes, 200);
 
-    engine.update(&batch(3, FlowLifecycle::Ended), &[attribution()], 4_000);
+    engine.update(
+        &batch(3, FlowLifecycle::Ended),
+        &[attribution()],
+        4_000,
+        4_000,
+    );
     let ended = engine.snapshot();
     assert!(ended.active_flows.is_empty());
     assert_eq!(ended.history.len(), 3);
@@ -106,7 +121,7 @@ fn partitions_total_throughput_by_scope() {
 
 fn engine_update_assertions(batch: TelemetryBatch) {
     let mut engine = RealtimeEngine::default();
-    engine.update(&batch, &[attribution(), attribution()], 2_000);
+    engine.update(&batch, &[attribution(), attribution()], 2_000, 2_000);
     let snapshot = engine.snapshot();
     assert_eq!(snapshot.total.upload_bytes_per_second, 140);
     assert_eq!(snapshot.internet.upload_bytes_per_second, 100);
@@ -123,6 +138,7 @@ async fn publishes_all_realtime_event_types() {
     engine.update(
         &batch(1, FlowLifecycle::Active),
         &[FlowAttribution::default()],
+        2_000,
         2_000,
     );
     let mut names = Vec::new();
@@ -143,7 +159,40 @@ fn history_is_bounded_to_fifteen_minutes() {
             &batch(sequence, FlowLifecycle::Active),
             &[attribution()],
             sequence * 1_000,
+            sequence * 1_000,
         );
     }
     assert_eq!(engine.snapshot().history.len(), MAX_HISTORY_POINTS);
+}
+
+#[test]
+fn snapshot_time_and_active_clients_follow_received_telemetry() {
+    let mut realtime = RealtimeEngine::default();
+    let batch = TelemetryBatch {
+        flows: vec![FlowDelta {
+            client_ip: vec![192, 0, 2, 10],
+            remote_ip: vec![1, 1, 1, 1],
+            client_mac: vec![2, 0, 0, 0, 0, 1],
+            upload_bytes: 1_000,
+            last_seen_unix_ms: 1_000,
+            lifecycle: FlowLifecycle::Active as i32,
+            ..FlowDelta::default()
+        }],
+        ..TelemetryBatch::default()
+    };
+    realtime.update(&batch, &[FlowAttribution::default()], 1_000, 50_000);
+
+    assert_eq!(realtime.snapshot.generated_at, 50_000);
+    assert_eq!(realtime.snapshot.clients.len(), 1);
+
+    realtime.update(&TelemetryBatch::default(), &[], 2_000, 55_000);
+    assert_eq!(realtime.snapshot.generated_at, 55_000);
+    assert_eq!(realtime.snapshot.clients.len(), 1);
+    assert_eq!(
+        realtime.snapshot.clients.values().next(),
+        Some(&Throughput::default())
+    );
+
+    realtime.update(&TelemetryBatch::default(), &[], 3_000, 81_000);
+    assert!(realtime.snapshot.clients.is_empty());
 }
