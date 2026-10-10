@@ -119,7 +119,7 @@ fn summarize(devices: &[Value], flows: &[Value], since: u64) -> Value {
         if !app && !protocol {
             unknown += count;
         }
-        if !has("domain_application") && known(&flow["domain"]) {
+        if !app && known(&flow["domain"]) {
             *unmatched_domains
                 .entry(flow["domain"].as_str().unwrap().into())
                 .or_default() += count;
@@ -140,7 +140,7 @@ fn summarize(devices: &[Value], flows: &[Value], since: u64) -> Value {
         }
     };
     json!({"device": {"total_clients": devices.len(), "device_type_identified":typed,"device_type_unknown":devices.len() as u64-typed,"vendor_identified":vendors,"private_mac":private,"evidence_source_coverage":coverage,"unknown_with_evidence_no_matching_device_type":no_rules,"unknown_without_evidence":no_evidence},
-        "traffic":{"since_unix_ms":since,"denominator":"stored_flow_sessions","total_flows":total,"application_identified_rate":rate(apps),"domain_application_hit_rate":rate(domains),"ndpi_application_hit_rate":rate(ndpi),"protocol_only_rate":rate(protocols),"tls_quic_only_rate":rate(generic),"unknown_rate":rate(unknown),"top_unmatched_ndpi_application":top(unmatched_ndpi),"top_unmatched_domain_sni":top(unmatched_domains)}})
+        "traffic":{"since_unix_ms":since,"denominator":"stored_flow_sessions","total_flows":total,"application_identified_rate":rate(apps),"domain_application_hit_rate":rate(domains),"ndpi_application_hit_rate":rate(ndpi),"protocol_only_rate":rate(protocols),"tls_quic_only_rate":rate(generic),"unknown_rate":rate(unknown),"top_unmatched_ndpi_application":top(unmatched_ndpi),"top_unmatched_domain":top(unmatched_domains)}})
 }
 #[cfg(test)]
 mod tests {

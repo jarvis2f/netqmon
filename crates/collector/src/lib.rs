@@ -100,7 +100,7 @@ pub async fn run_from_env() -> Result<(), Box<dyn Error>> {
         ClassifierHandle::connect(config.classifier_socket.clone()).map_err(ConfigError)?;
     tracing::info!(
         socket = %config.classifier_socket.display(),
-        "classifier IPC configured; Collector will accept traffic while it reconnects"
+        "classifier IPC configured; telemetry ingest will retry while it reconnects"
     );
     let geo_load = LocalDbProvider::load(&config.geo_directory);
     for warning in &geo_load.warnings {
@@ -495,8 +495,15 @@ impl CollectorState {
         })
     }
 
-    fn accept_batch(&self, batch: &TelemetryBatch) -> Result<BatchDisposition, StorageError> {
+    fn accept_batch(
+        &self,
+        batch: &TelemetryBatch,
+    ) -> Result<BatchDisposition, TelemetryIngestError> {
         let mut inner = self.lock();
+        inner
+            .classifier
+            .health()
+            .map_err(TelemetryIngestError::ClassifierUnavailable)?;
         let mut favicon_endpoints = std::mem::take(&mut inner.favicon_endpoints);
         favicon_endpoints.observe_results(&inner.classifier, batch);
         let dpi_results = self.sampling.lookup_batch(batch);
@@ -1055,6 +1062,18 @@ enum BatchDisposition {
     Duplicate,
 }
 
+#[derive(Debug)]
+enum TelemetryIngestError {
+    ClassifierUnavailable(String),
+    Storage(StorageError),
+}
+
+impl From<StorageError> for TelemetryIngestError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct IngestStats {
@@ -1072,7 +1091,7 @@ fn classify_batch(
     favicon_endpoints: &FaviconEndpointCache,
     batch: &TelemetryBatch,
     analyses: &[Option<dpi::SampleAnalysis>],
-) -> Result<Vec<FlowAttribution>, StorageError> {
+) -> Result<Vec<FlowAttribution>, TelemetryIngestError> {
     let remote_asns = lookup_batch_remote_asns(geo_provider, batch);
     batch
         .flows
@@ -1134,10 +1153,9 @@ fn classify_batch(
                 }),
                 signatures: signature_matches,
             };
-            let mut classification = classifier.classify(&input).unwrap_or_else(|error| {
-                tracing::debug!(%error, "classifier flow classification skipped");
-                classifier::ClassificationResult::default()
-            });
+            let mut classification = classifier
+                .classify(&input)
+                .map_err(TelemetryIngestError::ClassifierUnavailable)?;
             // A DNS attribution can be a generic CDN name. Still run SNI/Host through
             // the same domain rules, while retaining an already matched DNS application.
             if !classification
@@ -1153,7 +1171,9 @@ fn classify_batch(
                         domain: Some(hostname),
                         ..input.clone()
                     };
-                    let host_result = classifier.classify(&host_input).unwrap_or_default();
+                    let host_result = classifier
+                        .classify(&host_input)
+                        .map_err(TelemetryIngestError::ClassifierUnavailable)?;
                     if host_result
                         .evidence
                         .iter()
@@ -1590,10 +1610,20 @@ async fn telemetry(
                 .into_response()
         }
         Ok(BatchDisposition::Duplicate) => StatusCode::OK.into_response(),
-        Err(_) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "telemetry persistence failed",
-        ),
+        Err(TelemetryIngestError::ClassifierUnavailable(classifier_error)) => {
+            tracing::debug!(%classifier_error, "deferring telemetry until classifier is ready");
+            error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "classifier unavailable; retry telemetry batch",
+            )
+        }
+        Err(TelemetryIngestError::Storage(storage_error)) => {
+            tracing::warn!(%storage_error, "telemetry persistence failed");
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "telemetry persistence failed",
+            )
+        }
     }
 }
 
@@ -1812,7 +1842,14 @@ fn apply_sample_result(
         })],
     );
     inner.service_bindings = service_bindings;
-    let attributions = classified?;
+    let attributions = match classified {
+        Ok(attributions) => attributions,
+        Err(TelemetryIngestError::ClassifierUnavailable(classifier_error)) => {
+            tracing::debug!(%classifier_error, "skipping late DPI update while classifier is unavailable");
+            return Ok(());
+        }
+        Err(TelemetryIngestError::Storage(error)) => return Err(error),
+    };
     inner
         .storage
         .reclassify_flow(&cached.gateway, &batch.flows[0], &attributions[0])
