@@ -1733,6 +1733,7 @@ struct RelatedQuery {
     to: Option<u64>,
     limit: Option<u32>,
     offset: Option<u64>,
+    all: Option<bool>,
     scope: Option<String>,
     category: Option<String>,
 }
@@ -1784,6 +1785,8 @@ async fn application_related(
     }
     let inner = state.lock();
     let category = query.category.as_deref();
+    let include_all =
+        query.all.unwrap_or(false) && matches!(relation.as_str(), "domains" | "destinations");
     if let Some(clickhouse) = inner.storage.clickhouse_storage() {
         if !matches!(
             relation.as_str(),
@@ -1796,7 +1799,16 @@ async fn application_related(
             );
         }
         return clickhouse
-            .query_application_related(&id, category, &relation, from, to, page.limit, page.offset)
+            .query_application_related(
+                &id,
+                category,
+                &relation,
+                from,
+                to,
+                page.limit,
+                page.offset,
+                include_all,
+            )
             .map(|mut value| {
                 if relation == "flows" {
                     if let Some(items) = value.as_array_mut() {
@@ -1820,8 +1832,12 @@ async fn application_related(
     let result = match relation.as_str() {
         "traffic" => query_application_traffic(connection, &id, category, from, to),
         "clients" => query_application_clients(connection, &id, category, page, from, to),
-        "domains" => query_application_domains(connection, &id, category, page, from, to),
-        "destinations" => query_application_destinations(connection, &id, category, page, from, to),
+        "domains" => {
+            query_application_domains(connection, &id, category, page, from, to, include_all)
+        }
+        "destinations" => {
+            query_application_destinations(connection, &id, category, page, from, to, include_all)
+        }
         "flows" => {
             query_application_flows(connection, &inner.classifier, &id, category, page, from, to)
         }
@@ -1936,18 +1952,17 @@ fn query_application_domains(
     page: Page,
     from: u64,
     to: u64,
+    include_all: bool,
 ) -> rusqlite::Result<Value> {
-    let category_filter = if id.starts_with(PROTOCOL_APPLICATION_PREFIX) {
-        "?1 LIKE 'protocol:%' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
-    } else {
-        "?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
-    };
     let mut statement = connection.prepare(&format!(
-        "SELECT domain, SUM(upload_bytes), SUM(download_bytes), SUM(packets), COUNT(*), MAX(last_seen_at)
-         FROM flow_sessions WHERE {application_filter} AND domain IS NOT NULL
-           AND ({category_filter})
-           AND last_seen_at >= ?3 AND last_seen_at < ?4
-         GROUP BY domain ORDER BY SUM(upload_bytes + download_bytes) DESC LIMIT ?5 OFFSET ?6",
+        "SELECT domain, SUM(upload_bytes), SUM(download_bytes), SUM(packets),
+                SUM(flow_count), MAX(timestamp)
+         FROM traffic_scope_minute WHERE {application_filter}
+           AND (?2 IS NULL OR ?1 LIKE 'protocol:%' OR COALESCE(category_id, 'unknown') = ?2)
+           AND domain != '' AND domain != 'unknown'
+           AND timestamp >= ?3 AND timestamp < ?4
+         GROUP BY domain ORDER BY SUM(upload_bytes + download_bytes) DESC
+         LIMIT CASE WHEN ?5 THEN -1 ELSE ?6 END OFFSET ?7",
         application_filter = sqlite_application_flow_filter("?1", "")
     ))?;
     let items = statement
@@ -1957,6 +1972,7 @@ fn query_application_domains(
                 category,
                 to_i64(from),
                 to_i64(to),
+                include_all,
                 i64::from(page.limit),
                 to_i64(page.offset)
             ],
@@ -1979,19 +1995,16 @@ fn query_application_destinations(
     page: Page,
     from: u64,
     to: u64,
+    include_all: bool,
 ) -> rusqlite::Result<Value> {
-    let category_filter = if id.starts_with(PROTOCOL_APPLICATION_PREFIX) {
-        "?1 LIKE 'protocol:%' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
-    } else {
-        "?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
-    };
     let mut statement = connection.prepare(&format!(
-        "SELECT remote_ip, MAX(domain), SUM(upload_bytes), SUM(download_bytes), SUM(packets),
-                COUNT(*), MAX(last_seen_at)
-         FROM flow_sessions WHERE {application_filter}
-           AND ({category_filter})
-           AND last_seen_at >= ?3 AND last_seen_at < ?4
-         GROUP BY remote_ip ORDER BY SUM(upload_bytes + download_bytes) DESC LIMIT ?5 OFFSET ?6",
+        "SELECT remote_ip, NULLIF(MAX(domain), 'unknown'), SUM(upload_bytes),
+                SUM(download_bytes), SUM(packets), SUM(flow_count), MAX(timestamp)
+         FROM traffic_scope_minute WHERE {application_filter}
+           AND (?2 IS NULL OR ?1 LIKE 'protocol:%' OR COALESCE(category_id, 'unknown') = ?2)
+           AND timestamp >= ?3 AND timestamp < ?4
+         GROUP BY remote_ip ORDER BY SUM(upload_bytes + download_bytes) DESC
+         LIMIT CASE WHEN ?5 THEN -1 ELSE ?6 END OFFSET ?7",
         application_filter = sqlite_application_flow_filter("?1", "")
     ))?;
     let items = statement
@@ -2001,6 +2014,7 @@ fn query_application_destinations(
                 category,
                 to_i64(from),
                 to_i64(to),
+                include_all,
                 i64::from(page.limit),
                 to_i64(page.offset)
             ],

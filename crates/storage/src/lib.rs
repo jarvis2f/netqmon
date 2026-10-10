@@ -1687,7 +1687,7 @@ fn load_active_flows(connection: &Connection) -> rusqlite::Result<HashMap<FlowKe
                 application_id, category_id, traffic_role, protocol_id, organization_confidence,
                 application_confidence, protocol_confidence, classification_confidence,
                 classification_reason, classification_evidence_json, scope, path_type, nat,
-                source_segment, destination_segment, device_id
+                source_segment, destination_segment, device_id, id
          FROM flow_sessions WHERE ended_at IS NULL",
     )?;
     statement
@@ -1704,6 +1704,7 @@ fn load_active_flows(connection: &Connection) -> rusqlite::Result<HashMap<FlowKe
                     direction: row.get(7)?,
                 },
                 ActiveFlow {
+                    session_id: row.get(32)?,
                     client_mac: Vec::new(),
                     device_id: row.get(31)?,
                     upload_bytes: row.get(8)?,
@@ -2218,7 +2219,7 @@ fn update_active_flows(
         {
             let current = active
                 .entry(key.clone())
-                .or_insert_with(|| ActiveFlow::new(flow, attribution.clone(), received_at));
+                .or_insert_with(|| ActiveFlow::new(&key, flow, attribution.clone(), received_at));
             current.add(flow, attribution);
             if let Some(device_id) = device_id_for_mac(tx, &key.gateway_id, &current.client_mac)? {
                 current.device_id = Some(device_id);
@@ -2279,7 +2280,7 @@ fn write_flow_session(
             source_segment = excluded.source_segment,
             destination_segment = excluded.destination_segment",
         params![
-            key.id(),
+            flow.session_id,
             key.gateway_id,
             device_id,
             key.ip_version,
@@ -2445,10 +2446,15 @@ impl FlowKey {
             self.direction
         )
     }
+
+    fn session_id(&self, started_at: i64) -> String {
+        format!("{}:{started_at}", self.id())
+    }
 }
 
 #[derive(Clone, Debug)]
 struct ActiveFlow {
+    session_id: String,
     client_mac: Vec<u8>,
     device_id: Option<i64>,
     upload_bytes: i64,
@@ -2466,19 +2472,26 @@ struct ActiveFlow {
 }
 
 impl ActiveFlow {
-    fn new(flow: &FlowDelta, attribution: FlowAttribution, received_at: i64) -> Self {
+    fn new(
+        key: &FlowKey,
+        flow: &FlowDelta,
+        attribution: FlowAttribution,
+        received_at: i64,
+    ) -> Self {
         let observed_started_at = to_i64(flow.first_seen_unix_ms);
         let started_at = if observed_started_at == 0 {
             received_at
         } else {
             observed_started_at
         };
+        let session_id = key.session_id(started_at);
         let last_seen_at = if flow_has_traffic(flow) {
             to_i64(flow.last_seen_unix_ms).max(started_at)
         } else {
             0
         };
         Self {
+            session_id,
             client_mac: flow.client_mac.clone(),
             device_id: None,
             upload_bytes: 0,

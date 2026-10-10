@@ -375,28 +375,18 @@ impl ClickHouseStorage {
             return Ok(());
         }
         // DPI samples identify the bidirectional 5-tuple but do not carry the
-        // telemetry direction. SQLite's late-DPI update intentionally matches
-        // all directions, so include every protocol direction in the exact
-        // ClickHouse primary-key lookup as well.
-        let flow_ids = [0, 1, 2]
-            .into_iter()
-            .map(|direction| {
-                let mut key = FlowKey::from_batch(gateway, flow);
-                key.direction = direction;
-                format!("'{}'", escape_sql(&key.id()))
-            })
-            .collect::<Vec<_>>()
-            .join(",");
+        // telemetry direction. Match every direction and the sample's time
+        // range; session IDs also include the lifetime start time now.
         let sql=format!("INSERT INTO flow_sessions SELECT * REPLACE ('{protocol_id}' AS protocol_id,{protocol_confidence} AS protocol_confidence,
             if('{category}'='unknown',category_id,'{category}') AS category_id,if('{role}'='unknown',traffic_role,'{role}') AS traffic_role,greatest(classification_confidence,{confidence}) AS classification_confidence,
             '{reason}' AS classification_reason,'{evidence}' AS classification_evidence_json,
             greatest(checkpointed_at+1,toUnixTimestamp64Milli(now64(3))) AS checkpointed_at)
-            FROM flow_sessions FINAL WHERE gateway_id='{gateway}' AND id IN ({flow_ids}) AND ip_version={ip_version} AND protocol={protocol}
+            FROM flow_sessions FINAL WHERE gateway_id='{gateway}' AND ip_version={ip_version} AND protocol={protocol}
             AND client_ip='{client_ip}' AND client_port={client_port} AND remote_ip='{remote_ip}' AND remote_port={remote_port}
             AND started_at<={last} AND last_seen_at>={first} AND protocol_confidence<={protocol_confidence}",
             protocol_id=escape_sql(&attribution.protocol_id),protocol_confidence=attribution.protocol_confidence,
             category=escape_sql(&attribution.category_id),role=escape_sql(&attribution.traffic_role),confidence=attribution.confidence,
-            reason=escape_sql(&attribution.reason),evidence=escape_sql(&attribution.evidence_json),gateway=escape_sql(gateway),flow_ids=flow_ids,
+            reason=escape_sql(&attribution.reason),evidence=escape_sql(&attribution.evidence_json),gateway=escape_sql(gateway),
             ip_version=flow.ip_version,protocol=flow.protocol,client_ip=to_hex(&flow.client_ip),client_port=flow.client_port,
             remote_ip=to_hex(&flow.remote_ip),remote_port=flow.remote_port,last=flow.last_seen_unix_ms.saturating_add(1),first=flow.first_seen_unix_ms.saturating_sub(1));
         self.client.execute(&sql)?;
@@ -428,7 +418,7 @@ impl ClickHouseStorage {
                           protocol_id, organization_confidence, application_confidence,
                           protocol_confidence, classification_confidence, classification_reason,
                           classification_evidence_json, scope, path_type, nat,
-                          source_segment, destination_segment, device_id
+                          source_segment, destination_segment, device_id, id
                    FROM flow_sessions FINAL WHERE ended_at IS NULL FORMAT JSON";
         let result = self.client.query_json(sql)?;
         let mut active = HashMap::new();
@@ -453,6 +443,7 @@ impl ClickHouseStorage {
                 active.insert(
                     key,
                     ActiveFlow {
+                        session_id: row["id"].as_str().unwrap_or_default().to_owned(),
                         client_mac: Vec::new(),
                         device_id: row
                             .get("device_id")
@@ -1911,6 +1902,7 @@ impl ClickHouseStorage {
         to_ms: u64,
         limit: u32,
         offset: u64,
+        include_all: bool,
     ) -> StorageResult<Value> {
         let app = escape_sql(application_id);
         let from = to_i64(from_ms);
@@ -1929,7 +1921,11 @@ impl ClickHouseStorage {
                     escape_sql(value)
                 )
             });
-        let page = format!(" LIMIT {limit} OFFSET {offset}");
+        let page = if include_all && matches!(relation, "domains" | "destinations") {
+            String::new()
+        } else {
+            format!(" LIMIT {limit} OFFSET {offset}")
+        };
         if relation == "traffic" {
             let duration = to_ms.saturating_sub(from_ms);
             let bucket_ms = duration.div_ceil(180).max(60_000).div_ceil(60_000) * 60_000;
@@ -1963,11 +1959,20 @@ impl ClickHouseStorage {
 
         let application_filter = application_flow_filter(application_id, "");
         let flow_application_filter = application_flow_filter(application_id, "f.");
+        let scope_application_filter = application_flow_filter(application_id, "t.");
         let flow_category_filter = category
             .filter(|_| !is_protocol_application_id(application_id))
             .map_or_else(String::new, |value| {
                 format!(
                     " AND coalesce(f.category_id, 'unknown') = '{}'",
+                    escape_sql(value)
+                )
+            });
+        let scope_category_filter = category
+            .filter(|_| !is_protocol_application_id(application_id))
+            .map_or_else(String::new, |value| {
+                format!(
+                    " AND coalesce(t.category_id, 'unknown') = '{}'",
                     escape_sql(value)
                 )
             });
@@ -1990,22 +1995,25 @@ impl ClickHouseStorage {
                  ORDER BY upload_bytes + download_bytes DESC{page} FORMAT JSON"
             ),
             "domains" => format!(
-                "SELECT domain, sum(upload_bytes) AS upload_bytes,
-                        sum(download_bytes) AS download_bytes, sum(packets) AS packets,
-                        count() AS flow_count, max(last_seen_at) AS last_seen
-                 FROM flow_sessions FINAL
-                 WHERE {application_filter} AND domain IS NOT NULL{category_filter}
-                   AND last_seen_at >= {from} AND last_seen_at < {to}
-                 GROUP BY domain ORDER BY upload_bytes + download_bytes DESC{page} FORMAT JSON"
+                "SELECT t.domain, sum(t.upload_bytes) AS upload_bytes,
+                        sum(t.download_bytes) AS download_bytes, sum(t.packets) AS packets,
+                        sum(t.flow_count) AS flow_count, max(t.timestamp) AS last_seen
+                 FROM traffic_scope_minute AS t
+                 WHERE {scope_application_filter}{scope_category_filter}
+                   AND t.domain != '' AND t.domain != 'unknown'
+                   AND t.timestamp >= {from} AND t.timestamp < {to}
+                 GROUP BY t.domain ORDER BY upload_bytes + download_bytes DESC{page} FORMAT JSON"
             ),
             "destinations" => format!(
-                "SELECT remote_ip, max(domain) AS domain, sum(upload_bytes) AS upload_bytes,
-                        sum(download_bytes) AS download_bytes, sum(packets) AS packets,
-                        count() AS flow_count, max(last_seen_at) AS last_seen
-                 FROM flow_sessions FINAL
-                 WHERE {application_filter}{category_filter}
-                   AND last_seen_at >= {from} AND last_seen_at < {to}
-                 GROUP BY remote_ip ORDER BY upload_bytes + download_bytes DESC{page} FORMAT JSON"
+                "SELECT t.remote_ip, nullIf(max(t.domain), 'unknown') AS domain,
+                        sum(t.upload_bytes) AS upload_bytes,
+                        sum(t.download_bytes) AS download_bytes, sum(t.packets) AS packets,
+                        sum(t.flow_count) AS flow_count, max(t.timestamp) AS last_seen
+                 FROM traffic_scope_minute AS t
+                 WHERE {scope_application_filter}{scope_category_filter}
+                   AND t.timestamp >= {from} AND t.timestamp < {to}
+                 GROUP BY t.remote_ip
+                 ORDER BY upload_bytes + download_bytes DESC{page} FORMAT JSON"
             ),
             "flows" => format!(
                 "SELECT id, client_ip, client_port, remote_ip, remote_port, protocol, direction,
@@ -3507,7 +3515,7 @@ impl StorageBackend for ClickHouseStorage {
 
             let current = staged_active_flows
                 .entry(key.clone())
-                .or_insert_with(|| ActiveFlow::new(flow, attr.clone(), received_at));
+                .or_insert_with(|| ActiveFlow::new(&key, flow, attr.clone(), received_at));
             current.add(flow, attr);
             current.device_id = current
                 .client_mac
@@ -3524,7 +3532,7 @@ impl StorageBackend for ClickHouseStorage {
                 let dev_id = current.device_id;
                 let current_attribution = &current.attribution;
                 session_rows.push(json!({
-                    "id": key.id(),
+                    "id": current.session_id,
                     "gateway_id": key.gateway_id,
                     "device_id": dev_id,
                     "ip_version": key.ip_version,

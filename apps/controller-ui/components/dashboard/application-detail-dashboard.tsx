@@ -58,6 +58,7 @@ const RANGE_MS: Record<Exclude<TimeRangeValue, "custom" | "15m">, number> = {
   "7d": 7 * 24 * 60 * 60 * 1_000,
   "30d": 30 * 24 * 60 * 60 * 1_000,
 };
+const DETAIL_RELATION_PAGE_SIZE = 50;
 
 function rangeBounds(range: TimeRangeValue, from?: string, to?: string) {
   const end = range === "custom" && to ? Date.parse(to) : Date.now();
@@ -117,6 +118,8 @@ export function ApplicationDetailDashboard({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  const [domainsPage, setDomainsPage] = useState(0);
+  const [destinationsPage, setDestinationsPage] = useState(0);
 
   const tabs: Array<{ id: Tab; label: string }> = [
     { id: "overview", label: t("detail.tabs.overview") },
@@ -152,6 +155,8 @@ export function ApplicationDetailDashboard({
   useEffect(() => {
     const controller = new AbortController();
     async function load() {
+      setDomainsPage(0);
+      setDestinationsPage(0);
       setLoading(true);
       try {
         const encoded = encodeURIComponent(applicationId);
@@ -163,6 +168,10 @@ export function ApplicationDetailDashboard({
         });
         if (categoryId) query.set("category", categoryId);
         const relationQuery = query.toString();
+        const domainsQuery = new URLSearchParams(query);
+        const destinationsQuery = new URLSearchParams(query);
+        if (initialTab === "domains") domainsQuery.set("all", "true");
+        if (initialTab === "destinations") destinationsQuery.set("all", "true");
         const applicationQuery = new URLSearchParams({
           from: String(bounds.from),
           to: String(bounds.to),
@@ -181,14 +190,20 @@ export function ApplicationDetailDashboard({
             cache: "no-store",
             signal: controller.signal,
           }),
-          fetch(`/api/applications/${encoded}/domains?${relationQuery}`, {
-            cache: "no-store",
-            signal: controller.signal,
-          }),
-          fetch(`/api/applications/${encoded}/destinations?${relationQuery}`, {
-            cache: "no-store",
-            signal: controller.signal,
-          }),
+          fetch(
+            `/api/applications/${encoded}/domains?${domainsQuery.toString()}`,
+            {
+              cache: "no-store",
+              signal: controller.signal,
+            },
+          ),
+          fetch(
+            `/api/applications/${encoded}/destinations?${destinationsQuery.toString()}`,
+            {
+              cache: "no-store",
+              signal: controller.signal,
+            },
+          ),
           fetch(`/api/applications/${encoded}/flows?${relationQuery}`, {
             cache: "no-store",
             signal: controller.signal,
@@ -229,6 +244,7 @@ export function ApplicationDetailDashboard({
     initialFrom,
     initialRange,
     initialTo,
+    initialTab,
     reloadKey,
     t,
   ]);
@@ -527,12 +543,38 @@ export function ApplicationDetailDashboard({
           }
         />
       );
-    if (initialTab === "domains")
+    if (initialTab === "domains") {
+      const pageIndex = Math.min(
+        domainsPage,
+        Math.max(
+          0,
+          Math.ceil(data.domains.length / DETAIL_RELATION_PAGE_SIZE) - 1,
+        ),
+      );
+      const start = pageIndex * DETAIL_RELATION_PAGE_SIZE;
+      const end = Math.min(
+        start + DETAIL_RELATION_PAGE_SIZE,
+        data.domains.length,
+      );
       return (
         <DataTable
           columns={domainColumns}
-          data={data.domains}
+          data={data.domains.slice(start, end)}
           keyExtractor={(row) => row.domain}
+          pagination={
+            data.domains.length > DETAIL_RELATION_PAGE_SIZE
+              ? {
+                  pageIndex,
+                  pageSize: DETAIL_RELATION_PAGE_SIZE,
+                  hasPrevious: pageIndex > 0,
+                  hasNext: end < data.domains.length,
+                  onPreviousPage: () =>
+                    setDomainsPage((current) => Math.max(0, current - 1)),
+                  onNextPage: () => setDomainsPage((current) => current + 1),
+                  totalDisplay: `${start + 1}–${end} / ${data.domains.length}`,
+                }
+              : undefined
+          }
           emptyState={
             <EmptyState
               title={t("detail.empty.noDomains")}
@@ -542,12 +584,40 @@ export function ApplicationDetailDashboard({
           }
         />
       );
-    if (initialTab === "destinations")
+    }
+    if (initialTab === "destinations") {
+      const pageIndex = Math.min(
+        destinationsPage,
+        Math.max(
+          0,
+          Math.ceil(data.destinations.length / DETAIL_RELATION_PAGE_SIZE) - 1,
+        ),
+      );
+      const start = pageIndex * DETAIL_RELATION_PAGE_SIZE;
+      const end = Math.min(
+        start + DETAIL_RELATION_PAGE_SIZE,
+        data.destinations.length,
+      );
       return (
         <DataTable
           columns={destinationColumns}
-          data={data.destinations}
+          data={data.destinations.slice(start, end)}
           keyExtractor={(row) => row.remote_ip}
+          pagination={
+            data.destinations.length > DETAIL_RELATION_PAGE_SIZE
+              ? {
+                  pageIndex,
+                  pageSize: DETAIL_RELATION_PAGE_SIZE,
+                  hasPrevious: pageIndex > 0,
+                  hasNext: end < data.destinations.length,
+                  onPreviousPage: () =>
+                    setDestinationsPage((current) => Math.max(0, current - 1)),
+                  onNextPage: () =>
+                    setDestinationsPage((current) => current + 1),
+                  totalDisplay: `${start + 1}–${end} / ${data.destinations.length}`,
+                }
+              : undefined
+          }
           emptyState={
             <EmptyState
               title={t("detail.empty.noDestinations")}
@@ -557,6 +627,7 @@ export function ApplicationDetailDashboard({
           }
         />
       );
+    }
     if (initialTab === "flows")
       return (
         <DataTable
