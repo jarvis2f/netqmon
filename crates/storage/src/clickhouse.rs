@@ -1159,8 +1159,7 @@ impl ClickHouseStorage {
             |(from_ms, to_ms)| {
                 format!(
                     "(SELECT gateway_id, device_id, sum(upload_bytes) AS upload_bytes,
-                            sum(download_bytes) AS download_bytes, sum(flow_count) AS flow_count,
-                            max(timestamp) AS timestamp
+                            sum(download_bytes) AS download_bytes, sum(flow_count) AS flow_count
                      FROM traffic_device_minute
                      WHERE timestamp >= {from_ms} AND timestamp < {to_ms}
                      GROUP BY gateway_id, device_id) AS t"
