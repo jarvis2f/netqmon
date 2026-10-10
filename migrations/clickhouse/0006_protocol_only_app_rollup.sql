@@ -6,19 +6,30 @@ INSERT INTO traffic_application_minute
 SELECT
     timestamp,
     gateway_id,
-    if(coalesce(nullIf(protocol_id, ''), 'unknown') != 'unknown', 'protocol-only', 'unknown') AS application_id,
-    if(coalesce(nullIf(protocol_id, ''), 'unknown') != 'unknown', 'unknown', coalesce(category_id, 'unknown')) AS category_id,
+    application_id,
+    category_id,
     sum(upload_bytes),
     sum(download_bytes),
     sum(packets),
     sum(flow_count)
-FROM traffic_scope_minute
-WHERE traffic_scope_minute.application_id = 'unknown'
+FROM (
+    SELECT
+        timestamp,
+        gateway_id,
+        if(coalesce(nullIf(protocol_id, ''), 'unknown') != 'unknown', 'protocol-only', 'unknown') AS application_id,
+        if(coalesce(nullIf(protocol_id, ''), 'unknown') != 'unknown', 'unknown', coalesce(category_id, 'unknown')) AS category_id,
+        upload_bytes,
+        download_bytes,
+        packets,
+        flow_count
+    FROM traffic_scope_minute
+    WHERE traffic_scope_minute.application_id = 'unknown'
+)
 GROUP BY
     timestamp,
     gateway_id,
-    if(coalesce(nullIf(protocol_id, ''), 'unknown') != 'unknown', 'protocol-only', 'unknown'),
-    if(coalesce(nullIf(protocol_id, ''), 'unknown') != 'unknown', 'unknown', coalesce(category_id, 'unknown'));
+    application_id,
+    category_id;
 
 INSERT INTO traffic_rollup_dirty
 SELECT gateway_id, 'application', 'minute', timestamp,
