@@ -84,6 +84,95 @@ fn late_dpi_updates_only_matching_sessions_without_changing_counters() {
 
 #[test]
 #[ignore = "requires a disposable ClickHouse database"]
+fn protocol_only_application_is_listed_from_clickhouse() {
+    let _guard = CLICKHOUSE_TEST_LOCK.lock().unwrap();
+    let backend = disposable_clickhouse();
+    let mut storage = Storage::clickhouse(backend);
+    let now = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let gateway_id = format!("protocol-only-{}-{now}", std::process::id());
+    assert!(
+        storage
+            .save_gateway(&gateway_id, "protocol-only-test", "test", &[42; 32], now)
+            .unwrap()
+    );
+    let (before_applications, _) = storage
+        .clickhouse_storage()
+        .unwrap()
+        .query_applications_for_window(100, 0, None)
+        .unwrap();
+    let previous_protocol_only = before_applications
+        .iter()
+        .find(|app| app["application_id"] == "protocol-only");
+    let previous_upload_bytes = previous_protocol_only
+        .and_then(|app| app["upload_bytes"].as_i64())
+        .unwrap_or_default();
+    let previous_download_bytes = previous_protocol_only
+        .and_then(|app| app["download_bytes"].as_i64())
+        .unwrap_or_default();
+    let previous_flow_count = previous_protocol_only
+        .and_then(|app| app["flow_count"].as_i64())
+        .unwrap_or_default();
+
+    let batch = TelemetryBatch {
+        gateway_id,
+        boot_id: "protocol-only-test".into(),
+        sequence: 1,
+        sent_at: now,
+        flows: vec![FlowDelta {
+            client_ip: vec![192, 0, 2, 2],
+            client_port: 50000,
+            remote_ip: vec![198, 51, 100, 1],
+            remote_port: 443,
+            protocol: 6,
+            first_seen_unix_ms: now,
+            last_seen_unix_ms: now,
+            upload_bytes: 123,
+            download_bytes: 456,
+            packets: 8,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let attribution = FlowAttribution {
+        protocol_id: "tls".into(),
+        protocol_confidence: 1.0,
+        confidence: 1.0,
+        ..Default::default()
+    };
+    storage
+        .persist_classified_batch(&batch, &[attribution], &[], now)
+        .unwrap();
+
+    let (applications, total) = storage
+        .clickhouse_storage()
+        .unwrap()
+        .query_applications_for_window(100, 0, None)
+        .unwrap();
+    let app = applications
+        .iter()
+        .find(|app| app["application_id"] == "protocol-only")
+        .expect("protocol-only traffic should be returned by the application index");
+    assert!(total >= 1);
+    assert_eq!(app["category_id"], "unknown");
+    assert_eq!(
+        app["upload_bytes"].as_i64(),
+        Some(previous_upload_bytes + 123)
+    );
+    assert_eq!(
+        app["download_bytes"].as_i64(),
+        Some(previous_download_bytes + 456)
+    );
+    assert_eq!(app["flow_count"].as_i64(), Some(previous_flow_count + 1));
+}
+
+#[test]
+#[ignore = "requires a disposable ClickHouse database"]
 fn self_host_client_identity_is_single_application_per_ip() {
     let _guard = CLICKHOUSE_TEST_LOCK.lock().unwrap();
     let backend = disposable_clickhouse();

@@ -1669,10 +1669,14 @@ impl ClickHouseStorage {
                  WHERE 1 = 1{time_filter}
                  GROUP BY application_id, category_id
              ), client_counts AS (
-                 SELECT {flow_application} AS application_id,
+                 SELECT application_id,
                         uniqExactIf(device_id, {client_filter}) AS client_count,
                         anyIf(organization_id, organization_id IS NOT NULL AND organization_id != 'unknown') AS organization_id
-                 FROM flow_sessions FINAL GROUP BY {flow_application}
+                 FROM (
+                     SELECT {flow_application} AS application_id, device_id, organization_id, last_seen_at
+                     FROM flow_sessions FINAL
+                 ) AS classified_flows
+                 GROUP BY application_id
              )
              SELECT a.application_id, a.category_id, a.upload_bytes, a.download_bytes,
                     a.packets, a.flow_count, a.last_seen, coalesce(c.client_count, 0) AS client_count,
