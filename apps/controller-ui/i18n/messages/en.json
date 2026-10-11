@@ -1011,6 +1011,7 @@
       "description": "Controller service operational status, telemetry metrics and gateway hardware details",
       "copy": "Copy diagnostics to clipboard",
       "copied": "Copied to clipboard",
+      "copyError": "Unable to copy diagnostics. Please copy the diagnostic details manually.",
       "collectorVersion": "Collector Version",
       "dbBackend": "Database Backend",
       "dbSize": "Database Size",

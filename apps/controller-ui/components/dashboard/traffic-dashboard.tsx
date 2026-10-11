@@ -327,7 +327,7 @@ export function TrafficDashboard({
             onValueChange={(value) => value && updateUrl({ scope: value })}
           >
             <SelectTrigger className="h-8 min-w-[100px]">
-              <SelectValue />
+              <SelectValue>{t(`scopes.${initialScope}`)}</SelectValue>
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="internet">{t("scopes.internet")}</SelectItem>
@@ -346,7 +346,13 @@ export function TrafficDashboard({
             onValueChange={(value) => value && updateUrl({ direction: value })}
           >
             <SelectTrigger className="h-8 min-w-[90px]">
-              <SelectValue />
+              <SelectValue>
+                {initialDirection === "both"
+                  ? t("both")
+                  : initialDirection === "download"
+                    ? t("downloadOption")
+                    : t("uploadOption")}
+              </SelectValue>
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="both">{t("both")}</SelectItem>
@@ -364,7 +370,9 @@ export function TrafficDashboard({
             onValueChange={(value) => value && updateUrl({ group: value })}
           >
             <SelectTrigger className="h-8 min-w-[100px]">
-              <SelectValue />
+              <SelectValue>
+                {initialGroupBy === "none" ? t("none") : t(initialGroupBy)}
+              </SelectValue>
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="none">{t("none")}</SelectItem>

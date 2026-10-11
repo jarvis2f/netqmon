@@ -1011,6 +1011,7 @@
       "description": "控制器系统运行状态、遥测指标与硬件网关运行详情",
       "copy": "复制诊断信息至剪贴板",
       "copied": "已复制到剪贴板",
+      "copyError": "无法复制诊断信息，请手动复制诊断详情。",
       "collectorVersion": "Collector 版本",
       "dbBackend": "数据库后端",
       "dbSize": "数据库体积",

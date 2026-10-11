@@ -498,11 +498,48 @@ export function SettingsDashboard({ username }: { username: string }) {
     return t("iconCache.ttlSeconds", { count: seconds });
   };
 
-  const copyDiagnostics = () => {
-    if (diagnostics) {
-      void navigator.clipboard.writeText(JSON.stringify(diagnostics, null, 2));
+  const copyDiagnostics = async () => {
+    if (!diagnostics) return;
+    setCopiedDiag(false);
+
+    const diagnosticsJson = JSON.stringify(diagnostics, null, 2);
+
+    try {
+      let copied = false;
+
+      if (navigator.clipboard?.writeText) {
+        try {
+          await navigator.clipboard.writeText(diagnosticsJson);
+          copied = true;
+        } catch {
+          // Use the legacy copy API when the Clipboard API is denied.
+        }
+      }
+
+      if (!copied) {
+        const textarea = document.createElement("textarea");
+        textarea.value = diagnosticsJson;
+        textarea.setAttribute("readonly", "");
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+
+        try {
+          textarea.select();
+          copied = document.execCommand("copy");
+        } finally {
+          document.body.removeChild(textarea);
+        }
+      }
+
+      if (!copied) {
+        showToast({ title: t("diagnostics.copyError"), status: "error" });
+        return;
+      }
       setCopiedDiag(true);
       setTimeout(() => setCopiedDiag(false), 2000);
+    } catch {
+      showToast({ title: t("diagnostics.copyError"), status: "error" });
     }
   };
 
