@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Network, Search } from "lucide-react";
+import { Network, Search, Pencil } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { AppLayout } from "@/components/app-shell/app-layout";
 import { ClientDeviceIcon } from "@/components/icons/client-device-icon";
@@ -11,6 +11,11 @@ import {
   ClientTrafficFlowMap,
   type ThroughputRate,
 } from "@/components/dashboard/client-traffic-flow-map";
+import { EditClientDialog } from "@/components/dashboard/edit-client-dialog";
+import {
+  AnimatedToastStack,
+  useAnimatedToastStack,
+} from "@/components/motion/animated-toast-stack";
 import { DataTable, type ColumnDef } from "@/components/data/data-table";
 import { DotStatus } from "@/components/network/status-badge";
 import { PropertyRow, SidePanel } from "@/components/overlays/side-panel";
@@ -119,6 +124,10 @@ export function ClientsDashboard({
     t("logicalTopology.agentFallback"),
   );
   const [topology, setTopology] = useState<TopologySummary | null>(null);
+  const { toasts, showToast, dismissToast } = useAnimatedToastStack();
+  const [editingClient, setEditingClient] = useState<ClientSummary | null>(
+    null,
+  );
 
   const selected = items.find((item) => item.id === initialSelectedId) ?? null;
 
@@ -249,10 +258,22 @@ export function ClientsDashboard({
 
   useEffect(() => {
     const shortcut = (event: KeyboardEvent) => {
-      if (event.key === "/" && !(event.target instanceof HTMLInputElement)) {
-        event.preventDefault();
-        searchRef.current?.focus();
+      if (event.key !== "/") return;
+      const target = event.target as HTMLElement | null;
+      if (
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        target?.isContentEditable ||
+        target?.closest?.('[role="dialog"]') ||
+        target?.closest?.('[data-slot="dialog-content"]') ||
+        target?.closest?.('[data-slot="select-root"]') ||
+        target?.closest?.('[data-slot="select-content"]')
+      ) {
+        return;
       }
+      event.preventDefault();
+      searchRef.current?.focus();
     };
     window.addEventListener("keydown", shortcut);
     return () => window.removeEventListener("keydown", shortcut);
@@ -459,6 +480,7 @@ export function ClientsDashboard({
 
       <SidePanel
         open={Boolean(selected)}
+        activeModal={Boolean(editingClient)}
         onClose={() => replaceQuery({ id: "" })}
         title={
           selected
@@ -473,7 +495,15 @@ export function ClientsDashboard({
         }
         footerActions={
           selected && (
-            <div className="ml-auto">
+            <div className="flex items-center gap-2 ml-auto">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setEditingClient(selected)}
+              >
+                <Pencil className="size-3.5 mr-1" />
+                {t("editClient")}
+              </Button>
               <Link
                 href={`/clients/${selected.id}`}
                 className={buttonVariants({ size: "sm" })}
@@ -575,6 +605,24 @@ export function ClientsDashboard({
           </>
         )}
       </SidePanel>
+
+      <EditClientDialog
+        client={editingClient}
+        open={Boolean(editingClient)}
+        onOpenChange={(open) => {
+          if (!open) setEditingClient(null);
+        }}
+        showToast={showToast}
+        onSuccess={(updated) => {
+          setItems((prev) =>
+            prev.map((item) =>
+              item.id === updated.id ? { ...item, ...updated } : item,
+            ),
+          );
+        }}
+      />
+
+      <AnimatedToastStack toasts={toasts} onDismiss={dismissToast} fixed />
     </AppLayout>
   );
 }

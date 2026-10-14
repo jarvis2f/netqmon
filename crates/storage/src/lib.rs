@@ -602,6 +602,68 @@ impl SqliteStorage {
             .optional()
     }
 
+    /// Updates client editable attributes (display_name, device_type).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update query fails.
+    pub fn update_client(
+        &self,
+        id: i64,
+        display_name: Option<Option<&str>>,
+        device_type: Option<Option<&str>>,
+    ) -> rusqlite::Result<bool> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM devices WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        if count == 0 {
+            return Ok(false);
+        }
+        if display_name.is_none() && device_type.is_none() {
+            return Ok(true);
+        }
+        let mut sets = Vec::new();
+        let mut params: Vec<rusqlite::types::Value> = Vec::new();
+
+        if let Some(name_opt) = display_name {
+            sets.push(format!("display_name = ?{}", params.len() + 1));
+            match name_opt {
+                Some(name) if !name.trim().is_empty() => {
+                    params.push(rusqlite::types::Value::Text(name.trim().to_owned()));
+                }
+                _ => {
+                    params.push(rusqlite::types::Value::Null);
+                }
+            }
+        }
+
+        if let Some(type_opt) = device_type {
+            sets.push(format!("device_type = ?{}", params.len() + 1));
+            match type_opt {
+                Some(dtype) if !dtype.trim().is_empty() => {
+                    params.push(rusqlite::types::Value::Text(dtype.trim().to_owned()));
+                }
+                _ => {
+                    params.push(rusqlite::types::Value::Null);
+                }
+            }
+        }
+
+        let id_param_idx = params.len() + 1;
+        params.push(rusqlite::types::Value::Integer(id));
+
+        let sql = format!(
+            "UPDATE devices SET {} WHERE id = ?{}",
+            sets.join(", "),
+            id_param_idx
+        );
+        self.connection
+            .execute(&sql, rusqlite::params_from_iter(params))?;
+        Ok(true)
+    }
+
     /// Replaces expired sessions and stores a new hashed session token.
     ///
     /// # Errors
@@ -1390,6 +1452,25 @@ impl Storage {
 
     pub fn backend_name(&self) -> &'static str {
         StorageBackend::backend_name(self)
+    }
+
+    /// Updates client editable attributes (display_name, device_type).
+    ///
+    /// # Errors
+    ///
+    /// Returns `StorageError` if the update query or mutation fails.
+    pub fn update_client(
+        &self,
+        id: i64,
+        display_name: Option<Option<&str>>,
+        device_type: Option<Option<&str>>,
+    ) -> StorageResult<bool> {
+        match self {
+            Self::Sqlite(s) => s
+                .update_client(id, display_name, device_type)
+                .map_err(Into::into),
+            Self::ClickHouse(c) => c.update_client(id, display_name, device_type),
+        }
     }
 }
 

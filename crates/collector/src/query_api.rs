@@ -36,7 +36,10 @@ pub(crate) fn router() -> Router<CollectorState> {
         .route("/internal/overview", get(overview))
         .route("/internal/traffic", get(traffic))
         .route("/internal/clients", get(clients))
-        .route("/internal/clients/{id}", get(client_detail))
+        .route(
+            "/internal/clients/{id}",
+            get(client_detail).put(update_client_info),
+        )
         .route("/internal/clients/{id}/{relation}", get(client_related))
         .route("/internal/applications", get(applications))
         .route("/internal/organizations", get(organizations))
@@ -888,6 +891,58 @@ async fn client_detail(
     match query_client_detail(inner.storage.connection(), id) {
         Ok(Some(value)) => api_ok(value),
         Ok(None) => api_error(StatusCode::NOT_FOUND, "not_found", "client was not found"),
+        Err(error) => storage_error(error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateClientRequest {
+    name: Option<Option<String>>,
+    device_type: Option<Option<String>>,
+}
+
+async fn update_client_info(
+    State(state): State<CollectorState>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateClientRequest>,
+) -> Response {
+    let Ok(id) = id.parse::<i64>() else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_id",
+            "client id must be an integer",
+        );
+    };
+    if id <= 0 {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_id",
+            "client id must be positive",
+        );
+    }
+
+    let display_name = payload.name.as_ref().map(|opt| opt.as_deref());
+    let device_type = payload.device_type.as_ref().map(|opt| opt.as_deref());
+
+    let inner = state.lock();
+    match inner.storage.update_client(id, display_name, device_type) {
+        Ok(true) => {
+            if let Some(clickhouse) = inner.storage.clickhouse_storage() {
+                match clickhouse.query_client_detail(id) {
+                    Ok(Some(value)) => api_ok(value),
+                    Ok(None) => api_ok(json!({ "id": id })),
+                    Err(error) => storage_error(error),
+                }
+            } else {
+                match query_client_detail(inner.storage.connection(), id) {
+                    Ok(Some(value)) => api_ok(value),
+                    Ok(None) => api_ok(json!({ "id": id })),
+                    Err(error) => storage_error(error),
+                }
+            }
+        }
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "not_found", "client was not found"),
         Err(error) => storage_error(error),
     }
 }

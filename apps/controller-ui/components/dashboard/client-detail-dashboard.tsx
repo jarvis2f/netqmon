@@ -10,9 +10,15 @@ import {
   ArrowUp,
   Database,
   ExternalLink,
+  Pencil,
 } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { AppLayout } from "@/components/app-shell/app-layout";
+import { EditClientDialog } from "@/components/dashboard/edit-client-dialog";
+import {
+  AnimatedToastStack,
+  useAnimatedToastStack,
+} from "@/components/motion/animated-toast-stack";
 import { DataTable, type ColumnDef } from "@/components/data/data-table";
 import { MetricCard } from "@/components/data/metric-card";
 import { ApplicationIdentity } from "@/components/network/application-identity";
@@ -24,7 +30,7 @@ import {
   TrafficChart,
   type TrafficDataPoint,
 } from "@/components/data/traffic-chart";
-import { buttonVariants } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Select,
@@ -159,6 +165,8 @@ export function ClientDetailDashboard({
 
   const [lastTrafficSeen, setLastTrafficSeen] = useState(0);
   const [now, setNow] = useState(0);
+  const [editOpen, setEditOpen] = useState(false);
+  const { toasts, showToast, dismissToast } = useAnimatedToastStack();
 
   const tabs: Array<{ id: Tab; label: string }> = [
     { id: "overview", label: t("detail.tabs.overview") },
@@ -644,12 +652,24 @@ export function ClientDetailDashboard({
       username={username}
       isLive={streamConnected}
       headerActions={
-        <Link
-          href="/clients"
-          className={buttonVariants({ variant: "outline", size: "sm" })}
-        >
-          <ArrowLeft /> {tNav("clients")}
-        </Link>
+        <div className="flex items-center gap-2">
+          {client && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setEditOpen(true)}
+            >
+              <Pencil className="size-3.5 mr-1" />
+              {t("editClient")}
+            </Button>
+          )}
+          <Link
+            href="/clients"
+            className={buttonVariants({ variant: "outline", size: "sm" })}
+          >
+            <ArrowLeft /> {tNav("clients")}
+          </Link>
+        </div>
       }
       toolbar={
         <nav
@@ -926,6 +946,33 @@ export function ClientDetailDashboard({
         tabContent()
       )}
       <FlowPanel flow={selectedFlow} onClose={() => setSelectedFlow(null)} />
+
+      {client && (
+        <EditClientDialog
+          client={client}
+          open={editOpen}
+          onOpenChange={setEditOpen}
+          showToast={showToast}
+          onSuccess={(updated) => {
+            setData((prev) => {
+              if (!prev) return prev;
+              return {
+                ...prev,
+                detail: {
+                  ...prev.detail,
+                  client: {
+                    ...prev.detail.client,
+                    ...updated,
+                    identity: updated.identity ?? prev.detail.client.identity,
+                  },
+                },
+              };
+            });
+          }}
+        />
+      )}
+
+      <AnimatedToastStack toasts={toasts} onDismiss={dismissToast} fixed />
     </AppLayout>
   );
 }

@@ -15,6 +15,7 @@ interface SidePanelProps {
   footerActions?: React.ReactNode;
   width?: "sm" | "md" | "lg";
   className?: string;
+  activeModal?: boolean;
 }
 
 export function SidePanel({
@@ -27,6 +28,7 @@ export function SidePanel({
   footerActions,
   width = "md",
   className,
+  activeModal = false,
 }: SidePanelProps) {
   const tA11y = useTranslations("accessibility.panel");
   const panelRef = useRef<HTMLDivElement>(null);
@@ -34,7 +36,7 @@ export function SidePanel({
 
   // Trap focus, support Escape, and restore focus when the sheet closes.
   useEffect(() => {
-    if (!open) return;
+    if (!open || activeModal) return;
 
     const previouslyFocused = document.activeElement as HTMLElement | null;
     const focusableSelector =
@@ -74,7 +76,7 @@ export function SidePanel({
       window.removeEventListener("keydown", handleKeyDown);
       previouslyFocused?.focus();
     };
-  }, [open, onClose]);
+  }, [open, onClose, activeModal]);
 
   // Prevent background scrolling when panel is open
   useEffect(() => {

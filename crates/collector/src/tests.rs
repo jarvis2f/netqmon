@@ -649,6 +649,106 @@ async fn client_queries_expose_last_traffic_seen_separately_from_discovery() {
 }
 
 #[tokio::test]
+async fn update_client_info_modifies_display_name_and_device_type() {
+    let router = internal_router(query_state());
+
+    // 1. Update client 1 name and device_type
+    let update_req = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/internal/clients/1")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": "My Custom Laptop",
+                        "device_type": "laptop"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_req.status(), StatusCode::OK);
+    let update_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(update_req.into_body(), 64 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(update_json["data"]["client"]["name"], "My Custom Laptop");
+    assert_eq!(
+        update_json["data"]["client"]["identity"]["device_type"],
+        "laptop"
+    );
+
+    // 2. Verify GET /internal/clients/1 reflects the changes
+    let get_req = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/internal/clients/1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_req.status(), StatusCode::OK);
+    let get_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(get_req.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(get_json["data"]["client"]["name"], "My Custom Laptop");
+    assert_eq!(
+        get_json["data"]["client"]["identity"]["device_type"],
+        "laptop"
+    );
+
+    // 3. Clear display_name with null or empty string, fallback to hostname
+    let clear_name_req = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/internal/clients/1")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": ""
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(clear_name_req.status(), StatusCode::OK);
+    let clear_json: serde_json::Value = serde_json::from_slice(
+        &to_bytes(clear_name_req.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(clear_json["data"]["client"]["name"], "laptop");
+
+    // 4. Non-existent client returns 404
+    let not_found_req = router
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/internal/clients/999999")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": "Ghost"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(not_found_req.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn application_detail_filters_duplicate_unknown_rows_by_category() {
     let state = query_state();
     {

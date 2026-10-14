@@ -1452,6 +1452,67 @@ impl ClickHouseStorage {
         }
     }
 
+    /// Updates client editable attributes (display_name, device_type) in ClickHouse.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StorageError` on mutation failure.
+    pub fn update_client(
+        &self,
+        id: i64,
+        display_name: Option<Option<&str>>,
+        device_type: Option<Option<&str>>,
+    ) -> StorageResult<bool> {
+        let count_sql =
+            format!("SELECT count() AS c FROM devices FINAL WHERE id = {id} FORMAT JSON");
+        let count_res = self.client.query_json(&count_sql)?;
+        let count = count_res["data"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .and_then(|row| {
+                row["c"]
+                    .as_i64()
+                    .or_else(|| row["c"].as_str().and_then(|s| s.parse().ok()))
+            })
+            .unwrap_or(0);
+        if count == 0 {
+            return Ok(false);
+        }
+        if display_name.is_none() && device_type.is_none() {
+            return Ok(true);
+        }
+
+        let mut sets = Vec::new();
+        if let Some(name_opt) = display_name {
+            match name_opt {
+                Some(name) if !name.trim().is_empty() => {
+                    sets.push(format!("display_name = '{}'", escape_sql(name.trim())));
+                }
+                _ => {
+                    sets.push("display_name = NULL".to_owned());
+                }
+            }
+        }
+
+        if let Some(type_opt) = device_type {
+            match type_opt {
+                Some(dtype) if !dtype.trim().is_empty() => {
+                    sets.push(format!("device_type = '{}'", escape_sql(dtype.trim())));
+                }
+                _ => {
+                    sets.push("device_type = NULL".to_owned());
+                }
+            }
+        }
+
+        let sql = format!(
+            "ALTER TABLE devices UPDATE {} WHERE id = {id}",
+            sets.join(", ")
+        );
+        self.execute_mutation(&sql)?;
+        Ok(true)
+    }
+
     /// Queries one of the client detail relations exposed by the collector API.
     ///
     /// # Errors
