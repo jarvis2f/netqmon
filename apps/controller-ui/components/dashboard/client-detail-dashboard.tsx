@@ -145,6 +145,49 @@ function evidenceValue(evidence: DeviceEvidence, key: string) {
     : String(value);
 }
 
+function hash32(x: number): number {
+  x = Math.imul(x ^ (x >>> 16), 0x45d9f3b);
+  x = Math.imul(x ^ (x >>> 16), 0x45d9f3b);
+  return (x ^ (x >>> 16)) >>> 0;
+}
+
+function randAtGrid(seed: number, index: number): number {
+  return hash32((seed + Math.imul(index, 0x9e3779b9)) | 0) / 4294967296;
+}
+
+function smoothNoise(seed: number, tSec: number, scaleSec: number): number {
+  const p = tSec / scaleSec;
+  const idx = Math.floor(p);
+  const u = p - idx;
+  const w = u * u * (3.0 - 2.0 * u);
+  const v0 = randAtGrid(seed, idx);
+  const v1 = randAtGrid(seed, idx + 1);
+  return v0 + (v1 - v0) * w;
+}
+
+function clientNoiseFactor(
+  seed: number,
+  tSec: number,
+  isUpload: boolean,
+): number {
+  const s = seed ^ (isUpload ? 0xaaaaaaaa : 0x55555555);
+  const nBase = smoothNoise(s, tSec, isUpload ? 170 : 130);
+  const nBurst = smoothNoise(s ^ 0x12345678, tSec, isUpload ? 45 : 30);
+  const nMicro = smoothNoise(s ^ 0x9abcdef0, tSec, isUpload ? 12 : 8);
+  const nJit = smoothNoise(s ^ 0x2468ace0, tSec, 2.0);
+
+  const b = Math.max(0, nBurst - 0.45) / 0.55;
+  const burstCurve = b * b * 3.0;
+  const m = Math.max(0, nMicro - 0.55) / 0.45;
+  const microCurve = m * m * 1.8;
+  const jitter = 0.88 + 0.24 * nJit;
+
+  return Math.max(
+    0.04,
+    (0.25 + 0.75 * nBase) * (1.0 + burstCurve + microCurve) * jitter,
+  );
+}
+
 export function ClientDetailDashboard({
   username,
   clientId,
@@ -317,25 +360,39 @@ export function ClientDetailDashboard({
             const macSeed = mac
               .split("")
               .reduce((acc, c) => (acc * 31 + c.charCodeAt(0)) | 0, 0);
+            const curDownBps = client.download_bytes_per_second * 8;
+            const curUpBps = client.upload_bytes_per_second * 8;
+            const nowSec = Math.floor(snapshot.generated_at / 1000);
+            const nowFactorDown = isDemo
+              ? clientNoiseFactor(macSeed, nowSec, false)
+              : 1;
+            const nowFactorUp = isDemo
+              ? clientNoiseFactor(macSeed, nowSec, true)
+              : 1;
+
             const seeded = snapshot.history.map((pt) => {
               const tSec = Math.floor(pt.timestamp / 1000);
-              const mod = isDemo
-                ? Math.max(
-                    0.2,
-                    0.85 +
-                      0.18 * Math.sin(tSec * 0.04 + macSeed) +
-                      0.12 * Math.cos(tSec * 0.11 + (macSeed >> 3)),
-                  )
-                : 1;
+              if (isDemo) {
+                const fDown = clientNoiseFactor(macSeed, tSec, false);
+                const fUp = clientNoiseFactor(macSeed, tSec, true);
+                return {
+                  timestamp: pt.timestamp,
+                  downloadBps: Math.max(
+                    0,
+                    (curDownBps * fDown) / nowFactorDown,
+                  ),
+                  uploadBps: Math.max(0, (curUpBps * fUp) / nowFactorUp),
+                };
+              }
               return {
                 timestamp: pt.timestamp,
                 downloadBps: Math.max(
                   0,
-                  pt.download_bytes_per_second * 8 * downRatio * mod,
+                  pt.download_bytes_per_second * 8 * downRatio,
                 ),
                 uploadBps: Math.max(
                   0,
-                  pt.upload_bytes_per_second * 8 * upRatio * mod,
+                  pt.upload_bytes_per_second * 8 * upRatio,
                 ),
               };
             });
