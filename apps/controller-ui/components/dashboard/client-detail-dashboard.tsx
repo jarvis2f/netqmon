@@ -13,6 +13,7 @@ import {
   Pencil,
 } from "lucide-react";
 import { useTranslations } from "next-intl";
+import { useRuntimeMode } from "@/components/runtime-mode-provider";
 import { AppLayout } from "@/components/app-shell/app-layout";
 import { EditClientDialog } from "@/components/dashboard/edit-client-dialog";
 import {
@@ -93,11 +94,19 @@ interface RealtimeFlow {
   client_ip: string;
   scope?: string;
 }
+interface ThroughputPoint {
+  timestamp: number;
+  upload_bytes_per_second: number;
+  download_bytes_per_second: number;
+}
 interface RealtimeSnapshot {
   generated_at: number;
+  total?: Throughput;
+  internet?: Throughput;
   clients: Record<string, Throughput>;
   client_scopes?: Record<string, ScopedThroughput>;
   active_flows: RealtimeFlow[];
+  history?: ThroughputPoint[];
 }
 interface DetailData {
   detail: ClientDetailPayload;
@@ -150,6 +159,7 @@ export function ClientDetailDashboard({
   const tFlows = useTranslations("flows.columns");
   const tStatus = useTranslations("common.status");
   const router = useRouter();
+  const { isDemo } = useRuntimeMode();
 
   const [data, setData] = useState<DetailData | null>(null);
   const [loading, setLoading] = useState(true);
@@ -246,11 +256,18 @@ export function ClientDetailDashboard({
   const applySnapshot = useCallback(
     (snapshot: RealtimeSnapshot) => {
       if (!data) return;
-      const rates = snapshot.client_scopes?.[data.detail.client.mac] ?? null;
+      const mac = data.detail.client.mac;
+      const primaryIp = data.detail.addresses[0]?.ip;
+      const rates =
+        snapshot.client_scopes?.[mac] ??
+        snapshot.client_scopes?.[mac.toLowerCase()] ??
+        (primaryIp ? snapshot.client_scopes?.[primaryIp] : null) ??
+        null;
       setScopeRates(rates);
       const clientTraffic =
-        snapshot.clients[data.detail.client.mac] ??
-        snapshot.clients[data.detail.client.mac.toLowerCase()] ??
+        snapshot.clients[mac] ??
+        snapshot.clients[mac.toLowerCase()] ??
+        (primaryIp ? snapshot.clients[primaryIp] : null) ??
         null;
       const client = scope === "all" ? clientTraffic : (rates?.[scope] ?? null);
       setRealtime(client);
@@ -266,23 +283,62 @@ export function ClientDetailDashboard({
       const hasTraffic =
         (clientTraffic?.upload_bytes_per_second ?? 0) > 0 ||
         (clientTraffic?.download_bytes_per_second ?? 0) > 0;
-      if (hasTraffic)
+      if (hasTraffic || isDemo)
         setLastTrafficSeen((current) =>
           Math.max(current, snapshot.generated_at),
         );
       if (client)
-        setRealtimePoints((points) =>
-          [
+        setRealtimePoints((points) => {
+          if (
+            points.length === 0 &&
+            snapshot.history &&
+            snapshot.history.length > 0 &&
+            ((snapshot.internet?.download_bytes_per_second ?? 0) > 0 ||
+              (snapshot.total?.download_bytes_per_second ?? 0) > 0)
+          ) {
+            const totalDown = Math.max(
+              snapshot.internet?.download_bytes_per_second ?? 0,
+              snapshot.total?.download_bytes_per_second ?? 0,
+              1,
+            );
+            const totalUp = Math.max(
+              snapshot.internet?.upload_bytes_per_second ?? 0,
+              snapshot.total?.upload_bytes_per_second ?? 0,
+              1,
+            );
+            const downRatio = Math.min(
+              1,
+              Math.max(0.01, client.download_bytes_per_second / totalDown),
+            );
+            const upRatio = Math.min(
+              1,
+              Math.max(0.01, client.upload_bytes_per_second / totalUp),
+            );
+            const seeded = snapshot.history.map((pt) => ({
+              timestamp: pt.timestamp,
+              downloadBps: pt.download_bytes_per_second * 8 * downRatio,
+              uploadBps: pt.upload_bytes_per_second * 8 * upRatio,
+            }));
+            return [
+              ...seeded,
+              {
+                timestamp: snapshot.generated_at,
+                downloadBps: client.download_bytes_per_second * 8,
+                uploadBps: client.upload_bytes_per_second * 8,
+              },
+            ].slice(-900);
+          }
+          return [
             ...points,
             {
               timestamp: snapshot.generated_at,
               downloadBps: client.download_bytes_per_second * 8,
               uploadBps: client.upload_bytes_per_second * 8,
             },
-          ].slice(-900),
-        );
+          ].slice(-900);
+        });
     },
-    [data, scope],
+    [data, isDemo, scope],
   );
 
   useEffect(() => {
@@ -307,9 +363,10 @@ export function ClientDetailDashboard({
     client?.last_traffic_seen ?? 0,
   );
   const online =
-    now > 0 &&
-    effectiveLastTrafficSeen > 0 &&
-    now - effectiveLastTrafficSeen <= 30_000;
+    isDemo ||
+    (now > 0 &&
+      effectiveLastTrafficSeen > 0 &&
+      now - effectiveLastTrafficSeen <= 30_000);
   const status =
     loading || !client || now === 0 ? "loading" : online ? "online" : "offline";
   const downloadRate = splitBitrate(
@@ -340,7 +397,16 @@ export function ClientDetailDashboard({
     [data],
   );
   const scopeMix = useMemo(() => {
-    if (!scopeRates) return [];
+    if (!scopeRates) {
+      if (isDemo) {
+        return [
+          { id: "internet" as const, percent: 85 },
+          { id: "internal" as const, percent: 15 },
+          { id: "tunnel" as const, percent: 0 },
+        ];
+      }
+      return [];
+    }
     const values = (["internet", "internal", "tunnel"] as const).map((id) => ({
       id,
       bytes:
@@ -352,7 +418,7 @@ export function ClientDetailDashboard({
       ...item,
       percent: total > 0 ? Math.round((item.bytes * 100) / total) : 0,
     }));
-  }, [scopeRates]);
+  }, [isDemo, scopeRates]);
   const setTab = (tab: Tab) =>
     router.replace(`/clients/${clientId}?tab=${tab}`, { scroll: false });
 

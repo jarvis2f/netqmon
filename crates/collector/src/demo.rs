@@ -12,7 +12,7 @@ use tokio::sync::broadcast;
 
 use crate::realtime::{
     ActiveFlowSnapshot, GatewayHealthSnapshot, RealtimeEvent, RealtimeSnapshot, ScopedThroughput,
-    Throughput, ThroughputPoint, format_ip,
+    Throughput, ThroughputPoint, format_ip, format_mac,
 };
 use crate::{CollectorState, unix_time_ms};
 
@@ -59,6 +59,7 @@ struct DemoGatewayMeta {
 #[derive(Clone)]
 struct DemoClientProfile {
     ip: String,
+    mac: Option<String>,
     weight: f64,
 }
 
@@ -201,29 +202,31 @@ impl DemoRealtimeProvider {
         // 3. Client profiles
         let mut clients: Vec<DemoClientProfile> = Vec::new();
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT da.ip, COALESCE(SUM(t.upload_bytes + t.download_bytes), 1) as vol
+            "SELECT da.ip, d.mac, COALESCE(SUM(t.upload_bytes + t.download_bytes), 1) as vol
              FROM devices d
              JOIN device_addresses da ON da.device_id = d.id
              LEFT JOIN traffic_device_minute t ON t.device_id = d.id
-             GROUP BY da.ip
-             ORDER BY vol DESC
-             LIMIT 12",
+             GROUP BY da.ip, d.mac
+             ORDER BY vol DESC",
         ) {
             if let Ok(rows) = stmt.query_map([], |row| {
                 let ip_blob: Vec<u8> = row.get(0)?;
-                let vol: i64 = row.get(1)?;
-                Ok((format_ip(&ip_blob), vol as f64))
+                let mac_blob: Option<Vec<u8>> = row.get(1)?;
+                let vol: i64 = row.get(2)?;
+                let mac = mac_blob.map(|b| format_mac(&b));
+                Ok((format_ip(&ip_blob), mac, vol.max(1) as f64))
             }) {
                 let mut total_vol = 0.0;
                 let mut list = Vec::new();
                 for r in rows.flatten() {
-                    total_vol += r.1;
+                    total_vol += r.2;
                     list.push(r);
                 }
                 if total_vol > 0.0 {
-                    for (ip, vol) in list {
+                    for (ip, mac, vol) in list {
                         clients.push(DemoClientProfile {
                             ip,
+                            mac,
                             weight: vol / total_vol,
                         });
                     }
@@ -234,18 +237,22 @@ impl DemoRealtimeProvider {
             clients = vec![
                 DemoClientProfile {
                     ip: "192.168.1.101".to_owned(),
+                    mac: Some("02:00:00:00:00:01".to_owned()),
                     weight: 0.45,
                 },
                 DemoClientProfile {
                     ip: "192.168.1.102".to_owned(),
+                    mac: Some("02:00:00:00:00:02".to_owned()),
                     weight: 0.30,
                 },
                 DemoClientProfile {
                     ip: "192.168.1.103".to_owned(),
+                    mac: Some("02:00:00:00:00:03".to_owned()),
                     weight: 0.15,
                 },
                 DemoClientProfile {
                     ip: "192.168.1.104".to_owned(),
+                    mac: Some("02:00:00:00:00:04".to_owned()),
                     weight: 0.10,
                 },
             ];
@@ -411,6 +418,47 @@ impl DemoRealtimeProvider {
             });
         }
 
+        let mut initial_client_map = HashMap::new();
+        let mut initial_client_scopes = HashMap::new();
+        for client in &clients {
+            let cl_down = (base_down as f64 * client.weight) as u64;
+            let cl_up = (base_up as f64 * client.weight) as u64;
+            let tp = Throughput {
+                upload_bytes_per_second: cl_up,
+                download_bytes_per_second: cl_down,
+            };
+            let scoped = ScopedThroughput {
+                internet: tp.clone(),
+                internal: Throughput {
+                    upload_bytes_per_second: cl_up / 10,
+                    download_bytes_per_second: cl_down / 10,
+                },
+                tunnel: Throughput::default(),
+                unknown: Throughput::default(),
+            };
+            initial_client_map.insert(client.ip.clone(), tp.clone());
+            initial_client_scopes.insert(client.ip.clone(), scoped.clone());
+            if let Some(mac) = &client.mac {
+                initial_client_map.insert(mac.clone(), tp.clone());
+                initial_client_map.insert(mac.to_lowercase(), tp.clone());
+                initial_client_scopes.insert(mac.clone(), scoped.clone());
+                initial_client_scopes.insert(mac.to_lowercase(), scoped.clone());
+            }
+        }
+
+        let mut initial_app_map = HashMap::new();
+        for app in &apps {
+            let app_down = (base_down as f64 * app.weight) as u64;
+            let app_up = (base_up as f64 * app.weight) as u64;
+            initial_app_map.insert(
+                app.id.clone(),
+                Throughput {
+                    upload_bytes_per_second: app_up,
+                    download_bytes_per_second: app_down,
+                },
+            );
+        }
+
         let initial_snapshot = RealtimeSnapshot {
             generated_at: now,
             agent_batch_time: now,
@@ -428,9 +476,9 @@ impl DemoRealtimeProvider {
             },
             tunnel: Throughput::default(),
             unknown: Throughput::default(),
-            clients: HashMap::new(),
-            client_scopes: HashMap::new(),
-            applications: HashMap::new(),
+            clients: initial_client_map,
+            client_scopes: initial_client_scopes,
+            applications: initial_app_map,
             active_flows: flows.clone(),
             history,
             gateway_health: Some(GatewayHealthSnapshot {
@@ -522,6 +570,21 @@ impl DemoRealtimeProvider {
                     unknown: Throughput::default(),
                 },
             );
+            if let Some(mac) = &client.mac {
+                let scoped = ScopedThroughput {
+                    internet: tp.clone(),
+                    internal: Throughput {
+                        upload_bytes_per_second: cl_up / 10,
+                        download_bytes_per_second: cl_down / 10,
+                    },
+                    tunnel: Throughput::default(),
+                    unknown: Throughput::default(),
+                };
+                client_map.insert(mac.clone(), tp.clone());
+                client_map.insert(mac.to_lowercase(), tp.clone());
+                client_scopes.insert(mac.clone(), scoped.clone());
+                client_scopes.insert(mac.to_lowercase(), scoped.clone());
+            }
         }
 
         let mut app_map: HashMap<String, Throughput> = HashMap::new();

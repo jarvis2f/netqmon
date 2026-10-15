@@ -664,7 +664,7 @@ pub(crate) fn format_ip(bytes: &[u8]) -> String {
     }
 }
 
-fn format_mac(bytes: &[u8]) -> String {
+pub(crate) fn format_mac(bytes: &[u8]) -> String {
     if bytes.len() != 6 {
         return "unknown".to_owned();
     }
