@@ -281,7 +281,21 @@ fn handle_client(stream: &mut TcpStream, db: &Arc<Mutex<MockClickHouseDb>>) {
         }
     } else if body_str.contains("FROM auth_sessions") {
         let mock = db.lock().unwrap();
-        if let Some(pos) = body_str.find("s.token_hash = '") {
+        if body_str.contains("count() AS count") {
+            let token_hash = body_str.find("token_hash = '").and_then(|pos| {
+                let start = pos + 14;
+                body_str[start..]
+                    .find('\'')
+                    .map(|end| &body_str[start..start + end])
+            });
+            let count = token_hash.map_or(0, |token_hash| {
+                mock.auth_sessions
+                    .iter()
+                    .filter(|session| session["token_hash"].as_str() == Some(token_hash))
+                    .count()
+            });
+            serde_json::to_string(&json!({ "data": [{ "count": count }] })).unwrap()
+        } else if let Some(pos) = body_str.find("s.token_hash = '") {
             let start = pos + 16;
             let end = body_str[start..].find('\'').unwrap_or(0);
             let token_hash = &body_str[start..start + end];
@@ -339,11 +353,22 @@ fn handle_client(stream: &mut TcpStream, db: &Arc<Mutex<MockClickHouseDb>>) {
         let rows: Vec<Value> = mock
             .dns_observations
             .iter()
+            .filter(|observation| {
+                ["gateway_id", "client_ip", "answer_ip"]
+                    .into_iter()
+                    .all(|column| {
+                        let Some(expected) = sql_string_filter(&body_str, column) else {
+                            return false;
+                        };
+                        observation[column].as_str() == Some(expected)
+                    })
+            })
             .map(|d| {
                 json!({
+                    "id": d["id"],
                     "domain": d["domain"],
-                    "ttl_seconds": d["ttl_seconds"],
-                    "observed_at": d["observed_at"]
+                    "observed_at": d["observed_at"],
+                    "expires_at": d["expires_at"]
                 })
             })
             .collect();
@@ -391,6 +416,15 @@ fn handle_client(stream: &mut TcpStream, db: &Arc<Mutex<MockClickHouseDb>>) {
         response_body
     );
     stream.write_all(response.as_bytes()).ok();
+}
+
+fn sql_string_filter<'a>(query: &'a str, column: &str) -> Option<&'a str> {
+    let prefix = format!("{column} = '");
+    query
+        .split_once(&prefix)?
+        .1
+        .split_once('\'')
+        .map(|(value, _)| value)
 }
 
 #[test]

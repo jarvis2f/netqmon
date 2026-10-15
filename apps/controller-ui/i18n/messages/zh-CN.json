@@ -221,6 +221,7 @@
     "topApplications": "热门应用",
     "topClients": "活跃客户端",
     "topDestinations": "主要目标",
+    "recent24HoursHint": "排行按最近 24 小时记录的流量统计。",
     "categoryDistribution": "流量类别分布",
     "gatewayHealth": "网关健康状态",
     "noGatewayEnrolled": "未注册网关",
@@ -298,6 +299,8 @@
     "notFound": "未找到应用",
     "notFoundSearch": "没有应用匹配当前搜索条件。",
     "notFoundEmpty": "尚未记录到分类流量。",
+    "protocolApplicationDescription": "已识别协议，具体应用未知",
+    "protocolApplicationDetailSubtitle": "按此协议汇总；尚未识别到具体应用。",
     "openFullDetails": "查看完整详情",
     "columns": {
       "application": "应用",
@@ -324,7 +327,7 @@
       "unknownApp": "未知应用",
       "subtitle": "流量类别：{category} · 分类置信度 {confidence}",
       "fallbackSubtitle": "应用流量及关联活动",
-      "allRecordedTraffic": "所有已记录流量",
+      "allRecordedTraffic": "当前时间范围",
       "distinctClients": "分类关联的客户端数",
       "persistedObservations": "持久化观测样本",
       "classification": "分类信息",
@@ -334,17 +337,17 @@
       "observedProtocols": "观测到的协议",
       "noMatchingRule": "无匹配规则",
       "rulesSource": "规则匹配",
-      "trafficRecorded": "流量 — 所有已记录数据",
+      "trafficRecorded": "流量",
       "topClients": "主要客户端",
       "topDomains": "主要域名",
       "scope": {
         "title": "统计口径",
         "tabs": {
-          "overview": "概览卡片、图表和主要列表均统计该应用所有已记录的流量与持久化观测数据。",
-          "clients": "按局域网客户端聚合所有已记录的持久化连接流，合计上行、下行和连接流数量，最多显示 100 个客户端。",
-          "domains": "按观测到的域名聚合所有已记录的持久化连接流，合计上行、下行、数据包和连接流数量，最多显示 100 个域名。",
-          "destinations": "按远端 IP 聚合所有已记录的持久化连接流，并在有记录时显示最新关联域名，最多显示 100 个目标。",
-          "flows": "列出该应用所有已记录的单条持久化连接流，按最近活跃时间倒序排列，最多显示 100 条。"
+          "overview": "概览卡片、图表和主要列表均按所选时间范围统计。",
+          "clients": "按局域网客户端聚合所选时间范围内的连接流，合计上行、下行和连接流数量，最多显示 100 个客户端。",
+          "domains": "按观测到的域名聚合所选时间范围内的连接流，合计上行、下行、数据包和连接流数量，最多显示 100 个域名。",
+          "destinations": "按远端 IP 聚合所选时间范围内的连接流，并在有记录时显示最新关联域名，最多显示 100 个目标。",
+          "flows": "列出所选时间范围内该应用的连接流，按最近活跃时间倒序排列，最多显示 100 条。"
         }
       },
       "tabs": {
@@ -378,6 +381,35 @@
     "notFoundSearch": "没有客户端匹配当前搜索条件。",
     "notFoundEmpty": "尚未收到来自网关的设备观测数据。",
     "openClientDetails": "查看客户端详情",
+    "editClient": "修改客户端信息",
+    "editClientDialog": {
+      "title": "修改客户端信息",
+      "description": "修改设备备注名称与设备类型以优化拓扑展示与图标识别。",
+      "nameLabel": "备注名称",
+      "namePlaceholder": "输入自定义备注名称（留空使用默认名称/主机名）",
+      "deviceTypeLabel": "设备类型",
+      "deviceTypeAuto": "自动识别（根据指纹或规则）",
+      "deviceTypes": {
+        "smartphone": "智能手机",
+        "tablet": "平板电脑",
+        "laptop": "笔记本电脑",
+        "desktop": "台式机 / 工作站",
+        "tv": "电视 / 影音娱乐",
+        "nas": "网络存储 (NAS)",
+        "server": "服务器",
+        "printer": "打印机",
+        "camera": "摄像头 / 监控",
+        "game-console": "游戏主机",
+        "speaker": "智能音箱",
+        "router": "路由器 / 交换机",
+        "iot": "智能家居 / IoT"
+      },
+      "save": "保存",
+      "saving": "保存中...",
+      "cancel": "取消",
+      "saveSuccess": "客户端信息修改成功",
+      "saveError": "修改客户端信息失败"
+    },
     "topology": {
       "title": "实时网络流量拓扑",
       "subtitle": "客户端 · 路由器 · 互联网流量流向",
@@ -1010,6 +1042,7 @@
       "description": "控制器系统运行状态、遥测指标与硬件网关运行详情",
       "copy": "复制诊断信息至剪贴板",
       "copied": "已复制到剪贴板",
+      "copyError": "无法复制诊断信息，请手动复制诊断详情。",
       "collectorVersion": "Collector 版本",
       "dbBackend": "数据库后端",
       "dbSize": "数据库体积",

@@ -12,20 +12,34 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 NETQMON_DEFAULT_RELEASE_TAG="${NETQMON_DEFAULT_RELEASE_TAG:-}"
 
-# 1. Detect architecture
-ARCH="$(uname -m)"
-case "$ARCH" in
-    x86_64|amd64)
-        TARGET_ARCH="x86_64"
-        ;;
-    aarch64|arm64)
-        TARGET_ARCH="aarch64"
-        ;;
-    *)
-        echo "Warning: unverified architecture: $ARCH (assuming $ARCH)"
-        TARGET_ARCH="$ARCH"
-        ;;
-esac
+# 1. Detect the native OpenWrt package manager and package architecture.
+if command -v opkg >/dev/null 2>&1; then
+    PACKAGE_MANAGER=opkg
+    PACKAGE_FORMAT=ipk
+    TARGET_ARCH="$(opkg print-architecture 2>/dev/null | awk '
+        NF >= 3 && $2 != "all" && $2 != "noarch" && $3 >= best {
+            arch = $2
+            best = $3
+        }
+        END { print arch }
+    ')"
+elif command -v apk >/dev/null 2>&1; then
+    PACKAGE_MANAGER=apk
+    PACKAGE_FORMAT=apk
+    TARGET_ARCH="$(apk --print-arch 2>/dev/null)"
+else
+    PACKAGE_MANAGER=
+    PACKAGE_FORMAT=
+    ARCH="$(uname -m)"
+    case "$ARCH" in
+        x86_64|amd64) TARGET_ARCH="x86_64" ;;
+        aarch64|arm64) TARGET_ARCH="aarch64" ;;
+        *)
+            echo "Warning: unverified architecture: $ARCH (assuming $ARCH)"
+            TARGET_ARCH="$ARCH"
+            ;;
+    esac
+fi
 echo "Detected architecture: ${TARGET_ARCH}"
 
 # 2. Check kernel module dependencies
@@ -57,7 +71,7 @@ check_and_install_deps() {
 }
 check_and_install_deps
 
-# 3. Prefer OpenWrt IPK installation when opkg is available. This installs both
+# 3. Prefer native OpenWrt package installation when opkg or apk is available. This installs both
 # the agent package and the LuCI management app from local packages or GitHub
 # release assets, then exits before the standalone binary fallback.
 download_file() {
@@ -105,25 +119,34 @@ release_download_base_url() {
     fi
 }
 
-install_openwrt_ipks() {
+install_openwrt_packages() {
     [ "${NETQMON_INSTALL_IPK:-1}" = "1" ] || return 1
-    command -v opkg >/dev/null 2>&1 || return 1
+    [ -n "$PACKAGE_MANAGER" ] || return 1
 
-    local tmp_dir base_url manifest agent_pkg luci_pkg agent_url luci_url agent_sha luci_sha actual
+    local tmp_dir base_url manifest agent_pkg luci_pkg agent_url luci_url agent_sha luci_sha actual luci_arch
     tmp_dir="${TMPDIR:-/tmp}/netqmon-install"
     base_url="${NETQMON_RELEASE_BASE_URL:-$(release_download_base_url)}"
     mkdir -p "$tmp_dir"
 
     agent_pkg="$(first_existing_file \
+        "${SCRIPT_DIR}/netqmon-agent-"*"_${TARGET_ARCH}.${PACKAGE_FORMAT}" \
         "${SCRIPT_DIR}/netqmon-agent_"*"_${TARGET_ARCH}.ipk" \
-        "${SCRIPT_DIR}/netqmon-agent_${TARGET_ARCH}.ipk" \
+        "${SCRIPT_DIR}/netqmon-agent_${TARGET_ARCH}.${PACKAGE_FORMAT}" \
+        "${SCRIPT_DIR}/dist/netqmon-agent-"*"_${TARGET_ARCH}.${PACKAGE_FORMAT}" \
         "${SCRIPT_DIR}/dist/netqmon-agent_"*"_${TARGET_ARCH}.ipk" \
-        "${SCRIPT_DIR}/dist/netqmon-agent_${TARGET_ARCH}.ipk" 2>/dev/null || true)"
+        "${SCRIPT_DIR}/dist/netqmon-agent_${TARGET_ARCH}.${PACKAGE_FORMAT}" 2>/dev/null || true)"
+    if [ "$PACKAGE_FORMAT" = "ipk" ]; then
+        luci_arch=all
+    else
+        luci_arch="$TARGET_ARCH"
+    fi
     luci_pkg="$(first_existing_file \
+        "${SCRIPT_DIR}/luci-app-netqmon-"*"_${TARGET_ARCH}.${PACKAGE_FORMAT}" \
         "${SCRIPT_DIR}/luci-app-netqmon_"*"_all.ipk" \
-        "${SCRIPT_DIR}/luci-app-netqmon_all.ipk" \
+        "${SCRIPT_DIR}/luci-app-netqmon_${luci_arch}.${PACKAGE_FORMAT}" \
+        "${SCRIPT_DIR}/dist/luci-app-netqmon-"*"_${TARGET_ARCH}.${PACKAGE_FORMAT}" \
         "${SCRIPT_DIR}/dist/luci-app-netqmon_"*"_all.ipk" \
-        "${SCRIPT_DIR}/dist/luci-app-netqmon_all.ipk" 2>/dev/null || true)"
+        "${SCRIPT_DIR}/dist/luci-app-netqmon_${luci_arch}.${PACKAGE_FORMAT}" 2>/dev/null || true)"
 
     if [ -z "$agent_pkg" ] || [ -z "$luci_pkg" ]; then
         manifest="$tmp_dir/openwrt-agent-manifest.json"
@@ -131,16 +154,16 @@ install_openwrt_ipks() {
         download_file "${base_url}/openwrt-agent-manifest.json" "$manifest" || return 1
 
         if command -v jsonfilter >/dev/null 2>&1; then
-            agent_url="$(jsonfilter -i "$manifest" -e "@.channels.stable.packages[@.name='netqmon-agent'][@.openwrt_arch='${TARGET_ARCH}'].url" 2>/dev/null | head -n 1)"
-            agent_sha="$(jsonfilter -i "$manifest" -e "@.channels.stable.packages[@.name='netqmon-agent'][@.openwrt_arch='${TARGET_ARCH}'].sha256" 2>/dev/null | head -n 1)"
-            luci_url="$(jsonfilter -i "$manifest" -e "@.channels.stable.packages[@.name='luci-app-netqmon'][@.openwrt_arch='all'].url" 2>/dev/null | head -n 1)"
-            luci_sha="$(jsonfilter -i "$manifest" -e "@.channels.stable.packages[@.name='luci-app-netqmon'][@.openwrt_arch='all'].sha256" 2>/dev/null | head -n 1)"
+            agent_url="$(jsonfilter -i "$manifest" -e "@.channels.stable.packages[@.name='netqmon-agent'][@.openwrt_arch='${TARGET_ARCH}'][@.package_format='${PACKAGE_FORMAT}'].url" 2>/dev/null | head -n 1)"
+            agent_sha="$(jsonfilter -i "$manifest" -e "@.channels.stable.packages[@.name='netqmon-agent'][@.openwrt_arch='${TARGET_ARCH}'][@.package_format='${PACKAGE_FORMAT}'].sha256" 2>/dev/null | head -n 1)"
+            luci_url="$(jsonfilter -i "$manifest" -e "@.channels.stable.packages[@.name='luci-app-netqmon'][@.openwrt_arch='${luci_arch}'][@.package_format='${PACKAGE_FORMAT}'].url" 2>/dev/null | head -n 1)"
+            luci_sha="$(jsonfilter -i "$manifest" -e "@.channels.stable.packages[@.name='luci-app-netqmon'][@.openwrt_arch='${luci_arch}'][@.package_format='${PACKAGE_FORMAT}'].sha256" 2>/dev/null | head -n 1)"
         fi
 
-        agent_url="${agent_url:-${base_url}/netqmon-agent_${TARGET_ARCH}.ipk}"
-        luci_url="${luci_url:-${base_url}/luci-app-netqmon_all.ipk}"
-        agent_pkg="$tmp_dir/netqmon-agent_${TARGET_ARCH}.ipk"
-        luci_pkg="$tmp_dir/luci-app-netqmon_all.ipk"
+        [ -n "${agent_url:-}" ] || return 1
+        [ -n "${luci_url:-}" ] || return 1
+        agent_pkg="$tmp_dir/netqmon-agent_${TARGET_ARCH}.${PACKAGE_FORMAT}"
+        luci_pkg="$tmp_dir/luci-app-netqmon_${luci_arch}.${PACKAGE_FORMAT}"
 
         echo "Downloading netqmon-agent package..."
         download_file "$agent_url" "$agent_pkg" || return 1
@@ -164,7 +187,11 @@ install_openwrt_ipks() {
     fi
 
     echo "Installing OpenWrt packages..."
-    opkg install "$agent_pkg" "$luci_pkg"
+    if [ "$PACKAGE_MANAGER" = "opkg" ]; then
+        opkg install "$agent_pkg" "$luci_pkg"
+    else
+        apk add --allow-untrusted "$agent_pkg" "$luci_pkg"
+    fi
 
     if [ -x /etc/init.d/rpcd ]; then
         /etc/init.d/rpcd restart || true
@@ -183,11 +210,11 @@ install_openwrt_ipks() {
     return 0
 }
 
-if install_openwrt_ipks; then
+if install_openwrt_packages; then
     exit 0
 fi
 
-if command -v opkg >/dev/null 2>&1 && [ "${NETQMON_INSTALL_IPK:-1}" = "1" ]; then
+if [ -n "$PACKAGE_MANAGER" ] && [ "${NETQMON_INSTALL_IPK:-1}" = "1" ]; then
     echo "Error: OpenWrt package installation failed." >&2
     echo "Set NETQMON_INSTALL_IPK=0 to use the standalone binary fallback." >&2
     exit 1

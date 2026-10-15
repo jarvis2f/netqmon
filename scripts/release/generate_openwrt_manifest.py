@@ -49,7 +49,7 @@ def read_control(path: Path) -> dict[str, str]:
             return fields
 
 
-def package_record(path: Path, repository: str, tag: str) -> dict[str, str] | None:
+def ipk_package_record(path: Path, repository: str, tag: str) -> dict[str, str] | None:
     fields = read_control(path)
     name = fields.get("Package", "")
     if name not in PACKAGE_NAMES:
@@ -64,10 +64,55 @@ def package_record(path: Path, repository: str, tag: str) -> dict[str, str] | No
     return {
         "name": name,
         "openwrt_arch": architecture,
+        "package_format": "ipk",
         "version": version,
         "url": f"https://github.com/{repository}/releases/download/{tag}/{path.name}",
         "sha256": digest,
     }
+
+
+def apk_package_record(path: Path, repository: str, tag: str) -> dict[str, str] | None:
+    artifact_name = path.parent.name
+    prefix = "openwrt-"
+    suffix = "-apk"
+    if not artifact_name.startswith(prefix) or not artifact_name.endswith(suffix):
+        raise ValueError(
+            f"{path.name}: APK must be inside an openwrt-<arch>-apk artifact directory"
+        )
+
+    architecture = artifact_name[len(prefix) : -len(suffix)]
+    architecture_suffix = f"_{architecture}.apk"
+    if not path.name.endswith(architecture_suffix):
+        raise ValueError(f"{path.name}: APK filename does not match artifact architecture")
+
+    stem = path.name[: -len(architecture_suffix)]
+    name = next(
+        (candidate for candidate in sorted(PACKAGE_NAMES, key=len, reverse=True) if stem.startswith(f"{candidate}-")),
+        "",
+    )
+    if not name:
+        return None
+    version = stem[len(name) + 1 :]
+    if not version:
+        raise ValueError(f"{path.name}: APK filename has no version")
+
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return {
+        "name": name,
+        "openwrt_arch": architecture,
+        "package_format": "apk",
+        "version": version,
+        "url": f"https://github.com/{repository}/releases/download/{tag}/{path.name}",
+        "sha256": digest,
+    }
+
+
+def package_record(path: Path, repository: str, tag: str) -> dict[str, str] | None:
+    if path.suffix == ".ipk":
+        return ipk_package_record(path, repository, tag)
+    if path.suffix == ".apk":
+        return apk_package_record(path, repository, tag)
+    return None
 
 
 def parse_release(specification: str) -> tuple[str, str, Path]:
@@ -92,12 +137,13 @@ def create_manifest(repository: str, releases: list[str]) -> dict[str, object]:
         if channel in channels:
             raise ValueError(f"channel was specified more than once: {channel}")
 
-        packages: dict[tuple[str, str], dict[str, str]] = {}
-        for path in sorted(directory.rglob("*.ipk")):
+        packages: dict[tuple[str, str, str], dict[str, str]] = {}
+        package_paths = sorted(directory.rglob("*.ipk")) + sorted(directory.rglob("*.apk"))
+        for path in package_paths:
             record = package_record(path, repository, tag)
             if record is None:
                 continue
-            key = (record["name"], record["openwrt_arch"])
+            key = (record["name"], record["openwrt_arch"], record["package_format"])
             previous = packages.get(key)
             if previous is not None and previous["sha256"] != record["sha256"]:
                 raise ValueError(
@@ -105,8 +151,8 @@ def create_manifest(repository: str, releases: list[str]) -> dict[str, object]:
                 )
             packages[key] = record
 
-        agent_packages = [record for (name, _), record in packages.items() if name == "netqmon-agent"]
-        luci_packages = [record for (name, _), record in packages.items() if name == "luci-app-netqmon"]
+        agent_packages = [record for (name, _, _), record in packages.items() if name == "netqmon-agent"]
+        luci_packages = [record for (name, _, _), record in packages.items() if name == "luci-app-netqmon"]
         if not agent_packages:
             raise ValueError(f"{tag}: no netqmon-agent packages found")
         if not any(record["openwrt_arch"] == "all" for record in luci_packages):
@@ -114,12 +160,21 @@ def create_manifest(repository: str, releases: list[str]) -> dict[str, object]:
 
         channels[channel] = {
             "version": tag[1:],
-            "packages": sorted(packages.values(), key=lambda record: (record["name"], record["openwrt_arch"])),
+            # Keep every IPK record before every APK record so format-unaware
+            # v1 updaters continue to select an IPK agent by architecture.
+            "packages": sorted(
+                packages.values(),
+                key=lambda record: (
+                    0 if record["package_format"] == "ipk" else 1,
+                    record["name"],
+                    record["openwrt_arch"],
+                ),
+            ),
         }
 
     return {
         "format": "netqmon-openwrt-agent",
-        "format_version": 1,
+        "format_version": 2,
         "channels": channels,
     }
 

@@ -359,7 +359,7 @@ async fn public_and_internal_health_routes_are_available() {
 }
 
 #[tokio::test]
-async fn unavailable_classifier_keeps_ingestion_healthy_and_strict_apis_return_503() {
+async fn unavailable_classifier_defers_ingestion_and_strict_apis_return_503() {
     let state = unavailable_classifier_state();
     let enrollment = state
         .enroll(&EnrollRequest {
@@ -389,10 +389,11 @@ async fn unavailable_classifier_keeps_ingestion_healthy_and_strict_apis_return_5
         ..Default::default()
     };
 
-    assert_eq!(
-        state.accept_batch(&batch).unwrap(),
-        BatchDisposition::Accepted
-    );
+    assert!(matches!(
+        state.accept_batch(&batch),
+        Err(TelemetryIngestError::ClassifierUnavailable(_))
+    ));
+    assert_eq!(state.lock().accepted_batches, 0);
 
     let health = public_router(state.clone())
         .oneshot(
@@ -645,6 +646,106 @@ async fn client_queries_expose_last_traffic_seen_separately_from_discovery() {
         detail_json["data"]["client"]["last_traffic_seen"],
         serde_json::json!(1_700_000_000_000_i64)
     );
+}
+
+#[tokio::test]
+async fn update_client_info_modifies_display_name_and_device_type() {
+    let router = internal_router(query_state());
+
+    // 1. Update client 1 name and device_type
+    let update_req = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/internal/clients/1")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": "My Custom Laptop",
+                        "device_type": "laptop"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_req.status(), StatusCode::OK);
+    let update_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(update_req.into_body(), 64 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(update_json["data"]["client"]["name"], "My Custom Laptop");
+    assert_eq!(
+        update_json["data"]["client"]["identity"]["device_type"],
+        "laptop"
+    );
+
+    // 2. Verify GET /internal/clients/1 reflects the changes
+    let get_req = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/internal/clients/1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_req.status(), StatusCode::OK);
+    let get_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(get_req.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(get_json["data"]["client"]["name"], "My Custom Laptop");
+    assert_eq!(
+        get_json["data"]["client"]["identity"]["device_type"],
+        "laptop"
+    );
+
+    // 3. Clear display_name with null or empty string, fallback to hostname
+    let clear_name_req = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/internal/clients/1")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": ""
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(clear_name_req.status(), StatusCode::OK);
+    let clear_json: serde_json::Value = serde_json::from_slice(
+        &to_bytes(clear_name_req.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(clear_json["data"]["client"]["name"], "laptop");
+
+    // 4. Non-existent client returns 404
+    let not_found_req = router
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/internal/clients/999999")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": "Ghost"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(not_found_req.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -1449,6 +1550,18 @@ async fn insights_explain_each_capture_quality_warning() {
     assert!(codes.contains("capture.dns_event_drops"));
     assert!(codes.contains("capture.telemetry_queue_drops"));
     assert!(codes.contains("capture.collector_lag"));
+    let collector_lag = items
+        .iter()
+        .find(|item| item["code"] == "capture.collector_lag")
+        .unwrap();
+    assert_eq!(
+        collector_lag["evidence"]["agent_batch_time"],
+        1_700_000_000_000_u64
+    );
+    assert!(
+        collector_lag["params"]["lag_ms"].as_u64().unwrap()
+            >= crate::insights::collector_lag_threshold_ms()
+    );
     for item in items {
         assert!(item.get("title").is_none());
         assert!(item.get("reason").is_none());
@@ -1689,68 +1802,88 @@ fn spawn_asn_classifier_server(
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
         let mut observed = Vec::new();
+        let mut classification_requests = 0;
 
-        for _ in 0..expected_requests {
+        while classification_requests < expected_requests {
             let mut line = String::new();
             assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-            let netqmon_classifier_client::ClientRequest::ClassifyBatch {
-                request_id,
-                request,
-            } = serde_json::from_str(&line).unwrap()
-            else {
-                panic!("collector must use classify_batch IPC");
-            };
-            let entries = request
-                .entries
-                .into_iter()
-                .map(|entry| {
-                    observed.push(AsnClassifierRequest {
-                        domain: entry.domain.clone(),
-                        remote_ip: entry.remote_ip.clone(),
-                        remote_asn: entry.remote_asn,
-                        has_dpi: entry.dpi_evidence.is_some(),
-                    });
-                    let asn = entry.remote_asn;
-                    let suffix = asn.unwrap_or_default();
-                    netqmon_classifier_client::ClassificationResult {
-                        entry_id: entry.entry_id,
-                        organization: asn.map(|_| netqmon_classifier_client::ClassifiedEntity {
-                            id: format!("asn-org-{suffix}"),
-                            confidence: 0.91,
-                        }),
-                        application: asn.map(|_| netqmon_classifier_client::ClassifiedEntity {
-                            id: format!("asn-app-{suffix}"),
-                            confidence: 0.92,
-                        }),
-                        traffic_class: asn.map(|_| netqmon_classifier_client::ClassifiedEntity {
-                            id: "test-asn".to_owned(),
-                            confidence: 0.9,
-                        }),
-                        traffic_role: None,
-                        protocol: entry.dpi_evidence.as_ref().map(|_| {
-                            netqmon_classifier_client::ClassifiedEntity {
-                                id: "late-dpi".to_owned(),
-                                confidence: 0.95,
-                            }
-                        }),
-                        evidence: asn
-                            .map(|value| {
-                                vec![netqmon_classifier_client::ClassificationEvidence {
-                                    evidence_type: "remote_asn".to_owned(),
-                                    value: value.to_string(),
-                                    source: "test-geo".to_owned(),
-                                    weight: 0.92,
-                                }]
-                            })
-                            .unwrap_or_default(),
-                        device_evidence: Vec::new(),
-                        error: None,
+            let request: netqmon_classifier_client::ClientRequest =
+                serde_json::from_str(&line).unwrap();
+            let response = match request {
+                netqmon_classifier_client::ClientRequest::Health { request_id } => {
+                    netqmon_classifier_client::ServerResponse::Health {
+                        request_id,
+                        health: netqmon_classifier_client::ClassifierHealth {
+                            ready: true,
+                            detail: None,
+                        },
                     }
-                })
-                .collect();
-            let response = netqmon_classifier_client::ServerResponse::ClassificationBatch {
-                request_id,
-                result: netqmon_classifier_client::ClassificationBatchResult { entries },
+                }
+                netqmon_classifier_client::ClientRequest::ClassifyBatch {
+                    request_id,
+                    request,
+                } => {
+                    classification_requests += 1;
+                    let entries = request
+                        .entries
+                        .into_iter()
+                        .map(|entry| {
+                            observed.push(AsnClassifierRequest {
+                                domain: entry.domain.clone(),
+                                remote_ip: entry.remote_ip.clone(),
+                                remote_asn: entry.remote_asn,
+                                has_dpi: entry.dpi_evidence.is_some(),
+                            });
+                            let asn = entry.remote_asn;
+                            let suffix = asn.unwrap_or_default();
+                            netqmon_classifier_client::ClassificationResult {
+                                entry_id: entry.entry_id,
+                                organization: asn.map(|_| {
+                                    netqmon_classifier_client::ClassifiedEntity {
+                                        id: format!("asn-org-{suffix}"),
+                                        confidence: 0.91,
+                                    }
+                                }),
+                                application: asn.map(|_| {
+                                    netqmon_classifier_client::ClassifiedEntity {
+                                        id: format!("asn-app-{suffix}"),
+                                        confidence: 0.92,
+                                    }
+                                }),
+                                traffic_class: asn.map(|_| {
+                                    netqmon_classifier_client::ClassifiedEntity {
+                                        id: "test-asn".to_owned(),
+                                        confidence: 0.9,
+                                    }
+                                }),
+                                traffic_role: None,
+                                protocol: entry.dpi_evidence.as_ref().map(|_| {
+                                    netqmon_classifier_client::ClassifiedEntity {
+                                        id: "late-dpi".to_owned(),
+                                        confidence: 0.95,
+                                    }
+                                }),
+                                evidence: asn
+                                    .map(|value| {
+                                        vec![netqmon_classifier_client::ClassificationEvidence {
+                                            evidence_type: "remote_asn".to_owned(),
+                                            value: value.to_string(),
+                                            source: "test-geo".to_owned(),
+                                            weight: 0.92,
+                                        }]
+                                    })
+                                    .unwrap_or_default(),
+                                device_evidence: Vec::new(),
+                                error: None,
+                            }
+                        })
+                        .collect();
+                    netqmon_classifier_client::ServerResponse::ClassificationBatch {
+                        request_id,
+                        result: netqmon_classifier_client::ClassificationBatchResult { entries },
+                    }
+                }
+                other => panic!("unexpected classifier request: {other:?}"),
             };
             writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).unwrap();
             writer.flush().unwrap();
@@ -2248,6 +2381,7 @@ async fn overview_reports_interface_counter_sanity_warning() {
                 ..TelemetryBatch::default()
             },
             &[],
+            1_700_000_001_000,
             1_700_000_001_000,
         );
     }

@@ -413,6 +413,7 @@ impl DemoRealtimeProvider {
 
         let initial_snapshot = RealtimeSnapshot {
             generated_at: now,
+            agent_batch_time: now,
             total: Throughput {
                 upload_bytes_per_second: base_up,
                 download_bytes_per_second: base_down,
@@ -589,6 +590,7 @@ impl DemoRealtimeProvider {
 
         RealtimeSnapshot {
             generated_at: now,
+            agent_batch_time: now,
             total,
             internet,
             internal,

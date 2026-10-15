@@ -7,6 +7,7 @@
 </p>
 
 <p align="center">
+  <a href="https://demo.netqmon.com" target="_blank"><img src="https://img.shields.io/badge/Live%20Demo-demo.netqmon.com-10B981?style=flat-square&logo=googlechrome&logoColor=white" alt="Live Demo"></a>
   <img src="https://img.shields.io/badge/OpenWrt-24.10%2B-00B5E2?style=flat-square&logo=openwrt&logoColor=white" alt="OpenWrt 24.10+">
   <img src="https://img.shields.io/badge/Rust-eBPF-000000?style=flat-square&logo=rust&logoColor=white" alt="Rust + eBPF">
   <img src="https://img.shields.io/badge/Controller-Docker-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
@@ -17,42 +18,52 @@
   <img src="apps/controller-ui/public/netqmon-cloud-banner-1920*400.png" width="100%" alt="NetQmon Cloud">
 </p>
 
-NetQmon is a self-hosted network observability platform built for OpenWrt. It shows what is using your network, where traffic is going, and how that activity changes over time — without turning the router itself into a heavy analytics box.
+NetQmon is a self-hosted network observability platform built for OpenWrt. It shows what is using your network, where traffic is going, and how that activity
+changes over time — without turning the router itself into a heavy analytics box.
 
-A lightweight Agent runs on the gateway and collects flow telemetry with TC eBPF. The Controller handles storage, classification, realtime views, historical queries, and the web interface.
+A lightweight Agent runs on the gateway and collects flow telemetry with TC eBPF. The Controller handles storage, classification, realtime views, historical
+queries, and the web interface.
 
 > NetQmon focuses on **observability**. It is not intended to replace your firewall, QoS, or network policy system.
 
+## Screenshots
+
+<p align="center">
+  <img src="docs/netqmon-controller-screenshot-01.png" width="49%" alt="NetQmon Controller Overview">
+  <img src="docs/netqmon-controller-screenshot-02.png" width="49%" alt="NetQmon Controller Clients">
+</p>
+
 ## Highlights
 
-| | |
-| --- | --- |
-| **Clients** | Realtime upload/download, traffic history, IP/MAC/hostname correlation, and device identity signals. |
-| **Applications** | Classify traffic by organization, application, category, domain, protocol, IP/ASN metadata, and bounded DPI signals. |
-| **Flows** | Explore IPv4/IPv6 flows with source, destination, protocol, ports, bytes, and classification context. |
-| **Destinations** | Understand where traffic goes with domain, country/region, ASN/ISP, and geographic views. |
-| **Realtime + history** | Follow current activity and query historical ranges from the same interface. |
-| **OpenWrt-native** | TC eBPF data plane, native `procd` service, UCI configuration, diagnostics, and optional LuCI integration. |
-| **Self-hosted Controller** | Docker deployment with SQLite by default and optional ClickHouse for larger datasets. |
+|                            |                                                                                                                      |
+|----------------------------|----------------------------------------------------------------------------------------------------------------------|
+| **Clients**                | Realtime upload/download, traffic history, IP/MAC/hostname correlation, and device identity signals.                 |
+| **Applications**           | Classify traffic by organization, application, category, domain, protocol, IP/ASN metadata, and bounded DPI signals. |
+| **Flows**                  | Explore IPv4/IPv6 flows with source, destination, protocol, ports, bytes, and classification context.                |
+| **Destinations**           | Understand where traffic goes with domain, country/region, ASN/ISP, and geographic views.                            |
+| **Realtime + history**     | Follow current activity and query historical ranges from the same interface.                                         |
+| **OpenWrt-native**         | TC eBPF data plane, native `procd` service, UCI configuration, diagnostics, and optional LuCI integration.           |
+| **Self-hosted Controller** | Docker deployment with SQLite by default and optional ClickHouse for larger datasets.                                |
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    subgraph Gateway["OpenWrt Gateway"]
-        BPF["TC eBPF"]
-        Agent["NetQmon Agent"]
-        BPF --> Agent
-    end
+  subgraph Gateway["OpenWrt Gateway"]
+    BPF["TC eBPF"]
+    Agent["NetQmon Agent"]
+    BPF --> Agent
+  end
 
-    Agent -->|"Flow / DNS / device telemetry"| Collector["Collector"]
-    Collector --> Classifier["Classifier"]
-    Collector --> Storage[("SQLite / ClickHouse")]
-    Collector --> UI["Next.js Web UI"]
-    Cloud["NetQmon Cloud\nRule & update services"] -. "optional" .-> Classifier
+  Agent -->|" Flow / DNS / device telemetry "| Collector["Collector"]
+  Collector --> Classifier["Classifier"]
+  Collector --> Storage[("SQLite / ClickHouse")]
+  Collector --> UI["Next.js Web UI"]
+  Cloud["NetQmon Cloud\nRule & update services"] -. " optional " .-> Classifier
 ```
 
-The Agent stays focused on capture and lightweight enrichment. Expensive work — classification, aggregation, historical queries, and visualization — belongs on the Controller.
+The Agent stays focused on capture and lightweight enrichment. Expensive work — classification, aggregation, historical queries, and visualization — belongs on
+the Controller.
 
 ## Quick start
 
@@ -64,13 +75,17 @@ cd netqmon
 docker compose up -d
 ```
 
-Open `http://localhost:3000` after the Controller becomes healthy.
+1. Open `http://localhost:3000` after the Controller becomes healthy to complete the initial administrator setup.
+2. Navigate to **Settings** and click **Update GeoIP & ASN Database** to enable geographic location and ASN enrichment for destination traffic.
+3. Note or configure the **Enrollment Token** (default or via environment variable) to authenticate your OpenWrt Agent.
 
-SQLite is the default storage backend. ClickHouse can be enabled when you need higher ingest volume or longer retention. See [Controller Configuration](docs/controller-configuration.md) for environment variables, ports, and storage options.
+SQLite is the default storage backend. ClickHouse can be enabled when you need higher ingest volume or longer retention.
+See [Controller Configuration](docs/controller-configuration.md) for environment variables, ports, and storage options.
 
 ### OpenWrt Agent
 
-NetQmon currently targets **OpenWrt 24.10+** on **x86_64** and **aarch64**. Linux **6.6+** is recommended; kernels **5.15+** may work when the required eBPF/TC capabilities are available. See the [Platform Support Matrix](docs/platform-support-matrix.md) for details.
+NetQmon currently targets **OpenWrt 24.10+** on **x86_64** and **aarch64**. Linux **6.6+** is recommended; kernels **5.15+** may work when the required eBPF/TC
+capabilities are available. See the [Platform Support Matrix](docs/platform-support-matrix.md) for details.
 
 Install the required kernel modules first:
 
@@ -91,10 +106,10 @@ See [Agent CLI Reference](docs/agent-cli-reference.md) for command-line options,
 
 NetQmon Community and Pro use the same monitoring engine and interface. The difference is the classification data available to them.
 
-| Edition | Classification data |
-| --- | --- |
-| **Community** | Community rule dataset suitable for common applications and services. |
-| **Pro** | A larger, continuously maintained dataset delivered through NetQmon Cloud for broader application and organization coverage. |
+| Edition       | Classification data                                                                                                          |
+|---------------|------------------------------------------------------------------------------------------------------------------------------|
+| **Community** | Community rule dataset suitable for common applications and services.                                                        |
+| **Pro**       | A larger, continuously maintained dataset delivered through NetQmon Cloud for broader application and organization coverage. |
 
 Pro extends recognition coverage; it does not unlock a different capture engine or a separate set of monitoring features.
 
@@ -102,7 +117,8 @@ More information is available at [netqmon.com](https://netqmon.com).
 
 ## Privacy
 
-NetQmon is designed for traffic metadata and network observability, not content inspection. Protocol identification may use small, bounded samples from the beginning of a flow when needed. NetQmon does not decrypt TLS.
+NetQmon is designed for traffic metadata and network observability, not content inspection. Protocol identification may use small, bounded samples from the
+beginning of a flow when needed. NetQmon does not decrypt TLS.
 
 The standard deployment keeps the Controller and traffic database on infrastructure you operate.
 
@@ -148,6 +164,8 @@ NetQmon is licensed under the [Apache License 2.0](LICENSE).
 ---
 
 <p align="center">
+  <a href="https://demo.netqmon.com">Live Demo</a>
+  ·
   <a href="https://netqmon.com">Website</a>
   ·
   <a href="https://github.com/jarvis2f/netqmon/releases">Releases</a>

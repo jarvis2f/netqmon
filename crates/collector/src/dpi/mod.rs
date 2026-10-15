@@ -8,15 +8,104 @@ use netqmon_protocol::v1::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, VecDeque},
+    cmp::Reverse,
+    collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
 
 const CACHE_CAPACITY: usize = 4096;
 const CACHE_TTL: Duration = Duration::from_secs(300);
+const CACHE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
+const SEEN_FLOWS_CAPACITY: usize = 65_536;
+const SEEN_FLOWS_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+const ENDING_DELAY: Duration = Duration::from_secs(1);
 const WINDOW: Duration = Duration::from_secs(3600);
 type CacheKey = (String, String, String);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct FlowIdentity {
+    gateway: String,
+    boot: String,
+    ip_version: u32,
+    protocol: u32,
+    client_ip: Vec<u8>,
+    client_port: u32,
+    remote_ip: Vec<u8>,
+    remote_port: u32,
+}
+
+impl FlowIdentity {
+    fn from_sample(gateway: &str, boot: &str, key: &FlowSampleKey) -> Self {
+        Self {
+            gateway: gateway.to_owned(),
+            boot: boot.to_owned(),
+            ip_version: key.ip_version,
+            protocol: key.protocol,
+            client_ip: key.client_ip.clone(),
+            client_port: key.client_port,
+            remote_ip: key.remote_ip.clone(),
+            remote_port: key.remote_port,
+        }
+    }
+
+    fn from_delta(gateway: &str, boot: &str, flow: &netqmon_protocol::v1::FlowDelta) -> Self {
+        Self {
+            gateway: gateway.to_owned(),
+            boot: boot.to_owned(),
+            ip_version: flow.ip_version,
+            protocol: flow.protocol,
+            client_ip: flow.client_ip.clone(),
+            client_port: flow.client_port,
+            remote_ip: flow.remote_ip.clone(),
+            remote_port: flow.remote_port,
+        }
+    }
+}
+
+type FlowIndex = HashMap<FlowIdentity, HashSet<CacheKey>>;
+
+struct EndingIntervalIndex {
+    starts: Vec<u64>,
+    prefix_max_ends: Vec<u64>,
+}
+
+impl EndingIntervalIndex {
+    fn new(mut windows: Vec<(u64, u64)>) -> Option<Self> {
+        if windows.is_empty() {
+            return None;
+        }
+        windows.sort_unstable_by_key(|(first, _)| *first);
+        let mut starts = Vec::with_capacity(windows.len());
+        let mut prefix_max_ends = Vec::with_capacity(windows.len());
+        let mut max_end = 0;
+        for (first, last) in windows {
+            starts.push(first);
+            max_end = max_end.max(last);
+            prefix_max_ends.push(max_end);
+        }
+        Some(Self {
+            starts,
+            prefix_max_ends,
+        })
+    }
+
+    fn overlaps(&self, sample_first_seen_unix_ms: u64, sample_last_packet_ms: u64) -> bool {
+        let eligible = self
+            .starts
+            .partition_point(|first| *first <= sample_last_packet_ms.saturating_add(1));
+        eligible > 0
+            && self.prefix_max_ends[eligible - 1].saturating_add(1) >= sample_first_seen_unix_ms
+    }
+}
+
+struct EndingWindow {
+    id: u64,
+    first_seen_unix_ms: u64,
+    last_seen_unix_ms: u64,
+    received_at: Instant,
+    expires: Instant,
+}
 
 /// One application matched from sampled packet payloads by classifierd.
 #[derive(Clone, Debug, PartialEq)]
@@ -103,27 +192,245 @@ struct MinuteStats {
 }
 struct Stats {
     started: Instant,
+    next_cleanup: Instant,
     buckets: VecDeque<(Instant, MinuteStats)>,
     configs: HashMap<String, SampleConfig>,
-    endings: Vec<(String, String, netqmon_protocol::v1::FlowDelta, Instant)>,
+    endings: HashMap<FlowIdentity, Vec<EndingWindow>>,
+    ending_expirations: BTreeSet<(Instant, FlowIdentity, u64)>,
+    pending_ending_deadlines: HashMap<u64, (Instant, FlowIdentity)>,
+    ending_index_dirty: bool,
+    ending_count: usize,
+    next_ending_id: u64,
     health: HashMap<(String, String), (u64, u64)>,
-    seen_flows: HashMap<String, Instant>,
+    seen_flows: HashMap<Arc<str>, Instant>,
+    seen_flow_expirations: BTreeSet<(Instant, Arc<str>)>,
+    next_seen_flows_cleanup: Instant,
     results: HashMap<CacheKey, CachedResult>,
+    results_by_identity: FlowIndex,
+    result_expirations: BTreeSet<(Instant, CacheKey)>,
 }
 impl Default for Stats {
     fn default() -> Self {
+        let now = Instant::now();
         Self {
-            started: Instant::now(),
+            started: now,
+            next_cleanup: now + CACHE_MAINTENANCE_INTERVAL,
+            next_seen_flows_cleanup: now + SEEN_FLOWS_CLEANUP_INTERVAL,
             buckets: VecDeque::new(),
             configs: HashMap::new(),
-            endings: Vec::new(),
+            endings: HashMap::new(),
+            ending_expirations: BTreeSet::new(),
+            pending_ending_deadlines: HashMap::new(),
+            ending_index_dirty: false,
+            ending_count: 0,
+            next_ending_id: 0,
             health: HashMap::new(),
             seen_flows: HashMap::new(),
+            seen_flow_expirations: BTreeSet::new(),
             results: HashMap::new(),
+            results_by_identity: HashMap::new(),
+            result_expirations: BTreeSet::new(),
         }
     }
 }
 impl Stats {
+    fn cleanup_seen_flows_if_due(&mut self, now: Instant) {
+        if now < self.next_seen_flows_cleanup {
+            return;
+        }
+        self.next_seen_flows_cleanup = now + SEEN_FLOWS_CLEANUP_INTERVAL;
+        self.expire_seen_flows(now);
+    }
+
+    fn expire_seen_flows(&mut self, now: Instant) {
+        while let Some((expires, id)) = self.seen_flow_expirations.first().cloned() {
+            if expires > now {
+                break;
+            }
+            self.seen_flow_expirations.pop_first();
+            if self.seen_flows.get(id.as_ref()) == Some(&expires) {
+                self.seen_flows.remove(id.as_ref());
+            }
+        }
+    }
+
+    /// Records a flow observation and returns true when it is a new flow.
+    fn record_seen_flow(&mut self, id: String, now: Instant) -> bool {
+        let existing = self
+            .seen_flows
+            .get_key_value(id.as_str())
+            .map(|(key, expires)| (Arc::clone(key), *expires));
+        let is_new = existing.as_ref().is_none_or(|(_, expires)| *expires <= now);
+
+        if let Some((key, expires)) = &existing {
+            self.seen_flow_expirations
+                .remove(&(*expires, Arc::clone(key)));
+            if is_new {
+                self.seen_flows.remove(key.as_ref());
+            }
+        }
+
+        if is_new && self.seen_flows.len() >= SEEN_FLOWS_CAPACITY {
+            // At capacity, reclaim expired entries immediately before rejecting
+            // a new flow instead of waiting for the periodic sweep.
+            self.expire_seen_flows(now);
+        }
+        if is_new && self.seen_flows.len() >= SEEN_FLOWS_CAPACITY {
+            return false;
+        }
+
+        let key = existing
+            .filter(|_| !is_new)
+            .map_or_else(|| Arc::<str>::from(id), |(key, _)| key);
+        let expires = now + CACHE_TTL;
+        self.seen_flows.insert(Arc::clone(&key), expires);
+        self.seen_flow_expirations.insert((expires, key));
+        is_new
+    }
+
+    fn cleanup_if_due(&mut self, now: Instant) {
+        if now < self.next_cleanup {
+            return;
+        }
+        self.next_cleanup = now + CACHE_MAINTENANCE_INTERVAL;
+        self.expire_endings(now);
+        self.expire_results(now);
+    }
+
+    fn insert_ending(
+        &mut self,
+        identity: FlowIdentity,
+        first_seen_unix_ms: u64,
+        last_seen_unix_ms: u64,
+        now: Instant,
+    ) -> bool {
+        if self.ending_count >= CACHE_CAPACITY {
+            self.expire_endings(now);
+        }
+        if self.ending_count >= CACHE_CAPACITY {
+            return false;
+        }
+
+        let id = self.next_ending_id;
+        self.next_ending_id = self.next_ending_id.wrapping_add(1);
+        let expires = now + CACHE_TTL;
+        self.endings
+            .entry(identity.clone())
+            .or_default()
+            .push(EndingWindow {
+                id,
+                first_seen_unix_ms,
+                last_seen_unix_ms,
+                received_at: now,
+                expires,
+            });
+        self.ending_expirations
+            .insert((expires, identity.clone(), id));
+        self.pending_ending_deadlines
+            .insert(id, (now + ENDING_DELAY, identity));
+        self.ending_count += 1;
+        true
+    }
+
+    fn take_ending_updates(
+        &mut self,
+    ) -> (Vec<(Instant, FlowIdentity)>, HashSet<FlowIdentity>, bool) {
+        let pending = std::mem::take(&mut self.pending_ending_deadlines);
+        let mut refresh = HashSet::new();
+        let deadlines = pending
+            .into_values()
+            .inspect(|(_, identity)| {
+                refresh.insert(identity.clone());
+            })
+            .collect();
+        let rebuild_all = std::mem::take(&mut self.ending_index_dirty);
+        if rebuild_all {
+            refresh.extend(self.endings.keys().cloned());
+        }
+        (deadlines, refresh, rebuild_all)
+    }
+
+    fn mature_ending_windows(&self, identity: &FlowIdentity, now: Instant) -> Vec<(u64, u64)> {
+        self.endings
+            .get(identity)
+            .into_iter()
+            .flatten()
+            .filter(|ending| {
+                ending.expires > now
+                    && now.saturating_duration_since(ending.received_at) >= ENDING_DELAY
+            })
+            .map(|ending| (ending.first_seen_unix_ms, ending.last_seen_unix_ms))
+            .collect()
+    }
+
+    fn insert_result(&mut self, id: CacheKey, result: CachedResult, now: Instant) -> bool {
+        if !self.results.contains_key(&id) && self.results.len() >= CACHE_CAPACITY {
+            self.expire_results(now);
+        }
+        if !self.results.contains_key(&id) && self.results.len() >= CACHE_CAPACITY {
+            return false;
+        }
+
+        if let Some(previous) = self.results.remove(&id) {
+            self.result_expirations
+                .remove(&(previous.expires, id.clone()));
+            remove_index_entry(
+                &mut self.results_by_identity,
+                &FlowIdentity::from_sample(&previous.gateway, &previous.boot, &previous.key),
+                &id,
+            );
+        }
+
+        let identity = FlowIdentity::from_sample(&result.gateway, &result.boot, &result.key);
+        self.result_expirations.insert((result.expires, id.clone()));
+        self.results_by_identity
+            .entry(identity)
+            .or_default()
+            .insert(id.clone());
+        self.results.insert(id, result);
+        true
+    }
+
+    fn expire_endings(&mut self, now: Instant) {
+        let mut expired = HashMap::<FlowIdentity, HashSet<u64>>::new();
+        while let Some((expires, identity, id)) = self.ending_expirations.first().cloned() {
+            if expires > now {
+                break;
+            }
+            self.ending_expirations.pop_first();
+            self.pending_ending_deadlines.remove(&id);
+            expired.entry(identity).or_default().insert(id);
+        }
+        for (identity, ids) in expired {
+            if let Some(entries) = self.endings.get_mut(&identity) {
+                let before = entries.len();
+                entries.retain(|entry| !ids.contains(&entry.id));
+                let removed = before - entries.len();
+                self.ending_count -= removed;
+                self.ending_index_dirty |= removed > 0;
+                if entries.is_empty() {
+                    self.endings.remove(&identity);
+                }
+            }
+        }
+    }
+
+    fn expire_results(&mut self, now: Instant) {
+        while let Some((expires, id)) = self.result_expirations.first().cloned() {
+            if expires > now {
+                break;
+            }
+            self.result_expirations.pop_first();
+            if let Some(result) = self.results.remove(&id) {
+                remove_index_entry(
+                    &mut self.results_by_identity,
+                    &FlowIdentity::from_sample(&result.gateway, &result.boot, &result.key),
+                    &id,
+                );
+            }
+        }
+    }
+
     fn bucket(&mut self) -> &mut MinuteStats {
         let now = Instant::now();
         while self
@@ -142,6 +449,109 @@ impl Stats {
         }
         &mut self.buckets.back_mut().expect("bucket").1
     }
+}
+
+fn remove_index_entry(index: &mut FlowIndex, identity: &FlowIdentity, id: &CacheKey) {
+    if let Some(entries) = index.get_mut(identity) {
+        entries.remove(id);
+        if entries.is_empty() {
+            index.remove(identity);
+        }
+    }
+}
+
+fn matching_flows_for_endings(
+    identities: &HashSet<FlowIdentity>,
+    endings: &HashMap<FlowIdentity, EndingIntervalIndex>,
+    flow_index: &FlowIndex,
+    flows: &HashMap<CacheKey, FlowState>,
+) -> HashSet<CacheKey> {
+    let mut matching = HashSet::new();
+    for identity in identities {
+        let Some(endings) = endings.get(identity) else {
+            continue;
+        };
+        let Some(flow_ids) = flow_index.get(identity) else {
+            continue;
+        };
+        for id in flow_ids {
+            let Some(entry) = flows.get(id) else {
+                continue;
+            };
+            if entry.engine.is_some()
+                && endings.overlaps(entry.key.first_seen_unix_ms, entry.last_packet_ms)
+            {
+                matching.insert(id.clone());
+            }
+        }
+    }
+    matching
+}
+
+fn finish_flows<F: Fn(CachedResult)>(
+    ids: &HashSet<CacheKey>,
+    flows: &mut HashMap<CacheKey, FlowState>,
+    stats: &Mutex<Stats>,
+    completed: &F,
+    now: Instant,
+) {
+    for id in ids {
+        let Some(entry) = flows.get_mut(id) else {
+            continue;
+        };
+        if let Some(mut engine) = entry.engine.take() {
+            if let Some(result) = engine.finish() {
+                entry.result = Some(result);
+            }
+        }
+        if entry.result.is_none() && entry.signatures.is_empty() {
+            continue;
+        }
+
+        let cached = CachedResult {
+            gateway: id.0.clone(),
+            boot: id.1.clone(),
+            key: entry.key.clone(),
+            last_packet_ms: entry.last_packet_ms,
+            result: entry.result.clone(),
+            signatures: entry.signatures.clone(),
+            expires: now + CACHE_TTL,
+        };
+        stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert_result(id.clone(), cached.clone(), now);
+        completed(cached);
+    }
+}
+
+fn remove_flow(
+    id: &CacheKey,
+    flows: &mut HashMap<CacheKey, FlowState>,
+    flow_index: &mut FlowIndex,
+) {
+    if let Some(entry) = flows.remove(id) {
+        let identity = FlowIdentity::from_sample(&id.0, &id.1, &entry.key);
+        remove_index_entry(flow_index, &identity, id);
+    }
+}
+
+fn expired_flow_ids(flows: &HashMap<CacheKey, FlowState>, now: Instant) -> Vec<CacheKey> {
+    flows
+        .iter()
+        .filter(|(_, entry)| entry.expires <= now)
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+fn remove_flows(ids: &[CacheKey], flows: &mut HashMap<CacheKey, FlowState>, index: &mut FlowIndex) {
+    for id in ids {
+        remove_flow(id, flows, index);
+    }
+}
+
+fn expire_sequences(sequences: &mut HashMap<(String, String), (u64, Instant)>, now: Instant) {
+    sequences.retain(|_, (_, expires)| *expires > now);
 }
 
 pub struct SamplingService {
@@ -166,65 +576,88 @@ impl SamplingService {
             .name("netqmon-dpi".into())
             .spawn(move || {
                 let mut flows: HashMap<CacheKey, FlowState> = HashMap::new();
+                let mut flow_index = FlowIndex::new();
                 let mut sequences: HashMap<(String, String), (u64, Instant)> = HashMap::new();
+                let mut ending_deadlines = BinaryHeap::<Reverse<(Instant, FlowIdentity)>>::new();
+                let mut ready_endings: HashMap<FlowIdentity, EndingIntervalIndex> = HashMap::new();
+                let mut dirty_flow_identities = HashSet::new();
+                let mut next_cleanup = Instant::now() + CACHE_MAINTENANCE_INTERVAL;
                 loop {
                     let now = Instant::now();
-                    // End markers are metadata only; allow queued samples to arrive before finalization.
-                    let endings = {
+                    let cleanup_due = now >= next_cleanup;
+                    let mut finalizable = HashSet::new();
+                    let expired_flows = if cleanup_due {
+                        let expired = expired_flow_ids(&flows, now);
+                        finalizable.extend(
+                            expired
+                                .iter()
+                                .filter(|id| {
+                                    flows.get(*id).is_some_and(|entry| entry.engine.is_some())
+                                })
+                                .cloned(),
+                        );
+                        expire_sequences(&mut sequences, now);
+                        next_cleanup = now + CACHE_MAINTENANCE_INTERVAL;
+                        expired
+                    } else {
+                        Vec::new()
+                    };
+
+                    let (identities, ending_snapshots, rebuild_all_endings) = {
                         let mut stats = worker_stats
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        stats
-                            .endings
-                            .retain(|(_, _, _, at)| now.duration_since(*at) < CACHE_TTL);
-                        stats.endings.clone()
-                    };
-                    for (id, entry) in &mut flows {
-                        let ended = endings.iter().any(|(gateway, boot, flow, at)| {
-                            gateway == &id.0
-                                && boot == &id.1
-                                && now.duration_since(*at) >= Duration::from_secs(1)
-                                && entry.key.client_ip == flow.client_ip
-                                && entry.key.remote_ip == flow.remote_ip
-                                && entry.key.client_port == flow.client_port
-                                && entry.key.remote_port == flow.remote_port
-                                && entry.key.protocol == flow.protocol
-                                && entry.key.first_seen_unix_ms
-                                    <= flow.last_seen_unix_ms.saturating_add(1)
-                                && entry.last_packet_ms.saturating_add(1) >= flow.first_seen_unix_ms
-                        });
-                        if (entry.expires <= now || ended) && entry.engine.is_some() {
-                            let result = entry.engine.as_mut().and_then(|engine| engine.finish());
-                            if let Some(result) = result {
-                                entry.result = Some(result);
-                            }
-                            entry.engine = None;
-                            if entry.result.is_some() || !entry.signatures.is_empty() {
-                                let cached = CachedResult {
-                                    gateway: id.0.clone(),
-                                    boot: id.1.clone(),
-                                    key: entry.key.clone(),
-                                    last_packet_ms: entry.last_packet_ms,
-                                    result: entry.result.clone(),
-                                    signatures: entry.signatures.clone(),
-                                    expires: now + CACHE_TTL,
-                                };
-                                let mut stats = worker_stats
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                stats.results.retain(|_, value| value.expires > now);
-                                if stats.results.len() < CACHE_CAPACITY
-                                    || stats.results.contains_key(id)
-                                {
-                                    stats.results.insert(id.clone(), cached.clone());
-                                }
-                                drop(stats);
-                                completed(cached);
+                        if now >= stats.next_cleanup {
+                            stats.cleanup_if_due(now);
+                        } else {
+                            // Expire ready ending windows from the local interval index
+                            // without walking the full ending cache on every batch.
+                            stats.expire_endings(now);
+                        }
+                        let (deadlines, mut refresh_identities, rebuild_all) =
+                            stats.take_ending_updates();
+                        ending_deadlines.extend(deadlines.into_iter().map(Reverse));
+                        let mut identities = std::mem::take(&mut dirty_flow_identities);
+                        while ending_deadlines
+                            .peek()
+                            .is_some_and(|Reverse((deadline, _))| *deadline <= now)
+                        {
+                            if let Some(Reverse((_, identity))) = ending_deadlines.pop() {
+                                identities.insert(identity.clone());
+                                refresh_identities.insert(identity);
                             }
                         }
+                        let snapshots = refresh_identities
+                            .into_iter()
+                            .map(|identity| {
+                                let windows = stats.mature_ending_windows(&identity, now);
+                                (identity, windows)
+                            })
+                            .collect::<Vec<_>>();
+                        (identities, snapshots, rebuild_all)
+                    };
+                    if rebuild_all_endings {
+                        ready_endings.clear();
                     }
-                    flows.retain(|_, entry| entry.expires > now);
-                    sequences.retain(|_, (_, expires)| *expires > now);
+                    for (identity, windows) in ending_snapshots {
+                        if let Some(index) = EndingIntervalIndex::new(windows) {
+                            ready_endings.insert(identity, index);
+                        } else {
+                            ready_endings.remove(&identity);
+                        }
+                    }
+                    finalizable.extend(matching_flows_for_endings(
+                        &identities,
+                        &ready_endings,
+                        &flow_index,
+                        &flows,
+                    ));
+
+                    finish_flows(&finalizable, &mut flows, &worker_stats, &completed, now);
+                    if cleanup_due {
+                        remove_flows(&expired_flows, &mut flows, &mut flow_index);
+                    }
+
                     let batch = match receiver.recv_timeout(Duration::from_secs(1)) {
                         Ok(batch) => batch,
                         Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -233,9 +666,14 @@ impl SamplingService {
                     let sequence_key = (batch.gateway_id.clone(), batch.boot_id.clone());
                     if sequences
                         .get(&sequence_key)
-                        .is_some_and(|(sequence, _)| *sequence >= batch.sequence)
+                        .is_some_and(|(sequence, expires)| {
+                            *expires > now && *sequence >= batch.sequence
+                        })
                     {
                         continue;
+                    }
+                    if sequences.len() >= CACHE_CAPACITY && !sequences.contains_key(&sequence_key) {
+                        expire_sequences(&mut sequences, now);
                     }
                     if sequences.len() >= CACHE_CAPACITY && !sequences.contains_key(&sequence_key) {
                         continue;
@@ -248,6 +686,7 @@ impl SamplingService {
                             sample.flow_id,
                         );
                         let key = sample.key.expect("validated sample");
+                        let identity = FlowIdentity::from_sample(&id.0, &id.1, &key);
                         let mut stats = worker_stats
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -256,7 +695,37 @@ impl SamplingService {
                         bucket.bytes += u64::from(sample.total_captured_bytes);
                         *bucket.sizes.entry(sample.total_captured_bytes).or_default() += 1;
                         drop(stats);
+                        if flows.get(&id).is_some_and(|entry| entry.expires <= now) {
+                            if flows.get(&id).is_some_and(|entry| entry.engine.is_some()) {
+                                finish_flows(
+                                    &HashSet::from([id.clone()]),
+                                    &mut flows,
+                                    &worker_stats,
+                                    &completed,
+                                    now,
+                                );
+                            }
+                            remove_flow(&id, &mut flows, &mut flow_index);
+                        }
                         if !flows.contains_key(&id) {
+                            if flows.len() >= CACHE_CAPACITY {
+                                let expired = expired_flow_ids(&flows, now);
+                                let expired_set = expired
+                                    .iter()
+                                    .filter(|id| {
+                                        flows.get(*id).is_some_and(|entry| entry.engine.is_some())
+                                    })
+                                    .cloned()
+                                    .collect::<HashSet<_>>();
+                                finish_flows(
+                                    &expired_set,
+                                    &mut flows,
+                                    &worker_stats,
+                                    &completed,
+                                    now,
+                                );
+                                remove_flows(&expired, &mut flows, &mut flow_index);
+                            }
                             if flows.len() >= CACHE_CAPACITY {
                                 record_drop(
                                     &worker_stats,
@@ -279,6 +748,10 @@ impl SamplingService {
                                     signatures: Vec::new(),
                                 },
                             );
+                            flow_index
+                                .entry(identity.clone())
+                                .or_default()
+                                .insert(id.clone());
                             worker_stats
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -286,6 +759,7 @@ impl SamplingService {
                                 .attempted += 1;
                         }
                         let entry = flows.get_mut(&id).expect("flow inserted");
+                        dirty_flow_identities.insert(identity);
                         let mut counts = entry.packets;
                         for packet in &sample.packets {
                             counts[usize::from(packet.direction == 2)] += 1;
@@ -378,12 +852,7 @@ impl SamplingService {
                                 signatures: entry.signatures.clone(),
                                 expires: entry.expires,
                             };
-                            stats.results.retain(|_, value| value.expires > now);
-                            if stats.results.len() < CACHE_CAPACITY
-                                || stats.results.contains_key(&id)
-                            {
-                                stats.results.insert(id.clone(), cached.clone());
-                            }
+                            stats.insert_result(id.clone(), cached.clone(), now);
                             drop(stats);
                             completed(cached);
                         }
@@ -426,18 +895,15 @@ impl SamplingService {
             .stats
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let identity = FlowIdentity::from_delta(gateway, boot, flow);
         stats
-            .results
-            .values()
+            .results_by_identity
+            .get(&identity)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| stats.results.get(id))
             .filter(|r| {
-                r.gateway == gateway
-                    && r.boot == boot
-                    && r.expires > Instant::now()
-                    && r.key.client_ip == flow.client_ip
-                    && r.key.remote_ip == flow.remote_ip
-                    && r.key.client_port == flow.client_port
-                    && r.key.remote_port == flow.remote_port
-                    && r.key.protocol == flow.protocol
+                r.expires > Instant::now()
                     && r.key.first_seen_unix_ms <= flow.last_seen_unix_ms.saturating_add(1)
                     && r.last_packet_ms.saturating_add(1) >= flow.first_seen_unix_ms
             })
@@ -453,22 +919,19 @@ impl SamplingService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
-        stats
-            .endings
-            .retain(|(_, _, _, at)| now.duration_since(*at) < CACHE_TTL);
+        stats.cleanup_if_due(now);
+        stats.cleanup_seen_flows_if_due(now);
         for flow in &batch.flows {
-            if flow.lifecycle == netqmon_protocol::v1::FlowLifecycle::Ended as i32
-                && stats.endings.len() < CACHE_CAPACITY
-            {
-                stats.endings.push((
-                    batch.gateway_id.clone(),
-                    batch.boot_id.clone(),
-                    flow.clone(),
+            if flow.lifecycle == netqmon_protocol::v1::FlowLifecycle::Ended as i32 {
+                let identity = FlowIdentity::from_delta(&batch.gateway_id, &batch.boot_id, flow);
+                stats.insert_ending(
+                    identity,
+                    flow.first_seen_unix_ms,
+                    flow.last_seen_unix_ms,
                     now,
-                ));
+                );
             }
         }
-        stats.seen_flows.retain(|_, expires| *expires > now);
         let mut new_flows = 0;
         for f in &batch.flows {
             if f.packets == 0 {
@@ -484,11 +947,8 @@ impl SamplingService {
                 f.remote_port,
                 f.protocol
             );
-            if !stats.seen_flows.contains_key(&id) && stats.seen_flows.len() < 65536 {
+            if stats.record_seen_flow(id, now) {
                 new_flows += 1;
-            }
-            if stats.seen_flows.len() < 65536 || stats.seen_flows.contains_key(&id) {
-                stats.seen_flows.insert(id, now + CACHE_TTL);
             }
         }
         let mut drops = 0;
@@ -617,7 +1077,8 @@ impl SamplingService {
             remote_port: flow.remote_port,
             first_seen_unix_ms: flow.first_seen_unix_ms,
         };
-        self.stats.lock().unwrap().results.insert(
+        let now = Instant::now();
+        self.stats.lock().unwrap().insert_result(
             (
                 batch.gateway_id.clone(),
                 batch.boot_id.clone(),
@@ -635,8 +1096,9 @@ impl SamplingService {
                     metadata: std::collections::BTreeMap::new(),
                 }),
                 signatures: Vec::new(),
-                expires: Instant::now() + CACHE_TTL,
+                expires: now + CACHE_TTL,
             },
+            now,
         );
     }
 }

@@ -51,12 +51,15 @@ interface SelectContextValue {
   labelFor: (value: string | undefined) => React.ReactNode;
   reduce: boolean;
   triggerId: string;
+  setCustomTriggerId: (id: string) => void;
   listId: string;
   disabled: boolean;
   placement: Placement;
   setPlacement: (p: Placement) => void;
   triggerRect: DOMRect | null;
   setTriggerRect: (rect: DOMRect | null) => void;
+  triggerElement: HTMLElement | null;
+  registerTriggerElement: (el: HTMLElement | null) => void;
 }
 
 const SelectContext = React.createContext<SelectContextValue | null>(null);
@@ -75,6 +78,7 @@ export interface SelectProps {
   defaultOpen?: boolean;
   onOpenChange?: (open: boolean) => void;
   disabled?: boolean;
+  className?: string;
   children?: React.ReactNode;
 }
 
@@ -86,11 +90,22 @@ function Select({
   defaultOpen = false,
   onOpenChange,
   disabled = false,
+  className,
   children,
 }: SelectProps) {
   const reduce = useReducedMotion();
-  const triggerId = React.useId();
+  const generatedTriggerId = React.useId();
+  const [customTriggerId, setCustomTriggerId] = React.useState<string | null>(
+    null,
+  );
+  const triggerId = customTriggerId || generatedTriggerId;
   const listId = React.useId();
+  const [triggerElement, setTriggerElement] =
+    React.useState<HTMLElement | null>(null);
+
+  const registerTriggerElement = React.useCallback((el: HTMLElement | null) => {
+    setTriggerElement(el);
+  }, []);
 
   const [uncontrolledValue, setUncontrolledValue] = React.useState(
     defaultValue ?? "",
@@ -174,12 +189,15 @@ function Select({
       labelFor,
       reduce: Boolean(reduce),
       triggerId,
+      setCustomTriggerId,
       listId,
       disabled,
       placement,
       setPlacement,
       triggerRect,
       setTriggerRect,
+      triggerElement,
+      registerTriggerElement,
     }),
     [
       value,
@@ -191,18 +209,24 @@ function Select({
       labelFor,
       reduce,
       triggerId,
+      setCustomTriggerId,
       listId,
       disabled,
       placement,
       setPlacement,
       triggerRect,
       setTriggerRect,
+      triggerElement,
+      registerTriggerElement,
     ],
   );
 
   return (
     <SelectContext.Provider value={contextValue}>
-      <div data-slot="select-root" className="relative inline-block w-fit">
+      <div
+        data-slot="select-root"
+        className={cn("relative inline-block w-fit", className)}
+      >
         {children}
       </div>
     </SelectContext.Provider>
@@ -222,17 +246,41 @@ export interface SelectTriggerProps extends Omit<
 
 const SelectTrigger = React.forwardRef<HTMLButtonElement, SelectTriggerProps>(
   function SelectTrigger(
-    { className, size = "default", children, disabled: propDisabled, ...props },
+    {
+      className,
+      size = "default",
+      children,
+      disabled: propDisabled,
+      id: propId,
+      ...props
+    },
     ref,
   ) {
     const ctx = useSelectContext("SelectTrigger");
-    const triggerRef = React.useRef<HTMLButtonElement | null>(null);
     const disabled = ctx.disabled || propDisabled;
+
+    const localTriggerRef = React.useRef<HTMLButtonElement | null>(null);
+
+    React.useEffect(() => {
+      if (propId) {
+        ctx.setCustomTriggerId(propId);
+      }
+    }, [propId, ctx]);
+
+    const handleRef = React.useCallback(
+      (node: HTMLButtonElement | null) => {
+        localTriggerRef.current = node;
+        ctx.registerTriggerElement(node);
+        if (typeof ref === "function") ref(node);
+        else if (ref) ref.current = node;
+      },
+      [ref, ctx],
+    );
 
     const handleClick = (e: React.MouseEvent<HTMLButtonElement>) => {
       if (disabled) return;
-      if (triggerRef.current) {
-        ctx.setTriggerRect(triggerRef.current.getBoundingClientRect());
+      if (localTriggerRef.current) {
+        ctx.setTriggerRect(localTriggerRef.current.getBoundingClientRect());
       }
       ctx.setOpen(!ctx.open);
       props.onClick?.(e);
@@ -240,13 +288,9 @@ const SelectTrigger = React.forwardRef<HTMLButtonElement, SelectTriggerProps>(
 
     return (
       <motion.button
-        ref={(node) => {
-          triggerRef.current = node;
-          if (typeof ref === "function") ref(node);
-          else if (ref) ref.current = node;
-        }}
+        ref={handleRef}
         type="button"
-        id={ctx.triggerId}
+        id={propId || ctx.triggerId}
         disabled={disabled}
         aria-haspopup="listbox"
         aria-expanded={ctx.open}
@@ -337,7 +381,10 @@ function SelectContent({
   // Calculate position relative to trigger
   React.useLayoutEffect(() => {
     if (!ctx.open) return;
-    const trigger = document.getElementById(ctx.triggerId);
+    const trigger =
+      ctx.triggerElement ||
+      document.getElementById(ctx.triggerId) ||
+      document.querySelector<HTMLElement>(`[aria-controls="${ctx.listId}"]`);
     if (!trigger) return;
     const rect = trigger.getBoundingClientRect();
     const scrollY = window.scrollY;
@@ -364,7 +411,15 @@ function SelectContent({
       left: Math.max(8, left),
       minWidth: Math.max(120, rect.width),
     });
-  }, [ctx.open, ctx.triggerId, side, align, sideOffset]);
+  }, [
+    ctx.open,
+    ctx.triggerId,
+    ctx.triggerElement,
+    ctx.listId,
+    side,
+    align,
+    sideOffset,
+  ]);
 
   if (!mounted) return null;
 

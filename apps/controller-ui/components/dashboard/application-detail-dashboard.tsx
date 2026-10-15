@@ -17,7 +17,13 @@ import { AppLayout } from "@/components/app-shell/app-layout";
 import { ClientDeviceIcon } from "@/components/icons/client-device-icon";
 import { DataTable, type ColumnDef } from "@/components/data/data-table";
 import { MetricCard } from "@/components/data/metric-card";
+import {
+  TimeRangePicker,
+  type CustomDateRange,
+  type TimeRangeValue,
+} from "@/components/data/time-range-picker";
 import { ApplicationIdentity } from "@/components/network/application-identity";
+import { protocolApplicationName } from "@/lib/application-identity";
 import { FlowPanel } from "@/components/overlays/flow-panel";
 import { EmptyState } from "@/components/states/empty-state";
 import { ErrorState } from "@/components/states/error-state";
@@ -46,6 +52,23 @@ import type {
   FlowSummary,
 } from "@/lib/network-types";
 
+const RANGE_MS: Record<Exclude<TimeRangeValue, "custom" | "15m">, number> = {
+  "1h": 60 * 60 * 1_000,
+  "24h": 24 * 60 * 60 * 1_000,
+  "7d": 7 * 24 * 60 * 60 * 1_000,
+  "30d": 30 * 24 * 60 * 60 * 1_000,
+};
+const DETAIL_RELATION_PAGE_SIZE = 50;
+
+function rangeBounds(range: TimeRangeValue, from?: string, to?: string) {
+  const end = range === "custom" && to ? Date.parse(to) : Date.now();
+  const start =
+    range === "custom" && from
+      ? Date.parse(from)
+      : end - RANGE_MS[range as keyof typeof RANGE_MS];
+  return { from: start, to: end };
+}
+
 type Tab = "overview" | "clients" | "domains" | "destinations" | "flows";
 
 interface TrafficPayload {
@@ -70,15 +93,22 @@ export function ApplicationDetailDashboard({
   username,
   applicationId,
   categoryId,
+  initialRange,
+  initialFrom,
+  initialTo,
   initialTab,
 }: {
   username: string;
   applicationId: string;
   categoryId?: string;
+  initialRange: TimeRangeValue;
+  initialFrom?: string;
+  initialTo?: string;
   initialTab: Tab;
 }) {
   const t = useTranslations("applications");
   const tNav = useTranslations("navigation");
+  const tTime = useTranslations("common.timeRange");
   const tFlows = useTranslations("flows.columns");
   const tStatus = useTranslations("common.status");
   const router = useRouter();
@@ -88,6 +118,8 @@ export function ApplicationDetailDashboard({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  const [domainsPage, setDomainsPage] = useState(0);
+  const [destinationsPage, setDestinationsPage] = useState(0);
 
   const tabs: Array<{ id: Tab; label: string }> = [
     { id: "overview", label: t("detail.tabs.overview") },
@@ -123,21 +155,33 @@ export function ApplicationDetailDashboard({
   useEffect(() => {
     const controller = new AbortController();
     async function load() {
+      setDomainsPage(0);
+      setDestinationsPage(0);
       setLoading(true);
       try {
         const encoded = encodeURIComponent(applicationId);
+        const bounds = rangeBounds(initialRange, initialFrom, initialTo);
         const query = new URLSearchParams({
           limit: "100",
-          from: "0",
-          to: String(Date.now()),
+          from: String(bounds.from),
+          to: String(bounds.to),
         });
         if (categoryId) query.set("category", categoryId);
         const relationQuery = query.toString();
+        const domainsQuery = new URLSearchParams(query);
+        const destinationsQuery = new URLSearchParams(query);
+        if (initialTab === "domains") domainsQuery.set("all", "true");
+        if (initialTab === "destinations") destinationsQuery.set("all", "true");
+        const applicationQuery = new URLSearchParams({
+          from: String(bounds.from),
+          to: String(bounds.to),
+        });
+        if (categoryId) applicationQuery.set("category", categoryId);
         const responses = await Promise.all([
-          fetch(
-            `/api/applications/${encoded}${categoryId ? `?category=${encodeURIComponent(categoryId)}` : ""}`,
-            { cache: "no-store", signal: controller.signal },
-          ),
+          fetch(`/api/applications/${encoded}?${applicationQuery.toString()}`, {
+            cache: "no-store",
+            signal: controller.signal,
+          }),
           fetch(`/api/applications/${encoded}/traffic?${relationQuery}`, {
             cache: "no-store",
             signal: controller.signal,
@@ -146,14 +190,20 @@ export function ApplicationDetailDashboard({
             cache: "no-store",
             signal: controller.signal,
           }),
-          fetch(`/api/applications/${encoded}/domains?${relationQuery}`, {
-            cache: "no-store",
-            signal: controller.signal,
-          }),
-          fetch(`/api/applications/${encoded}/destinations?${relationQuery}`, {
-            cache: "no-store",
-            signal: controller.signal,
-          }),
+          fetch(
+            `/api/applications/${encoded}/domains?${domainsQuery.toString()}`,
+            {
+              cache: "no-store",
+              signal: controller.signal,
+            },
+          ),
+          fetch(
+            `/api/applications/${encoded}/destinations?${destinationsQuery.toString()}`,
+            {
+              cache: "no-store",
+              signal: controller.signal,
+            },
+          ),
           fetch(`/api/applications/${encoded}/flows?${relationQuery}`, {
             cache: "no-store",
             signal: controller.signal,
@@ -188,16 +238,62 @@ export function ApplicationDetailDashboard({
     }
     void load();
     return () => controller.abort();
-  }, [applicationId, categoryId, reloadKey, t]);
+  }, [
+    applicationId,
+    categoryId,
+    initialFrom,
+    initialRange,
+    initialTo,
+    initialTab,
+    reloadKey,
+    t,
+  ]);
 
   const setTab = (tab: Tab) => {
-    const query = new URLSearchParams({ tab });
+    const query = new URLSearchParams({ tab, range: initialRange });
     if (categoryId) query.set("category", categoryId);
+    if (initialRange === "custom" && initialFrom && initialTo) {
+      query.set("from", initialFrom);
+      query.set("to", initialTo);
+    }
     router.replace(
       `/applications/${encodeURIComponent(applicationId)}?${query}`,
       { scroll: false },
     );
   };
+  const handleRange = (range: TimeRangeValue, custom?: CustomDateRange) => {
+    const query = new URLSearchParams({ range });
+    if (categoryId) query.set("category", categoryId);
+    if (initialTab !== "overview") query.set("tab", initialTab);
+    if (range === "custom" && custom) {
+      query.set("from", custom.from);
+      query.set("to", custom.to);
+    }
+    router.replace(
+      `/applications/${encodeURIComponent(applicationId)}?${query.toString()}`,
+      { scroll: false },
+    );
+  };
+  const formatRangeLabel = () => {
+    if (initialRange === "custom") return tTime("customRange");
+    const rangeLabel =
+      initialRange === "1h"
+        ? tTime("range1h")
+        : initialRange === "7d"
+          ? tTime("range7d")
+          : initialRange === "30d"
+            ? tTime("range30d")
+            : tTime("range24h");
+    return tTime("lastRange", { range: rangeLabel });
+  };
+  const applicationsHref = (() => {
+    const query = new URLSearchParams({ range: initialRange });
+    if (initialRange === "custom" && initialFrom && initialTo) {
+      query.set("from", initialFrom);
+      query.set("to", initialTo);
+    }
+    return `/applications?${query.toString()}`;
+  })();
   const chartData = useMemo<TrafficDataPoint[]>(
     () =>
       (data?.traffic.points ?? []).map((point) => ({
@@ -447,12 +543,38 @@ export function ApplicationDetailDashboard({
           }
         />
       );
-    if (initialTab === "domains")
+    if (initialTab === "domains") {
+      const pageIndex = Math.min(
+        domainsPage,
+        Math.max(
+          0,
+          Math.ceil(data.domains.length / DETAIL_RELATION_PAGE_SIZE) - 1,
+        ),
+      );
+      const start = pageIndex * DETAIL_RELATION_PAGE_SIZE;
+      const end = Math.min(
+        start + DETAIL_RELATION_PAGE_SIZE,
+        data.domains.length,
+      );
       return (
         <DataTable
           columns={domainColumns}
-          data={data.domains}
+          data={data.domains.slice(start, end)}
           keyExtractor={(row) => row.domain}
+          pagination={
+            data.domains.length > DETAIL_RELATION_PAGE_SIZE
+              ? {
+                  pageIndex,
+                  pageSize: DETAIL_RELATION_PAGE_SIZE,
+                  hasPrevious: pageIndex > 0,
+                  hasNext: end < data.domains.length,
+                  onPreviousPage: () =>
+                    setDomainsPage((current) => Math.max(0, current - 1)),
+                  onNextPage: () => setDomainsPage((current) => current + 1),
+                  totalDisplay: `${start + 1}–${end} / ${data.domains.length}`,
+                }
+              : undefined
+          }
           emptyState={
             <EmptyState
               title={t("detail.empty.noDomains")}
@@ -462,12 +584,40 @@ export function ApplicationDetailDashboard({
           }
         />
       );
-    if (initialTab === "destinations")
+    }
+    if (initialTab === "destinations") {
+      const pageIndex = Math.min(
+        destinationsPage,
+        Math.max(
+          0,
+          Math.ceil(data.destinations.length / DETAIL_RELATION_PAGE_SIZE) - 1,
+        ),
+      );
+      const start = pageIndex * DETAIL_RELATION_PAGE_SIZE;
+      const end = Math.min(
+        start + DETAIL_RELATION_PAGE_SIZE,
+        data.destinations.length,
+      );
       return (
         <DataTable
           columns={destinationColumns}
-          data={data.destinations}
+          data={data.destinations.slice(start, end)}
           keyExtractor={(row) => row.remote_ip}
+          pagination={
+            data.destinations.length > DETAIL_RELATION_PAGE_SIZE
+              ? {
+                  pageIndex,
+                  pageSize: DETAIL_RELATION_PAGE_SIZE,
+                  hasPrevious: pageIndex > 0,
+                  hasNext: end < data.destinations.length,
+                  onPreviousPage: () =>
+                    setDestinationsPage((current) => Math.max(0, current - 1)),
+                  onNextPage: () =>
+                    setDestinationsPage((current) => current + 1),
+                  totalDisplay: `${start + 1}–${end} / ${data.destinations.length}`,
+                }
+              : undefined
+          }
           emptyState={
             <EmptyState
               title={t("detail.empty.noDestinations")}
@@ -477,6 +627,7 @@ export function ApplicationDetailDashboard({
           }
         />
       );
+    }
     if (initialTab === "flows")
       return (
         <DataTable
@@ -502,56 +653,74 @@ export function ApplicationDetailDashboard({
       title={
         app?.application_id === "unknown"
           ? t("detail.unknownApp")
-          : app?.name || formatIdentifier(app?.application_id ?? applicationId)
+          : app?.application_id
+            ? protocolApplicationName(app.application_id) ||
+              app.name ||
+              formatIdentifier(app.application_id)
+            : app?.name || formatIdentifier(applicationId)
       }
       subtitle={
-        app
-          ? t("detail.subtitle", {
-              category: app.category_id,
-              confidence: formatPercent(app.confidence ?? 0),
-            })
-          : t("detail.fallbackSubtitle")
+        app?.application_id?.startsWith("protocol:")
+          ? t("protocolApplicationDetailSubtitle")
+          : app
+            ? t("detail.subtitle", {
+                category: app.category_id,
+                confidence: formatPercent(app.confidence ?? 0),
+              })
+            : t("detail.fallbackSubtitle")
       }
       username={username}
       isLive={false}
       headerActions={
         <Link
-          href="/applications"
+          href={applicationsHref}
           className={buttonVariants({ variant: "outline", size: "sm" })}
         >
           <ArrowLeft /> {tNav("applications")}
         </Link>
       }
       toolbar={
-        <nav
-          className="flex min-w-max items-center gap-1"
-          aria-label={t("detail.fallbackSubtitle")}
-        >
-          <ApplicationIdentity
-            id={applicationId}
-            name={app?.name}
-            category={app?.category_id}
-            icon={app?.icon}
-          />
-          <div className="mx-2 h-5 w-px bg-border" />
-          <Tabs
-            value={initialTab}
-            onValueChange={(val) => setTab(val as Tab)}
-            variant="pill"
+        <div className="flex min-w-max flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <nav
+            className="flex min-w-max items-center gap-1"
+            aria-label={t("detail.fallbackSubtitle")}
           >
-            <TabsList className="h-8 p-0.5 bg-surface-subtle/80">
-              {tabs.map((tab) => (
-                <TabsTrigger
-                  key={tab.id}
-                  value={tab.id}
-                  className="h-7 px-2.5 text-xs"
-                >
-                  {tab.label}
-                </TabsTrigger>
-              ))}
-            </TabsList>
-          </Tabs>
-        </nav>
+            <ApplicationIdentity
+              id={applicationId}
+              name={app?.name}
+              category={app?.category_id}
+              icon={app?.icon}
+            />
+            <div className="mx-2 h-5 w-px bg-border" />
+            <Tabs
+              value={initialTab}
+              onValueChange={(val) => setTab(val as Tab)}
+              variant="pill"
+            >
+              <TabsList className="h-8 p-0.5 bg-surface-subtle/80">
+                {tabs.map((tab) => (
+                  <TabsTrigger
+                    key={tab.id}
+                    value={tab.id}
+                    className="h-7 px-2.5 text-xs"
+                  >
+                    {tab.label}
+                  </TabsTrigger>
+                ))}
+              </TabsList>
+            </Tabs>
+          </nav>
+          <TimeRangePicker
+            value={initialRange}
+            onChange={handleRange}
+            customRange={
+              initialFrom && initialTo
+                ? { from: initialFrom, to: initialTo }
+                : undefined
+            }
+            className="shrink-0 self-start sm:self-auto"
+          />
+        </div>
       }
     >
       <section
@@ -585,14 +754,14 @@ export function ApplicationDetailDashboard({
               value={formatBytes(app?.download_bytes ?? 0)}
               icon={ArrowDown}
               loading={loading}
-              subtext={t("detail.allRecordedTraffic")}
+              subtext={formatRangeLabel()}
             />
             <MetricCard
               label={t("columns.upload")}
               value={formatBytes(app?.upload_bytes ?? 0)}
               icon={ArrowUp}
               loading={loading}
-              subtext={t("detail.allRecordedTraffic")}
+              subtext={formatRangeLabel()}
             />
             <MetricCard
               label={t("columns.clients")}
@@ -678,7 +847,7 @@ export function ApplicationDetailDashboard({
           )}
           <TrafficChart
             data={chartData}
-            title={t("detail.trafficRecorded")}
+            title={`${t("detail.trafficRecorded")} · ${formatRangeLabel()}`}
             height={300}
             loading={loading}
             maxPoints={200}

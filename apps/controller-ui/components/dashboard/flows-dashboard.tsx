@@ -32,6 +32,7 @@ import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { SimpleTooltip } from "@/components/ui/tooltip";
 import { useTopologyLabels } from "@/hooks/use-topology-labels";
+import { protocolDisplayName } from "@/lib/application-identity";
 import {
   formatBytes,
   formatDuration,
@@ -491,11 +492,13 @@ export function FlowsDashboard(props: Props) {
       header: t("columns.classification"),
       cell: (row) => {
         const applicationId = row.application;
-        const name =
-          applicationId === "unknown"
-            ? !row.protocol_id || row.protocol_id === "unknown"
-              ? tStatus("unknown")
-              : row.protocol_id
+        const protocolOnly =
+          applicationId === "unknown" &&
+          Boolean(row.protocol_id && row.protocol_id !== "unknown");
+        const name = protocolOnly
+          ? protocolDisplayName(row.protocol_id ?? "")
+          : applicationId === "unknown"
+            ? tStatus("unknown")
             : row.application_name || formatIdentifier(applicationId);
         return (
           <div className="flex min-w-0 items-center gap-2">
@@ -506,6 +509,8 @@ export function FlowsDashboard(props: Props) {
                 icon={row.icon}
                 size="md"
               />
+            ) : protocolOnly ? (
+              <ProtocolIcon protocol={row.protocol_id ?? "unknown"} size="md" />
             ) : row.category && row.category !== "unknown" ? (
               <CategoryIcon category={row.category} size="md" />
             ) : (

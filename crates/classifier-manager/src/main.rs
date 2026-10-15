@@ -23,7 +23,7 @@ use tokio::process::{Child, Command};
 const DEFAULT_COMPONENT_ROOT: &str = "/data/components/classifierd";
 const DEFAULT_SOCKET: &str = "/run/netqmon/classifierd.sock";
 const DEFAULT_COMPONENT_API_URL: &str = "https://netqmon.com";
-const DEFAULT_UPDATE_CHANNEL: &str = "beta";
+const DEFAULT_UPDATE_CHANNEL: &str = "stable";
 const DEFAULT_UPDATE_SECONDS: u64 = 5 * 60;
 const DEFAULT_TRUSTED_KEY_ID: &str = "production-classifier-component";
 const DEFAULT_TRUSTED_KEY_VERSION: u32 = 1;

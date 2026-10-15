@@ -14,6 +14,8 @@ const DEFAULT_INTERVAL_MS: u64 = 1_000;
 const MAX_HISTORY_POINTS: usize = 900;
 const MAX_ACTIVE_FLOWS: usize = 10_000;
 const EVENT_CHANNEL_CAPACITY: usize = 128;
+const ACTIVE_CLIENT_WINDOW_MS: u64 = 30_000;
+const CLIENT_RATE_WINDOW_MS: u64 = 2_000;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Throughput {
@@ -116,6 +118,8 @@ pub(crate) struct ActiveFlowSnapshot {
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub(crate) struct RealtimeSnapshot {
     pub(crate) generated_at: u64,
+    #[serde(skip)]
+    pub(crate) agent_batch_time: u64,
     pub(crate) total: Throughput,
     pub(crate) internet: Throughput,
     pub(crate) internal: Throughput,
@@ -184,6 +188,7 @@ impl RealtimeEvent {
 pub(crate) struct RealtimeEngine {
     snapshot: RealtimeSnapshot,
     active_flows: HashMap<String, ActiveFlowSnapshot>,
+    recent_clients: HashMap<String, (Throughput, u64)>,
     last_update_at: Option<u64>,
     sender: broadcast::Sender<RealtimeEvent>,
 }
@@ -194,6 +199,7 @@ impl Default for RealtimeEngine {
         Self {
             snapshot: RealtimeSnapshot::default(),
             active_flows: HashMap::new(),
+            recent_clients: HashMap::new(),
             last_update_at: None,
             sender,
         }
@@ -224,13 +230,41 @@ impl RealtimeEngine {
         batch: &TelemetryBatch,
         attributions: &[FlowAttribution],
         observed_at: u64,
+        received_at: u64,
     ) {
-        let (total, internet, internal, tunnel, unknown, clients, client_scopes, applications) =
-            self.apply_flow_deltas(batch, attributions, observed_at);
+        let (
+            total,
+            internet,
+            internal,
+            tunnel,
+            unknown,
+            batch_clients,
+            client_scopes,
+            applications,
+        ) = self.apply_flow_deltas(batch, attributions, observed_at);
+
+        for (client_id, rate) in batch_clients {
+            self.recent_clients.insert(client_id, (rate, received_at));
+        }
+        self.recent_clients.retain(|_, (_, last_seen)| {
+            received_at.saturating_sub(*last_seen) <= ACTIVE_CLIENT_WINDOW_MS
+        });
+        let clients = self
+            .recent_clients
+            .iter()
+            .map(|(client_id, (rate, last_seen))| {
+                let rate = if received_at.saturating_sub(*last_seen) <= CLIENT_RATE_WINDOW_MS {
+                    rate.clone()
+                } else {
+                    Throughput::default()
+                };
+                (client_id.clone(), rate)
+            })
+            .collect();
 
         let mut history = VecDeque::from(std::mem::take(&mut self.snapshot.history));
         history.push_back(ThroughputPoint {
-            timestamp: observed_at,
+            timestamp: received_at,
             upload_bytes_per_second: internet.upload_bytes_per_second,
             download_bytes_per_second: internet.download_bytes_per_second,
         });
@@ -316,7 +350,8 @@ impl RealtimeEngine {
             },
         );
         self.snapshot = RealtimeSnapshot {
-            generated_at: observed_at,
+            generated_at: received_at,
+            agent_batch_time: observed_at,
             total,
             internet,
             internal,
@@ -330,7 +365,7 @@ impl RealtimeEngine {
             gateway_health,
         };
 
-        self.publish_batch_events(batch, attributions, observed_at);
+        self.publish_batch_events(batch, attributions, received_at);
     }
 
     fn apply_flow_deltas(
@@ -381,11 +416,13 @@ impl RealtimeEngine {
             );
             let client_ip = format_ip(&flow.client_ip);
             let client_id = client_id(flow);
-            add_rate(
-                clients.entry(client_id.clone()).or_default(),
-                upload_rate,
-                download_rate,
-            );
+            if flow.upload_bytes > 0 || flow.download_bytes > 0 || flow.packets > 0 {
+                add_rate(
+                    clients.entry(client_id.clone()).or_default(),
+                    upload_rate,
+                    download_rate,
+                );
+            }
             let scoped = client_scopes.entry(client_id).or_default();
             add_rate(
                 match wire_scope {

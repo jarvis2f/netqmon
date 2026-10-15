@@ -29,13 +29,17 @@ const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_GATEWAY_OFFLINE_AFTER_MS: u64 = 30_000;
 const DEFAULT_INSIGHT_WINDOW_MS: u64 = DAY_MS;
 const MAX_INSIGHT_WINDOW_MS: u64 = 30 * DAY_MS;
+const PROTOCOL_APPLICATION_PREFIX: &str = "protocol:";
 
 pub(crate) fn router() -> Router<CollectorState> {
     Router::new()
         .route("/internal/overview", get(overview))
         .route("/internal/traffic", get(traffic))
         .route("/internal/clients", get(clients))
-        .route("/internal/clients/{id}", get(client_detail))
+        .route(
+            "/internal/clients/{id}",
+            get(client_detail).put(update_client_info),
+        )
         .route("/internal/clients/{id}/{relation}", get(client_related))
         .route("/internal/applications", get(applications))
         .route("/internal/organizations", get(organizations))
@@ -123,7 +127,7 @@ async fn check_license(State(state): State<CollectorState>) -> Response {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PageQuery {
     limit: Option<u32>,
@@ -132,10 +136,21 @@ struct PageQuery {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct WindowPageQuery {
+    limit: Option<u32>,
+    offset: Option<u64>,
+    from: Option<u64>,
+    to: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ApplicationDetailQuery {
     limit: Option<u32>,
     offset: Option<u64>,
     category: Option<String>,
+    from: Option<u64>,
+    to: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -185,6 +200,10 @@ impl Page {
                 &error.body_text(),
             ))
         })?;
+        Self::from_query(query)
+    }
+
+    fn from_query(query: PageQuery) -> Result<Self, Box<Response>> {
         let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE);
         let offset = query.offset.unwrap_or(0);
         if limit == 0 || limit > MAX_PAGE_SIZE {
@@ -202,6 +221,16 @@ impl Page {
             )));
         }
         Ok(Self { limit, offset })
+    }
+}
+
+fn query_window(from: Option<u64>, to: Option<u64>) -> Result<Option<(i64, i64)>, &'static str> {
+    match (from, to) {
+        (None, None) => Ok(None),
+        (Some(from), Some(to)) if from < to && i64::try_from(to).is_ok() => {
+            Ok(Some((to_i64(from), to_i64(to))))
+        }
+        _ => Err("from and to must be supplied together as a valid timestamp range"),
     }
 }
 
@@ -307,6 +336,72 @@ async fn overview(
     }
     let snapshot = state.realtime_snapshot();
     let inner = state.lock();
+    if let Some(clickhouse) = inner.storage.clickhouse_storage() {
+        let now = now_ms();
+        let offline_after_ms = gateway_offline_after_ms();
+        return clickhouse
+            .query_overview(now, offline_after_ms, None)
+            .map(|mut value| {
+                let gateway_status = value["gateway_status"]
+                    .as_str()
+                    .unwrap_or("unenrolled")
+                    .to_owned();
+                let warning = capture_warning(&gateway_status, &snapshot);
+                if let Some(gateway) = value["gateway"].as_object_mut() {
+                    let health = snapshot.gateway_health.as_ref();
+                    if let Some(health) = health {
+                        gateway.insert("agent_version".to_owned(), json!(health.agent_version));
+                        gateway.insert("kernel_version".to_owned(), json!(health.kernel_version));
+                        gateway.insert("openwrt_version".to_owned(), json!(health.openwrt_version));
+                    }
+                    gateway.insert(
+                        "offloading_status".to_owned(),
+                        json!(
+                            health.map_or("unknown", |value| value.hardware_flow_offload.as_str())
+                        ),
+                    );
+                    gateway.insert(
+                        "capture_interface".to_owned(),
+                        json!(health.map_or("", |value| value.capture_interface.as_str())),
+                    );
+                    gateway.insert(
+                        "capture_interfaces".to_owned(),
+                        json!(
+                            health.map_or_else(Vec::new, |value| value.capture_interfaces.clone())
+                        ),
+                    );
+                    gateway.insert(
+                        "interface_counter_sanity".to_owned(),
+                        json!(
+                            health
+                                .map_or("unknown", |value| value.interface_counter_sanity.as_str())
+                        ),
+                    );
+                    gateway.insert(
+                        "interface_delta_bytes".to_owned(),
+                        json!(health.map_or(0, |value| value.interface_delta_bytes)),
+                    );
+                    gateway.insert(
+                        "flow_delta_bytes".to_owned(),
+                        json!(health.map_or(0, |value| value.flow_delta_bytes)),
+                    );
+                    gateway.insert("capture_warning".to_owned(), json!(warning));
+                    gateway.insert("offline_after_ms".to_owned(), json!(offline_after_ms));
+                }
+                json!({
+                    "gateway_status": gateway_status,
+                    "gateway": value["gateway"].clone(),
+                    "realtime": snapshot,
+                    "last_24_hours": {
+                        "upload_bytes": value["traffic_total_upload_bytes_24h"].clone(),
+                        "download_bytes": value["traffic_total_download_bytes_24h"].clone(),
+                    },
+                    "device_count": value["devices"].clone(),
+                    "application_count": value["applications"].clone(),
+                })
+            })
+            .map_or_else(storage_error, api_ok);
+    }
     let connection = inner.storage.connection();
     let result = (|| -> rusqlite::Result<Value> {
         let now = now_ms();
@@ -354,41 +449,8 @@ async fn overview(
         };
         let capture_warning = if is_demo {
             None
-        } else if gateway_status == "offline" {
-            Some("No gateway telemetry has arrived within the offline threshold".to_owned())
-        } else if let Some(health) = snapshot.gateway_health.as_ref() {
-            let mut reasons = Vec::new();
-            if health.hardware_flow_offload == "enabled" {
-                reasons.push("hardware flow offloading is enabled".to_owned());
-            }
-            if health.dropped_batches > 0 {
-                reasons.push(format!(
-                    "{} dropped telemetry batches",
-                    health.dropped_batches
-                ));
-            }
-            if health.dns_dropped_events > 0 {
-                reasons.push(format!("{} dropped DNS events", health.dns_dropped_events));
-            }
-            if health.protocol_probe_dropped_events > 0 {
-                reasons.push(format!(
-                    "{} dropped protocol probe events",
-                    health.protocol_probe_dropped_events
-                ));
-            }
-            if health.interface_counter_sanity == "degraded" {
-                reasons.push(format!(
-                    "interface counters exceeded captured flow deltas ({}B interface, {}B flows)",
-                    health.interface_delta_bytes, health.flow_delta_bytes
-                ));
-            }
-            if reasons.is_empty() {
-                None
-            } else {
-                Some(format!("Capture degraded: {}", reasons.join("; ")))
-            }
         } else {
-            Some("Capture health telemetry has not been reported".to_owned())
+            capture_warning(gateway_status, &snapshot)
         };
         let gateway = gateway
             .map(|gateway| {
@@ -448,6 +510,44 @@ async fn overview(
         }))
     })();
     result.map_or_else(storage_error, api_ok)
+}
+
+fn capture_warning(
+    gateway_status: &str,
+    snapshot: &crate::realtime::RealtimeSnapshot,
+) -> Option<String> {
+    if gateway_status == "offline" {
+        return Some("No gateway telemetry has arrived within the offline threshold".to_owned());
+    }
+    let Some(health) = snapshot.gateway_health.as_ref() else {
+        return Some("Capture health telemetry has not been reported".to_owned());
+    };
+    let mut reasons = Vec::new();
+    if health.hardware_flow_offload == "enabled" {
+        reasons.push("hardware flow offloading is enabled".to_owned());
+    }
+    if health.dropped_batches > 0 {
+        reasons.push(format!(
+            "{} dropped telemetry batches",
+            health.dropped_batches
+        ));
+    }
+    if health.dns_dropped_events > 0 {
+        reasons.push(format!("{} dropped DNS events", health.dns_dropped_events));
+    }
+    if health.protocol_probe_dropped_events > 0 {
+        reasons.push(format!(
+            "{} dropped protocol probe events",
+            health.protocol_probe_dropped_events
+        ));
+    }
+    if health.interface_counter_sanity == "degraded" {
+        reasons.push(format!(
+            "interface counters exceeded captured flow deltas ({}B interface, {}B flows)",
+            health.interface_delta_bytes, health.flow_delta_bytes
+        ));
+    }
+    (!reasons.is_empty()).then(|| format!("Capture degraded: {}", reasons.join("; ")))
 }
 
 async fn traffic(
@@ -521,6 +621,40 @@ fn traffic_breakdown(
     direction: Option<i64>,
 ) -> Response {
     let inner = state.lock();
+    if let Some(clickhouse) = inner.storage.clickhouse_storage() {
+        let duration = to.saturating_sub(from);
+        let bucket_ms = duration.div_ceil(180).max(60_000).div_ceil(60_000) * 60_000;
+        return clickhouse
+            .query_traffic_breakdown(
+                from,
+                to,
+                group_by,
+                page.limit,
+                page.offset,
+                scope,
+                direction,
+                bucket_ms,
+            )
+            .map(|mut data| {
+                if group_by == "application" {
+                    if let Some(items) = data["breakdown"].as_array_mut() {
+                        for item in items {
+                            let id = item["id"].as_str().unwrap_or("unknown");
+                            let metadata = inner.classifier.application_metadata(id);
+                            if let Some(object) = item.as_object_mut() {
+                                object.insert(
+                                    "name".to_owned(),
+                                    json!(metadata.as_ref().map(|value| value.name.clone())),
+                                );
+                                object.insert("icon".to_owned(), icon_json(metadata));
+                            }
+                        }
+                    }
+                }
+                data
+            })
+            .map_or_else(storage_error, api_ok);
+    }
     let connection = inner.storage.connection();
     let result = (|| -> rusqlite::Result<Value> {
         // Keep historical charts bounded while retaining the exact requested window.
@@ -725,19 +859,36 @@ fn query_direction_name(value: Option<i64>) -> &'static str {
 
 async fn clients(
     State(state): State<CollectorState>,
-    query: Result<Query<PageQuery>, QueryRejection>,
+    query: Result<Query<WindowPageQuery>, QueryRejection>,
 ) -> Response {
-    let page = match Page::parse(query) {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => {
+            return api_error(StatusCode::BAD_REQUEST, "invalid_query", &error.body_text());
+        }
+    };
+    let page = match Page::from_query(PageQuery {
+        limit: query.limit,
+        offset: query.offset,
+    }) {
         Ok(page) => page,
         Err(response) => return *response,
     };
+    let window = match query_window(query.from, query.to) {
+        Ok(window) => window,
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_time_range", message),
+    };
     let inner = state.lock();
     if let Some(clickhouse) = inner.storage.clickhouse_storage() {
-        return clickhouse
-            .query_clients(page.limit, page.offset)
-            .map_or_else(storage_error, |(items, total)| page_ok(items, page, total));
+        let query = match window {
+            Some((from, to)) => {
+                clickhouse.query_clients_in_range(page.limit, page.offset, from, to)
+            }
+            None => clickhouse.query_clients(page.limit, page.offset),
+        };
+        return query.map_or_else(storage_error, |(items, total)| page_ok(items, page, total));
     }
-    query_clients(inner.storage.connection(), page)
+    query_clients(inner.storage.connection(), page, window)
         .map_or_else(storage_error, |(items, total)| page_ok(items, page, total))
 }
 
@@ -774,6 +925,58 @@ async fn client_detail(
     match query_client_detail(inner.storage.connection(), id) {
         Ok(Some(value)) => api_ok(value),
         Ok(None) => api_error(StatusCode::NOT_FOUND, "not_found", "client was not found"),
+        Err(error) => storage_error(error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateClientRequest {
+    name: Option<Option<String>>,
+    device_type: Option<Option<String>>,
+}
+
+async fn update_client_info(
+    State(state): State<CollectorState>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateClientRequest>,
+) -> Response {
+    let Ok(id) = id.parse::<i64>() else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_id",
+            "client id must be an integer",
+        );
+    };
+    if id <= 0 {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_id",
+            "client id must be positive",
+        );
+    }
+
+    let display_name = payload.name.as_ref().map(|opt| opt.as_deref());
+    let device_type = payload.device_type.as_ref().map(|opt| opt.as_deref());
+
+    let inner = state.lock();
+    match inner.storage.update_client(id, display_name, device_type) {
+        Ok(true) => {
+            if let Some(clickhouse) = inner.storage.clickhouse_storage() {
+                match clickhouse.query_client_detail(id) {
+                    Ok(Some(value)) => api_ok(value),
+                    Ok(None) => api_ok(json!({ "id": id })),
+                    Err(error) => storage_error(error),
+                }
+            } else {
+                match query_client_detail(inner.storage.connection(), id) {
+                    Ok(Some(value)) => api_ok(value),
+                    Ok(None) => api_ok(json!({ "id": id })),
+                    Err(error) => storage_error(error),
+                }
+            }
+        }
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "not_found", "client was not found"),
         Err(error) => storage_error(error),
     }
 }
@@ -824,6 +1027,50 @@ async fn client_related(
         Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_scope", message),
     };
     let inner = state.lock();
+    if let Some(clickhouse) = inner.storage.clickhouse_storage() {
+        if !matches!(
+            relation.as_str(),
+            "traffic" | "applications" | "domains" | "destinations" | "flows"
+        ) {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "client relation was not found",
+            );
+        }
+        return clickhouse
+            .query_client_related(id, &relation, from, to, scope, page.limit, page.offset)
+            .map(|mut value| {
+                if let Some(items) = value.as_array_mut() {
+                    if matches!(relation.as_str(), "applications" | "flows") {
+                        for item in items {
+                            let app = item["application_id"]
+                                .as_str()
+                                .or_else(|| item["application"].as_str())
+                                .unwrap_or("unknown");
+                            let metadata = inner.classifier.application_metadata(app);
+                            if relation == "applications" {
+                                if let Some(object) = item.as_object_mut() {
+                                    object.insert(
+                                        "name".to_owned(),
+                                        json!(metadata.as_ref().map(|value| value.name.clone())),
+                                    );
+                                    object.insert("icon".to_owned(), icon_json(metadata));
+                                }
+                            } else if let Some(object) = item.as_object_mut() {
+                                object.insert(
+                                    "application_name".to_owned(),
+                                    json!(metadata.as_ref().map(|value| value.name.clone())),
+                                );
+                                object.insert("icon".to_owned(), icon_json(metadata));
+                            }
+                        }
+                    }
+                }
+                value
+            })
+            .map_or_else(storage_error, api_ok);
+    }
     let connection = inner.storage.connection();
     let result = match relation.as_str() {
         "traffic" => query_client_traffic(connection, id, from, to, scope),
@@ -1049,70 +1296,190 @@ fn query_client_flows(
 
 async fn applications(
     State(state): State<CollectorState>,
-    query: Result<Query<PageQuery>, QueryRejection>,
+    query: Result<Query<WindowPageQuery>, QueryRejection>,
 ) -> Response {
-    let page = match Page::parse(query) {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => {
+            return api_error(StatusCode::BAD_REQUEST, "invalid_query", &error.body_text());
+        }
+    };
+    let page = match Page::from_query(PageQuery {
+        limit: query.limit,
+        offset: query.offset,
+    }) {
         Ok(page) => page,
         Err(response) => return *response,
     };
+    let window = match query_window(query.from, query.to) {
+        Ok(window) => window,
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_time_range", message),
+    };
     let inner = state.lock();
+    if let Some(clickhouse) = inner.storage.clickhouse_storage() {
+        return clickhouse
+            .query_applications_for_window(page.limit, page.offset, window)
+            .map(|(mut items, total)| {
+                for item in &mut items {
+                    let application_id = item["application_id"].as_str().unwrap_or("unknown");
+                    let application = inner.classifier.application_metadata(application_id);
+                    let organization_id = item["organization_id"].as_str().unwrap_or("unknown");
+                    let organization = (organization_id != "unknown")
+                        .then(|| inner.classifier.organization_metadata(organization_id))
+                        .flatten();
+                    if let Some(object) = item.as_object_mut() {
+                        object.insert(
+                            "name".to_owned(),
+                            json!(application.as_ref().map(|value| value.name.clone())),
+                        );
+                        object.insert("icon".to_owned(), icon_json(application));
+                        object.insert(
+                            "organization_name".to_owned(),
+                            json!(organization.as_ref().map(|value| value.name.clone())),
+                        );
+                    }
+                }
+                page_ok(items, page, total)
+            })
+            .unwrap_or_else(storage_error);
+    }
     let connection = inner.storage.connection();
     let result = (|| -> rusqlite::Result<(Vec<Value>, u64)> {
-        let total: i64 = scalar(
-            connection,
-            "SELECT COUNT(*) FROM (SELECT 1 FROM traffic_application_minute GROUP BY application_id, category_id)",
-            [],
-        )?;
-        let mut statement = connection.prepare(
-            "SELECT t.application_id, t.category_id, SUM(t.upload_bytes), SUM(t.download_bytes),
-                    SUM(t.packets), SUM(t.flow_count), MAX(t.timestamp),
-                    (SELECT COUNT(DISTINCT f.device_id) FROM flow_sessions f
-                     WHERE f.application_id = t.application_id AND f.device_id IS NOT NULL),
+        let total = if let Some((from, to)) = window {
+            scalar(
+                connection,
+                "SELECT COUNT(*) FROM (
+                    SELECT application_id, category_id FROM traffic_application_minute
+                    WHERE timestamp >= ?1 AND timestamp < ?2
+                    GROUP BY application_id, category_id
+                 )",
+                params![from, to],
+            )?
+        } else {
+            scalar(
+                connection,
+                "SELECT COUNT(*) FROM (
+                    SELECT application_id, category_id FROM traffic_application_minute
+                    GROUP BY application_id, category_id
+                 )",
+                [],
+            )?
+        };
+        let query_sql = if window.is_some() {
+            "WITH app_totals AS (
+                 SELECT application_id, category_id, SUM(upload_bytes) AS upload_bytes,
+                        SUM(download_bytes) AS download_bytes, SUM(packets) AS packets,
+                        SUM(flow_count) AS flow_count, MAX(timestamp) AS last_seen
+                 FROM traffic_application_minute
+                 WHERE timestamp >= ?1 AND timestamp < ?2
+                 GROUP BY application_id, category_id
+             ), client_counts AS (
+                 SELECT CASE WHEN COALESCE(application_id, 'unknown') = 'unknown' AND COALESCE(NULLIF(protocol_id, ''), 'unknown') != 'unknown'
+                             THEN 'protocol:' || COALESCE(NULLIF(protocol_id, ''), 'unknown') ELSE COALESCE(application_id, 'unknown') END AS application_id,
+                        COUNT(DISTINCT device_id) AS client_count
+                 FROM flow_sessions
+                 WHERE device_id IS NOT NULL AND last_seen_at >= ?1 AND last_seen_at < ?2
+                 GROUP BY CASE WHEN COALESCE(application_id, 'unknown') = 'unknown' AND COALESCE(NULLIF(protocol_id, ''), 'unknown') != 'unknown'
+                               THEN 'protocol:' || COALESCE(NULLIF(protocol_id, ''), 'unknown') ELSE COALESCE(application_id, 'unknown') END
+             )
+             SELECT t.application_id, t.category_id, t.upload_bytes, t.download_bytes,
+                    t.packets, t.flow_count, t.last_seen, COALESCE(c.client_count, 0),
                     CASE
-                        WHEN t.application_id = 'unknown' THEN NULL
+                            WHEN t.application_id IN ('unknown', 'protocol-only') OR t.application_id LIKE 'protocol:%' THEN NULL
                         ELSE (SELECT f.organization_id FROM flow_sessions f
                               WHERE f.application_id = t.application_id
                                 AND f.organization_id IS NOT NULL AND f.organization_id != 'unknown'
                               LIMIT 1)
                     END
-             FROM traffic_application_minute t GROUP BY t.application_id, t.category_id
-             ORDER BY SUM(t.upload_bytes + t.download_bytes) DESC, t.application_id
-             LIMIT ?1 OFFSET ?2",
-        )?;
-        let items = statement
-            .query_map(params![i64::from(page.limit), to_i64(page.offset)], |row| {
-                let application_id = row.get::<_, String>(0)?;
-                let application_metadata = inner.classifier.application_metadata(&application_id);
-                let organization_id = if application_id == "unknown" {
-                    None
-                } else {
-                    row.get::<_, Option<String>>(8)?
-                };
-                let organization_metadata = organization_id
-                    .as_deref()
-                    .filter(|id| !id.is_empty() && *id != "unknown")
-                    .and_then(|id| inner.classifier.organization_metadata(id));
-                Ok(json!({
-                    "application_id": application_id,
-                    "name": application_metadata
-                        .as_ref()
-                        .map(|metadata| metadata.name.clone()),
-                    "category_id": row.get::<_, String>(1)?,
-                    "upload_bytes": row.get::<_, i64>(2)?,
-                    "download_bytes": row.get::<_, i64>(3)?,
-                    "packets": row.get::<_, i64>(4)?,
-                    "flow_count": row.get::<_, i64>(5)?,
-                    "last_seen": row.get::<_, i64>(6)?,
-                    "client_count": row.get::<_, i64>(7)?,
-                    "organization_id": organization_id,
-                    "organization_name": organization_metadata.as_ref().map(|metadata| metadata.name.clone()),
-                    "icon": icon_json(application_metadata),
-                }))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+             FROM app_totals t LEFT JOIN client_counts c ON c.application_id = t.application_id
+             ORDER BY t.upload_bytes + t.download_bytes DESC, t.application_id
+             LIMIT ?3 OFFSET ?4"
+        } else {
+            "WITH app_totals AS (
+                 SELECT application_id, category_id, SUM(upload_bytes) AS upload_bytes,
+                        SUM(download_bytes) AS download_bytes, SUM(packets) AS packets,
+                        SUM(flow_count) AS flow_count, MAX(timestamp) AS last_seen
+                 FROM traffic_application_minute
+                 GROUP BY application_id, category_id
+             ), client_counts AS (
+                 SELECT CASE WHEN COALESCE(application_id, 'unknown') = 'unknown' AND COALESCE(NULLIF(protocol_id, ''), 'unknown') != 'unknown'
+                             THEN 'protocol:' || COALESCE(NULLIF(protocol_id, ''), 'unknown') ELSE COALESCE(application_id, 'unknown') END AS application_id,
+                        COUNT(DISTINCT device_id) AS client_count
+                 FROM flow_sessions WHERE device_id IS NOT NULL
+                 GROUP BY CASE WHEN COALESCE(application_id, 'unknown') = 'unknown' AND COALESCE(NULLIF(protocol_id, ''), 'unknown') != 'unknown'
+                               THEN 'protocol:' || COALESCE(NULLIF(protocol_id, ''), 'unknown') ELSE COALESCE(application_id, 'unknown') END
+             )
+             SELECT t.application_id, t.category_id, t.upload_bytes, t.download_bytes,
+                    t.packets, t.flow_count, t.last_seen, COALESCE(c.client_count, 0),
+                    CASE
+                            WHEN t.application_id IN ('unknown', 'protocol-only') OR t.application_id LIKE 'protocol:%' THEN NULL
+                        ELSE (SELECT f.organization_id FROM flow_sessions f
+                              WHERE f.application_id = t.application_id
+                                AND f.organization_id IS NOT NULL AND f.organization_id != 'unknown'
+                              LIMIT 1)
+                    END
+             FROM app_totals t LEFT JOIN client_counts c ON c.application_id = t.application_id
+             ORDER BY t.upload_bytes + t.download_bytes DESC, t.application_id
+             LIMIT ?1 OFFSET ?2"
+        };
+        let mut statement = connection.prepare(query_sql)?;
+        let map_row = |row: &Row<'_>| map_application_row(row, &inner);
+        let items = match window {
+            Some((from, to)) => statement
+                .query_map(
+                    params![from, to, i64::from(page.limit), to_i64(page.offset)],
+                    map_row,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => statement
+                .query_map(params![i64::from(page.limit), to_i64(page.offset)], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
         Ok((items, to_u64(total)))
     })();
     result.map_or_else(storage_error, |(items, total)| page_ok(items, page, total))
+}
+
+fn map_application_row(row: &Row<'_>, inner: &crate::CollectorInner) -> rusqlite::Result<Value> {
+    let application_id = row.get::<_, String>(0)?;
+    let application_metadata = inner.classifier.application_metadata(&application_id);
+    let organization_id = if matches!(application_id.as_str(), "unknown" | "protocol-only") {
+        None
+    } else if application_id.starts_with(PROTOCOL_APPLICATION_PREFIX) {
+        None
+    } else {
+        row.get::<_, Option<String>>(8)?
+    };
+    let organization_metadata = organization_id
+        .as_deref()
+        .filter(|id| !id.is_empty() && *id != "unknown")
+        .and_then(|id| inner.classifier.organization_metadata(id));
+    Ok(json!({
+        "application_id": application_id,
+        "name": application_metadata
+            .as_ref()
+            .map(|metadata| metadata.name.clone()),
+        "category_id": row.get::<_, String>(1)?,
+        "upload_bytes": row.get::<_, i64>(2)?,
+        "download_bytes": row.get::<_, i64>(3)?,
+        "packets": row.get::<_, i64>(4)?,
+        "flow_count": row.get::<_, i64>(5)?,
+        "last_seen": row.get::<_, i64>(6)?,
+        "client_count": row.get::<_, i64>(7)?,
+        "organization_id": organization_id,
+        "organization_name": organization_metadata.as_ref().map(|metadata| metadata.name.clone()),
+        "icon": icon_json(application_metadata),
+    }))
+}
+
+fn sqlite_application_flow_filter(id_parameter: &str, prefix: &str) -> String {
+    let application = format!("COALESCE({prefix}application_id, 'unknown')");
+    let protocol = format!("COALESCE(NULLIF({prefix}protocol_id, ''), 'unknown')");
+    format!(
+        "(({id_parameter} LIKE '{PROTOCOL_APPLICATION_PREFIX}%' AND {application} = 'unknown' AND {protocol} = substr({id_parameter}, 10)) \
+         OR ({id_parameter} = 'unknown' AND {application} = 'unknown' AND {protocol} = 'unknown') \
+         OR ({id_parameter} NOT IN ('unknown', 'protocol-only') AND {id_parameter} NOT LIKE '{PROTOCOL_APPLICATION_PREFIX}%' AND {application} = {id_parameter}))"
+    )
 }
 
 async fn organizations(
@@ -1124,6 +1491,25 @@ async fn organizations(
         Err(response) => return *response,
     };
     let inner = state.lock();
+    if let Some(clickhouse) = inner.storage.clickhouse_storage() {
+        return clickhouse
+            .query_flow_groups("organization_id", page.limit, page.offset)
+            .map(|(mut items, total)| {
+                for item in &mut items {
+                    let id = item["id"].as_str().unwrap_or("unknown").to_owned();
+                    let metadata = inner.classifier.organization_metadata(&id);
+                    if let Some(object) = item.as_object_mut() {
+                        object.insert(
+                            "name".to_owned(),
+                            json!(metadata_name(metadata.as_ref(), &id)),
+                        );
+                        object.insert("icon".to_owned(), icon_json(metadata));
+                    }
+                }
+                page_ok(items, page, total)
+            })
+            .unwrap_or_else(storage_error);
+    }
     let connection = inner.storage.connection();
     let result = (|| -> rusqlite::Result<(Vec<Value>, u64)> {
         let total: i64 = scalar(
@@ -1166,6 +1552,12 @@ async fn protocols(
         Err(response) => return *response,
     };
     let inner = state.lock();
+    if let Some(clickhouse) = inner.storage.clickhouse_storage() {
+        return clickhouse
+            .query_flow_groups("protocol_id", page.limit, page.offset)
+            .map(|(items, total)| page_ok(items, page, total))
+            .unwrap_or_else(storage_error);
+    }
     let connection = inner.storage.connection();
     let result = (|| -> rusqlite::Result<(Vec<Value>, u64)> {
         let total: i64 = scalar(
@@ -1213,7 +1605,11 @@ async fn application_detail(
     }))) {
         return *response;
     }
-    if !valid_identifier(&id) {
+    let window = match query_window(query.from, query.to) {
+        Ok(window) => window,
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_time_range", message),
+    };
+    if !valid_application_identifier(&id) {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_application_id",
@@ -1233,16 +1629,52 @@ async fn application_detail(
     }
     let category = query.category.as_deref();
     let inner = state.lock();
+    if let Some(clickhouse) = inner.storage.clickhouse_storage() {
+        return match clickhouse.query_application_detail(&id, category, window) {
+            Ok(Some(mut value)) => {
+                let organization_id = value["organization_id"].as_str().unwrap_or("unknown");
+                let organization = (organization_id != "unknown")
+                    .then(|| inner.classifier.organization_metadata(organization_id))
+                    .flatten();
+                let application = inner.classifier.application_metadata(&id);
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "name".to_owned(),
+                        json!(application.as_ref().map(|metadata| metadata.name.clone())),
+                    );
+                    object.insert(
+                        "organization_name".to_owned(),
+                        json!(organization.as_ref().map(|metadata| metadata.name.clone())),
+                    );
+                    object.insert("icon".to_owned(), icon_json(application));
+                }
+                api_ok(value)
+            }
+            Ok(None) => api_error(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "application was not found",
+            ),
+            Err(error) => storage_error(error),
+        };
+    }
+    let summary_sql = "SELECT application_id, category_id, SUM(upload_bytes), SUM(download_bytes),
+                              SUM(packets), SUM(flow_count), MAX(timestamp)
+                       FROM traffic_application_minute
+                       WHERE application_id = ?1 AND (?2 IS NULL OR category_id = ?2)
+                         AND (?3 IS NULL OR timestamp >= ?3) AND (?4 IS NULL OR timestamp < ?4)
+                       GROUP BY application_id, category_id";
     let result = inner
         .storage
         .connection()
         .query_row(
-            "SELECT application_id, category_id, SUM(upload_bytes), SUM(download_bytes),
-                    SUM(packets), SUM(flow_count), MAX(timestamp)
-             FROM traffic_application_minute
-             WHERE application_id = ?1 AND (?2 IS NULL OR category_id = ?2)
-             GROUP BY application_id, category_id",
-            params![id, category],
+            summary_sql,
+            params![
+                id,
+                category,
+                window.map(|(from, _)| from),
+                window.map(|(_, to)| to)
+            ],
             |row| summary_row(row, &["application_id", "category_id"]),
         )
         .optional();
@@ -1250,17 +1682,26 @@ async fn application_detail(
         Ok(Some(mut value)) => {
             let connection = inner.storage.connection();
             let classifier = connection.query_row(
-                "SELECT COUNT(DISTINCT device_id), COUNT(DISTINCT domain),
+                &format!("SELECT COUNT(DISTINCT device_id), COUNT(DISTINCT domain),
                         COUNT(DISTINCT hex(remote_ip)), AVG(COALESCE(classification_confidence, 0)),
                         COALESCE(MAX(classification_reason), 'no matching rule'),
                         COALESCE(MAX(CASE
-                            WHEN ?1 != 'unknown' AND organization_id IS NOT NULL AND organization_id != 'unknown'
+                            WHEN ?1 NOT IN ('unknown', 'protocol-only') AND ?1 NOT LIKE '{PROTOCOL_APPLICATION_PREFIX}%'
+                             AND organization_id IS NOT NULL AND organization_id != 'unknown'
                             THEN organization_id
                         END), 'unknown')
                  FROM flow_sessions
-                 WHERE application_id = ?1
-                   AND (?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)",
-                params![id, category],
+                 WHERE {flow_filter}
+                   AND (?3 IS NULL OR last_seen_at >= ?3) AND (?4 IS NULL OR last_seen_at < ?4)
+                   AND (?1 LIKE '{PROTOCOL_APPLICATION_PREFIX}%' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)",
+                    flow_filter = sqlite_application_flow_filter("?1", "")
+                ),
+                params![
+                    id,
+                    category,
+                    window.map(|(from, _)| from),
+                    window.map(|(_, to)| to)
+                ],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
@@ -1279,8 +1720,14 @@ async fn application_detail(
                     } else {
                         organization
                     };
-                    let observed_protocols = query_application_protocols(connection, &id, category)
-                        .unwrap_or_else(|_| Vec::new());
+                    let observed_protocols = query_application_protocols(
+                        connection,
+                        &id,
+                        category,
+                        window.map(|(from, _)| from),
+                        window.map(|(_, to)| to),
+                    )
+                    .unwrap_or_else(|_| Vec::new());
                     let application_metadata = inner.classifier.application_metadata(&id);
                     let organization_metadata = (organization != "unknown")
                         .then(|| inner.classifier.organization_metadata(&organization))
@@ -1316,6 +1763,22 @@ async fn application_detail(
                 Err(error) => storage_error(error),
             }
         }
+        Ok(None) if window.is_some() => api_ok(json!({
+            "application_id": id,
+            "category_id": category.unwrap_or("unknown"),
+            "upload_bytes": 0,
+            "download_bytes": 0,
+            "packets": 0,
+            "flow_count": 0,
+            "last_seen": 0,
+            "client_count": 0,
+            "domain_count": 0,
+            "destination_count": 0,
+            "confidence": 0.0,
+            "classifier_reason": "no matching rule",
+            "organization_id": "unknown",
+            "observed_protocols": [],
+        })),
         Ok(None) => api_error(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -1329,17 +1792,21 @@ fn query_application_protocols(
     connection: &Connection,
     id: &str,
     category: Option<&str>,
+    from: Option<i64>,
+    to: Option<i64>,
 ) -> rusqlite::Result<Vec<Value>> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(&format!(
         "SELECT COALESCE(protocol_id, 'unknown'), COUNT(*)
          FROM flow_sessions
-         WHERE application_id = ?1
-           AND (?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)
+         WHERE {flow_filter}
+           AND (?3 IS NULL OR last_seen_at >= ?3) AND (?4 IS NULL OR last_seen_at < ?4)
+           AND (?1 LIKE '{PROTOCOL_APPLICATION_PREFIX}%' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)
          GROUP BY COALESCE(protocol_id, 'unknown')
          ORDER BY COUNT(*) DESC, COALESCE(protocol_id, 'unknown')",
-    )?;
+        flow_filter = sqlite_application_flow_filter("?1", "")
+    ))?;
     statement
-        .query_map(params![id, category], |row| {
+        .query_map(params![id, category, from, to], |row| {
             Ok(json!({
                 "id": row.get::<_, String>(0)?,
                 "flows": row.get::<_, i64>(1)?,
@@ -1355,6 +1822,7 @@ struct RelatedQuery {
     to: Option<u64>,
     limit: Option<u32>,
     offset: Option<u64>,
+    all: Option<bool>,
     scope: Option<String>,
     category: Option<String>,
 }
@@ -1364,7 +1832,7 @@ async fn application_related(
     Path((id, relation)): Path<(String, String)>,
     query: Result<Query<RelatedQuery>, QueryRejection>,
 ) -> Response {
-    if !valid_identifier(&id) {
+    if !valid_application_identifier(&id) {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_application_id",
@@ -1405,13 +1873,60 @@ async fn application_related(
         );
     }
     let inner = state.lock();
-    let connection = inner.storage.connection();
     let category = query.category.as_deref();
+    let include_all =
+        query.all.unwrap_or(false) && matches!(relation.as_str(), "domains" | "destinations");
+    if let Some(clickhouse) = inner.storage.clickhouse_storage() {
+        if !matches!(
+            relation.as_str(),
+            "traffic" | "clients" | "domains" | "destinations" | "flows"
+        ) {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "application relation was not found",
+            );
+        }
+        return clickhouse
+            .query_application_related(
+                &id,
+                category,
+                &relation,
+                from,
+                to,
+                page.limit,
+                page.offset,
+                include_all,
+            )
+            .map(|mut value| {
+                if relation == "flows" {
+                    if let Some(items) = value.as_array_mut() {
+                        let metadata = inner.classifier.application_metadata(&id);
+                        for item in items {
+                            if let Some(object) = item.as_object_mut() {
+                                object.insert(
+                                    "application_name".to_owned(),
+                                    json!(metadata.as_ref().map(|value| value.name.clone())),
+                                );
+                                object.insert("icon".to_owned(), icon_json(metadata.clone()));
+                            }
+                        }
+                    }
+                }
+                value
+            })
+            .map_or_else(storage_error, api_ok);
+    }
+    let connection = inner.storage.connection();
     let result = match relation.as_str() {
         "traffic" => query_application_traffic(connection, &id, category, from, to),
         "clients" => query_application_clients(connection, &id, category, page, from, to),
-        "domains" => query_application_domains(connection, &id, category, page, from, to),
-        "destinations" => query_application_destinations(connection, &id, category, page, from, to),
+        "domains" => {
+            query_application_domains(connection, &id, category, page, from, to, include_all)
+        }
+        "destinations" => {
+            query_application_destinations(connection, &id, category, page, from, to, include_all)
+        }
         "flows" => {
             query_application_flows(connection, &inner.classifier, &id, category, page, from, to)
         }
@@ -1435,14 +1950,15 @@ fn query_application_traffic(
 ) -> rusqlite::Result<Value> {
     let duration = to.saturating_sub(from);
     let bucket_ms = duration.div_ceil(180).max(60_000).div_ceil(60_000) * 60_000;
-    let mut statement = connection.prepare(
+    let table = "traffic_application_minute";
+    let mut statement = connection.prepare(&format!(
         "SELECT (timestamp / ?1) * ?1 AS bucket, SUM(upload_bytes), SUM(download_bytes),
                 SUM(packets), SUM(flow_count)
-         FROM traffic_application_minute
+         FROM {table}
          WHERE application_id = ?2 AND (?3 IS NULL OR category_id = ?3)
            AND timestamp >= ?4 AND timestamp < ?5
-         GROUP BY bucket ORDER BY bucket",
-    )?;
+         GROUP BY bucket ORDER BY bucket"
+    ))?;
     let points = statement
         .query_map(
             params![to_i64(bucket_ms), id, category, to_i64(from), to_i64(to)],
@@ -1468,7 +1984,12 @@ fn query_application_clients(
     from: u64,
     to: u64,
 ) -> rusqlite::Result<Value> {
-    let mut statement = connection.prepare(
+    let category_filter = if id.starts_with(PROTOCOL_APPLICATION_PREFIX) {
+        "?1 LIKE 'protocol:%' OR ?2 IS NULL OR COALESCE(f.category_id, 'unknown') = ?2"
+    } else {
+        "?2 IS NULL OR COALESCE(f.category_id, 'unknown') = ?2"
+    };
+    let mut statement = connection.prepare(&format!(
         "SELECT d.id, d.mac, COALESCE(d.display_name, d.hostname, ''), d.vendor,
                 d.device_type, d.os_family, d.model, d.identity_confidence,
                 COALESCE((SELECT json_group_array(json_object(
@@ -1481,12 +2002,13 @@ fn query_application_clients(
                 d.model_confidence, d.private_mac, d.last_seen,
                 SUM(f.upload_bytes), SUM(f.download_bytes), COUNT(*)
          FROM flow_sessions f JOIN devices d ON d.id = f.device_id
-         WHERE f.application_id = ?1
-           AND (?2 IS NULL OR COALESCE(f.category_id, 'unknown') = ?2)
+         WHERE {application_filter}
+           AND ({category_filter})
            AND f.last_seen_at >= ?3 AND f.last_seen_at < ?4
          GROUP BY d.id ORDER BY SUM(f.upload_bytes + f.download_bytes) DESC
          LIMIT ?5 OFFSET ?6",
-    )?;
+        application_filter = sqlite_application_flow_filter("?1", "f.")
+    ))?;
     let items = statement
         .query_map(
             params![
@@ -1519,14 +2041,19 @@ fn query_application_domains(
     page: Page,
     from: u64,
     to: u64,
+    include_all: bool,
 ) -> rusqlite::Result<Value> {
-    let mut statement = connection.prepare(
-        "SELECT domain, SUM(upload_bytes), SUM(download_bytes), SUM(packets), COUNT(*), MAX(last_seen_at)
-         FROM flow_sessions WHERE application_id = ?1 AND domain IS NOT NULL
-           AND (?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)
-           AND last_seen_at >= ?3 AND last_seen_at < ?4
-         GROUP BY domain ORDER BY SUM(upload_bytes + download_bytes) DESC LIMIT ?5 OFFSET ?6",
-    )?;
+    let mut statement = connection.prepare(&format!(
+        "SELECT domain, SUM(upload_bytes), SUM(download_bytes), SUM(packets),
+                SUM(flow_count), MAX(timestamp)
+         FROM traffic_scope_minute WHERE {application_filter}
+           AND (?2 IS NULL OR ?1 LIKE 'protocol:%' OR COALESCE(category_id, 'unknown') = ?2)
+           AND domain != '' AND domain != 'unknown'
+           AND timestamp >= ?3 AND timestamp < ?4
+         GROUP BY domain ORDER BY SUM(upload_bytes + download_bytes) DESC
+         LIMIT CASE WHEN ?5 THEN -1 ELSE ?6 END OFFSET ?7",
+        application_filter = sqlite_application_flow_filter("?1", "")
+    ))?;
     let items = statement
         .query_map(
             params![
@@ -1534,6 +2061,7 @@ fn query_application_domains(
                 category,
                 to_i64(from),
                 to_i64(to),
+                include_all,
                 i64::from(page.limit),
                 to_i64(page.offset)
             ],
@@ -1556,15 +2084,18 @@ fn query_application_destinations(
     page: Page,
     from: u64,
     to: u64,
+    include_all: bool,
 ) -> rusqlite::Result<Value> {
-    let mut statement = connection.prepare(
-        "SELECT remote_ip, MAX(domain), SUM(upload_bytes), SUM(download_bytes), SUM(packets),
-                COUNT(*), MAX(last_seen_at)
-         FROM flow_sessions WHERE application_id = ?1
-           AND (?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)
-           AND last_seen_at >= ?3 AND last_seen_at < ?4
-         GROUP BY remote_ip ORDER BY SUM(upload_bytes + download_bytes) DESC LIMIT ?5 OFFSET ?6",
-    )?;
+    let mut statement = connection.prepare(&format!(
+        "SELECT remote_ip, NULLIF(MAX(domain), 'unknown'), SUM(upload_bytes),
+                SUM(download_bytes), SUM(packets), SUM(flow_count), MAX(timestamp)
+         FROM traffic_scope_minute WHERE {application_filter}
+           AND (?2 IS NULL OR ?1 LIKE 'protocol:%' OR COALESCE(category_id, 'unknown') = ?2)
+           AND timestamp >= ?3 AND timestamp < ?4
+         GROUP BY remote_ip ORDER BY SUM(upload_bytes + download_bytes) DESC
+         LIMIT CASE WHEN ?5 THEN -1 ELSE ?6 END OFFSET ?7",
+        application_filter = sqlite_application_flow_filter("?1", "")
+    ))?;
     let items = statement
         .query_map(
             params![
@@ -1572,6 +2103,7 @@ fn query_application_destinations(
                 category,
                 to_i64(from),
                 to_i64(to),
+                include_all,
                 i64::from(page.limit),
                 to_i64(page.offset)
             ],
@@ -1602,16 +2134,22 @@ fn query_application_flows(
         .application_metadata(id)
         .as_ref()
         .map(|metadata| metadata.name.clone());
-    let mut statement = connection.prepare(
+    let category_filter = if id.starts_with(PROTOCOL_APPLICATION_PREFIX) {
+        "?1 LIKE 'protocol:%' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
+    } else {
+        "?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
+    };
+    let mut statement = connection.prepare(&format!(
         "SELECT id, client_ip, client_port, remote_ip, remote_port, protocol, direction,
                 domain, category_id, classification_confidence, classification_reason,
                 upload_bytes, download_bytes, packets, started_at, last_seen_at, ended_at,
                 scope, path_type, nat, source_segment, destination_segment
-         FROM flow_sessions WHERE application_id = ?1
-           AND (?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)
+         FROM flow_sessions WHERE {application_filter}
+           AND ({category_filter})
            AND last_seen_at >= ?3 AND last_seen_at < ?4
          ORDER BY last_seen_at DESC LIMIT ?5 OFFSET ?6",
-    )?;
+        application_filter = sqlite_application_flow_filter("?1", "")
+    ))?;
     let items = statement.query_map(
         params![id, category, to_i64(from), to_i64(to), i64::from(page.limit), to_i64(page.offset)],
         |row| {
@@ -1680,6 +2218,58 @@ async fn destinations(
         }
     }
     let inner = state.lock();
+    if let Some(clickhouse) = inner.storage.clickhouse_storage() {
+        let window = match (query.from, query.to) {
+            (Some(from), Some(to)) => Some((to_i64(from), to_i64(to))),
+            _ => None,
+        };
+        return clickhouse
+            .query_destination_details(page.limit, page.offset, window)
+            .map(|(mut items, total)| {
+                for item in &mut items {
+                    let remote_ip = item["remote_ip"].as_str().unwrap_or_default();
+                    let geo = remote_ip
+                        .parse::<IpAddr>()
+                        .ok()
+                        .and_then(|ip| {
+                            match inner
+                                .geo_provider
+                                .lookup_with_lang(ip, query.lang.as_deref())
+                            {
+                                Ok(record) => record,
+                                Err(error) => {
+                                    tracing::warn!(%ip, %error, "Geo lookup failed");
+                                    None
+                                }
+                            }
+                        })
+                        .unwrap_or_default();
+                    let application_id = item["application_id"].as_str().map(ToOwned::to_owned);
+                    let metadata = application_id
+                        .as_deref()
+                        .filter(|id| !id.is_empty() && *id != "unknown")
+                        .and_then(|id| inner.classifier.application_metadata(id));
+                    if let Some(object) = item.as_object_mut() {
+                        object.remove("application_id");
+                        object.insert("application".to_owned(), json!(application_id));
+                        object.insert(
+                            "application_name".to_owned(),
+                            json!(metadata.as_ref().map(|value| value.name.clone())),
+                        );
+                        object.insert("country_code".to_owned(), json!(geo.country_code));
+                        object.insert("country_name".to_owned(), json!(geo.country_name));
+                        object.insert("region".to_owned(), json!(geo.region));
+                        object.insert("city".to_owned(), json!(geo.city));
+                        object.insert("latitude".to_owned(), json!(geo.latitude));
+                        object.insert("longitude".to_owned(), json!(geo.longitude));
+                        object.insert("asn".to_owned(), json!(geo.asn));
+                        object.insert("organization".to_owned(), json!(geo.organization));
+                    }
+                }
+                page_ok(items, page, total)
+            })
+            .unwrap_or_else(storage_error);
+    }
     let connection = inner.storage.connection();
     let result = (|| -> rusqlite::Result<(Vec<Value>, u64)> {
         let (total, items) = match (query.from, query.to) {
@@ -1853,6 +2443,12 @@ async fn geo_summary(
             "country_distribution": [],
         }));
     }
+    if let Some(clickhouse) = inner.storage.clickhouse_storage() {
+        return clickhouse
+            .query_geo_traffic(query.from, query.to)
+            .map(|rows| aggregate_geo_values(&inner, rows, query.lang.as_deref()))
+            .map_or_else(storage_error, api_ok);
+    }
     aggregate_geo_traffic(&inner, query.from, query.to, query.lang.as_deref())
         .map_or_else(storage_error, api_ok)
 }
@@ -1867,6 +2463,17 @@ async fn insights(
     };
     let snapshot = state.realtime_snapshot();
     let inner = state.lock();
+    if let Some(clickhouse) = inner.storage.clickhouse_storage() {
+        return crate::insights::detect_clickhouse(
+            clickhouse.client(),
+            &snapshot,
+            window,
+            crate::insights::collector_lag_threshold_ms(),
+            crate::insights::high_upload_threshold_bytes(),
+        )
+        .map(|items| serde_json::to_value(items).unwrap_or(Value::Array(Vec::new())))
+        .map_or_else(storage_error, api_ok);
+    }
     let result = (|| -> rusqlite::Result<Value> {
         let connection = inner.storage.connection();
         let items = crate::insights::detect(
@@ -1887,9 +2494,6 @@ fn aggregate_geo_traffic(
     to: Option<u64>,
     lang: Option<&str>,
 ) -> rusqlite::Result<Value> {
-    let mut countries: HashMap<(String, String), u64> = HashMap::new();
-    let mut asns: HashMap<(u32, String), u64> = HashMap::new();
-    let mut unknown_bytes = 0_u64;
     let (sql, params_vec): (&str, Vec<SqlValue>) = match (from, to) {
         (Some(from), Some(to)) => (
             "SELECT remote_ip, SUM(upload_bytes + download_bytes)
@@ -1911,11 +2515,24 @@ fn aggregate_geo_traffic(
         ),
     };
     let mut statement = inner.storage.connection().prepare(sql)?;
-    let rows = statement.query_map(rusqlite::params_from_iter(params_vec), |row| {
-        Ok((row.get::<_, Vec<u8>>(0)?, to_u64(row.get::<_, i64>(1)?)))
-    })?;
-    for row in rows {
-        let (address, bytes) = row?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(params_vec), |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(aggregate_geo_values(inner, rows, lang))
+}
+
+fn aggregate_geo_values(
+    inner: &crate::CollectorInner,
+    rows: impl IntoIterator<Item = (Vec<u8>, i64)>,
+    lang: Option<&str>,
+) -> Value {
+    let mut countries: HashMap<(String, String), u64> = HashMap::new();
+    let mut asns: HashMap<(u32, String), u64> = HashMap::new();
+    let mut unknown_bytes = 0_u64;
+    for (address, bytes) in rows {
+        let bytes = to_u64(bytes);
         let record = format_ip(&address).parse::<IpAddr>().ok().and_then(|ip| {
             match inner.geo_provider.lookup_with_lang(ip, lang) {
                 Ok(record) => record,
@@ -1944,7 +2561,7 @@ fn aggregate_geo_traffic(
             *total = total.saturating_add(bytes);
         }
     }
-    Ok(geo_summary_value(countries, asns, unknown_bytes))
+    geo_summary_value(countries, asns, unknown_bytes)
 }
 
 fn geo_summary_value(
@@ -2037,6 +2654,26 @@ async fn flows(
         Err(response) => return *response,
     };
     let inner = state.lock();
+    if let Some(clickhouse) = inner.storage.clickhouse_storage() {
+        if let Err(rusqlite::Error::InvalidParameterName(name)) = flow_filters(&query) {
+            return flow_query_error(&name);
+        }
+        return query_flow_page_clickhouse(clickhouse, &inner.classifier, &query, &options)
+            .map(|(items, next_cursor)| {
+                Json(json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "data": items,
+                    "pagination": {
+                        "limit": options.limit,
+                        "next_cursor": next_cursor,
+                        "sort": options.sort_name,
+                        "order": if options.descending { "desc" } else { "asc" },
+                    }
+                }))
+                .into_response()
+            })
+            .unwrap_or_else(storage_error);
+    }
     let result = query_flow_page(
         inner.storage.connection(),
         &inner.classifier,
@@ -2174,6 +2811,267 @@ fn query_flow_page(
             .remove("cursor_value");
     }
     Ok((items, next_cursor))
+}
+
+fn query_flow_page_clickhouse(
+    clickhouse: &netqmon_storage::ClickHouseStorage,
+    classifier: &crate::classifier::ClassifierHandle,
+    query: &FlowQuery,
+    options: &FlowPageOptions,
+) -> netqmon_storage::StorageResult<(Vec<Value>, Option<String>)> {
+    let mut clauses = Vec::new();
+    if let Some(search) = non_empty(query.search.as_deref()) {
+        if let Ok(ip) = search.parse::<IpAddr>() {
+            let ip_hex = netqmon_storage::to_hex(&ip_bytes(ip));
+            let ip_hex = clickhouse_quote(&ip_hex);
+            clauses.push(format!(
+                "(f.client_ip = '{ip_hex}' OR f.remote_ip = '{ip_hex}')"
+            ));
+        } else {
+            let pattern = clickhouse_quote(&format!("%{}%", search.to_lowercase()));
+            clauses.push(format!(
+                "(lower(coalesce(f.domain, '')) LIKE '{pattern}' OR lower(coalesce(f.application_id, '')) LIKE '{pattern}' OR lower(coalesce(d.display_name, d.hostname, '')) LIKE '{pattern}' OR lower(coalesce(d.mac, '')) LIKE '{pattern}')"
+            ));
+        }
+    }
+    if let Some(client) = non_empty(query.client.as_deref()) {
+        if let Ok(id) = client.parse::<i64>() {
+            clauses.push(format!("f.device_id = {id}"));
+        } else if let Ok(ip) = client.parse::<IpAddr>() {
+            let ip_hex = clickhouse_quote(&netqmon_storage::to_hex(&ip_bytes(ip)));
+            clauses.push(format!("f.client_ip = '{ip_hex}'"));
+        } else {
+            let pattern = clickhouse_quote(&format!(
+                "%{}%",
+                client.to_lowercase().replace([':', '-'], "")
+            ));
+            clauses.push(format!(
+                "(lower(coalesce(d.display_name, d.hostname, '')) LIKE '{pattern}' OR lower(coalesce(d.mac, '')) LIKE '{pattern}')"
+            ));
+        }
+    }
+    for (value, column) in [
+        (query.application.as_deref(), "f.application_id"),
+        (query.organization.as_deref(), "f.organization_id"),
+        (query.detected_protocol.as_deref(), "f.protocol_id"),
+    ] {
+        if let Some(value) = non_empty(value) {
+            clauses.push(format!(
+                "lower(coalesce({column}, 'unknown')) = '{}'",
+                clickhouse_quote(&value.to_lowercase())
+            ));
+        }
+    }
+    if let Some(domain) = non_empty(query.domain.as_deref()) {
+        clauses.push(format!(
+            "lower(coalesce(f.domain, '')) LIKE '{}'",
+            clickhouse_quote(&format!("%{}%", domain.to_lowercase()))
+        ));
+    }
+    if let Some(ip) = non_empty(query.ip.as_deref()) {
+        let ip = ip
+            .parse::<IpAddr>()
+            .expect("flow_filters validates IP filters");
+        let ip_hex = clickhouse_quote(&netqmon_storage::to_hex(&ip_bytes(ip)));
+        clauses.push(format!("f.remote_ip = '{ip_hex}'"));
+    }
+    if let Some(protocol) = non_empty(query.protocol.as_deref()) {
+        let protocol = match protocol.to_ascii_lowercase().as_str() {
+            "tcp" => 6,
+            "udp" => 17,
+            value => value
+                .parse::<u8>()
+                .expect("flow_filters validates protocols"),
+        };
+        clauses.push(format!("f.protocol = {protocol}"));
+    }
+    if let Some(port) = query.port {
+        clauses.push(format!(
+            "(f.client_port = {port} OR f.remote_port = {port})"
+        ));
+    }
+    if let Some(direction) = non_empty(query.direction.as_deref()) {
+        let direction = match direction.to_ascii_lowercase().as_str() {
+            "unknown" => 0,
+            "upload" => 1,
+            "download" => 2,
+            _ => unreachable!("flow_filters validates directions"),
+        };
+        clauses.push(format!("f.direction = {direction}"));
+    }
+    if let Some(scope) = non_empty(query.scope.as_deref()) {
+        let scope = match scope.to_ascii_lowercase().as_str() {
+            "internet" => netqmon_protocol::v1::FlowScope::Internet as i64,
+            "internal" => netqmon_protocol::v1::FlowScope::Internal as i64,
+            "tunnel" => netqmon_protocol::v1::FlowScope::Tunnel as i64,
+            "unknown" => netqmon_protocol::v1::FlowScope::Unknown as i64,
+            _ => unreachable!("flow_filters validates scopes"),
+        };
+        clauses.push(format!("f.scope = {scope}"));
+    }
+    if let Some(path_type) = non_empty(query.path_type.as_deref()) {
+        let path_type = match path_type.to_ascii_lowercase().as_str() {
+            "forwarded" => netqmon_protocol::v1::PathType::Forwarded as i64,
+            "internal" => netqmon_protocol::v1::PathType::Internal as i64,
+            "tunnel" => netqmon_protocol::v1::PathType::Tunnel as i64,
+            "unknown" => netqmon_protocol::v1::PathType::Unknown as i64,
+            _ => unreachable!("flow_filters validates path types"),
+        };
+        clauses.push(format!("f.path_type = {path_type}"));
+    }
+    if let Some(nat) = non_empty(query.nat.as_deref()) {
+        let nat = match nat.to_ascii_lowercase().as_str() {
+            "none" => netqmon_protocol::v1::NatType::None as i64,
+            "snat" => netqmon_protocol::v1::NatType::Snat as i64,
+            "dnat" => netqmon_protocol::v1::NatType::Dnat as i64,
+            "both" => netqmon_protocol::v1::NatType::Both as i64,
+            "unknown" => netqmon_protocol::v1::NatType::Unknown as i64,
+            _ => unreachable!("flow_filters validates NAT types"),
+        };
+        clauses.push(format!("f.nat = {nat}"));
+    }
+    if query.from.is_some() || query.to.is_some() {
+        let from = to_i64(query.from.unwrap_or(0));
+        let to = to_i64(query.to.unwrap_or_else(now_ms));
+        clauses.push(format!(
+            "f.last_seen_at >= {from} AND f.last_seen_at < {to}"
+        ));
+    }
+    if let Some(cursor) = options.cursor.as_ref() {
+        let comparison = if options.descending { "<" } else { ">" };
+        clauses.push(format!(
+            "({column} {comparison} {value} OR ({column} = {value} AND f.id > '{id}'))",
+            column = options.sort_column,
+            value = cursor.sort_value,
+            id = clickhouse_quote(&cursor.id),
+        ));
+    }
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+    let order = if options.descending { "DESC" } else { "ASC" };
+    let limit = u64::from(options.limit) + 1;
+    let sql = format!(
+        "SELECT f.id, f.client_ip, f.client_port, f.remote_ip, f.remote_port, f.protocol,
+                f.direction, f.domain, f.organization_id, f.application_id, f.category_id,
+                f.traffic_role, f.protocol_id, f.organization_confidence, f.application_confidence,
+                f.protocol_confidence, f.classification_confidence,
+                f.classification_reason, f.classification_evidence_json, f.upload_bytes,
+                f.download_bytes, f.packets, f.started_at, f.last_seen_at, f.ended_at,
+                f.device_id, coalesce(d.display_name, d.hostname, '') AS client_name, d.mac,
+                d.device_type, d.model, d.vendor, d.os_family,
+                f.scope, f.path_type, f.nat, f.source_segment, f.destination_segment,
+                {sort_column} AS cursor_value
+         FROM flow_sessions AS f FINAL LEFT JOIN devices AS d FINAL ON d.id = f.device_id{where_clause}
+         ORDER BY {sort_column} {order}, f.id ASC LIMIT {limit} FORMAT JSON",
+        sort_column = options.sort_column,
+    );
+    let result = clickhouse.client().query_json(&sql)?;
+    let mut items = result["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|row| {
+            let client_ip =
+                netqmon_storage::from_hex(row["client_ip"].as_str().unwrap_or_default())
+                    .unwrap_or_default();
+            let remote_ip =
+                netqmon_storage::from_hex(row["remote_ip"].as_str().unwrap_or_default())
+                    .unwrap_or_default();
+            let application = row["application_id"].as_str().unwrap_or("unknown");
+            let organization = row["organization_id"].as_str().unwrap_or("unknown");
+            let category = row["category_id"].as_str().unwrap_or("unknown");
+            let traffic_role = row["traffic_role"].as_str().unwrap_or("unknown");
+            let protocol_id = row["protocol_id"].as_str().unwrap_or("unknown");
+            let application_metadata = classifier.application_metadata(application);
+            let organization_metadata = classifier.organization_metadata(organization);
+            let client_mac = netqmon_storage::from_hex(row["mac"].as_str().unwrap_or_default())
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| format_mac(&value));
+            let number = |name: &str| {
+                row[name]
+                    .as_i64()
+                    .or_else(|| row[name].as_str().and_then(|value| value.parse().ok()))
+                    .unwrap_or(0)
+            };
+            let optional_number = |name: &str| {
+                row.get(name).filter(|value| !value.is_null()).map(|value| {
+                    value
+                        .as_i64()
+                        .or_else(|| value.as_str().and_then(|number| number.parse().ok()))
+                        .unwrap_or(0)
+                })
+            };
+            let decimal = |name: &str| {
+                row[name]
+                    .as_f64()
+                    .or_else(|| row[name].as_str().and_then(|value| value.parse().ok()))
+                    .unwrap_or(0.0)
+            };
+            json!({
+                "id": row["id"].as_str().unwrap_or_default(),
+                "client_ip": format_ip(&client_ip),
+                "client_port": number("client_port"),
+                "remote_ip": format_ip(&remote_ip),
+                "remote_port": number("remote_port"),
+                "protocol": number("protocol"),
+                "direction": number("direction"),
+                "domain": row["domain"].as_str(),
+                "organization": organization,
+                "organization_name": organization_metadata.as_ref().map(|value| value.name.clone()),
+                "application": application,
+                "application_name": application_metadata.as_ref().map(|value| value.name.clone()),
+                "icon": icon_json(application_metadata),
+                "category": category,
+                "traffic_role": traffic_role,
+                "protocol_id": protocol_id,
+                "organization_confidence": decimal("organization_confidence"),
+                "application_confidence": decimal("application_confidence"),
+                "protocol_confidence": decimal("protocol_confidence"),
+                "confidence": decimal("classification_confidence"),
+                "reason": row["classification_reason"].as_str().unwrap_or("no matching rule"),
+                "evidence": row["classification_evidence_json"].as_str().unwrap_or("[]"),
+                "upload_bytes": number("upload_bytes"),
+                "download_bytes": number("download_bytes"),
+                "packets": number("packets"),
+                "started_at": number("started_at"),
+                "last_seen": number("last_seen_at"),
+                "ended_at": optional_number("ended_at"),
+                "client_id": optional_number("device_id"),
+                "client_name": row["client_name"].as_str().unwrap_or_default(),
+                "client_mac": client_mac,
+                "client_identity": {
+                    "device_type": row["device_type"].as_str(),
+                    "model": row["model"].as_str(),
+                    "vendor": row["vendor"].as_str(),
+                    "os_family": row["os_family"].as_str(),
+                },
+                "scope": flow_scope_name(number("scope") as i32),
+                "path_type": flow_path_name(number("path_type") as i32),
+                "nat": flow_nat_name(number("nat") as i32),
+                "source_segment": row["source_segment"].as_str().unwrap_or_default(),
+                "destination_segment": row["destination_segment"].as_str().unwrap_or_default(),
+                "cursor_value": number("cursor_value"),
+            })
+        })
+        .collect::<Vec<_>>();
+    let has_more = items.len() > options.limit as usize;
+    items.truncate(options.limit as usize);
+    let next_cursor = has_more
+        .then(|| flow_cursor_for(items.last().expect("extra row implies a non-empty page")));
+    for item in &mut items {
+        item.as_object_mut()
+            .expect("flow result is an object")
+            .remove("cursor_value");
+    }
+    Ok((items, next_cursor))
+}
+
+fn clickhouse_quote(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
 fn flow_filters(query: &FlowQuery) -> rusqlite::Result<(Vec<String>, Vec<SqlValue>)> {
@@ -2495,6 +3393,14 @@ fn summary_page(
         Err(response) => return *response,
     };
     let inner = state.lock();
+    if table == "traffic_domain_minute" {
+        if let Some(clickhouse) = inner.storage.clickhouse_storage() {
+            return clickhouse
+                .query_domains(page.limit, page.offset)
+                .map(|(items, total)| page_ok(items, page, total))
+                .unwrap_or_else(storage_error);
+        }
+    }
     let connection = inner.storage.connection();
     let result = (|| -> rusqlite::Result<(Vec<Value>, u64)> {
         let count_sql = format!("SELECT COUNT(*) FROM (SELECT 1 FROM {table} GROUP BY {group})");
@@ -2540,9 +3446,32 @@ fn summary_row(row: &rusqlite::Row<'_>, names: &[&str]) -> rusqlite::Result<Valu
     Ok(Value::Object(object))
 }
 
-fn query_clients(connection: &Connection, page: Page) -> rusqlite::Result<(Vec<Value>, u64)> {
+fn query_clients(
+    connection: &Connection,
+    page: Page,
+    window: Option<(i64, i64)>,
+) -> rusqlite::Result<(Vec<Value>, u64)> {
     let total: i64 = scalar(connection, "SELECT COUNT(*) FROM devices", [])?;
-    let mut statement = connection.prepare(
+    let traffic_join = if window.is_some() {
+        "(SELECT device_id, SUM(upload_bytes) AS upload_bytes,
+                SUM(download_bytes) AS download_bytes, SUM(flow_count) AS flow_count,
+                MAX(timestamp) AS timestamp
+         FROM traffic_device_minute WHERE timestamp >= ?1 AND timestamp < ?2
+         GROUP BY device_id)"
+    } else {
+        "traffic_device_minute"
+    };
+    let session_window = if window.is_some() {
+        "AND flow_sessions.last_seen_at >= ?1 AND flow_sessions.last_seen_at < ?2"
+    } else {
+        ""
+    };
+    let page_window = if window.is_some() {
+        "?3 OFFSET ?4"
+    } else {
+        "?1 OFFSET ?2"
+    };
+    let sql = format!(
         "SELECT d.id, d.mac, COALESCE(d.display_name, d.hostname, ''), d.vendor,
                 d.device_type, d.os_family, d.model, d.identity_confidence,
                 COALESCE((SELECT json_group_array(json_object(
@@ -2556,7 +3485,7 @@ fn query_clients(connection: &Connection, page: Page) -> rusqlite::Result<(Vec<V
                 (SELECT MAX(flow_sessions.last_seen_at) FROM flow_sessions
                  WHERE flow_sessions.device_id = d.id
                    AND (flow_sessions.upload_bytes > 0 OR flow_sessions.download_bytes > 0
-                        OR flow_sessions.packets > 0)),
+                        OR flow_sessions.packets > 0) {session_window}),
                 COALESCE(SUM(t.upload_bytes), 0), COALESCE(SUM(t.download_bytes), 0),
                 COALESCE(SUM(t.flow_count), 0),
                 (SELECT ip FROM device_addresses a WHERE a.device_id = d.id
@@ -2570,37 +3499,47 @@ fn query_clients(connection: &Connection, page: Page) -> rusqlite::Result<(Vec<V
                 CASE WHEN (SELECT COUNT(*) FROM device_addresses a WHERE a.device_id=d.id)=1
                      THEN (SELECT application_source FROM device_addresses a WHERE a.device_id=d.id LIMIT 1)
                 END
-         FROM devices d LEFT JOIN traffic_device_minute t ON t.device_id = d.id
+         FROM devices d LEFT JOIN {traffic_join} t ON t.device_id = d.id
          GROUP BY d.id ORDER BY SUM(COALESCE(t.upload_bytes, 0) + COALESCE(t.download_bytes, 0)) DESC,
-                  d.id LIMIT ?1 OFFSET ?2",
-    )?;
-    let items = statement
-        .query_map(params![i64::from(page.limit), to_i64(page.offset)], |row| {
-            let mac: Vec<u8> = row.get(1)?;
-            let ip = row
-                .get::<_, Option<Vec<u8>>>(19)?
-                .map(|value| format_ip(&value));
-            Ok(json!({
-                "id": row.get::<_, i64>(0)?,
-                "mac": format_mac(&mac),
-                "name": row.get::<_, String>(2)?,
-                "vendor": row.get::<_, Option<String>>(3)?,
-                "identity": device_identity_json(row, 3)?,
-                "last_seen": row.get::<_, i64>(14)?,
-                "last_traffic_seen": row.get::<_, Option<i64>>(15)?,
-                "upload_bytes": row.get::<_, i64>(16)?,
-                "download_bytes": row.get::<_, i64>(17)?,
-                "flow_count": row.get::<_, i64>(18)?,
-                "ip": ip,
-                "self_host_application": row.get::<_, Option<String>>(20)?.map(|application_id| json!({
-                    "application_id": application_id,
-                    "confidence": row.get::<_, f64>(21).unwrap_or(0.0),
-                    "source": row.get::<_, Option<String>>(22).ok().flatten(),
-                    "role": "server",
-                })),
-            }))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+                  d.id LIMIT {page_window}"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let map_row = |row: &Row<'_>| {
+        let mac: Vec<u8> = row.get(1)?;
+        let ip = row
+            .get::<_, Option<Vec<u8>>>(19)?
+            .map(|value| format_ip(&value));
+        Ok(json!({
+            "id": row.get::<_, i64>(0)?,
+            "mac": format_mac(&mac),
+            "name": row.get::<_, String>(2)?,
+            "vendor": row.get::<_, Option<String>>(3)?,
+            "identity": device_identity_json(row, 3)?,
+            "last_seen": row.get::<_, i64>(14)?,
+            "last_traffic_seen": row.get::<_, Option<i64>>(15)?,
+            "upload_bytes": row.get::<_, i64>(16)?,
+            "download_bytes": row.get::<_, i64>(17)?,
+            "flow_count": row.get::<_, i64>(18)?,
+            "ip": ip,
+            "self_host_application": row.get::<_, Option<String>>(20)?.map(|application_id| json!({
+                "application_id": application_id,
+                "confidence": row.get::<_, f64>(21).unwrap_or(0.0),
+                "source": row.get::<_, Option<String>>(22).ok().flatten(),
+                "role": "server",
+            })),
+        }))
+    };
+    let items = match window {
+        Some((from, to)) => statement
+            .query_map(
+                params![from, to, i64::from(page.limit), to_i64(page.offset)],
+                map_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+        None => statement
+            .query_map(params![i64::from(page.limit), to_i64(page.offset)], map_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+    };
     Ok((items, to_u64(total)))
 }
 
@@ -2993,6 +3932,13 @@ fn valid_identifier(value: &str) -> bool {
         && value.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
         })
+}
+
+fn valid_application_identifier(value: &str) -> bool {
+    value
+        .strip_prefix(PROTOCOL_APPLICATION_PREFIX)
+        .is_some_and(valid_identifier)
+        || valid_identifier(value)
 }
 
 fn now_ms() -> u64 {

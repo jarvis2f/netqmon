@@ -2,6 +2,7 @@
 
 pub mod capture;
 pub mod classification;
+mod clickhouse;
 pub mod destination;
 pub mod device;
 pub mod dns;
@@ -9,6 +10,8 @@ pub mod model;
 pub mod protocol;
 pub mod traffic;
 
+pub(crate) use capture::query_capture_insights_with_received_at as detect_capture_clickhouse;
+pub(crate) use clickhouse::detect as detect_clickhouse;
 pub use model::{
     AffectedClient, Insight, InsightCategory, InsightSeverity, InsightWindow, format_mac, to_i64,
     to_u64,

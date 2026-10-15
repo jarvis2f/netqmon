@@ -1,0 +1,14 @@
+ALTER TABLE gateways MODIFY SETTING non_replicated_deduplication_window = 1000;
+ALTER TABLE devices MODIFY SETTING non_replicated_deduplication_window = 1000;
+ALTER TABLE device_addresses MODIFY SETTING non_replicated_deduplication_window = 1000;
+ALTER TABLE device_evidence MODIFY SETTING non_replicated_deduplication_window = 1000;
+ALTER TABLE self_host_endpoint_evidence MODIFY SETTING non_replicated_deduplication_window = 1000;
+ALTER TABLE dns_observations MODIFY SETTING non_replicated_deduplication_window = 1000;
+ALTER TABLE traffic_total_minute MODIFY SETTING non_replicated_deduplication_window = 1000;
+ALTER TABLE traffic_device_minute MODIFY SETTING non_replicated_deduplication_window = 1000;
+ALTER TABLE traffic_application_minute MODIFY SETTING non_replicated_deduplication_window = 1000;
+ALTER TABLE traffic_domain_minute MODIFY SETTING non_replicated_deduplication_window = 1000;
+ALTER TABLE traffic_destination_minute MODIFY SETTING non_replicated_deduplication_window = 1000;
+ALTER TABLE traffic_scope_minute MODIFY SETTING non_replicated_deduplication_window = 1000;
+ALTER TABLE flow_sessions MODIFY SETTING non_replicated_deduplication_window = 1000;
+ALTER TABLE ingest_batches MODIFY SETTING non_replicated_deduplication_window = 1000;

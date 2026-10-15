@@ -14,7 +14,20 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 const INITIAL_MIGRATION: &str = include_str!("../../../migrations/sqlite/0001_initial.sql");
 const PROTOCOL_MIGRATION: &str =
     include_str!("../../../migrations/sqlite/0002_traffic_scope_protocol.sql");
-const MIGRATIONS: [(i64, &str); 2] = [(1, INITIAL_MIGRATION), (2, PROTOCOL_MIGRATION)];
+const SCOPE_TIMESTAMP_MIGRATION: &str =
+    include_str!("../../../migrations/sqlite/0003_traffic_scope_timestamp.sql");
+const PROTOCOL_ONLY_APPLICATION_MIGRATION: &str =
+    include_str!("../../../migrations/sqlite/0004_protocol_only_app_rollup.sql");
+const PROTOCOL_APPLICATION_ROLLUP_MIGRATION: &str =
+    include_str!("../../../migrations/sqlite/0005_protocol_application_rollup.sql");
+const MIGRATIONS: [(i64, &str); 5] = [
+    (1, INITIAL_MIGRATION),
+    (2, PROTOCOL_MIGRATION),
+    (3, SCOPE_TIMESTAMP_MIGRATION),
+    (4, PROTOCOL_ONLY_APPLICATION_MIGRATION),
+    (5, PROTOCOL_APPLICATION_ROLLUP_MIGRATION),
+];
+pub(crate) const PROTOCOL_APPLICATION_PREFIX: &str = "protocol:";
 const MINUTE_MS: i64 = 60 * 1_000;
 const HOUR_MS: i64 = 60 * MINUTE_MS;
 const DAY_MS: i64 = 24 * HOUR_MS;
@@ -587,6 +600,68 @@ impl SqliteStorage {
                 },
             )
             .optional()
+    }
+
+    /// Updates client editable attributes (display_name, device_type).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update query fails.
+    pub fn update_client(
+        &self,
+        id: i64,
+        display_name: Option<Option<&str>>,
+        device_type: Option<Option<&str>>,
+    ) -> rusqlite::Result<bool> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM devices WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        if count == 0 {
+            return Ok(false);
+        }
+        if display_name.is_none() && device_type.is_none() {
+            return Ok(true);
+        }
+        let mut sets = Vec::new();
+        let mut params: Vec<rusqlite::types::Value> = Vec::new();
+
+        if let Some(name_opt) = display_name {
+            sets.push(format!("display_name = ?{}", params.len() + 1));
+            match name_opt {
+                Some(name) if !name.trim().is_empty() => {
+                    params.push(rusqlite::types::Value::Text(name.trim().to_owned()));
+                }
+                _ => {
+                    params.push(rusqlite::types::Value::Null);
+                }
+            }
+        }
+
+        if let Some(type_opt) = device_type {
+            sets.push(format!("device_type = ?{}", params.len() + 1));
+            match type_opt {
+                Some(dtype) if !dtype.trim().is_empty() => {
+                    params.push(rusqlite::types::Value::Text(dtype.trim().to_owned()));
+                }
+                _ => {
+                    params.push(rusqlite::types::Value::Null);
+                }
+            }
+        }
+
+        let id_param_idx = params.len() + 1;
+        params.push(rusqlite::types::Value::Integer(id));
+
+        let sql = format!(
+            "UPDATE devices SET {} WHERE id = ?{}",
+            sets.join(", "),
+            id_param_idx
+        );
+        self.connection
+            .execute(&sql, rusqlite::params_from_iter(params))?;
+        Ok(true)
     }
 
     /// Replaces expired sessions and stores a new hashed session token.
@@ -1378,6 +1453,25 @@ impl Storage {
     pub fn backend_name(&self) -> &'static str {
         StorageBackend::backend_name(self)
     }
+
+    /// Updates client editable attributes (display_name, device_type).
+    ///
+    /// # Errors
+    ///
+    /// Returns `StorageError` if the update query or mutation fails.
+    pub fn update_client(
+        &self,
+        id: i64,
+        display_name: Option<Option<&str>>,
+        device_type: Option<Option<&str>>,
+    ) -> StorageResult<bool> {
+        match self {
+            Self::Sqlite(s) => s
+                .update_client(id, display_name, device_type)
+                .map_err(Into::into),
+            Self::ClickHouse(c) => c.update_client(id, display_name, device_type),
+        }
+    }
 }
 
 impl StorageBackend for Storage {
@@ -1674,7 +1768,7 @@ fn load_active_flows(connection: &Connection) -> rusqlite::Result<HashMap<FlowKe
                 application_id, category_id, traffic_role, protocol_id, organization_confidence,
                 application_confidence, protocol_confidence, classification_confidence,
                 classification_reason, classification_evidence_json, scope, path_type, nat,
-                source_segment, destination_segment
+                source_segment, destination_segment, device_id, id
          FROM flow_sessions WHERE ended_at IS NULL",
     )?;
     statement
@@ -1691,7 +1785,9 @@ fn load_active_flows(connection: &Connection) -> rusqlite::Result<HashMap<FlowKe
                     direction: row.get(7)?,
                 },
                 ActiveFlow {
+                    session_id: row.get(32)?,
                     client_mac: Vec::new(),
+                    device_id: row.get(31)?,
                     upload_bytes: row.get(8)?,
                     download_bytes: row.get(9)?,
                     packets: row.get(10)?,
@@ -2041,6 +2137,19 @@ fn persist_minute_rollups(
         let upload = to_i64(flow.upload_bytes);
         let download = to_i64(flow.download_bytes);
         let packets = to_i64(flow.packets);
+        let protocol_application_id = (attribution.application_id == "unknown"
+            && !attribution.protocol_id.is_empty()
+            && attribution.protocol_id != "unknown")
+            .then(|| format!("{PROTOCOL_APPLICATION_PREFIX}{}", attribution.protocol_id));
+        let (application_id, category_id) = protocol_application_id.as_deref().map_or_else(
+            || {
+                (
+                    attribution.application_id.as_str(),
+                    attribution.category_id.as_str(),
+                )
+            },
+            |id| (id, "unknown"),
+        );
         upsert_rollup(
             tx,
             "traffic_total_minute",
@@ -2072,8 +2181,8 @@ fn persist_minute_rollups(
             &[
                 timestamp.into(),
                 batch.gateway_id.clone().into(),
-                attribution.application_id.clone().into(),
-                attribution.category_id.clone().into(),
+                application_id.to_owned().into(),
+                category_id.to_owned().into(),
             ],
             upload,
             download,
@@ -2191,8 +2300,11 @@ fn update_active_flows(
         {
             let current = active
                 .entry(key.clone())
-                .or_insert_with(|| ActiveFlow::new(flow, attribution.clone(), received_at));
+                .or_insert_with(|| ActiveFlow::new(&key, flow, attribution.clone(), received_at));
             current.add(flow, attribution);
+            if let Some(device_id) = device_id_for_mac(tx, &key.gateway_id, &current.client_mac)? {
+                current.device_id = Some(device_id);
+            }
             let checkpoint =
                 received_at.saturating_sub(current.checkpointed_at) >= FLOW_CHECKPOINT_MS;
             let ended_at = ended.then(|| flow_lifecycle_end_at(flow, received_at));
@@ -2217,7 +2329,7 @@ fn write_flow_session(
     ended_at: Option<i64>,
     checkpointed_at: i64,
 ) -> rusqlite::Result<()> {
-    let device_id = device_id_for_mac(tx, &key.gateway_id, &flow.client_mac)?;
+    let device_id = device_id_for_mac(tx, &key.gateway_id, &flow.client_mac)?.or(flow.device_id);
     tx.execute(
         "INSERT INTO flow_sessions(
             id, gateway_id, device_id, ip_version, protocol, client_ip, client_port,
@@ -2249,7 +2361,7 @@ fn write_flow_session(
             source_segment = excluded.source_segment,
             destination_segment = excluded.destination_segment",
         params![
-            key.id(),
+            flow.session_id,
             key.gateway_id,
             device_id,
             key.ip_version,
@@ -2415,11 +2527,17 @@ impl FlowKey {
             self.direction
         )
     }
+
+    fn session_id(&self, started_at: i64) -> String {
+        format!("{}:{started_at}", self.id())
+    }
 }
 
 #[derive(Clone, Debug)]
 struct ActiveFlow {
+    session_id: String,
     client_mac: Vec<u8>,
+    device_id: Option<i64>,
     upload_bytes: i64,
     download_bytes: i64,
     packets: i64,
@@ -2435,20 +2553,28 @@ struct ActiveFlow {
 }
 
 impl ActiveFlow {
-    fn new(flow: &FlowDelta, attribution: FlowAttribution, received_at: i64) -> Self {
+    fn new(
+        key: &FlowKey,
+        flow: &FlowDelta,
+        attribution: FlowAttribution,
+        received_at: i64,
+    ) -> Self {
         let observed_started_at = to_i64(flow.first_seen_unix_ms);
         let started_at = if observed_started_at == 0 {
             received_at
         } else {
             observed_started_at
         };
+        let session_id = key.session_id(started_at);
         let last_seen_at = if flow_has_traffic(flow) {
             to_i64(flow.last_seen_unix_ms).max(started_at)
         } else {
             0
         };
         Self {
+            session_id,
             client_mac: flow.client_mac.clone(),
+            device_id: None,
             upload_bytes: 0,
             download_bytes: 0,
             packets: 0,

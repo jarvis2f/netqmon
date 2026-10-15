@@ -58,6 +58,16 @@ body:
     validations:
       required: false
   - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostic JSON
+      description: |
+        In the Controller UI, open **Settings → System Diagnostics**, click **Copy diagnostics to clipboard**, then paste the JSON here.
+        Review the diagnostic data for sensitive gateway identifiers or network addresses before submitting.
+      render: json
+    validations:
+      required: false
+  - type: textarea
     id: logs
     attributes:
       label: Relevant Logs or Screenshots
