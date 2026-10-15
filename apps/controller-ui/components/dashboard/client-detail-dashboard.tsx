@@ -314,11 +314,31 @@ export function ClientDetailDashboard({
               1,
               Math.max(0.01, client.upload_bytes_per_second / totalUp),
             );
-            const seeded = snapshot.history.map((pt) => ({
-              timestamp: pt.timestamp,
-              downloadBps: pt.download_bytes_per_second * 8 * downRatio,
-              uploadBps: pt.upload_bytes_per_second * 8 * upRatio,
-            }));
+            const macSeed = mac
+              .split("")
+              .reduce((acc, c) => (acc * 31 + c.charCodeAt(0)) | 0, 0);
+            const seeded = snapshot.history.map((pt) => {
+              const tSec = Math.floor(pt.timestamp / 1000);
+              const mod = isDemo
+                ? Math.max(
+                    0.2,
+                    0.85 +
+                      0.18 * Math.sin(tSec * 0.04 + macSeed) +
+                      0.12 * Math.cos(tSec * 0.11 + (macSeed >> 3)),
+                  )
+                : 1;
+              return {
+                timestamp: pt.timestamp,
+                downloadBps: Math.max(
+                  0,
+                  pt.download_bytes_per_second * 8 * downRatio * mod,
+                ),
+                uploadBps: Math.max(
+                  0,
+                  pt.upload_bytes_per_second * 8 * upRatio * mod,
+                ),
+              };
+            });
             return [
               ...seeded,
               {

@@ -16,9 +16,43 @@ use crate::realtime::{
 };
 use crate::{CollectorState, unix_time_ms};
 
-const DEMO_TICK_INTERVAL: Duration = Duration::from_secs(3);
+const DEMO_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_HISTORY_POINTS: usize = 900;
 const EVENT_CHANNEL_CAPACITY: usize = 128;
+
+/// Deterministic 64-bit mixer (SplitMix64)
+fn hash64(mut x: u64) -> u64 {
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^ (x >> 31)
+}
+
+/// Simple deterministic string hash (FNV-1a 64-bit)
+fn hash_str(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h = (h ^ (*b as u64)).wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Returns a deterministic pseudo-random float in [0.0, 1.0) given a seed, timestamp, and salt
+fn pseudo_rand(seed: u64, t_secs: u64, salt: u64) -> f64 {
+    let combined = seed
+        .wrapping_add(t_secs.wrapping_mul(0x9e3779b97f4a7c15))
+        .wrapping_add(salt);
+    let h = hash64(combined);
+    (h >> 11) as f64 / ((1u64 << 53) as f64)
+}
+
+/// Incommensurate multi-frequency wave. Smooth non-repeating float approximately in [-1.0, 1.0].
+fn multi_octave_wave(t: f64, phase: f64) -> f64 {
+    0.35 * (t * 0.012 + phase).sin()
+        + 0.25 * (t * 0.029 + phase * 1.618).sin()
+        + 0.20 * (t * 0.071 + phase * 2.718).cos()
+        + 0.12 * (t * 0.187 + phase * 3.141).sin()
+        + 0.08 * (t * 0.443 + phase * 0.577).cos()
+}
 
 /// Returns true if netqmon is configured to run in Demo Mode.
 pub fn demo_mode() -> bool {
@@ -56,17 +90,32 @@ struct DemoGatewayMeta {
     openwrt_version: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct DemoClientProfile {
     ip: String,
     mac: Option<String>,
-    weight: f64,
+    device_type: String,
+    #[allow(dead_code)]
+    hostname: String,
+    up_weight: f64,
+    down_weight: f64,
+    seed: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct DemoAppProfile {
     id: String,
     weight: f64,
+    seed: u64,
+}
+
+struct DemoTrafficFrame {
+    total: Throughput,
+    internet: Throughput,
+    internal: Throughput,
+    clients: HashMap<String, Throughput>,
+    client_scopes: HashMap<String, ScopedThroughput>,
+    applications: HashMap<String, Throughput>,
 }
 
 pub(crate) struct DemoRealtimeProvider {
@@ -202,32 +251,53 @@ impl DemoRealtimeProvider {
         // 3. Client profiles
         let mut clients: Vec<DemoClientProfile> = Vec::new();
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT da.ip, d.mac, COALESCE(SUM(t.upload_bytes + t.download_bytes), 1) as vol
+            "SELECT da.ip, d.mac, COALESCE(d.device_type, 'unknown'), COALESCE(d.hostname, ''),
+                    COALESCE(SUM(t.upload_bytes), 1000) as up_vol,
+                    COALESCE(SUM(t.download_bytes), 5000) as down_vol
              FROM devices d
              JOIN device_addresses da ON da.device_id = d.id
              LEFT JOIN traffic_device_minute t ON t.device_id = d.id
-             GROUP BY da.ip, d.mac
-             ORDER BY vol DESC",
+             GROUP BY da.ip, d.mac, d.device_type, d.hostname
+             ORDER BY (up_vol + down_vol) DESC",
         ) {
             if let Ok(rows) = stmt.query_map([], |row| {
                 let ip_blob: Vec<u8> = row.get(0)?;
                 let mac_blob: Option<Vec<u8>> = row.get(1)?;
-                let vol: i64 = row.get(2)?;
+                let dev_type: String = row.get(2)?;
+                let hostname: String = row.get(3)?;
+                let up_vol: i64 = row.get(4)?;
+                let down_vol: i64 = row.get(5)?;
                 let mac = mac_blob.map(|b| format_mac(&b));
-                Ok((format_ip(&ip_blob), mac, vol.max(1) as f64))
+                let ip = format_ip(&ip_blob);
+                Ok((
+                    ip,
+                    mac,
+                    dev_type,
+                    hostname,
+                    up_vol.max(1) as f64,
+                    down_vol.max(1) as f64,
+                ))
             }) {
-                let mut total_vol = 0.0;
                 let mut list = Vec::new();
+                let mut total_up_vol = 0.0;
+                let mut total_down_vol = 0.0;
                 for r in rows.flatten() {
-                    total_vol += r.2;
+                    total_up_vol += r.4;
+                    total_down_vol += r.5;
                     list.push(r);
                 }
-                if total_vol > 0.0 {
-                    for (ip, mac, vol) in list {
+                if total_up_vol > 0.0 && total_down_vol > 0.0 {
+                    for (ip, mac, dev_type, hostname, up_vol, down_vol) in list {
+                        let seed_src = mac.as_deref().unwrap_or(&ip);
+                        let seed = hash_str(seed_src);
                         clients.push(DemoClientProfile {
                             ip,
                             mac,
-                            weight: vol / total_vol,
+                            device_type: dev_type,
+                            hostname,
+                            up_weight: up_vol / total_up_vol,
+                            down_weight: down_vol / total_down_vol,
+                            seed,
                         });
                     }
                 }
@@ -238,22 +308,38 @@ impl DemoRealtimeProvider {
                 DemoClientProfile {
                     ip: "192.168.1.101".to_owned(),
                     mac: Some("02:00:00:00:00:01".to_owned()),
-                    weight: 0.45,
+                    device_type: "laptop".to_owned(),
+                    hostname: "demo-macbook".to_owned(),
+                    up_weight: 0.30,
+                    down_weight: 0.35,
+                    seed: hash_str("02:00:00:00:00:01"),
                 },
                 DemoClientProfile {
                     ip: "192.168.1.102".to_owned(),
                     mac: Some("02:00:00:00:00:02".to_owned()),
-                    weight: 0.30,
+                    device_type: "mobile".to_owned(),
+                    hostname: "demo-iphone".to_owned(),
+                    up_weight: 0.15,
+                    down_weight: 0.25,
+                    seed: hash_str("02:00:00:00:00:02"),
                 },
                 DemoClientProfile {
                     ip: "192.168.1.103".to_owned(),
                     mac: Some("02:00:00:00:00:03".to_owned()),
-                    weight: 0.15,
+                    device_type: "tv".to_owned(),
+                    hostname: "demo-appletv".to_owned(),
+                    up_weight: 0.05,
+                    down_weight: 0.30,
+                    seed: hash_str("02:00:00:00:00:03"),
                 },
                 DemoClientProfile {
                     ip: "192.168.1.104".to_owned(),
                     mac: Some("02:00:00:00:00:04".to_owned()),
-                    weight: 0.10,
+                    device_type: "nas".to_owned(),
+                    hostname: "demo-nas".to_owned(),
+                    up_weight: 0.50,
+                    down_weight: 0.10,
+                    seed: hash_str("02:00:00:00:00:04"),
                 },
             ];
         }
@@ -278,9 +364,11 @@ impl DemoRealtimeProvider {
                 }
                 if total_vol > 0.0 {
                     for (id, vol) in list {
+                        let seed = hash_str(&id);
                         apps.push(DemoAppProfile {
                             id,
                             weight: vol / total_vol,
+                            seed,
                         });
                     }
                 }
@@ -291,18 +379,22 @@ impl DemoRealtimeProvider {
                 DemoAppProfile {
                     id: "youtube".to_owned(),
                     weight: 0.40,
+                    seed: hash_str("youtube"),
                 },
                 DemoAppProfile {
                     id: "github".to_owned(),
                     weight: 0.25,
+                    seed: hash_str("github"),
                 },
                 DemoAppProfile {
                     id: "google".to_owned(),
                     weight: 0.20,
+                    seed: hash_str("google"),
                 },
                 DemoAppProfile {
                     id: "apple".to_owned(),
                     weight: 0.15,
+                    seed: hash_str("apple"),
                 },
             ];
         }
@@ -402,83 +494,34 @@ impl DemoRealtimeProvider {
             ];
         }
 
-        // 6. Build initial 15-minute history points
-        let mut history: Vec<ThroughputPoint> = Vec::with_capacity(300);
-        let start_ts = now.saturating_sub(15 * 60 * 1_000);
-        for step in 0..180 {
-            let point_ts = start_ts + (step as u64 * 5_000);
-            let t_secs = point_ts / 1000;
-            let wave =
-                0.85 + 0.15 * (t_secs as f64 * 0.08).sin() + 0.05 * (t_secs as f64 * 0.02).cos();
-            let wave = wave.clamp(0.4, 1.6);
+        // 6. Build initial 15-minute history points (900 points, 1s step)
+        let mut history: Vec<ThroughputPoint> = Vec::with_capacity(MAX_HISTORY_POINTS);
+        let start_ts = now.saturating_sub((MAX_HISTORY_POINTS as u64) * 1_000);
+        for step in 0..MAX_HISTORY_POINTS {
+            let point_ts = start_ts + (step as u64 * 1_000);
+            let frame =
+                Self::calculate_snapshot_state(point_ts, &clients, &apps, base_up, base_down);
             history.push(ThroughputPoint {
                 timestamp: point_ts,
-                upload_bytes_per_second: (base_up as f64 * (2.0 - wave)).max(10_000.0) as u64,
-                download_bytes_per_second: (base_down as f64 * wave).max(50_000.0) as u64,
+                upload_bytes_per_second: frame.internet.upload_bytes_per_second,
+                download_bytes_per_second: frame.internet.download_bytes_per_second,
             });
         }
 
-        let mut initial_client_map = HashMap::new();
-        let mut initial_client_scopes = HashMap::new();
-        for client in &clients {
-            let cl_down = (base_down as f64 * client.weight) as u64;
-            let cl_up = (base_up as f64 * client.weight) as u64;
-            let tp = Throughput {
-                upload_bytes_per_second: cl_up,
-                download_bytes_per_second: cl_down,
-            };
-            let scoped = ScopedThroughput {
-                internet: tp.clone(),
-                internal: Throughput {
-                    upload_bytes_per_second: cl_up / 10,
-                    download_bytes_per_second: cl_down / 10,
-                },
-                tunnel: Throughput::default(),
-                unknown: Throughput::default(),
-            };
-            initial_client_map.insert(client.ip.clone(), tp.clone());
-            initial_client_scopes.insert(client.ip.clone(), scoped.clone());
-            if let Some(mac) = &client.mac {
-                initial_client_map.insert(mac.clone(), tp.clone());
-                initial_client_map.insert(mac.to_lowercase(), tp.clone());
-                initial_client_scopes.insert(mac.clone(), scoped.clone());
-                initial_client_scopes.insert(mac.to_lowercase(), scoped.clone());
-            }
-        }
-
-        let mut initial_app_map = HashMap::new();
-        for app in &apps {
-            let app_down = (base_down as f64 * app.weight) as u64;
-            let app_up = (base_up as f64 * app.weight) as u64;
-            initial_app_map.insert(
-                app.id.clone(),
-                Throughput {
-                    upload_bytes_per_second: app_up,
-                    download_bytes_per_second: app_down,
-                },
-            );
-        }
+        let initial_frame =
+            Self::calculate_snapshot_state(now, &clients, &apps, base_up, base_down);
 
         let initial_snapshot = RealtimeSnapshot {
             generated_at: now,
             agent_batch_time: now,
-            total: Throughput {
-                upload_bytes_per_second: base_up,
-                download_bytes_per_second: base_down,
-            },
-            internet: Throughput {
-                upload_bytes_per_second: base_up,
-                download_bytes_per_second: base_down,
-            },
-            internal: Throughput {
-                upload_bytes_per_second: base_up / 10,
-                download_bytes_per_second: base_down / 10,
-            },
+            total: initial_frame.total,
+            internet: initial_frame.internet.clone(),
+            internal: initial_frame.internal,
             tunnel: Throughput::default(),
             unknown: Throughput::default(),
-            clients: initial_client_map,
-            client_scopes: initial_client_scopes,
-            applications: initial_app_map,
+            clients: initial_frame.clients,
+            client_scopes: initial_frame.client_scopes,
+            applications: initial_frame.applications,
             active_flows: flows.clone(),
             history,
             gateway_health: Some(GatewayHealthSnapshot {
@@ -498,10 +541,12 @@ impl DemoRealtimeProvider {
                 interface_tx_bytes: 12_000_000_000,
                 interface_rx_packets: 35_000_000,
                 interface_tx_packets: 15_000_000,
-                interface_delta_bytes: base_down * 3,
-                interface_delta_packets: (base_down / 1400) * 3,
-                flow_delta_bytes: base_down * 3,
-                flow_delta_packets: (base_down / 1400) * 3,
+                interface_delta_bytes: initial_frame.internet.download_bytes_per_second,
+                interface_delta_packets: (initial_frame.internet.download_bytes_per_second / 1400)
+                    .max(1),
+                flow_delta_bytes: initial_frame.internet.download_bytes_per_second,
+                flow_delta_packets: (initial_frame.internet.download_bytes_per_second / 1400)
+                    .max(1),
                 interface_counter_sanity: "ok".to_owned(),
                 topology: None,
             }),
@@ -518,6 +563,260 @@ impl DemoRealtimeProvider {
         )
     }
 
+    fn simulate_client_traffic(
+        client: &DemoClientProfile,
+        t_secs: u64,
+        base_up_total: u64,
+        base_down_total: u64,
+    ) -> (Throughput, ScopedThroughput) {
+        let nominal_down = (base_down_total as f64 * client.down_weight).max(1_500.0);
+        let nominal_up = (base_up_total as f64 * client.up_weight).max(500.0);
+
+        let phase_down = (client.seed % 1000) as f64 * 0.01;
+        let phase_up = ((client.seed >> 16) % 1000) as f64 * 0.01 + 2.5;
+
+        let macro_down = (1.0 + 0.35 * multi_octave_wave(t_secs as f64, phase_down)).max(0.15);
+        let macro_up = (1.0 + 0.35 * multi_octave_wave(t_secs as f64, phase_up)).max(0.15);
+
+        let (burst_down, burst_up, internal_ratio) = match client.device_type.as_str() {
+            "tv" | "entertainment" => {
+                let period = 14 + (client.seed % 5);
+                let offset = (client.seed / 11) % period;
+                let phase = (t_secs + offset) % period;
+                if phase < 3 {
+                    (
+                        3.8 + 1.2 * pseudo_rand(client.seed, t_secs, 11),
+                        0.5 + 0.2 * pseudo_rand(client.seed, t_secs, 12),
+                        0.15,
+                    )
+                } else {
+                    (
+                        0.06 + 0.04 * pseudo_rand(client.seed, t_secs, 13),
+                        0.03,
+                        0.10,
+                    )
+                }
+            }
+            "console" => {
+                let period = 35 + (client.seed % 15);
+                let offset = (client.seed / 17) % period;
+                let phase = (t_secs + offset) % period;
+                if phase < 8 {
+                    (
+                        2.8 + 0.8 * pseudo_rand(client.seed, t_secs, 21),
+                        1.1 + 0.3 * pseudo_rand(client.seed, t_secs, 22),
+                        0.12,
+                    )
+                } else {
+                    (
+                        0.20 + 0.10 * pseudo_rand(client.seed, t_secs, 23),
+                        0.15 + 0.05 * pseudo_rand(client.seed, t_secs, 24),
+                        0.08,
+                    )
+                }
+            }
+            "laptop" | "desktop" | "pc" => {
+                let period = 22 + (client.seed % 9);
+                let phase = (t_secs + (client.seed % period)) % period;
+                if phase < 4 {
+                    (
+                        2.6 + 0.9 * pseudo_rand(client.seed, t_secs, 31),
+                        1.8 + 0.8 * pseudo_rand(client.seed, t_secs, 32),
+                        0.20,
+                    )
+                } else {
+                    (
+                        0.20 + 0.12 * pseudo_rand(client.seed, t_secs, 33),
+                        0.15 + 0.08 * pseudo_rand(client.seed, t_secs, 34),
+                        0.15,
+                    )
+                }
+            }
+            "mobile" | "tablet" | "phone" => {
+                let main_phase = (t_secs + (client.seed % 50)) % 50;
+                if main_phase < 22 {
+                    let sub_pos = main_phase % 7;
+                    if sub_pos < 2 {
+                        (
+                            2.4 + 0.8 * pseudo_rand(client.seed, t_secs, 41),
+                            0.7 + 0.3 * pseudo_rand(client.seed, t_secs, 42),
+                            0.08,
+                        )
+                    } else {
+                        (
+                            0.25 + 0.10 * pseudo_rand(client.seed, t_secs, 43),
+                            0.12,
+                            0.05,
+                        )
+                    }
+                } else {
+                    (
+                        0.03 + 0.02 * pseudo_rand(client.seed, t_secs, 44),
+                        0.02,
+                        0.04,
+                    )
+                }
+            }
+            "server" | "nas" => {
+                let period = 48 + (client.seed % 16);
+                let phase = (t_secs + (client.seed % period)) % period;
+                if phase < 14 {
+                    (
+                        1.5 + 0.5 * pseudo_rand(client.seed, t_secs, 51),
+                        3.4 + 1.2 * pseudo_rand(client.seed, t_secs, 52),
+                        0.45,
+                    )
+                } else {
+                    (
+                        0.35 + 0.10 * pseudo_rand(client.seed, t_secs, 53),
+                        0.40 + 0.15 * pseudo_rand(client.seed, t_secs, 54),
+                        0.35,
+                    )
+                }
+            }
+            "speaker" | "audio" => (
+                0.90 + 0.15 * pseudo_rand(client.seed, t_secs, 61),
+                0.06 + 0.02 * pseudo_rand(client.seed, t_secs, 62),
+                0.15,
+            ),
+            "camera" => (
+                0.05 + 0.02 * pseudo_rand(client.seed, t_secs, 71),
+                2.0 + 0.3 * pseudo_rand(client.seed, t_secs, 72),
+                0.10,
+            ),
+            _ => (
+                0.04 + 0.03 * pseudo_rand(client.seed, t_secs, 81),
+                0.05 + 0.03 * pseudo_rand(client.seed, t_secs, 82),
+                0.06,
+            ),
+        };
+
+        let jitter_down = 0.88 + 0.24 * pseudo_rand(client.seed, t_secs, 101);
+        let jitter_up = 0.88 + 0.24 * pseudo_rand(client.seed, t_secs, 202);
+
+        let down_bps = (nominal_down * macro_down * burst_down * jitter_down).max(300.0) as u64;
+        let up_bps = (nominal_up * macro_up * burst_up * jitter_up).max(100.0) as u64;
+
+        let internal_factor_up =
+            internal_ratio * (0.8 + 0.4 * pseudo_rand(client.seed, t_secs, 301));
+        let internal_factor_down =
+            internal_ratio * (0.8 + 0.4 * pseudo_rand(client.seed, t_secs, 401));
+
+        let internal_up = (up_bps as f64 * internal_factor_up).max(50.0) as u64;
+        let internal_down = (down_bps as f64 * internal_factor_down).max(100.0) as u64;
+
+        let internet_tp = Throughput {
+            upload_bytes_per_second: up_bps,
+            download_bytes_per_second: down_bps,
+        };
+        let internal_tp = Throughput {
+            upload_bytes_per_second: internal_up,
+            download_bytes_per_second: internal_down,
+        };
+        let total_tp = Throughput {
+            upload_bytes_per_second: up_bps + internal_up,
+            download_bytes_per_second: down_bps + internal_down,
+        };
+
+        let scoped = ScopedThroughput {
+            internet: internet_tp,
+            internal: internal_tp,
+            tunnel: Throughput::default(),
+            unknown: Throughput::default(),
+        };
+
+        (total_tp, scoped)
+    }
+
+    fn calculate_snapshot_state(
+        t_ms: u64,
+        clients: &[DemoClientProfile],
+        apps: &[DemoAppProfile],
+        base_up: u64,
+        base_down: u64,
+    ) -> DemoTrafficFrame {
+        let t_secs = t_ms / 1000;
+        let mut client_map: HashMap<String, Throughput> = HashMap::with_capacity(clients.len() * 3);
+        let mut client_scopes: HashMap<String, ScopedThroughput> =
+            HashMap::with_capacity(clients.len() * 3);
+
+        let mut sum_internet_up: u64 = 0;
+        let mut sum_internet_down: u64 = 0;
+        let mut sum_internal_up: u64 = 0;
+        let mut sum_internal_down: u64 = 0;
+
+        for client in clients {
+            let (total_tp, scoped) =
+                Self::simulate_client_traffic(client, t_secs, base_up, base_down);
+            sum_internet_up += scoped.internet.upload_bytes_per_second;
+            sum_internet_down += scoped.internet.download_bytes_per_second;
+            sum_internal_up += scoped.internal.upload_bytes_per_second;
+            sum_internal_down += scoped.internal.download_bytes_per_second;
+
+            client_map.insert(client.ip.clone(), total_tp.clone());
+            client_scopes.insert(client.ip.clone(), scoped.clone());
+            if let Some(mac) = &client.mac {
+                client_map.insert(mac.clone(), total_tp.clone());
+                client_map.insert(mac.to_lowercase(), total_tp.clone());
+                client_scopes.insert(mac.clone(), scoped.clone());
+                client_scopes.insert(mac.to_lowercase(), scoped.clone());
+            }
+        }
+
+        // Add background gateway router noise (DNS/NTP/pings)
+        let gw_up = (3_500.0 * (0.8 + 0.4 * pseudo_rand(0xdeadbeef, t_secs, 501))) as u64;
+        let gw_down = (7_500.0 * (0.8 + 0.4 * pseudo_rand(0xbeefcafe, t_secs, 502))) as u64;
+        sum_internet_up += gw_up;
+        sum_internet_down += gw_down;
+
+        let internet = Throughput {
+            upload_bytes_per_second: sum_internet_up,
+            download_bytes_per_second: sum_internet_down,
+        };
+        let internal = Throughput {
+            upload_bytes_per_second: sum_internal_up,
+            download_bytes_per_second: sum_internal_down,
+        };
+        let total = Throughput {
+            upload_bytes_per_second: sum_internet_up + sum_internal_up,
+            download_bytes_per_second: sum_internet_down + sum_internal_down,
+        };
+
+        // Application distribution
+        let mut app_weights: Vec<f64> = Vec::with_capacity(apps.len());
+        for app in apps {
+            let app_wave = (1.0
+                + 0.3 * multi_octave_wave(t_secs as f64, (app.seed % 500) as f64 * 0.05))
+            .max(0.15);
+            let app_jitter = 0.85 + 0.3 * pseudo_rand(app.seed, t_secs, 601);
+            app_weights.push(app.weight * app_wave * app_jitter);
+        }
+        let sum_app_weights: f64 = app_weights.iter().sum::<f64>().max(0.001);
+
+        let mut app_map: HashMap<String, Throughput> = HashMap::with_capacity(apps.len());
+        for (i, app) in apps.iter().enumerate() {
+            let frac = app_weights[i] / sum_app_weights;
+            let app_down = (sum_internet_down as f64 * frac) as u64;
+            let app_up = (sum_internet_up as f64 * frac) as u64;
+            app_map.insert(
+                app.id.clone(),
+                Throughput {
+                    upload_bytes_per_second: app_up,
+                    download_bytes_per_second: app_down,
+                },
+            );
+        }
+
+        DemoTrafficFrame {
+            total,
+            internet,
+            internal,
+            clients: client_map,
+            client_scopes,
+            applications: app_map,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn generate_tick(
         now: u64,
@@ -532,77 +831,26 @@ impl DemoRealtimeProvider {
         total_tx: &AtomicU64,
     ) -> RealtimeSnapshot {
         let t_secs = now / 1000;
-        let wave = 0.85 + 0.15 * (t_secs as f64 * 0.08).sin() + 0.05 * (t_secs as f64 * 0.02).cos();
-        let wave = wave.clamp(0.4, 1.6);
-
-        let current_down = (base_down as f64 * wave).max(50_000.0) as u64;
-        let current_up = (base_up as f64 * (2.0 - wave)).max(10_000.0) as u64;
-
-        let total = Throughput {
-            upload_bytes_per_second: current_up,
-            download_bytes_per_second: current_down,
-        };
-        let internet = total.clone();
-        let internal = Throughput {
-            upload_bytes_per_second: current_up / 10,
-            download_bytes_per_second: current_down / 10,
-        };
-
-        let mut client_map: HashMap<String, Throughput> = HashMap::new();
-        let mut client_scopes: HashMap<String, ScopedThroughput> = HashMap::new();
-        for client in clients {
-            let cl_down = (current_down as f64 * client.weight) as u64;
-            let cl_up = (current_up as f64 * client.weight) as u64;
-            let tp = Throughput {
-                upload_bytes_per_second: cl_up,
-                download_bytes_per_second: cl_down,
-            };
-            client_map.insert(client.ip.clone(), tp.clone());
-            client_scopes.insert(
-                client.ip.clone(),
-                ScopedThroughput {
-                    internet: tp.clone(),
-                    internal: Throughput {
-                        upload_bytes_per_second: cl_up / 10,
-                        download_bytes_per_second: cl_down / 10,
-                    },
-                    tunnel: Throughput::default(),
-                    unknown: Throughput::default(),
-                },
-            );
-            if let Some(mac) = &client.mac {
-                let scoped = ScopedThroughput {
-                    internet: tp.clone(),
-                    internal: Throughput {
-                        upload_bytes_per_second: cl_up / 10,
-                        download_bytes_per_second: cl_down / 10,
-                    },
-                    tunnel: Throughput::default(),
-                    unknown: Throughput::default(),
-                };
-                client_map.insert(mac.clone(), tp.clone());
-                client_map.insert(mac.to_lowercase(), tp.clone());
-                client_scopes.insert(mac.clone(), scoped.clone());
-                client_scopes.insert(mac.to_lowercase(), scoped.clone());
-            }
-        }
-
-        let mut app_map: HashMap<String, Throughput> = HashMap::new();
-        for app in apps {
-            let app_down = (current_down as f64 * app.weight) as u64;
-            let app_up = (current_up as f64 * app.weight) as u64;
-            app_map.insert(
-                app.id.clone(),
-                Throughput {
-                    upload_bytes_per_second: app_up,
-                    download_bytes_per_second: app_down,
-                },
-            );
-        }
+        let frame = Self::calculate_snapshot_state(now, clients, apps, base_up, base_down);
+        let current_up = frame.internet.upload_bytes_per_second;
+        let current_down = frame.internet.download_bytes_per_second;
 
         let mut active_flows = base_flows.to_vec();
-        for flow in &mut active_flows {
+        let flow_count = (active_flows.len() as u64).max(1);
+        for (idx, flow) in active_flows.iter_mut().enumerate() {
             flow.last_seen = now;
+            let flow_seed = hash64((idx as u64).wrapping_add(t_secs));
+            let flow_delta_down = ((current_down / flow_count) as f64
+                * (0.5 + 0.8 * pseudo_rand(flow_seed, t_secs, 777)))
+                as u64;
+            let flow_delta_up = ((current_up / flow_count) as f64
+                * (0.5 + 0.8 * pseudo_rand(flow_seed, t_secs, 888)))
+                as u64;
+            flow.download_bytes = flow.download_bytes.saturating_add(flow_delta_down);
+            flow.upload_bytes = flow.upload_bytes.saturating_add(flow_delta_up);
+            flow.packets = flow
+                .packets
+                .saturating_add((flow_delta_down + flow_delta_up) / 1200 + 1);
         }
 
         let mut history = {
@@ -621,8 +869,9 @@ impl DemoRealtimeProvider {
             history.drain(0..excess);
         }
 
-        let delta_bytes_down = current_down.saturating_mul(3);
-        let delta_bytes_up = current_up.saturating_mul(3);
+        // Tick interval is 1s, so delta bytes equals current bytes/sec
+        let delta_bytes_down = current_down;
+        let delta_bytes_up = current_up;
         let rx = total_rx.fetch_add(delta_bytes_down, Ordering::Relaxed) + delta_bytes_down;
         let tx = total_tx.fetch_add(delta_bytes_up, Ordering::Relaxed) + delta_bytes_up;
 
@@ -654,14 +903,14 @@ impl DemoRealtimeProvider {
         RealtimeSnapshot {
             generated_at: now,
             agent_batch_time: now,
-            total,
-            internet,
-            internal,
+            total: frame.total,
+            internet: frame.internet,
+            internal: frame.internal,
             tunnel: Throughput::default(),
             unknown: Throughput::default(),
-            clients: client_map,
-            client_scopes,
-            applications: app_map,
+            clients: frame.clients,
+            client_scopes: frame.client_scopes,
+            applications: frame.applications,
             active_flows,
             history,
             gateway_health: Some(gateway_health),
@@ -884,5 +1133,75 @@ mod tests {
         // Second call should not shift because it is already fresh
         let shifted_again = ensure_demo_database_freshness(&conn).unwrap();
         assert!(!shifted_again);
+    }
+
+    #[test]
+    fn test_realistic_traffic_engine_simulation() {
+        let clients = vec![
+            DemoClientProfile {
+                ip: "192.168.1.101".to_owned(),
+                mac: Some("02:00:00:00:00:01".to_owned()),
+                device_type: "laptop".to_owned(),
+                hostname: "demo-macbook".to_owned(),
+                up_weight: 0.35,
+                down_weight: 0.30,
+                seed: hash_str("02:00:00:00:00:01"),
+            },
+            DemoClientProfile {
+                ip: "192.168.1.102".to_owned(),
+                mac: Some("02:00:00:00:00:02".to_owned()),
+                device_type: "tv".to_owned(),
+                hostname: "demo-appletv".to_owned(),
+                up_weight: 0.05,
+                down_weight: 0.50,
+                seed: hash_str("02:00:00:00:00:02"),
+            },
+            DemoClientProfile {
+                ip: "192.168.1.103".to_owned(),
+                mac: Some("02:00:00:00:00:03".to_owned()),
+                device_type: "nas".to_owned(),
+                hostname: "demo-nas".to_owned(),
+                up_weight: 0.60,
+                down_weight: 0.20,
+                seed: hash_str("02:00:00:00:00:03"),
+            },
+        ];
+        let apps = vec![DemoAppProfile {
+            id: "youtube".to_owned(),
+            weight: 1.0,
+            seed: hash_str("youtube"),
+        }];
+
+        let base_up = 200_000;
+        let base_down = 1_500_000;
+
+        let frame1 = DemoRealtimeProvider::calculate_snapshot_state(
+            1700000000000,
+            &clients,
+            &apps,
+            base_up,
+            base_down,
+        );
+        let frame2 = DemoRealtimeProvider::calculate_snapshot_state(
+            1700000005000,
+            &clients,
+            &apps,
+            base_up,
+            base_down,
+        );
+
+        assert!(frame1.internet.download_bytes_per_second > 0);
+        assert!(frame1.internet.upload_bytes_per_second > 0);
+        assert!(frame2.internet.download_bytes_per_second > 0);
+        // Ensure values fluctuate and are not identical
+        assert_ne!(
+            frame1.internet.download_bytes_per_second,
+            frame2.internet.download_bytes_per_second
+        );
+
+        // TV vs NAS traffic behavior: NAS has substantially higher upload than TV
+        let tv_tp = frame1.clients.get("02:00:00:00:00:02").unwrap();
+        let nas_tp = frame1.clients.get("02:00:00:00:00:03").unwrap();
+        assert!(nas_tp.upload_bytes_per_second > tv_tp.upload_bytes_per_second);
     }
 }
