@@ -410,6 +410,50 @@ mod tests {
     }
 
     #[test]
+    fn application_allow_clears_block_and_keeps_matching_limit_active() {
+        let policies = [
+            policy(
+                "application-block",
+                10,
+                PolicyActionKind::Block,
+                vec!["02:00:00:00:00:01"],
+                vec!["video"],
+                vec![],
+            ),
+            policy(
+                "application-allow",
+                5,
+                PolicyActionKind::Allow,
+                vec!["02:00:00:00:00:01"],
+                vec!["video"],
+                vec![],
+            ),
+            policy(
+                "application-limit",
+                20,
+                PolicyActionKind::Limit,
+                vec!["02:00:00:00:00:01"],
+                vec!["video"],
+                vec![],
+            ),
+        ];
+
+        let result = evaluate_preview(&request("video", "streaming"), &policies, true, true);
+
+        assert_eq!(result.selected_block_verdict, "allow");
+        assert!(
+            result
+                .matched_policies
+                .iter()
+                .any(|item| item.policy_id == "application-allow" && item.selected)
+        );
+        assert_eq!(result.active_limits.len(), 1);
+        assert_eq!(result.active_limits[0].policy_id, "application-limit");
+        assert_eq!(result.active_limits[0].status, "supported");
+        assert!(result.unsupported_reasons.is_empty());
+    }
+
+    #[test]
     fn category_match_requires_a_known_application_and_limits_are_capability_gated() {
         let policies = [
             policy(

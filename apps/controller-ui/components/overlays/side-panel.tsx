@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useId, useRef } from "react";
+import React, { useEffect, useEffectEvent, useId, useRef } from "react";
 import { X, Copy, Check, ExternalLink } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { cn } from "@/lib/utils";
@@ -31,8 +31,10 @@ export function SidePanel({
   const tA11y = useTranslations("accessibility.panel");
   const panelRef = useRef<HTMLDivElement>(null);
   const titleId = useId();
+  const closeFromKeyboard = useEffectEvent(() => onClose());
 
   // Trap focus, support Escape, and restore focus when the sheet closes.
+  // Changing the close callback during a refresh must not reset input focus.
   useEffect(() => {
     if (!open) return;
 
@@ -43,9 +45,16 @@ export function SidePanel({
     panel?.querySelector<HTMLElement>(focusableSelector)?.focus();
 
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Portalled confirmation dialogs own their keyboard events.
+      if (
+        e.defaultPrevented ||
+        !(e.target instanceof Node) ||
+        !panel?.contains(e.target)
+      )
+        return;
       if (e.key === "Escape") {
         e.preventDefault();
-        onClose();
+        closeFromKeyboard();
         return;
       }
       if (e.key !== "Tab" || !panel) return;
@@ -74,7 +83,7 @@ export function SidePanel({
       window.removeEventListener("keydown", handleKeyDown);
       previouslyFocused?.focus();
     };
-  }, [open, onClose]);
+  }, [open]);
 
   // Prevent background scrolling when panel is open
   useEffect(() => {

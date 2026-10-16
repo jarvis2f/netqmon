@@ -11,6 +11,18 @@ pub const POLICY_MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const POLICY_MAX_METRICS_FRAME_BYTES: usize = 256 * 1024;
 pub const POLICY_MAX_SNAPSHOT_BYTES: usize = 768 * 1024;
 pub const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+/// Client totals on the Agent's verified client-facing path, independent of app identification.
+pub const POLICY_CLIENT_TOTAL_SCOPE: &str = "agent";
+
+#[must_use]
+pub fn is_client_total_spec(spec: &PolicySpecV1) -> bool {
+    spec.network.scope == POLICY_CLIENT_TOTAL_SCOPE
+        && spec.network.direction == "both"
+        && spec.action.kind == PolicyActionKind::Limit
+        && !spec.selectors.clients.is_empty()
+        && spec.selectors.applications.is_empty()
+        && spec.selectors.categories.is_empty()
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -824,7 +836,9 @@ fn validate_policy_spec(gateway_id: &str, spec: &PolicySpecV1) -> Result<(), Str
     if spec.description.chars().count() > 500 || spec.priority > 1000 {
         return Err("policy spec description or priority is invalid".to_owned());
     }
-    if spec.network.scope != "internet" || spec.network.direction != "both" {
+    if (spec.network.scope != "internet" && !is_client_total_spec(spec))
+        || spec.network.direction != "both"
+    {
         return Err("policy spec uses an unsupported network scope".to_owned());
     }
     if spec.selectors.clients.len() > 32
@@ -1008,6 +1022,29 @@ mod tests {
             },
             schedule: None,
         }
+    }
+
+    #[test]
+    fn client_total_scope_is_explicit_and_cannot_expand_application_or_block_rules() {
+        let mut total = spec();
+        total.network.scope = POLICY_CLIENT_TOTAL_SCOPE.to_owned();
+        total.action.kind = PolicyActionKind::Limit;
+        total.action.upload_bps = Some(1_000_000);
+        assert!(validate_policy_spec("gw-test", &total).is_ok());
+        for (index, mut invalid) in [total.clone(), total.clone(), total.clone()]
+            .into_iter()
+            .enumerate()
+        {
+            match index {
+                0 => invalid.selectors.applications.push("youtube".to_owned()),
+                1 => invalid.selectors.clients.clear(),
+                _ => invalid.action.kind = PolicyActionKind::Block,
+            }
+            assert!(validate_policy_spec("gw-test", &invalid).is_err());
+        }
+        let mut internet = spec();
+        internet.network.scope = "internet".to_owned();
+        assert!(validate_policy_spec("gw-test", &internet).is_ok());
     }
 
     fn snapshot(generation: u64, id: &str) -> PolicyWireFrame {

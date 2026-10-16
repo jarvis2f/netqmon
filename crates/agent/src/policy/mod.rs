@@ -1,5 +1,8 @@
 mod capabilities;
 #[cfg(target_os = "linux")]
+mod capacity;
+pub(crate) mod classid;
+#[cfg(target_os = "linux")]
 pub(crate) mod executor;
 pub(crate) mod flow_alias;
 #[cfg(target_os = "linux")]
@@ -9,14 +12,40 @@ mod mark;
 #[cfg(target_os = "linux")]
 mod nft;
 #[cfg(target_os = "linux")]
+pub(crate) mod priority_delivery;
+#[cfg(target_os = "linux")]
+pub(crate) mod priority_plan;
+#[cfg(feature = "qos-client-priority")]
+pub(crate) mod priority_selection;
+pub(crate) mod priority_slots;
+#[cfg(target_os = "linux")]
 mod qdisc;
 #[cfg(target_os = "linux")]
 pub(crate) mod receiver;
-mod schedule;
+pub(crate) mod schedule;
 mod shaper;
 mod state;
 
 use crate::config::{AgentConfig, PoliciesAction, PoliciesArgs};
+
+pub(crate) fn snapshot_has_enabled_application_verdicts(
+    snapshot: &netqmon_protocol::policy::PolicyWireFrame,
+) -> bool {
+    use netqmon_protocol::policy::{PolicyActionKind, PolicyWireFrame};
+
+    let PolicyWireFrame::PolicySnapshot { policies, .. } = snapshot else {
+        return false;
+    };
+    policies.iter().any(|policy| {
+        policy.spec.enabled
+            && (!policy.spec.selectors.applications.is_empty()
+                || !policy.spec.selectors.categories.is_empty())
+            && matches!(
+                policy.spec.action.kind,
+                PolicyActionKind::Block | PolicyActionKind::Allow | PolicyActionKind::Limit
+            )
+    })
+}
 
 pub(crate) fn handle_command(args: PoliciesArgs, config: &AgentConfig) -> Result<(), String> {
     match args.action {

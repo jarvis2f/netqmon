@@ -3,6 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::config::{MAX_POLICY_CAPACITY_BPS, MIN_POLICY_CAPACITY_BPS};
+
 pub(super) const MAX_CLIENTS_PER_EGRESS: usize = 256;
 const MAX_CLASS_TAG: u16 = MAX_CLIENTS_PER_EGRESS as u16;
 pub(super) const MAX_APPLICATION_CLASSES_PER_EGRESS: usize = 4_096;
@@ -160,7 +162,8 @@ impl ShapingState {
             if interface.name.is_empty()
                 || interface.name.len() > 15
                 || interface.ifindex == 0
-                || !(64_000..=1_000_000_000).contains(&interface.capacity_bps)
+                || !(MIN_POLICY_CAPACITY_BPS..=MAX_POLICY_CAPACITY_BPS)
+                    .contains(&interface.capacity_bps)
                 || !matches!(
                     interface.original_root_kind.as_str(),
                     "" | "fq_codel" | "pfifo_fast" | "noqueue"
@@ -187,7 +190,8 @@ impl ShapingState {
                     || !valid_client_tag(client, interface.shared_egress)
                     || client.class_minor != client_class_minor(client.tag, interface.shared_egress)
                     || client.leaf_minor != 1_000 + client.tag
-                    || !(64_000..=1_000_000_000).contains(&client.rate_bps)
+                    || !(MIN_POLICY_CAPACITY_BPS..=MAX_POLICY_CAPACITY_BPS)
+                        .contains(&client.rate_bps)
                     || (interface.shared_egress && client.rate_bps > interface.capacity_bps)
                     || !tags.insert(client.tag)
                     || !classes.insert(client.class_minor)
@@ -371,10 +375,10 @@ pub(super) fn allocate_classes(
     }
     if rates
         .values()
-        .any(|rate| !(64_000..=1_000_000_000).contains(rate))
+        .any(|rate| !(MIN_POLICY_CAPACITY_BPS..=MAX_POLICY_CAPACITY_BPS).contains(rate))
     {
         return Err(
-            "invalid_client_rate: client rates must be between 64000 and 1000000000 bps".to_owned(),
+            "invalid_client_rate: client budgets are outside the safe capacity range".to_owned(),
         );
     }
 

@@ -7,6 +7,14 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Isolated compatibility experiments only; absent from ordinary release builds.
+qos-compatibility-poc = []
+# Stage 2 read-only packet-path evidence, never a policy capability.
+qos-client-path-probe = []
+# Experimental client backend; runtime activation remains gated in test netns.
+qos-client-priority = ["qos-client-path-probe"]
+
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.0", features = ["derive"] }

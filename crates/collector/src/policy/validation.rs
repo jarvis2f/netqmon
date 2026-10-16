@@ -180,12 +180,12 @@ fn validate_selectors(
 }
 
 fn validate_network(spec: &PolicySpecV1, issues: &mut Vec<ValidationIssue>) {
-    if spec.network.scope != "internet" {
+    if spec.network.scope != "internet" && !netqmon_protocol::policy::is_client_total_spec(spec) {
         issue(
             issues,
             "network.scope",
             "unsupported_scope",
-            "V1 supports only the internet scope",
+            "use internet scope, or agent scope for client-only aggregate limits in both directions",
         );
     }
     if spec.network.direction != "both" {
@@ -479,6 +479,20 @@ mod tests {
             },
             schedule: None,
         }
+    }
+
+    #[test]
+    fn client_total_scope_requires_explicit_client_only_limit() {
+        let mut total = spec(ActionKind::Limit, vec!["AA:BB:CC:DD:EE:FF".to_owned()]);
+        total.selectors.applications.clear();
+        total.network.scope = netqmon_protocol::policy::POLICY_CLIENT_TOTAL_SCOPE.to_owned();
+        assert!(normalize_and_validate(&mut total, None).is_empty());
+        total.selectors.applications.push("youtube".to_owned());
+        assert!(
+            normalize_and_validate(&mut total, None)
+                .iter()
+                .any(|issue| issue.path == "network.scope" && issue.code == "unsupported_scope")
+        );
     }
 
     #[test]

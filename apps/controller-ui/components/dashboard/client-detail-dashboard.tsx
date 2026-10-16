@@ -642,7 +642,6 @@ export function ClientDetailDashboard({
           : t("detail.fallbackSubtitle")
       }
       username={username}
-      isLive={streamConnected}
       headerActions={
         <Link
           href="/clients"

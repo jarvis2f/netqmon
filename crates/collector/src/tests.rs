@@ -18,7 +18,51 @@ use super::*;
 const ENROLLMENT_TOKEN: &str = "test-enrollment-token";
 
 #[test]
-fn idle_without_new_evidence_keeps_a_flow_verdict_but_end_revokes_it() {
+fn ambiguous_high_confidence_application_signatures_fall_back_to_default() {
+    use crate::dpi::SignatureApplicationMatch;
+
+    let signatures = vec![
+        SignatureApplicationMatch {
+            application_id: "netqmon_qos_test".to_owned(),
+            confidence: 0.99,
+        },
+        SignatureApplicationMatch {
+            application_id: "netqmon_qos_ambiguous".to_owned(),
+            confidence: 0.99,
+        },
+    ];
+    assert_eq!(
+        ambiguous_signature_application_ids(&signatures),
+        ["netqmon_qos_ambiguous", "netqmon_qos_test"]
+    );
+
+    let same_application = vec![
+        SignatureApplicationMatch {
+            application_id: "netqmon_qos_test".to_owned(),
+            confidence: 0.99,
+        },
+        SignatureApplicationMatch {
+            application_id: "netqmon_qos_test".to_owned(),
+            confidence: 0.95,
+        },
+    ];
+    assert!(ambiguous_signature_application_ids(&same_application).is_empty());
+
+    let low_confidence_collision = vec![
+        SignatureApplicationMatch {
+            application_id: "netqmon_qos_test".to_owned(),
+            confidence: 0.99,
+        },
+        SignatureApplicationMatch {
+            application_id: "weak_candidate".to_owned(),
+            confidence: 0.79,
+        },
+    ];
+    assert!(ambiguous_signature_application_ids(&low_confidence_collision).is_empty());
+}
+
+#[test]
+fn lifecycle_without_new_evidence_keeps_a_flow_verdict_but_end_revokes_it() {
     let service = policy::PolicyService::open_in_memory().unwrap();
     let hub = PolicyHub::new();
     let bundle = hub.refresh_gateway(&service, "gw-test", false).unwrap();
@@ -55,8 +99,11 @@ fn idle_without_new_evidence_keeps_a_flow_verdict_but_end_revokes_it() {
         }],
         ..Default::default()
     };
-    queue_policy_flow_decisions(&hub, &batch, &[FlowAttribution::default()]);
-    assert!(hub.take_flow_command(&session, 0).is_none());
+    for lifecycle in [FlowLifecycle::Active, FlowLifecycle::Idle] {
+        batch.flows[0].lifecycle = lifecycle as i32;
+        queue_policy_flow_decisions(&hub, &batch, &[FlowAttribution::default()]);
+        assert!(hub.take_flow_command(&session, 0).is_none());
+    }
     batch.flows[0].lifecycle = FlowLifecycle::Ended as i32;
     queue_policy_flow_decisions(&hub, &batch, &[FlowAttribution::default()]);
     assert!(matches!(
@@ -66,6 +113,104 @@ fn idle_without_new_evidence_keeps_a_flow_verdict_but_end_revokes_it() {
             ..
         })
     ));
+}
+
+#[test]
+fn late_dpi_recovers_exact_client_context_and_queues_block() {
+    let state = test_state_with_repository_rules();
+    let gateway = "gw-late";
+    let mac = vec![2, 0, 0, 0, 1, 35];
+    let spec = serde_json::from_value(serde_json::json!({
+        "schema_version": 1, "gateway_id": gateway, "name": "Block YouTube", "description": "", "enabled": true, "priority": 500,
+        "selectors": {"clients": ["02:00:00:00:01:23"], "applications": ["youtube"], "categories": [], "min_application_confidence": 0.85},
+        "network": {"scope": "internet", "direction": "both"},
+        "action": {"type": "block", "download_bps": null, "upload_bps": null}, "schedule": null
+    })).unwrap();
+    state.policy_service.create(&spec, "admin", 0).unwrap();
+    let bundle = state
+        .policy_hub
+        .refresh_gateway(&state.policy_service, gateway, false)
+        .unwrap();
+    let session = state.policy_hub.register(gateway).unwrap();
+    state.policy_hub.record_flow_capabilities(
+        gateway,
+        bundle.frame.snapshot_identity().unwrap().2,
+        &netqmon_protocol::policy::PolicyCapabilities {
+            application_block: netqmon_protocol::policy::PolicyCapability::Degraded,
+            ..netqmon_protocol::policy::PolicyCapabilities::unsupported()
+        },
+    );
+    let flow = FlowDelta {
+        ip_version: 4,
+        protocol: 6,
+        client_ip: vec![192, 0, 2, 1],
+        client_port: 50_000,
+        remote_ip: vec![198, 51, 100, 1],
+        remote_port: 443,
+        client_mac: mac,
+        scope: FlowScope::Internet as i32,
+        lifecycle: FlowLifecycle::Active as i32,
+        direction: Direction::Upload as i32,
+        packets: 3,
+        upload_bytes: 500,
+        first_seen_unix_ms: 1_000,
+        last_seen_unix_ms: 1_100,
+        policy_flow_id: "00000000000000000000000000000001".into(),
+        ..Default::default()
+    };
+    let batch = TelemetryBatch {
+        gateway_id: gateway.into(),
+        boot_id: "boot-late".into(),
+        flows: vec![flow.clone()],
+        ..Default::default()
+    };
+    state
+        .lock()
+        .policy_flow_contexts
+        .observe(&batch, std::time::Instant::now());
+    let mut sample = dpi::CachedResult::for_test(
+        gateway.into(),
+        batch.boot_id.clone(),
+        netqmon_protocol::v1::FlowSampleKey {
+            ip_version: 4,
+            protocol: 6,
+            client_ip: flow.client_ip.clone(),
+            client_port: flow.client_port,
+            remote_ip: flow.remote_ip.clone(),
+            remote_port: flow.remote_port,
+            first_seen_unix_ms: 1_000,
+        },
+        1_100,
+        Some(dpi::engine::DpiResult {
+            protocol: "tls".into(),
+            confidence: 1.0,
+            source: "ndpi".into(),
+            metadata: std::collections::BTreeMap::from([(
+                "hostname".into(),
+                "www.youtube.com".into(),
+            )]),
+        }),
+    );
+    sample.policy_flow_ids.push(flow.policy_flow_id.clone());
+    let decisions = apply_sample_result(&mut state.lock(), &sample).unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].1.application_id, "youtube");
+    queue_policy_flow_decisions(
+        &state.policy_hub,
+        &decisions[0].0,
+        std::slice::from_ref(&decisions[0].1),
+    );
+    assert!(
+        matches!(state.policy_hub.take_flow_command(&session, 1), Some(PolicyWireFrame::FlowCommand {
+        operation: FlowCommandOperation::Upsert, verdict: Some(FlowVerdict::Block), policy_flow_id, ..
+    }) if policy_flow_id == flow.policy_flow_id)
+    );
+    sample.boot = "another-boot".into();
+    assert!(
+        apply_sample_result(&mut state.lock(), &sample)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 fn strong_self_host_attribution(application_id: &str) -> FlowAttribution {

@@ -313,6 +313,20 @@ fn process_snapshot_with(
         );
     }
 
+    if matches!(snapshot, PolicyWireFrame::PolicySnapshot { policies, .. }
+        if policies.iter().any(|policy| policy.spec.enabled
+            && netqmon_protocol::policy::is_client_total_spec(&policy.spec)))
+    {
+        return failure_ack(
+            snapshot,
+            boot_id,
+            &topology.capabilities,
+            "priority_backend_required",
+            "client totals require the verified priority backend; the previous policy remains active",
+            PolicyAckStatus::Failed,
+        );
+    }
+
     let old = match state::load(&config.policy_state_path, gateway_id) {
         Ok(old) => old,
         Err(error) => {
@@ -958,8 +972,9 @@ pub(crate) fn status_json(config: &AgentConfig) -> serde_json::Value {
         "client_limit_reason": topology.client_limit_reason,
         "one_arm_return_path_verified": config.policy_one_arm_return_path_verified,
         "interface_capacities": topology.lan_interfaces.iter().chain(topology.wan_interfaces.iter()).collect::<std::collections::BTreeSet<_>>().into_iter().map(|interface| {
-            let capacity = qdisc::effective_capacity_bps(interface, config.policy_interface_capacity_bps.get(interface).copied()).ok();
-            serde_json::json!({"interface": interface, "capacity_bps": capacity.map(|(bps, _)| bps), "source": capacity.map(|(_, source)| source)})
+            let capacity = super::capacity::effective(interface, config.policy_interface_capacity_bps.get(interface).copied());
+            let measured = capacity.as_ref().ok();
+            serde_json::json!({"interface": interface, "capacity_bps": measured.map(|capacity| capacity.bps), "source": measured.map(|capacity| capacity.source), "link_interfaces": measured.map(|capacity| &capacity.link_interfaces), "reason": capacity.as_ref().err()})
         }).collect::<Vec<_>>(),
         "shaping_interfaces": state.as_ref().and_then(|state| state.shaping_state.as_ref()).map(|shaping| {
             shaping.interfaces()
@@ -2085,6 +2100,44 @@ fn policy_ack(
     }
 }
 
+pub(crate) fn priority_policy_ack(
+    snapshot: &PolicyWireFrame,
+    boot_id: &str,
+    capabilities: PolicyCapabilities,
+    status: PolicyAckStatus,
+    results: Vec<PolicyResult>,
+) -> PolicyWireFrame {
+    policy_ack(snapshot, boot_id, capabilities, status, results)
+}
+
+pub(crate) fn priority_failure_ack(
+    snapshot: &PolicyWireFrame,
+    boot_id: &str,
+    message: &str,
+) -> PolicyWireFrame {
+    policy_ack(
+        snapshot,
+        boot_id,
+        PolicyCapabilities {
+            client_block: PolicyCapability::Unsupported,
+            client_limit: PolicyCapability::Unsupported,
+            application_block: PolicyCapability::Unsupported,
+            application_limit: PolicyCapability::Unsupported,
+        },
+        PolicyAckStatus::Failed,
+        snapshot_results(
+            snapshot,
+            PolicyResultStatus::Failed,
+            Some((
+                message
+                    .split_once(": ")
+                    .map_or("priority_backend_failed", |(code, _)| code),
+                message,
+            )),
+        ),
+    )
+}
+
 fn failure_ack(
     snapshot: &PolicyWireFrame,
     boot_id: &str,
@@ -2146,6 +2199,9 @@ fn now_ms() -> Option<i64> {
 
 fn topology_fingerprint(topology: &PolicyTopology) -> String {
     let bytes = serde_json::to_vec(&(
+        // Force reconciliation after upgrades that change the owned rules,
+        // even when the saved snapshot and network topology are unchanged.
+        super::nft::RULESET_VERSION,
         &topology.lan_interfaces,
         &topology.wan_interfaces,
         &topology.internal_networks,
@@ -2348,6 +2404,48 @@ mod tests {
             internal_networks: vec!["192.168.1.0/24".to_owned(), "fd00::/64".to_owned()],
             neighbor_bindings,
             ipv6_coverage,
+        }
+    }
+
+    #[test]
+    fn multigig_application_only_plan_uses_detected_capacity_for_implicit_parents() {
+        let mac = "aa:bb:cc:dd:ee:ff".to_owned();
+        for capacity in [2_500_000_000, 10_000_000_000] {
+            for one_arm in [false, true] {
+                let mut topology = topology(Vec::new(), true);
+                topology.lan_capacity_bps = Some(capacity);
+                topology.wan_capacity_bps = Some(capacity);
+                if one_arm {
+                    topology.wan_interfaces = topology.lan_interfaces.clone();
+                    topology.wan_ifindex = topology.lan_ifindex;
+                }
+                let applications = BTreeMap::from([(
+                    ("app".to_owned(), mac.clone()),
+                    ClientRates {
+                        upload_bps: Some(1_000_000),
+                        download_bps: Some(1_000_000),
+                    },
+                )]);
+                let state =
+                    build_shaping_state("gw", &topology, &BTreeMap::new(), &applications, None)
+                        .unwrap();
+                state.validate().unwrap();
+                for interface in state.interfaces() {
+                    assert_eq!(interface.capacity_bps, capacity);
+                    assert!(
+                        interface
+                            .clients
+                            .iter()
+                            .all(|client| client.rate_bps == capacity && !client.has_total_budget)
+                    );
+                    assert!(
+                        interface
+                            .application_classes
+                            .iter()
+                            .all(|application| application.rate_bps == 1_000_000)
+                    );
+                }
+            }
         }
     }
 
@@ -2820,6 +2918,43 @@ mod tests {
         assert_eq!(
             runner.replace_calls, 1,
             "the installed snapshot should be reused"
+        );
+    }
+
+    #[test]
+    fn upgrade_replaces_legacy_forward_only_rules_for_the_same_snapshot() {
+        let (_directory, config, topology) = executor_context();
+        let frame = snapshot(1);
+        let mut runner = FakeNftRunner::default();
+        process_with_fake(&config, &topology, &mut runner, &frame);
+        let mut saved = state::load(&config.policy_state_path, "gw-test")
+            .unwrap()
+            .unwrap();
+        let legacy = serde_json::to_vec(&(
+            &topology.lan_interfaces,
+            &topology.wan_interfaces,
+            &topology.internal_networks,
+            topology.ipv6_coverage,
+        ))
+        .unwrap();
+        saved.topology_fingerprint = Sha256::digest(legacy)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        state::persist(&config.policy_state_path, &saved).unwrap();
+
+        assert_eq!(
+            ack_status(&process_with_fake(&config, &topology, &mut runner, &frame)),
+            PolicyAckStatus::Applied
+        );
+        assert_eq!(
+            runner.replace_calls, 2,
+            "an upgrade must replace the old forward-only table"
+        );
+        process_with_fake(&config, &topology, &mut runner, &frame);
+        assert_eq!(
+            runner.replace_calls, 2,
+            "the upgraded table remains idempotent"
         );
     }
 
@@ -3428,6 +3563,67 @@ exec "$NETQMON_TC_REAL" "$@"
         assert_eq!(
             state::load(&config.policy_state_path, "gw-test").unwrap(),
             Some(old_state)
+        );
+    }
+
+    #[test]
+    fn client_total_scope_cannot_overwrite_legacy_state_or_remove_working_rules() {
+        let (_directory, config, topology) = executor_context();
+        let mut runner = FakeNftRunner::default();
+        assert_eq!(
+            ack_status(&process_with_fake(
+                &config,
+                &topology,
+                &mut runner,
+                &snapshot(1)
+            )),
+            PolicyAckStatus::Applied
+        );
+        let before = std::fs::read(&config.policy_state_path).unwrap();
+        let installed = runner.installed.clone();
+        let replace_calls = runner.replace_calls;
+        let clear_calls = runner.clear_calls;
+        let journal_path = config
+            .policy_state_path
+            .with_extension("shaping-journal.json");
+        std::fs::write(&journal_path, b"untouched legacy recovery journal").unwrap();
+        let PolicyWireFrame::PolicySnapshot {
+            gateway_id,
+            controller_epoch,
+            config_revision,
+            bundle_generation,
+            generated_at_ms,
+            valid_until_ms,
+            mut policies,
+            schedule_intervals,
+            ..
+        } = limit_snapshot(2)
+        else {
+            unreachable!()
+        };
+        policies[0].spec.network.scope =
+            netqmon_protocol::policy::POLICY_CLIENT_TOTAL_SCOPE.to_owned();
+        let total = PolicyWireFrame::snapshot(
+            gateway_id,
+            controller_epoch,
+            config_revision,
+            bundle_generation,
+            generated_at_ms,
+            valid_until_ms,
+            policies,
+            schedule_intervals,
+        )
+        .unwrap();
+        let ack = process_with_fake(&config, &topology, &mut runner, &total);
+        assert_eq!(ack_status(&ack), PolicyAckStatus::Failed);
+        assert_eq!(failure_code(&ack), Some("priority_backend_required"));
+        assert_eq!(runner.replace_calls, replace_calls);
+        assert_eq!(runner.clear_calls, clear_calls);
+        assert_eq!(runner.installed, installed);
+        assert_eq!(std::fs::read(&config.policy_state_path).unwrap(), before);
+        assert_eq!(
+            std::fs::read(journal_path).unwrap(),
+            b"untouched legacy recovery journal"
         );
     }
 

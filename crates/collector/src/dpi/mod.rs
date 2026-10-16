@@ -436,6 +436,94 @@ impl Stats {
         }
     }
 
+    fn combined_result(
+        &self,
+        identity: &FlowIdentity,
+        first_seen_ms: u64,
+        last_seen_ms: u64,
+        now: Instant,
+    ) -> Option<CachedResult> {
+        let candidates = self
+            .results_by_identity
+            .get(identity)?
+            .iter()
+            .filter_map(|id| self.results.get(id))
+            .filter(|r| {
+                r.expires > now
+                    && r.key.first_seen_unix_ms <= last_seen_ms.saturating_add(1)
+                    && r.last_packet_ms.saturating_add(1) >= first_seen_ms
+            })
+            .collect::<Vec<_>>();
+        let latest = candidates
+            .iter()
+            .copied()
+            .max_by_key(|r| r.key.first_seen_unix_ms)?;
+        // NAT observation points can give the two directions separate sample
+        // lifetimes. Combine overlapping evidence, but never a disjoint reuse
+        // of the same five tuple. A ServerHello without SNI must not erase the
+        // hostname already extracted from the ClientHello.
+        let overlapping = candidates
+            .into_iter()
+            .filter(|r| {
+                r.key.first_seen_unix_ms <= latest.last_packet_ms.saturating_add(1)
+                    && r.last_packet_ms.saturating_add(1) >= latest.key.first_seen_unix_ms
+            })
+            .collect::<Vec<_>>();
+        let mut combined = latest.clone();
+        combined.result = overlapping
+            .iter()
+            .copied()
+            .filter(|r| r.result.is_some())
+            .max_by_key(|r| {
+                (
+                    r.result.as_ref().is_some_and(|result| {
+                        result
+                            .metadata
+                            .get("hostname")
+                            .is_some_and(|host| !host.is_empty())
+                    }),
+                    r.key.first_seen_unix_ms,
+                )
+            })
+            .and_then(|r| r.result.clone());
+        combined.signatures.clear();
+        let mut policy_ids = BTreeSet::new();
+        for result in overlapping {
+            combined.expires = combined.expires.min(result.expires);
+            policy_ids.extend(result.policy_flow_ids.iter().cloned());
+            for signature in &result.signatures {
+                if let Some(existing) = combined
+                    .signatures
+                    .iter_mut()
+                    .find(|s| s.application_id == signature.application_id)
+                {
+                    existing.confidence = existing.confidence.max(signature.confidence);
+                } else {
+                    combined.signatures.push(signature.clone());
+                }
+            }
+        }
+        combined.policy_flow_ids = policy_ids
+            .into_iter()
+            .take(MAX_POLICY_FLOW_IDENTITIES_PER_SAMPLE)
+            .collect();
+        Some(combined)
+    }
+
+    fn completion_result(&self, cached: &CachedResult, now: Instant) -> Option<CachedResult> {
+        let mut combined = self.combined_result(
+            &FlowIdentity::from_sample(&cached.gateway, &cached.boot, &cached.key),
+            cached.key.first_seen_unix_ms,
+            cached.last_packet_ms,
+            now,
+        )?;
+        // Preserve the identity/interval of the completion event even when its
+        // classification includes evidence from another observation point.
+        combined.key.clone_from(&cached.key);
+        combined.last_packet_ms = cached.last_packet_ms;
+        Some(combined)
+    }
+
     fn bucket(&mut self) -> &mut MinuteStats {
         let now = Instant::now();
         while self
@@ -523,11 +611,16 @@ fn finish_flows<F: Fn(CachedResult)>(
             policy_flow_ids: entry.policy_flow_ids.iter().cloned().collect(),
             expires: now + CACHE_TTL,
         };
-        stats
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert_result(id.clone(), cached.clone(), now);
-        completed(cached);
+        let combined = {
+            let mut stats = stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            stats.insert_result(id.clone(), cached.clone(), now);
+            stats.completion_result(&cached, now)
+        };
+        if let Some(combined) = combined {
+            completed(combined);
+        }
     }
 }
 
@@ -869,8 +962,11 @@ impl SamplingService {
                                 expires: entry.expires,
                             };
                             stats.insert_result(id.clone(), cached.clone(), now);
+                            let combined = stats.completion_result(&cached, now);
                             drop(stats);
-                            completed(cached);
+                            if let Some(combined) = combined {
+                                completed(combined);
+                            }
                         }
                     }
                 }
@@ -913,20 +1009,15 @@ impl SamplingService {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let identity = FlowIdentity::from_delta(gateway, boot, flow);
         stats
-            .results_by_identity
-            .get(&identity)
-            .into_iter()
-            .flatten()
-            .filter_map(|id| stats.results.get(id))
-            .filter(|r| {
-                r.expires > Instant::now()
-                    && r.key.first_seen_unix_ms <= flow.last_seen_unix_ms.saturating_add(1)
-                    && r.last_packet_ms.saturating_add(1) >= flow.first_seen_unix_ms
-            })
-            .max_by_key(|r| r.key.first_seen_unix_ms)
+            .combined_result(
+                &identity,
+                flow.first_seen_unix_ms,
+                flow.last_seen_unix_ms,
+                Instant::now(),
+            )
             .map(|r| SampleAnalysis {
-                dpi: r.result.clone(),
-                signatures: r.signatures.clone(),
+                dpi: r.result,
+                signatures: r.signatures,
             })
     }
     pub fn observe_telemetry(&self, batch: &TelemetryBatch) {

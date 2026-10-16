@@ -1102,6 +1102,11 @@ function handlePolicies(request, response, path, params, state) {
     );
     return true;
   }
+  if (path === "policies/republish" && request.method === "POST") {
+    state.policyRevision = revision() + 1;
+    json(response, 200, envelope({ desired_revision: revision() }));
+    return true;
+  }
   if (path === "policies/deployment" && request.method === "GET") {
     json(
       response,

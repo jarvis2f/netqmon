@@ -38,13 +38,21 @@ use crate::normalization::{NormalizedFlow, normalize_with_resolution};
 use crate::policy::flow_alias::{FlowAliasError, PolicyFlowAliasCache};
 use crate::sample;
 use crate::telemetry;
-use crate::topology::{TopologyContext, TopologyMode};
+use crate::topology::TopologyContext;
 use crate::transport::{self, SampleQueue, TelemetryQueue};
 
 mod capabilities;
 mod map_options;
 pub(crate) mod neighbor;
 pub(crate) mod network;
+#[cfg(feature = "qos-client-path-probe")]
+mod qos_path_probe;
+#[cfg(feature = "qos-compatibility-poc")]
+mod qos_poc;
+#[cfg(feature = "qos-client-priority")]
+mod qos_priority_maps;
+#[cfg(feature = "qos-client-priority")]
+pub(crate) mod qos_priority_runtime;
 mod tc;
 
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -174,6 +182,8 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
         .map_err(|error| AgentError::Runtime(error.to_string()))?;
     let session_boot_id = session_boot_id();
     let flow_policy_boot_id = session_boot_id.clone();
+    // Track exact Flow IDs as soon as the BPF path is ready so the Collector can
+    // identify applications before it has an application policy to enforce.
     let policy_flows_enabled = Arc::new(AtomicBool::new(false));
     let flow_commands_enabled = Arc::new(AtomicBool::new(false));
     let flow_alias_cache = Arc::new(Mutex::new(PolicyFlowAliasCache::default()));
@@ -203,11 +213,8 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
         .iter()
         .any(|candidate| candidate.name == interface && candidate.is_bridge);
     let (attach_ingress, attach_egress) = observation_hooks();
-    let mut observation_interfaces = resolve_observation_interfaces(
-        &configured_interfaces,
-        network.snapshot.mode,
-        capture_is_bridge,
-    )?;
+    let mut observation_interfaces =
+        resolve_observation_interfaces(&configured_interfaces, capture_is_bridge)?;
     let observed_ingress_ifindices =
         compute_observed_ingress_ifindices(&config.interfaces, &observation_interfaces);
     let builder = FlowSkelBuilder::default();
@@ -242,6 +249,63 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
     let skeleton = open_skeleton
         .load()
         .map_err(|error| classify_bpf_error(BpfStage::Load, error))?;
+    #[cfg(feature = "qos-client-priority")]
+    let priority_maps = Arc::new(Mutex::new(
+        (|| -> anyhow::Result<_> {
+            qos_priority_maps::PriorityMaps::new(
+                MapHandle::try_from(&skeleton.maps.qos_clients_active)?,
+                MapHandle::try_from(&skeleton.maps.qos_clients_empty)?,
+                MapHandle::try_from(&skeleton.maps.qos_priority_ifb)?,
+                MapHandle::try_from(&skeleton.maps.qos_priority_ingress_ports)?,
+                MapHandle::try_from(&skeleton.maps.qos_priority_roots)?,
+                MapHandle::try_from(&skeleton.maps.qos_priority_counters)?,
+                MapHandle::try_from(&skeleton.maps.qos_internal_v4)?,
+                MapHandle::try_from(&skeleton.maps.qos_internal_v6)?,
+            )
+        })()
+        .map_err(|error| AgentError::Runtime(format!("QoS priority map gate: {error:#}")))?,
+    ));
+    #[cfg(feature = "qos-client-priority")]
+    let qos_priority_runtime = crate::linux::qos_priority_runtime::PriorityRuntime::prepare(
+        &config,
+        &observation_interfaces,
+        Arc::clone(&priority_maps),
+    )
+    .map_err(|error| AgentError::Runtime(format!("QoS priority runtime gate: {error:#}")))?
+    .map(|runtime| Arc::new(Mutex::new(runtime)));
+    #[cfg(feature = "qos-client-priority")]
+    eprintln!("QoS priority BPF maps verified");
+    #[cfg(feature = "qos-client-path-probe")]
+    let mut qos_path_probe = (|| -> anyhow::Result<_> {
+        qos_path_probe::prepare(
+            &config,
+            &observation_interfaces,
+            MapHandle::try_from(&skeleton.maps.qos_path_control)?,
+            MapHandle::try_from(&skeleton.maps.qos_path_frames)?,
+            MapHandle::try_from(&skeleton.maps.qos_path_overflow)?,
+        )
+    })()
+    .map_err(|error| AgentError::Runtime(format!("QoS client path probe: {error:#}")))?;
+    #[cfg(feature = "qos-client-priority")]
+    if let Some(probe) = &qos_path_probe {
+        priority_maps
+            .lock()
+            .map_err(|_| AgentError::Runtime("QoS priority map lock poisoned".to_owned()))?
+            .verify_idle_publication()
+            .and_then(|evidence| probe.record_idle_priority_maps(&evidence))
+            .map_err(|error| AgentError::Runtime(format!("QoS idle map publication: {error:#}")))?;
+    }
+    #[cfg(feature = "qos-compatibility-poc")]
+    let mut qos_poc = (|| -> anyhow::Result<_> {
+        qos_poc::prepare(
+            &config,
+            &observation_interfaces,
+            MapHandle::try_from(&skeleton.maps.qos_poc_config_map)?,
+            MapHandle::try_from(&skeleton.maps.qos_poc_observations)?,
+            MapHandle::try_from(&skeleton.maps.observed_ifindexes)?,
+        )
+    })()
+    .map_err(|error| AgentError::Runtime(format!("QoS compatibility gate: {error:#}")))?;
     for target_ifindex in &observed_ingress_ifindices {
         let key = u32::try_from(*target_ifindex)
             .map_err(|_| AgentError::Runtime("interface index overflow".to_owned()))?
@@ -308,6 +372,48 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
     };
     let mut hooks_attached = hooks.len() == observation_interfaces.len()
         && hooks.iter().all(tc::AttachLinks::covers_required_hooks);
+    #[cfg(feature = "qos-compatibility-poc")]
+    if let Some(poc) = &mut qos_poc {
+        poc.activate(
+            &skeleton.progs.netqmon_qos_poc_match,
+            &skeleton.progs.netqmon_qos_poc_ifb,
+            &skeleton.progs.netqmon_qos_poc_lan_egress,
+        )
+        .map_err(|error| AgentError::Runtime(format!("QoS compatibility gate: {error:#}")))?;
+    }
+    #[cfg(feature = "qos-client-priority")]
+    if let Some(runtime) = &qos_priority_runtime {
+        let activation = runtime
+            .lock()
+            .map_err(|_| AgentError::Runtime("QoS priority runtime lock poisoned".to_owned()))?
+            .activate(
+                &skeleton.progs.netqmon_qos_priority_match,
+                &skeleton.progs.netqmon_qos_priority_ifb,
+                &skeleton.maps.observed_ifindexes,
+            );
+        if let Err(error) = activation {
+            if let Ok(mut runtime) = runtime.lock() {
+                let _ = runtime.shutdown(&skeleton.maps.observed_ifindexes);
+            }
+            return Err(AgentError::Runtime(format!(
+                "QoS priority activation: {error:#}"
+            )));
+        }
+    }
+    #[cfg(feature = "qos-client-path-probe")]
+    if let Some(probe) = &mut qos_path_probe {
+        if let Err(error) = probe.activate(&skeleton.progs.netqmon_qos_path_egress) {
+            #[cfg(feature = "qos-client-priority")]
+            if let Some(runtime) = &qos_priority_runtime
+                && let Ok(mut runtime) = runtime.lock()
+            {
+                let _ = runtime.shutdown(&skeleton.maps.observed_ifindexes);
+            }
+            return Err(AgentError::Runtime(format!(
+                "QoS client path probe: {error:#}"
+            )));
+        }
+    }
     let policy_drop_map = match MapHandle::try_from(&skeleton.maps.policy_drop_counters) {
         Ok(map) => Some(map),
         Err(error) => {
@@ -361,6 +467,8 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
         flow_verdict_writer,
         Arc::clone(&flow_bpf_ready),
         Arc::clone(&shutdown),
+        #[cfg(feature = "qos-client-priority")]
+        qos_priority_runtime.clone(),
     );
     let observation_names = observation_interfaces
         .iter()
@@ -623,17 +731,19 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                 .join("bridge")
                 .exists();
             let refreshed_observation = refreshed_configured.and_then(|configured| {
-                resolve_observation_interfaces(
-                    &configured,
-                    network.snapshot.mode,
-                    refreshed_capture_is_bridge,
-                )
+                resolve_observation_interfaces(&configured, refreshed_capture_is_bridge)
             });
             match refreshed_observation {
                 Ok(refreshed_observation) => {
                     let refreshed_is_empty = refreshed_observation.is_empty();
                     let interfaces_changed = refreshed_observation != observation_interfaces;
                     if interfaces_changed || !hooks_attached {
+                        #[cfg(feature = "qos-client-path-probe")]
+                        if let Some(probe) = &mut qos_path_probe {
+                            probe
+                                .disable("observation interfaces or hooks changed")
+                                .map_err(|error| AgentError::Runtime(error.to_string()))?;
+                        }
                         flow_bpf_ready.store(false, Ordering::Release);
                         if interfaces_changed {
                             hooks.clear();
@@ -890,10 +1000,16 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
         if now >= next_neighbor_refresh {
             let refresh_started = Instant::now();
             if let Ok(mut devices) = devices.lock() {
-                for (_, target_ifindex) in &observation_interfaces {
+                // One-arm sampling runs on bridge members, while L3 ARP/NDP
+                // neighbors belong to the configured bridge master. Include
+                // both identities so real devices can be registered and used
+                // by Controller policies; member-only discovery is empty.
+                for target_ifindex in
+                    compute_observed_ingress_ifindices(&config.interfaces, &observation_interfaces)
+                {
                     refresh_neighbors(
                         &mut devices,
-                        u32::try_from(*target_ifindex).unwrap_or_default(),
+                        u32::try_from(target_ifindex).unwrap_or_default(),
                         log_level,
                     );
                 }
@@ -990,7 +1106,7 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                             log_debug(
                                 log_level,
                                 format_args!(
-                                    "flow delta ip={} protocol={} client={}:{} remote={}:{} direction={} packets={} bytes={} client_mac={}",
+                                    "flow delta ip={} protocol={} client={}:{} remote={}:{} direction={} packets={} bytes={} client_mac={} policy_flow_id={} raw_hook={} raw_ifindex={} first_seen_ns={} path_type={:?} conntrack_resolved={}",
                                     delta.key.ip_version,
                                     delta.key.protocol,
                                     flow.client_addr,
@@ -1000,7 +1116,13 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                                     flow.direction,
                                     delta.packets,
                                     delta.bytes,
-                                    client_mac
+                                    client_mac,
+                                    delta.policy_flow_id.as_deref().unwrap_or("unavailable"),
+                                    delta.key.hook,
+                                    delta.key.ifindex,
+                                    delta.counters.first_seen_ns,
+                                    flow.path_type,
+                                    conntrack_snapshot.resolve(&delta.key).is_some()
                                 ),
                             );
                             if !is_controller_transport(&flow, &controller_endpoints) {
@@ -1265,6 +1387,37 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
         thread::sleep(SHUTDOWN_POLL_INTERVAL.min(next_wakeup.saturating_duration_since(now)));
     }
 
+    // Join snapshot/reconciliation work before exporting final map state or
+    // detaching classification and deleting owned queues. A pending policy
+    // command must not recreate resources while the data path is torn down.
+    policy_receiver.stop();
+    #[cfg(feature = "qos-client-priority")]
+    let priority_shutdown_error = qos_priority_runtime.as_ref().and_then(|runtime| {
+        runtime
+            .lock()
+            .map_err(|_| "QoS priority runtime lock poisoned".to_owned())
+            .and_then(|mut runtime| {
+                runtime
+                    .shutdown(&skeleton.maps.observed_ifindexes)
+                    .map_err(|error| format!("{error:#}"))
+            })
+            .err()
+    });
+    #[cfg(feature = "qos-client-priority")]
+    if let Some(probe) = &qos_path_probe {
+        priority_maps
+            .lock()
+            .map_err(|_| AgentError::Runtime("QoS priority map lock poisoned".to_owned()))?
+            .idle_snapshot()
+            .and_then(|evidence| probe.record_final_priority_maps(&evidence))
+            .map_err(|error| {
+                AgentError::Runtime(format!("QoS idle map final evidence: {error:#}"))
+            })?;
+    }
+    #[cfg(feature = "qos-client-path-probe")]
+    drop(qos_path_probe);
+    #[cfg(feature = "qos-compatibility-poc")]
+    drop(qos_poc);
     for hook in &mut hooks {
         hook.detach()
             .map_err(|error| AgentError::Runtime(error.to_string()))?;
@@ -1277,11 +1430,16 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
         ),
     );
     drop(ring_buffer);
-    policy_receiver.stop();
     if let Ok(queue) = Arc::try_unwrap(sample_queue) {
         queue.stop();
     }
     telemetry_queue.stop();
+    #[cfg(feature = "qos-client-priority")]
+    if let Some(error) = priority_shutdown_error {
+        return Err(AgentError::Runtime(format!(
+            "QoS priority cleanup incomplete: {error}"
+        )));
+    }
     Ok(())
 }
 
@@ -1293,12 +1451,14 @@ fn observation_hooks() -> (bool, bool) {
 
 fn resolve_observation_interfaces(
     configured: &[(String, i32)],
-    mode: TopologyMode,
     capture_is_bridge: bool,
 ) -> Result<Vec<(String, i32)>, AgentError> {
-    if mode != TopologyMode::OneArmRouter || !capture_is_bridge {
+    if !capture_is_bridge {
         return Ok(configured.to_vec());
     }
+    // QoS queues and client MACs live on actual bridge ports, including on a
+    // routed LAN. Keep the bridge master in the observation set as well: a
+    // routed packet can acquire the bridge as skb_iif after member ingress.
     let primary = &configured[0].0;
     let directory = Path::new("/sys/class/net").join(primary).join("brif");
     let mut members = fs::read_dir(&directory)
@@ -1335,6 +1495,14 @@ fn compute_observed_ingress_ifindices(
         .map(|(_, ifindex)| *ifindex)
         .collect::<Vec<_>>();
     for interface in configured {
+        // A routed bridge packet can acquire the bridge's skb_iif after its
+        // member ingress was sampled. One-arm capture observes members, but
+        // must also recognize their configured bridge at the egress dedup
+        // guard; otherwise conntrack normalizes both observations to the
+        // same client Flow and doubles its bytes.
+        if let Ok(ifindex) = resolve_interface(interface) {
+            ifindices.push(ifindex);
+        }
         let directory = Path::new("/sys/class/net").join(interface).join("brif");
         let Ok(entries) = fs::read_dir(directory) else {
             continue;

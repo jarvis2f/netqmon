@@ -11,6 +11,7 @@ use super::capabilities::PolicyTopology;
 
 pub(super) const TABLE_NAME: &str = "netqmon_policy";
 const TABLE_MARKER: &str = "netqmon:managed-policy:v1";
+pub(super) const RULESET_VERSION: u8 = 2;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BLOCKED_ADDRESSES_PER_FAMILY: usize = 16_384;
 const MAX_NFT_SCRIPT_BYTES: usize = 2 * 1024 * 1024;
@@ -171,6 +172,24 @@ fn render(topology: &PolicyTopology, plan: &NftPlan, delete_previous: bool) -> S
         "ipv6_addr",
         plan.blocked_v6.iter().map(ToString::to_string),
     );
+    // Before conntrack/NAT and transparent-proxy mangle hooks: evaluate the
+    // client's original Internet destination, not the redirected local socket.
+    output.push_str(concat!(
+        "  chain prerouting_guard {\n    type filter hook prerouting priority -305; policy accept;\n",
+        "    iifname != @managed_lan return\n",
+        "    ip saddr != @blocked_clients_v4 return\n",
+        "    ip6 saddr != @blocked_clients_v6 return\n",
+        "    iifname @managed_lan fib daddr type local return comment \"netqmon preserves router services\"\n",
+        "    iifname @managed_lan ip daddr { 169.254.0.0/16, 224.0.0.0/4, 255.255.255.255 } return comment \"netqmon preserves IPv4 link traffic\"\n",
+        "    iifname @managed_lan ip6 daddr { fe80::/10, ff00::/8 } return comment \"netqmon preserves IPv6 link traffic\"\n",
+        "    iifname @managed_lan ip saddr @blocked_clients_v4 ip daddr != @internal_v4 counter drop comment \"netqmon pre-proxy client Internet block\"\n",
+    ));
+    if topology.ipv6_coverage {
+        output.push_str(
+            "    iifname @managed_lan ip6 saddr @blocked_clients_v6 ip6 daddr != @internal_v6 counter drop comment \"netqmon pre-proxy IPv6 client Internet block\"\n",
+        );
+    }
+    output.push_str("  }\n");
     output.push_str(
         "  chain forward_guard {\n    type filter hook forward priority -5; policy accept;\n",
     );
@@ -200,6 +219,25 @@ fn render(topology: &PolicyTopology, plan: &NftPlan, delete_previous: bool) -> S
         );
         output.push_str(
             "    iifname @wan_egress oifname @managed_lan ip6 daddr @blocked_clients_v6 ip6 saddr != @internal_v6 ip6 saddr != fe80::/10 counter drop comment \"netqmon inbound IPv6 client Internet block\"\n",
+        );
+    }
+    output.push_str("  }\n");
+    // REDIRECT replies originate locally and bypass forward. After reverse
+    // source NAT (priority 100), their original Internet source is visible
+    // again; preserve real router/LAN services while blocking proxy downloads.
+    output.push_str(concat!(
+        "  chain postrouting_guard {\n    type filter hook postrouting priority 110; policy accept;\n",
+        "    oifname != @managed_lan return\n",
+        "    ip daddr != @blocked_clients_v4 return\n",
+        "    ip6 daddr != @blocked_clients_v6 return\n",
+        "    oifname @managed_lan fib saddr type local return comment \"netqmon preserves router replies\"\n",
+        "    oifname @managed_lan ip saddr 169.254.0.0/16 return comment \"netqmon preserves IPv4 link replies\"\n",
+        "    oifname @managed_lan ip6 saddr fe80::/10 return comment \"netqmon preserves IPv6 link replies\"\n",
+        "    oifname @managed_lan ip daddr @blocked_clients_v4 ip saddr != @internal_v4 counter drop comment \"netqmon post-proxy client Internet block\"\n",
+    ));
+    if topology.ipv6_coverage {
+        output.push_str(
+            "    oifname @managed_lan ip6 daddr @blocked_clients_v6 ip6 saddr != @internal_v6 counter drop comment \"netqmon post-proxy IPv6 client Internet block\"\n",
         );
     }
     output.push_str("  }\n}\n");
@@ -402,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_table_uses_owned_forward_only_rules_and_atomic_replace() {
+    fn generated_table_guards_proxy_paths_and_preserves_local_services() {
         let script = render(
             &topology(),
             &NftPlan {
@@ -415,11 +453,33 @@ mod tests {
         assert!(script.starts_with("delete table inet netqmon_policy"));
         assert!(script.contains(TABLE_MARKER));
         assert!(script.contains("hook forward priority -5; policy accept"));
+        assert!(script.contains("hook prerouting priority -305; policy accept"));
+        assert!(script.contains("hook postrouting priority 110; policy accept"));
+        assert!(script.contains("fib daddr type local return"));
+        assert!(script.contains("fib saddr type local return"));
+        assert!(script.contains("ip6 daddr { fe80::/10, ff00::/8 } return"));
+        assert!(script.contains("255.255.255.255 } return"));
+        assert!(
+            script.contains("ip saddr @blocked_clients_v4 ip daddr != @internal_v4 counter drop")
+        );
+        assert!(
+            script.contains("ip daddr @blocked_clients_v4 ip saddr != @internal_v4 counter drop")
+        );
         assert!(script.contains("192.168.1.42"));
         assert!(script.contains("fd00::42"));
         assert!(script.contains("nd-neighbor-solicit"));
         assert!(!script.contains("flush ruleset"));
         assert!(!script.contains("hook input"));
+    }
+
+    #[test]
+    fn incomplete_ipv6_coverage_does_not_install_ipv6_proxy_blocks() {
+        let mut topology = topology();
+        topology.ipv6_coverage = false;
+        let script = render(&topology, &NftPlan::default(), false);
+        assert!(!script.contains("ip6 saddr @blocked_clients_v6"));
+        assert!(!script.contains("ip6 daddr @blocked_clients_v6"));
+        assert!(script.contains("ip6 daddr { fe80::/10, ff00::/8 } return"));
     }
 
     #[test]

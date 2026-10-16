@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "netqmon_bpf.h"
 
+#ifdef NETQMON_QOS_PATH_PROBE
+#include "netqmon_qos_path_probe.h"
+#endif
+#ifdef NETQMON_QOS_POC
+#include "netqmon_qos_poc.h"
+#endif
+#ifdef NETQMON_QOS_PRIORITY
+#include "netqmon_qos_priority.h"
+#endif
+
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
@@ -137,6 +147,26 @@ static __always_inline int apply_flow_policy(struct __sk_buff *skb,
         return TC_ACT_OK;
 
     if (verdict->verdict == NETQMON_VERDICT_SHAPE) {
+#ifdef NETQMON_QOS_PRIORITY
+        __u32 ifindex = skb->ifindex;
+        if (bpf_map_lookup_elem(&qos_priority_roots, &ifindex)) {
+            __u32 major = verdict->policy_tag >> 16;
+            __u32 minor = verdict->policy_tag & 0xffff;
+            if (((key->hook == NETQMON_HOOK_INGRESS &&
+                  major == NETQMON_QOS_UPLOAD_MAJOR) ||
+                 (key->hook == NETQMON_HOOK_EGRESS &&
+                  major == NETQMON_QOS_DOWNLOAD_MAJOR)) &&
+                minor >= NETQMON_QOS_APPLICATION_FIRST &&
+                minor <= NETQMON_QOS_APPLICATION_LAST)
+                skb->priority = verdict->policy_tag;
+        } else if (key->hook == NETQMON_HOOK_EGRESS &&
+                   verdict->policy_tag > 0 &&
+                   verdict->policy_tag <= NETQMON_APPLICATION_MARK_MAX_TAG) {
+            skb->mark = (skb->mark & ~NETQMON_APPLICATION_MARK_MASK) |
+                        ((verdict->policy_tag << NETQMON_APPLICATION_MARK_SHIFT) &
+                         NETQMON_APPLICATION_MARK_MASK);
+        }
+#else
         if (key->hook == NETQMON_HOOK_EGRESS &&
             verdict->policy_tag > 0 &&
             verdict->policy_tag <= NETQMON_APPLICATION_MARK_MAX_TAG) {
@@ -144,6 +174,7 @@ static __always_inline int apply_flow_policy(struct __sk_buff *skb,
                         ((verdict->policy_tag << NETQMON_APPLICATION_MARK_SHIFT) &
                          NETQMON_APPLICATION_MARK_MASK);
         }
+#endif
         return TC_ACT_OK;
     }
     if (verdict->verdict != NETQMON_VERDICT_BLOCK)
@@ -966,19 +997,65 @@ static __always_inline int parse_packet(struct __sk_buff *skb, void *data,
     return TC_ACT_OK;
 }
 
+#ifdef NETQMON_QOS_PRIORITY
+/* A global BPF subprogram is verified independently of all IPv4/IPv6 parser
+ * branches. Inlining this continuation multiplies those states through the
+ * map-in-map classifier and path observer, exceeding the verifier complexity
+ * bound on the supported 6.1 test kernel. Keep the ordering explicit: policy
+ * verdict first, priority only for accepted packets, then one observation. */
+__attribute__((noinline)) int qos_priority_finish_egress(struct __sk_buff *skb, int action)
+{
+    if (action == TC_ACT_OK) {
+#ifdef NETQMON_QOS_POC
+        qos_poc_egress(skb);
+#endif
+        action = qos_priority_egress(skb);
+    }
+    qos_path_observe(skb, NETQMON_HOOK_EGRESS);
+    return action;
+}
+#endif
+
 SEC("tc")
 int netqmon_ingress(struct __sk_buff *skb)
 {
+#ifdef NETQMON_QOS_PATH_PROBE
+    qos_path_observe(skb, NETQMON_HOOK_INGRESS);
+#endif
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
 
-    return parse_packet(skb, data, data_end, skb->ifindex, skb->len,
-                        NETQMON_HOOK_INGRESS, 0);
+    int action = parse_packet(skb, data, data_end, skb->ifindex, skb->len,
+                              NETQMON_HOOK_INGRESS, 0);
+#ifdef NETQMON_QOS_PRIORITY
+    if (action == TC_ACT_OK) {
+        int priority_action = qos_priority_ingress(skb);
+        if (priority_action != TC_ACT_OK)
+            return priority_action;
+    }
+#endif
+#ifdef NETQMON_QOS_POC
+    if (action == TC_ACT_OK)
+        return qos_poc_ingress(skb);
+#endif
+    return action;
 }
 
+#ifdef NETQMON_QOS_PRIORITY
+__attribute__((noinline))
+int netqmon_policy_account_egress(struct __sk_buff *skb)
+#else
 SEC("tc")
 int netqmon_egress(struct __sk_buff *skb)
+#endif
 {
+#if defined(NETQMON_QOS_POC) && !defined(NETQMON_QOS_PRIORITY)
+    /* Classification must run even if accounting is suppressed at this hook. */
+    qos_poc_egress(skb);
+#endif
+#if defined(NETQMON_QOS_PATH_PROBE) && !defined(NETQMON_QOS_PRIORITY)
+    qos_path_observe(skb, NETQMON_HOOK_EGRESS);
+#endif
     __u32 ingress_ifindex = skb->ingress_ifindex;
     int policy_only = 0;
 
@@ -987,17 +1064,28 @@ int netqmon_egress(struct __sk_buff *skb)
      * inspect the exact flow key when policy execution is active. */
     if (ingress_ifindex &&
         bpf_map_lookup_elem(&observed_ifindexes, &ingress_ifindex)) {
-        if (!flow_policy_state.enabled)
+        if (!flow_policy_state.enabled) {
             return TC_ACT_OK;
+        }
         policy_only = 1;
     }
 
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
 
-    return parse_packet(skb, data, data_end, skb->ifindex, skb->len,
-                        NETQMON_HOOK_EGRESS, policy_only);
+    int action = parse_packet(skb, data, data_end, skb->ifindex, skb->len,
+                              NETQMON_HOOK_EGRESS, policy_only);
+    return action;
 }
+
+#ifdef NETQMON_QOS_PRIORITY
+SEC("tc")
+int netqmon_egress(struct __sk_buff *skb)
+{
+    int action = netqmon_policy_account_egress(skb);
+    return qos_priority_finish_egress(skb, action);
+}
+#endif
 
 SEC("tc")
 int netqmon_attach_probe(struct __sk_buff *skb)

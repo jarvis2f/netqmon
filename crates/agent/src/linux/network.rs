@@ -14,10 +14,7 @@ use crate::topology::{
 
 pub(crate) fn discover(config: &AgentConfig) -> Result<TopologyContext, String> {
     let interfaces = discover_interfaces()?;
-    let mut routes = parse_ipv4_routes(&fs::read_to_string("/proc/net/route").unwrap_or_default());
-    routes.extend(parse_ipv6_routes(
-        &fs::read_to_string("/proc/net/ipv6_route").unwrap_or_default(),
-    ));
+    let routes = discover_routes();
     let local_addresses = interfaces
         .iter()
         .flat_map(|interface| interface.addresses.iter().map(|(address, _)| *address))
@@ -69,6 +66,14 @@ pub(crate) fn discover(config: &AgentConfig) -> Result<TopologyContext, String> 
     snapshot.segments = infer_segments(config, &snapshot)?;
     snapshot.finish_health();
     Ok(TopologyContext { snapshot })
+}
+
+pub(crate) fn discover_routes() -> Vec<RouteInfo> {
+    let mut routes = parse_ipv4_routes(&fs::read_to_string("/proc/net/route").unwrap_or_default());
+    routes.extend(parse_ipv6_routes(
+        &fs::read_to_string("/proc/net/ipv6_route").unwrap_or_default(),
+    ));
+    routes
 }
 
 fn discover_interfaces() -> Result<Vec<InterfaceInfo>, String> {

@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import type { PolicyRecord } from "../../lib/network-types";
 import { login, setCollectorScenario } from "./support/session";
 
 const gatewayId = "openwrt-dev";
@@ -29,6 +30,123 @@ async function createPolicy(page: Page, name: string) {
 test.describe("traffic policies", () => {
   test.beforeEach(async ({ request }) => {
     await setCollectorScenario(request, "live");
+  });
+
+  test("requires component confirmation for toggles, deletion and republishing", async ({
+    page,
+  }) => {
+    page.on("dialog", () => {
+      throw new Error("Unexpected browser-native dialog");
+    });
+    await openPolicies(page);
+    await createPolicy(page, "Confirmation policy");
+    const row = page.getByRole("row", { name: /Confirmation policy/ });
+    let mutations = 0;
+    page.on("request", (request) => {
+      if (
+        ["POST", "PATCH", "PUT", "DELETE"].includes(request.method()) &&
+        new URL(request.url()).pathname.startsWith("/api/policies")
+      )
+        mutations++;
+    });
+    await row.getByRole("button", { name: "Enable", exact: true }).click();
+    await page
+      .getByRole("dialog", { name: "Enable policy?" })
+      .getByRole("button", { name: "Cancel" })
+      .click();
+    expect(mutations).toBe(0);
+    await row.getByRole("button", { name: "Enable", exact: true }).click();
+    await page
+      .getByRole("dialog", { name: "Enable policy?" })
+      .getByRole("button", { name: "Enable", exact: true })
+      .click();
+    await expect(
+      row.getByRole("button", { name: "Disable", exact: true }),
+    ).toBeVisible();
+    expect(mutations).toBe(1);
+    await row.getByRole("button", { name: "Disable", exact: true }).click();
+    await page
+      .getByRole("dialog", { name: "Disable policy?" })
+      .getByRole("button", { name: "Cancel" })
+      .click();
+    expect(mutations).toBe(1);
+    await row.getByRole("button", { name: "Delete", exact: true }).click();
+    await page
+      .getByRole("dialog", { name: "Delete policy?" })
+      .getByRole("button", { name: "Cancel" })
+      .click();
+    expect(mutations).toBe(1);
+
+    const republish = page.getByRole("button", {
+      name: "Republish after restore",
+    });
+    await republish.click();
+    await page
+      .getByRole("dialog", { name: "Republish policies?" })
+      .getByRole("button", { name: "Cancel" })
+      .click();
+    expect(mutations).toBe(1);
+    await republish.click();
+    await page
+      .getByRole("dialog", { name: "Republish policies?" })
+      .getByRole("button", { name: "Republish", exact: true })
+      .click();
+    await expect(
+      page.getByText("A new desired revision was created and queued for push."),
+    ).toBeVisible();
+    expect(mutations).toBe(2);
+  });
+
+  test("keeps editor focus across background deployment refreshes", async ({
+    page,
+  }) => {
+    await openPolicies(page);
+    const trigger = page.getByRole("button", { name: "New policy" }).first();
+    await trigger.click();
+    const editor = page.getByRole("dialog");
+    const name = editor.getByLabel("Policy name");
+    await name.fill("Persistent draft");
+
+    const waitForRefresh = async () => {
+      await Promise.all([
+        page.waitForResponse("**/api/policies/deployment?*"),
+        // Keep the field idle through a full polling cycle and its render.
+        page.waitForTimeout(5_500),
+      ]);
+    };
+
+    await waitForRefresh();
+    await expect(name).toBeFocused();
+    await page.keyboard.type(" after refresh");
+    await expect(name).toHaveValue("Persistent draft after refresh");
+
+    await editor.getByRole("tab", { name: "Advanced YAML" }).click();
+    const yaml = editor.getByLabel("Advanced policy YAML editor");
+    await yaml.click();
+    await waitForRefresh();
+    await expect(yaml).toBeFocused();
+    await expect(yaml).toHaveValue(/Persistent draft after refresh/);
+
+    await page.keyboard.press("Escape");
+    await expect(editor).toHaveCount(0);
+    await expect(trigger).toBeFocused();
+  });
+
+  test("keeps preview input focus while typing", async ({ page }) => {
+    await openPolicies(page);
+    await page.getByRole("button", { name: "Preview decision" }).click();
+    const preview = page.getByRole("dialog");
+    for (const [label, value] of [
+      ["Client MAC", "AA:BB:CC:DD:EE:01"],
+      ["Application ID", "youtube"],
+      ["Category ID", "streaming"],
+    ]) {
+      const input = preview.getByLabel(label, { exact: true });
+      await input.clear();
+      await input.pressSequentially(value, { delay: 20 });
+      await expect(input).toHaveValue(value);
+      await expect(input).toBeFocused();
+    }
   });
 
   test("keeps unsafe YAML in advanced mode and localizes the standalone page", async ({
@@ -167,8 +285,11 @@ test.describe("traffic policies", () => {
     await expect(details.getByText("Change history")).toBeVisible();
     await details.getByRole("button", { name: "Close property panel" }).click();
 
-    page.once("dialog", (dialog) => dialog.accept());
     await page.getByRole("button", { name: "Enable", exact: true }).click();
+    await page
+      .getByRole("dialog", { name: "Enable policy?" })
+      .getByRole("button", { name: "Enable", exact: true })
+      .click();
     await expect(
       page
         .getByRole("row", { name: /Evening TV policy/ })
@@ -179,12 +300,34 @@ test.describe("traffic policies", () => {
     ).toBeVisible();
 
     await page.getByRole("button", { name: "Edit", exact: true }).click();
-    const editor = page.getByRole("dialog");
+    const editor = page.getByRole("dialog", { name: "Edit traffic policy" });
     await editor.getByLabel("Description").fill("Evening viewing only");
     await editor.getByRole("button", { name: "Validate" }).click();
     await expect(editor.getByText("Policy is valid")).toBeVisible();
-    page.once("dialog", (dialog) => dialog.accept());
     await editor.getByRole("button", { name: "Save Changes" }).click();
+    await page
+      .getByRole("dialog", { name: "Save policy changes?" })
+      .getByRole("button", { name: "Cancel" })
+      .click();
+    await expect(
+      page.getByRole("dialog", { name: "Save policy changes?" }),
+    ).toBeHidden();
+    await expect(editor.getByLabel("Description")).toHaveValue(
+      "Evening viewing only",
+    );
+    await expect(
+      editor.getByRole("button", { name: "Save Changes" }),
+    ).toBeFocused();
+    await editor.getByRole("button", { name: "Save Changes" }).click();
+    await page.keyboard.press("Escape");
+    await expect(editor.getByLabel("Description")).toHaveValue(
+      "Evening viewing only",
+    );
+    await editor.getByRole("button", { name: "Save Changes" }).click();
+    await page
+      .getByRole("dialog", { name: "Save policy changes?" })
+      .getByRole("button", { name: "Save Changes" })
+      .click();
     await expect(
       page.getByText("Policy changes saved and queued for Agent delivery."),
     ).toBeVisible();
@@ -272,8 +415,70 @@ test.describe("traffic policies", () => {
       overview.getByRole("group", { name: /Acknowledged: r6/ }),
     ).toBeVisible();
     await expect(
-      overview.getByRole("group", { name: /Applied: r5/ }),
+      overview.getByRole("group", { name: /Last fully applied: r5/ }),
     ).toBeVisible();
+  });
+
+  test("localizes policy reason tooltips and preserves unknown diagnostics", async ({
+    page,
+  }) => {
+    await openPolicies(page);
+    await createPolicy(page, "Localized policy");
+    let reasonCode = "one_arm_icmp_redirects_enabled";
+    let reasonMessage =
+      "One-arm forwarding is active and ICMP redirects are enabled";
+    await page.route("**/api/policies?*", async (route) => {
+      const response = await route.fetch();
+      const payload = await response.json();
+      payload.data.items = payload.data.items.map((record: PolicyRecord) => ({
+        ...record,
+        spec: { ...record.spec, enabled: true },
+        execution_status: "degraded",
+        execution_reason_code: reasonCode,
+        execution_message: reasonMessage,
+      }));
+      await route.fulfill({ response, body: JSON.stringify(payload) });
+    });
+    await page.route("**/api/policies/deployment?*", async (route) => {
+      const response = await route.fetch();
+      const payload = await response.json();
+      payload.data.last_error_code = "one_arm_redirects_unsafe";
+      payload.data.last_error_message =
+        "ICMP redirects must be confirmed disabled";
+      await route.fulfill({ response, body: JSON.stringify(payload) });
+    });
+    await page.getByRole("button", { name: "Refresh", exact: true }).click();
+
+    const row = page.getByRole("row", { name: /Localized policy/ });
+    await row.getByText("Degraded", { exact: true }).hover();
+    await expect(page.getByRole("tooltip")).toContainText(
+      "Clients may learn the upstream gateway and bypass this policy.",
+    );
+    await expect(page.getByRole("tooltip")).toContainText(reasonCode);
+
+    await page.getByRole("button", { name: "Switch language" }).first().click();
+    await page.getByRole("option", { name: "简体中文" }).click();
+    await expect(page.locator("html")).toHaveAttribute("lang", "zh-CN");
+    await row.getByText("已降级", { exact: true }).focus();
+    await expect(page.getByRole("tooltip")).toContainText(
+      "客户端可能学习到上游网关，从而绕过此策略。",
+    );
+    const deployment = page.getByRole("group", {
+      name: "下发状态",
+      exact: true,
+    });
+    await deployment.getByRole("status").hover();
+    await expect(
+      page.getByRole("tooltip").filter({ hasText: "one_arm_redirects_unsafe" }),
+    ).toContainText("必须确认 ICMP 重定向已关闭，才能执行单臂限速。");
+
+    reasonCode = "future_policy_reason";
+    reasonMessage = "Diagnostic from a newer Agent";
+    await page.getByRole("button", { name: "刷新", exact: true }).click();
+    await row.getByText("已降级", { exact: true }).hover();
+    await expect(
+      page.getByRole("tooltip").filter({ hasText: reasonCode }),
+    ).toContainText(reasonMessage);
   });
 
   test("rejects cross-origin policy mutations at the BFF", async ({ page }) => {
@@ -340,7 +545,7 @@ test.describe("traffic policies", () => {
     const revision = list.data.desired_revision;
     const localEditor = page.getByRole("button", { name: "Edit", exact: true });
     await localEditor.click();
-    const editor = page.getByRole("dialog");
+    const editor = page.getByRole("dialog", { name: "Edit traffic policy" });
     await editor.getByLabel("Description").fill("local unsaved draft");
     await editor.getByRole("button", { name: "Validate" }).click();
     await expect(editor.getByText("Policy is valid")).toBeVisible();
@@ -365,12 +570,31 @@ test.describe("traffic policies", () => {
       );
     expect(remoteUpdate.status()).toBe(200);
 
-    page.once("dialog", (dialog) => dialog.accept());
     await editor.getByRole("button", { name: "Save Changes" }).click();
+    await page
+      .getByRole("dialog", { name: "Save policy changes?" })
+      .getByRole("button", { name: "Save Changes" })
+      .click();
     await expect(editor.getByText("Concurrent edit detected")).toBeVisible();
     await expect(
       editor.getByRole("textbox", { name: "Description" }),
     ).toHaveValue("local unsaved draft");
     await expect(editor.getByText("saved by another editor")).toBeVisible();
+    await editor.getByRole("button", { name: "Reload server version" }).click();
+    await page
+      .getByRole("dialog", { name: "Replace local draft?" })
+      .getByRole("button", { name: "Cancel" })
+      .click();
+    await expect(editor.getByLabel("Description")).toHaveValue(
+      "local unsaved draft",
+    );
+    await editor.getByRole("button", { name: "Reload server version" }).click();
+    await page
+      .getByRole("dialog", { name: "Replace local draft?" })
+      .getByRole("button", { name: "Reload server version" })
+      .click();
+    await expect(editor.getByLabel("Description")).toHaveValue(
+      "saved by another editor",
+    );
   });
 });

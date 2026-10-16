@@ -123,9 +123,6 @@ export function OverviewDashboard({ username }: { username: string }) {
   const [gatewayStatus, setGatewayStatus] = useState<
     "online" | "offline" | "degraded" | "loading"
   >("loading");
-  const [streamStatus, setStreamStatus] = useState<
-    "live" | "delayed" | "loading"
-  >("loading");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [topApplications, setTopApplications] = useState<RankItem[]>([]);
@@ -409,7 +406,6 @@ export function OverviewDashboard({ username }: { username: string }) {
         if ((err as Error).name !== "AbortError" && mounted.current) {
           setError(t("loadError"));
           setGatewayStatus("offline");
-          setStreamStatus("delayed");
         }
       } finally {
         if (mounted.current) setLoading(false);
@@ -418,16 +414,8 @@ export function OverviewDashboard({ username }: { username: string }) {
 
     void loadOverview();
     const events = new EventSource("/api/realtime");
-    const streamTimeout = window.setTimeout(() => {
-      if (mounted.current) {
-        setStreamStatus((curr) => (curr === "loading" ? "delayed" : curr));
-      }
-    }, 8000);
-
     events.onopen = () => {
       if (!mounted.current) return;
-      window.clearTimeout(streamTimeout);
-      setStreamStatus("live");
       setError(null);
     };
     events.addEventListener("snapshot", (event) => {
@@ -442,7 +430,8 @@ export function OverviewDashboard({ username }: { username: string }) {
       if (!mounted.current) return;
       try {
         const status = (JSON.parse(event.data) as { status?: string }).status;
-        const nextStatus = status === "online" ? "online" : "degraded";
+        const nextStatus =
+          status === "online" || status === "offline" ? status : "degraded";
         setGatewayStatus(nextStatus);
         setGateway((current) =>
           current
@@ -456,15 +445,9 @@ export function OverviewDashboard({ username }: { username: string }) {
         setGatewayStatus("degraded");
       }
     });
-    events.onerror = () => {
-      if (!mounted.current) return;
-      setStreamStatus("delayed");
-    };
-
     return () => {
       mounted.current = false;
       controller.abort();
-      window.clearTimeout(streamTimeout);
       events.close();
     };
   }, [applySnapshot, categoryItems, locale, rankItems, t]);
@@ -507,18 +490,10 @@ export function OverviewDashboard({ username }: { username: string }) {
     uploadBps: point.upload_bytes_per_second * 8,
   }));
 
-  const isLiveState: boolean | "loading" =
-    streamStatus === "loading"
-      ? "loading"
-      : streamStatus === "live" && gatewayStatus === "online";
-
   return (
     <AppLayout
       title={tNav("overview")}
       subtitle={t("subtitle")}
-      gatewayStatus={gatewayStatus}
-      gatewayName={gateway?.name}
-      isLive={isLiveState}
       username={username}
       warningBanner={error}
     >

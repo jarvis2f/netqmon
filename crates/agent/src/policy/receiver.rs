@@ -16,6 +16,8 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{WebSocketStream, connect_async_with_config};
 
 use crate::config::AgentConfig;
+#[cfg(feature = "qos-client-priority")]
+use crate::linux::qos_priority_runtime::PriorityRuntime;
 use crate::transport::Credentials;
 
 use super::executor;
@@ -34,6 +36,64 @@ pub(crate) struct PolicyReceiver {
     worker: Option<JoinHandle<()>>,
 }
 
+fn restore_local(
+    config: &AgentConfig,
+    gateway_id: &str,
+    boot_id: &str,
+    flow_bpf_ready: bool,
+    #[cfg(feature = "qos-client-priority")] priority_runtime: Option<&Arc<Mutex<PriorityRuntime>>>,
+) -> Option<(String, PolicyWireFrame)> {
+    #[cfg(feature = "qos-client-priority")]
+    if let Some(priority_runtime) = priority_runtime {
+        let restored =
+            priority_runtime
+                .lock()
+                .ok()?
+                .restore_local(gateway_id, boot_id, flow_bpf_ready)?;
+        return Some((gateway_id.to_owned(), restored));
+    }
+    executor::restore_local(config, gateway_id, boot_id, flow_bpf_ready)
+}
+
+fn reconcile_saved(
+    config: &AgentConfig,
+    gateway_id: &str,
+    boot_id: &str,
+    flow_bpf_ready: bool,
+    #[cfg(feature = "qos-client-priority")] priority_runtime: Option<&Arc<Mutex<PriorityRuntime>>>,
+) -> Option<PolicyWireFrame> {
+    #[cfg(feature = "qos-client-priority")]
+    if let Some(priority_runtime) = priority_runtime {
+        return priority_runtime
+            .lock()
+            .ok()?
+            .reconcile_saved(gateway_id, boot_id, flow_bpf_ready);
+    }
+    executor::reconcile_saved_with_flow_capability(config, gateway_id, boot_id, flow_bpf_ready)
+}
+
+fn has_enabled_application_flow_policy(
+    config: &AgentConfig,
+    gateway_id: &str,
+    #[cfg(feature = "qos-client-priority")] priority_runtime: Option<&Arc<Mutex<PriorityRuntime>>>,
+) -> bool {
+    #[cfg(feature = "qos-client-priority")]
+    if let Some(priority_runtime) = priority_runtime {
+        return priority_runtime
+            .lock()
+            .is_ok_and(|runtime| runtime.has_enabled_application_flow_policy());
+    }
+
+    super::state::load(&config.policy_state_path, gateway_id)
+        .ok()
+        .flatten()
+        .is_some_and(|saved| super::snapshot_has_enabled_application_verdicts(&saved.snapshot))
+}
+
+fn flow_identity_tracking_enabled(flow_bpf_ready: bool, emergency_disabled: bool) -> bool {
+    flow_bpf_ready && !emergency_disabled
+}
+
 impl PolicyReceiver {
     pub(crate) fn spawn(
         config: AgentConfig,
@@ -45,6 +105,9 @@ impl PolicyReceiver {
         flow_verdict_writer: FlowVerdictWriter,
         flow_bpf_ready: Arc<AtomicBool>,
         shutdown: Arc<AtomicBool>,
+        #[cfg(feature = "qos-client-priority")] priority_runtime: Option<
+            Arc<Mutex<PriorityRuntime>>,
+        >,
     ) -> Self {
         let worker_shutdown = Arc::clone(&shutdown);
         let worker = thread::Builder::new()
@@ -70,6 +133,8 @@ impl PolicyReceiver {
                     flow_verdict_writer,
                     flow_bpf_ready,
                     worker_shutdown,
+                    #[cfg(feature = "qos-client-priority")]
+                    priority_runtime,
                 ));
             })
             .expect("policy receiver thread must start");
@@ -106,6 +171,7 @@ async fn run(
     mut flow_verdict_writer: FlowVerdictWriter,
     flow_bpf_ready: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
+    #[cfg(feature = "qos-client-priority")] priority_runtime: Option<Arc<Mutex<PriorityRuntime>>>,
 ) {
     tokio::spawn(reconcile_loop(
         config.clone(),
@@ -113,6 +179,8 @@ async fn run(
         credentials.clone(),
         Arc::clone(&flow_bpf_ready),
         Arc::clone(&shutdown),
+        #[cfg(feature = "qos-client-priority")]
+        priority_runtime.clone(),
     ));
 
     let url = match config.effective_policy_ws_url() {
@@ -145,6 +213,12 @@ async fn run(
         ) {
             tracing::warn!(%error, "could not clear application verdicts after emergency policy disable");
         }
+        #[cfg(feature = "qos-client-priority")]
+        if let Err(error) =
+            synchronize_priority_emergency_disable(&config, priority_runtime.as_ref())
+        {
+            tracing::warn!(%error, "could not bypass client budgets after emergency policy disable");
+        }
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
@@ -157,11 +231,13 @@ async fn run(
             continue;
         };
         if !startup_restore_checked {
-            if let Some((gateway_id, _)) = executor::restore_local(
+            if let Some((gateway_id, _)) = restore_local(
                 &config,
                 &credential.gateway_id,
                 &boot_id,
                 flow_bpf_ready.load(Ordering::Acquire),
+                #[cfg(feature = "qos-client-priority")]
+                priority_runtime.as_ref(),
             ) {
                 tracing::info!(gateway_id, "restored last persisted policy snapshot");
             }
@@ -181,6 +257,8 @@ async fn run(
             &mut applied_flow_snapshot,
             &emergency_disable_applied,
             &shutdown,
+            #[cfg(feature = "qos-client-priority")]
+            priority_runtime.clone(),
         )
         .await;
         match session {
@@ -211,6 +289,12 @@ async fn run(
                     ) {
                         tracing::warn!(%error, "could not clear application verdicts after emergency policy disable");
                     }
+                    #[cfg(feature = "qos-client-priority")]
+                    if let Err(error) =
+                        synchronize_priority_emergency_disable(&config, priority_runtime.as_ref())
+                    {
+                        tracing::warn!(%error, "could not bypass client budgets after emergency policy disable");
+                    }
                     if sleep_remaining <= sleep_for {
                         break 'retry_wait;
                     }
@@ -235,7 +319,17 @@ async fn connect_and_run(
     applied_flow_snapshot: &mut Option<(String, u64)>,
     emergency_disable_applied: &AtomicBool,
     shutdown: &AtomicBool,
+    #[cfg(feature = "qos-client-priority")] priority_runtime: Option<Arc<Mutex<PriorityRuntime>>>,
 ) -> Result<()> {
+    #[cfg(feature = "qos-client-priority")]
+    if priority_runtime.is_none() {
+        executor::invalidate_gateway_mismatch(config, &credentials.gateway_id)
+            .map_err(anyhow::Error::msg)
+            .context(
+                "local policy state belongs to another gateway and could not be safely quarantined",
+            )?;
+    }
+    #[cfg(not(feature = "qos-client-priority"))]
     executor::invalidate_gateway_mismatch(config, &credentials.gateway_id)
         .map_err(anyhow::Error::msg)
         .context(
@@ -290,11 +384,13 @@ async fn connect_and_run(
                 send_frame(&mut socket, &executor::health_frame_with_flow_capability(config, &credentials.gateway_id, boot_id, flow_bpf_ready.load(Ordering::Acquire))).await?;
             }
             _ = policy_tick.tick() => {
-                if let Some(acknowledgement) = executor::reconcile_saved_with_flow_capability(
+                if let Some(acknowledgement) = reconcile_saved(
                     config,
                     &credentials.gateway_id,
                     boot_id,
                     flow_bpf_ready.load(Ordering::Acquire),
+                    #[cfg(feature = "qos-client-priority")]
+                    priority_runtime.as_ref(),
                 ) {
                     if let PolicyWireFrame::PolicyAck {
                         status,
@@ -304,15 +400,12 @@ async fn connect_and_run(
                         ..
                     } = &acknowledgement
                     {
-                        let has_flow_policy = super::state::load(
-                            &config.policy_state_path,
+                        let has_flow_policy = has_enabled_application_flow_policy(
+                            config,
                             &credentials.gateway_id,
-                        )
-                        .ok()
-                        .flatten()
-                        .is_some_and(|saved| {
-                            snapshot_has_enabled_application_verdicts(&saved.snapshot)
-                        });
+                            #[cfg(feature = "qos-client-priority")]
+                            priority_runtime.as_ref(),
+                        );
                         let flow_capability_supported = application_verdict_capable(capabilities);
                         if !std::path::Path::new(&config.policy_disabled_path).exists()
                             && emergency_disable_applied.swap(false, Ordering::AcqRel) {
@@ -331,9 +424,14 @@ async fn connect_and_run(
                                 }
                             }
                         }
-                        let flow_ready = flow_bpf_ready.load(Ordering::Acquire)
-                            && !std::path::Path::new(&config.policy_disabled_path).exists();
-                        policy_flows_enabled.store(has_flow_policy && flow_ready, Ordering::Release);
+                        let flow_ready = flow_identity_tracking_enabled(
+                            flow_bpf_ready.load(Ordering::Acquire),
+                            std::path::Path::new(&config.policy_disabled_path).exists(),
+                        );
+                        // Identity tracking must be live before an application policy exists:
+                        // the Collector needs a Flow ID before it can return an exact-flow
+                        // command. `flow_commands_enabled` remains gated by an accepted policy.
+                        policy_flows_enabled.store(flow_ready, Ordering::Release);
                         flow_commands_enabled.store(
                             has_flow_policy
                                 && flow_ready
@@ -373,12 +471,19 @@ async fn connect_and_run(
                 ) {
                     tracing::warn!(%error, "could not clear application verdicts after emergency policy disable");
                 }
+                #[cfg(feature = "qos-client-priority")]
+                if let Err(error) = synchronize_priority_emergency_disable(
+                    config,
+                    priority_runtime.as_ref(),
+                ) {
+                    tracing::warn!(%error, "could not bypass client budgets after emergency policy disable");
+                }
             }
             message = socket.next() => {
                 let Some(message) = message else { return Err(anyhow!("policy WebSocket closed")); };
                 match message? {
-                    Message::Text(text) => handle_frame(&mut socket, text.as_bytes(), credentials, config, boot_id, policy_flows_enabled, flow_commands_enabled, flow_alias_cache, flow_verdict_writer, flow_bpf_ready, applied_flow_snapshot, emergency_disable_applied).await?,
-                    Message::Binary(bytes) => handle_frame(&mut socket, bytes.as_ref(), credentials, config, boot_id, policy_flows_enabled, flow_commands_enabled, flow_alias_cache, flow_verdict_writer, flow_bpf_ready, applied_flow_snapshot, emergency_disable_applied).await?,
+                    Message::Text(text) => handle_frame(&mut socket, text.as_bytes(), credentials, config, boot_id, policy_flows_enabled, flow_commands_enabled, flow_alias_cache, flow_verdict_writer, flow_bpf_ready, applied_flow_snapshot, emergency_disable_applied, #[cfg(feature = "qos-client-priority")] priority_runtime.as_ref()).await?,
+                    Message::Binary(bytes) => handle_frame(&mut socket, bytes.as_ref(), credentials, config, boot_id, policy_flows_enabled, flow_commands_enabled, flow_alias_cache, flow_verdict_writer, flow_bpf_ready, applied_flow_snapshot, emergency_disable_applied, #[cfg(feature = "qos-client-priority")] priority_runtime.as_ref()).await?,
                     Message::Ping(payload) => socket.send(Message::Pong(payload)).await.context("reply to policy ping")?,
                     Message::Pong(_) => {},
                     Message::Close(_) => return Err(anyhow!("Collector closed the policy WebSocket")),
@@ -419,6 +524,24 @@ fn synchronize_emergency_disable(
     emergency_disable_applied.store(true, Ordering::Release);
     tracing::info!("cleared application flow verdicts after emergency policy disable");
     Ok(())
+}
+
+#[cfg(feature = "qos-client-priority")]
+fn synchronize_priority_emergency_disable(
+    config: &AgentConfig,
+    priority_runtime: Option<&Arc<Mutex<PriorityRuntime>>>,
+) -> Result<(), String> {
+    if !std::path::Path::new(&config.policy_disabled_path).exists() {
+        return Ok(());
+    }
+    let Some(priority_runtime) = priority_runtime else {
+        return Ok(());
+    };
+    priority_runtime
+        .lock()
+        .map_err(|_| "priority runtime lock poisoned".to_owned())?
+        .emergency_disable()
+        .map_err(|error| format!("{error:#}"))
 }
 
 fn acknowledgement_signature(frame: &PolicyWireFrame) -> Option<String> {
@@ -462,6 +585,7 @@ async fn handle_frame(
     flow_bpf_ready: &AtomicBool,
     applied_flow_snapshot: &mut Option<(String, u64)>,
     emergency_disable_applied: &AtomicBool,
+    #[cfg(feature = "qos-client-priority")] priority_runtime: Option<&Arc<Mutex<PriorityRuntime>>>,
 ) -> Result<()> {
     if std::path::Path::new(&config.policy_disabled_path).exists() {
         synchronize_emergency_disable(
@@ -474,6 +598,14 @@ async fn handle_frame(
         )
         .map_err(anyhow::Error::msg)
         .context("could not clear application verdicts after emergency policy disable")?;
+        #[cfg(feature = "qos-client-priority")]
+        if let Some(priority_runtime) = priority_runtime {
+            priority_runtime
+                .lock()
+                .map_err(|_| anyhow!("priority runtime lock poisoned"))?
+                .emergency_disable()
+                .context("could not bypass client HTB assignments after emergency disable")?;
+        }
     } else if emergency_disable_applied.swap(false, Ordering::AcqRel) {
         *applied_flow_snapshot = None;
     }
@@ -494,6 +626,37 @@ async fn handle_frame(
                     "Collector snapshot gateway binding does not match enrollment"
                 ));
             }
+            #[cfg(feature = "qos-client-priority")]
+            let mut acknowledgement = if let Some(priority_runtime) = priority_runtime {
+                let mut runtime = priority_runtime
+                    .lock()
+                    .map_err(|_| anyhow!("priority runtime lock poisoned"))?;
+                if runtime.should_handle(&snapshot) {
+                    runtime.apply_snapshot(
+                        &snapshot,
+                        &credentials.gateway_id,
+                        boot_id,
+                        flow_bpf_ready,
+                    )
+                } else {
+                    executor::process_snapshot_with_flow_capability(
+                        config,
+                        &credentials.gateway_id,
+                        boot_id,
+                        &snapshot,
+                        flow_bpf_ready,
+                    )
+                }
+            } else {
+                executor::process_snapshot_with_flow_capability(
+                    config,
+                    &credentials.gateway_id,
+                    boot_id,
+                    &snapshot,
+                    flow_bpf_ready,
+                )
+            };
+            #[cfg(not(feature = "qos-client-priority"))]
             let mut acknowledgement = executor::process_snapshot_with_flow_capability(
                 config,
                 &credentials.gateway_id,
@@ -551,7 +714,15 @@ async fn handle_frame(
                 } else if reset_result.is_err() {
                     *applied_flow_snapshot = None;
                 }
-                policy_flows_enabled.store(needs_flow_block, Ordering::Release);
+                // Keep emitting exact identities before the Collector has an application
+                // policy to request. Enforcement remains gated by `flow_commands_enabled`.
+                policy_flows_enabled.store(
+                    flow_identity_tracking_enabled(
+                        flow_bpf_ready,
+                        std::path::Path::new(&config.policy_disabled_path).exists(),
+                    ),
+                    Ordering::Release,
+                );
                 flow_commands_enabled.store(reset_result.is_ok() && enabled, Ordering::Release);
                 if !needs_flow_block && let Ok(mut aliases) = flow_alias_cache.lock() {
                     aliases.clear();
@@ -569,6 +740,8 @@ async fn handle_frame(
                 flow_commands_enabled,
                 flow_verdict_writer,
                 flow_bpf_ready.load(Ordering::Acquire),
+                #[cfg(feature = "qos-client-priority")]
+                priority_runtime,
             );
             send_frame(socket, &acknowledgement).await?;
         }
@@ -586,6 +759,7 @@ fn apply_flow_command(
     flow_commands_enabled: &AtomicBool,
     flow_verdict_writer: &FlowVerdictWriter,
     flow_bpf_ready: bool,
+    #[cfg(feature = "qos-client-priority")] priority_runtime: Option<&Arc<Mutex<PriorityRuntime>>>,
 ) -> PolicyWireFrame {
     use netqmon_protocol::policy::{
         FlowAckStatus, FlowCommandOperation, FlowVerdict, POLICY_WIRE_VERSION, PolicyWireFrame,
@@ -635,6 +809,64 @@ fn apply_flow_command(
     let stale_command = flow_alias_cache.lock().map_or(true, |cache| {
         cache.command_is_stale(&policy_flow_id, issued_at_ms)
     });
+    let revision_matches = {
+        #[cfg(feature = "qos-client-priority")]
+        if let Some(priority_runtime) = priority_runtime {
+            priority_runtime.lock().is_ok_and(|runtime| {
+                runtime.flow_revision_matches(&controller_epoch, config_revision)
+            })
+        } else {
+            saved.as_ref().is_some_and(|state| {
+                state.controller_epoch == controller_epoch
+                    && state.config_revision == config_revision
+            })
+        }
+        #[cfg(not(feature = "qos-client-priority"))]
+        saved.as_ref().is_some_and(|state| {
+            state.controller_epoch == controller_epoch && state.config_revision == config_revision
+        })
+    };
+    let policy_references_valid = {
+        #[cfg(feature = "qos-client-priority")]
+        if let Some(priority_runtime) = priority_runtime {
+            let application_verdict = verdict.filter(|verdict| {
+                matches!(
+                    verdict,
+                    FlowVerdict::Shape | FlowVerdict::Block | FlowVerdict::Allow
+                )
+            });
+            application_verdict.is_some()
+                && client_mac.as_deref().is_some_and(|client_mac| {
+                    priority_runtime.lock().is_ok_and(|runtime| {
+                        runtime.application_policy_references_valid(
+                            &controller_epoch,
+                            config_revision,
+                            &policy_ids,
+                            client_mac,
+                            application_verdict.expect("application verdict checked above"),
+                            issued_at_ms,
+                            expires_at_ms,
+                        )
+                    })
+                })
+        } else {
+            flow_command_policy_references_valid(
+                saved.as_ref(),
+                &policy_ids,
+                verdict,
+                issued_at_ms,
+                expires_at_ms,
+            )
+        }
+        #[cfg(not(feature = "qos-client-priority"))]
+        flow_command_policy_references_valid(
+            saved.as_ref(),
+            &policy_ids,
+            verdict,
+            issued_at_ms,
+            expires_at_ms,
+        )
+    };
     let (mut status, mut reason_code) = if command_gateway != gateway_id || command_boot != boot_id
     {
         (
@@ -648,9 +880,7 @@ fn apply_flow_command(
             FlowAckStatus::Unsupported,
             Some("emergency_disabled".to_owned()),
         )
-    } else if saved.as_ref().is_none_or(|state| {
-        state.controller_epoch != controller_epoch || state.config_revision != config_revision
-    }) {
+    } else if !revision_matches {
         (
             FlowAckStatus::Unsupported,
             Some("revision_mismatch".to_owned()),
@@ -672,15 +902,20 @@ fn apply_flow_command(
             FlowAckStatus::Unsupported,
             Some("flow_identity_unresolved".to_owned()),
         )
+    } else if operation == FlowCommandOperation::Upsert && flow_partial {
+        (
+            FlowAckStatus::Unsupported,
+            Some("flow_identity_partial".to_owned()),
+        )
     } else if stale_command && alias_count != 0 {
         (
             FlowAckStatus::Expired,
             Some("stale_flow_command".to_owned()),
         )
     } else if alias_count == 0 {
-        let no_app_verdicts = saved
-            .as_ref()
-            .is_some_and(|state| !snapshot_has_enabled_application_verdicts(&state.snapshot));
+        let no_app_verdicts = saved.as_ref().is_some_and(|state| {
+            !super::snapshot_has_enabled_application_verdicts(&state.snapshot)
+        });
         if operation == FlowCommandOperation::Revoke && no_app_verdicts {
             (FlowAckStatus::Applied, None)
         } else {
@@ -697,15 +932,7 @@ fn apply_flow_command(
             || aliases.iter().any(|key| key.protocol != protocol)
         {
             (FlowAckStatus::Failed, Some("invalid_flow_ttl".to_owned()))
-        } else if operation == FlowCommandOperation::Upsert
-            && !flow_command_policy_references_valid(
-                saved.as_ref(),
-                &policy_ids,
-                verdict,
-                issued_at_ms,
-                expires_at_ms,
-            )
-        {
+        } else if operation == FlowCommandOperation::Upsert && !policy_references_valid {
             (
                 FlowAckStatus::Failed,
                 Some("invalid_policy_reference".to_owned()),
@@ -728,6 +955,11 @@ fn apply_flow_command(
                             deadline,
                         ) {
                             Ok(_) => {
+                                if config.log_level >= crate::config::LogLevel::Debug {
+                                    eprintln!(
+                                        "application block verdict installed: flow={policy_flow_id} policy={policy_id} client={client_mac} generation={config_revision} aliases={aliases:?}"
+                                    );
+                                }
                                 if let Ok(mut cache) = flow_alias_cache.lock() {
                                     cache.record_command(&policy_flow_id, issued_at_ms);
                                 }
@@ -760,23 +992,52 @@ fn apply_flow_command(
                     }
                 }
                 (FlowCommandOperation::Upsert, Some(FlowVerdict::Shape)) => {
-                    let tags = saved
-                        .as_ref()
-                        .and_then(|state| state.shaping_state.as_ref())
-                        .and_then(|shaping| {
-                            application_shape_tags(
-                                shaping,
-                                &aliases,
-                                client_mac.as_deref()?,
-                                &policy_ids,
-                                &|alias| {
-                                    flow_alias_cache
-                                        .lock()
-                                        .ok()
-                                        .and_then(|cache| cache.direction(&policy_flow_id, alias))
-                                },
-                            )
-                        });
+                    let direction = |alias: &crate::flow::FlowKey| {
+                        flow_alias_cache
+                            .lock()
+                            .ok()
+                            .and_then(|cache| cache.direction(&policy_flow_id, alias))
+                    };
+                    let tags: Option<Vec<(crate::flow::FlowKey, u32)>> = {
+                        #[cfg(feature = "qos-client-priority")]
+                        if let Some(priority_runtime) = priority_runtime {
+                            priority_runtime.lock().ok().and_then(|runtime| {
+                                priority_application_shape_tags(
+                                    &runtime,
+                                    &aliases,
+                                    client_mac.as_deref()?,
+                                    &policy_ids,
+                                    &direction,
+                                )
+                            })
+                        } else {
+                            saved
+                                .as_ref()
+                                .and_then(|state| state.shaping_state.as_ref())
+                                .and_then(|shaping| {
+                                    application_shape_tags(
+                                        shaping,
+                                        &aliases,
+                                        client_mac.as_deref()?,
+                                        &policy_ids,
+                                        &direction,
+                                    )
+                                })
+                        }
+                        #[cfg(not(feature = "qos-client-priority"))]
+                        saved
+                            .as_ref()
+                            .and_then(|state| state.shaping_state.as_ref())
+                            .and_then(|shaping| {
+                                application_shape_tags(
+                                    shaping,
+                                    &aliases,
+                                    client_mac.as_deref()?,
+                                    &policy_ids,
+                                    &direction,
+                                )
+                            })
+                    };
                     if let Some(tags) = tags {
                         let remaining_ms = expires_at_ms.saturating_sub(now_ms).max(0) as u64;
                         let deadline = crate::linux::monotonic_ns()
@@ -877,30 +1138,13 @@ fn application_verdict_capable(
         || capabilities.application_limit == PolicyCapability::Supported
 }
 
-fn snapshot_has_enabled_application_verdicts(snapshot: &PolicyWireFrame) -> bool {
-    let PolicyWireFrame::PolicySnapshot { policies, .. } = snapshot else {
-        return false;
-    };
-    policies.iter().any(|policy| {
-        policy.spec.enabled
-            && (!policy.spec.selectors.applications.is_empty()
-                || !policy.spec.selectors.categories.is_empty())
-            && matches!(
-                policy.spec.action.kind,
-                netqmon_protocol::policy::PolicyActionKind::Block
-                    | netqmon_protocol::policy::PolicyActionKind::Allow
-                    | netqmon_protocol::policy::PolicyActionKind::Limit
-            )
-    })
-}
-
 fn application_shape_tags(
     shaping: &ShapingState,
     aliases: &[crate::flow::FlowKey],
     client_mac: &str,
     policy_ids: &[String],
     direction: &impl Fn(&crate::flow::FlowKey) -> Option<super::shaper::Direction>,
-) -> Option<Vec<(crate::flow::FlowKey, u16)>> {
+) -> Option<Vec<(crate::flow::FlowKey, u32)>> {
     let mut tags = Vec::new();
     for alias in aliases.iter().filter(|alias| alias.hook == 2) {
         let class = policy_ids.iter().find_map(|policy_id| {
@@ -918,8 +1162,34 @@ fn application_shape_tags(
                 })
         });
         if let Some(class) = class {
-            tags.push((alias.clone(), class.tag));
+            tags.push((alias.clone(), u32::from(class.tag)));
         }
+    }
+    (!tags.is_empty()).then_some(tags)
+}
+
+#[cfg(feature = "qos-client-priority")]
+fn priority_application_shape_tags(
+    runtime: &PriorityRuntime,
+    aliases: &[crate::flow::FlowKey],
+    client_mac: &str,
+    policy_ids: &[String],
+    direction: &impl Fn(&crate::flow::FlowKey) -> Option<super::shaper::Direction>,
+) -> Option<Vec<(crate::flow::FlowKey, u32)>> {
+    use super::shaper::Direction;
+
+    let mut tags = Vec::new();
+    for alias in aliases {
+        let direction = direction(alias)?;
+        let upload = match (direction, alias.hook) {
+            // Upload is shaped before mirred on LAN ingress. Its routed LAN
+            // egress alias is deliberately left on the 51:fffe bypass leaf.
+            (Direction::Upload, 1) => true,
+            (Direction::Download, 2) => false,
+            _ => continue,
+        };
+        let classid = runtime.application_classid(policy_ids, client_mac, upload, alias.ifindex)?;
+        tags.push((alias.clone(), classid));
     }
     (!tags.is_empty()).then_some(tags)
 }
@@ -1054,6 +1324,7 @@ async fn reconcile_loop(
     credentials: watch::Receiver<Option<Credentials>>,
     flow_bpf_ready: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
+    #[cfg(feature = "qos-client-priority")] priority_runtime: Option<Arc<Mutex<PriorityRuntime>>>,
 ) {
     let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1062,12 +1333,37 @@ async fn reconcile_loop(
             _ = interval.tick() => {
                 if shutdown.load(Ordering::Relaxed) { return; }
                 if std::path::Path::new(&config.policy_disabled_path).exists() { continue; }
-                let Ok(Some(saved)) = super::state::load_any(&config.policy_state_path) else { continue; };
                 let Some(credential) = credentials.borrow().clone() else { continue; };
-                if credential.gateway_id != saved.gateway_id { continue; }
-                if let Some(ack) = executor::reconcile_saved_with_flow_capability(&config, &saved.gateway_id, &boot_id, flow_bpf_ready.load(Ordering::Acquire)) {
+                #[cfg(feature = "qos-client-priority")]
+                let ack = if let Some(priority_runtime) = &priority_runtime {
+                    let priority_ack = priority_runtime
+                        .lock()
+                        .ok()
+                        .and_then(|mut runtime| runtime.reconcile_saved(
+                            &credential.gateway_id,
+                            &boot_id,
+                            flow_bpf_ready.load(Ordering::Acquire),
+                        ));
+                    priority_ack
+                } else {
+                    let Ok(Some(saved)) = super::state::load_any(&config.policy_state_path) else { continue; };
+                    if credential.gateway_id != saved.gateway_id { continue; }
+                    executor::reconcile_saved_with_flow_capability(
+                        &config,
+                        &saved.gateway_id,
+                        &boot_id,
+                        flow_bpf_ready.load(Ordering::Acquire),
+                    )
+                };
+                #[cfg(not(feature = "qos-client-priority"))]
+                let ack = {
+                    let Ok(Some(saved)) = super::state::load_any(&config.policy_state_path) else { continue; };
+                    if credential.gateway_id != saved.gateway_id { continue; }
+                    executor::reconcile_saved_with_flow_capability(&config, &saved.gateway_id, &boot_id, flow_bpf_ready.load(Ordering::Acquire))
+                };
+                if let Some(ack) = ack {
                     if matches!(ack, PolicyWireFrame::PolicyAck { status: netqmon_protocol::policy::PolicyAckStatus::Failed, .. }) {
-                        tracing::debug!(gateway_id = saved.gateway_id, "local policy schedule reconciliation reported failure");
+                        tracing::debug!(gateway_id = credential.gateway_id, "local policy schedule reconciliation reported failure");
                     }
                 }
             }
@@ -1097,6 +1393,55 @@ fn jitter(delay: Duration) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exact_flow_identity_tracking_does_not_require_an_active_app_policy() {
+        // The exact-flow map can track identities while empty. The Collector needs those IDs
+        // to identify an application and only then request a policy for it.
+        assert!(super::flow_identity_tracking_enabled(true, false));
+        assert!(!super::flow_identity_tracking_enabled(false, false));
+        assert!(!super::flow_identity_tracking_enabled(true, true));
+    }
+
+    #[test]
+    fn application_limit_snapshot_requires_application_flow_identity() {
+        use netqmon_protocol::policy::{PolicySnapshotEntry, PolicyWireFrame};
+
+        let spec = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "gateway_id": "gw-test",
+            "name": "Application limit",
+            "enabled": true,
+            "selectors": {
+                "clients": ["AA:BB:CC:DD:EE:FF"],
+                "applications": ["netqmon_qos_test"],
+                "categories": [],
+                "min_application_confidence": 0.95
+            },
+            "network": { "scope": "internet", "direction": "both" },
+            "action": { "type": "limit", "upload_bps": 2000000, "download_bps": 4000000 },
+            "schedule": null
+        }))
+        .unwrap();
+        let snapshot = PolicyWireFrame::snapshot(
+            "gw-test".to_owned(),
+            "00000000-0000-4000-8000-000000000002".to_owned(),
+            1,
+            1,
+            1,
+            1_000_000,
+            vec![PolicySnapshotEntry {
+                id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                spec,
+            }],
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(crate::policy::snapshot_has_enabled_application_verdicts(
+            &snapshot
+        ));
+    }
+
     #[test]
     fn degraded_application_block_enables_verdicts_but_degraded_shaping_does_not() {
         use netqmon_protocol::policy::{PolicyCapabilities, PolicyCapability};
@@ -1201,7 +1546,7 @@ mod tests {
                 .unwrap()
                 .application_classes
                 .first()
-                .map(|class| class.tag)
+                .map(|class| u32::from(class.tag))
         );
         assert!(
             application_shape_tags(
@@ -1255,7 +1600,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(tags, vec![(up, upload_tag), (down, 2)]);
+        assert_eq!(tags, vec![(up, u32::from(upload_tag)), (down, 2)]);
         assert!(
             application_shape_tags(
                 &shaping,

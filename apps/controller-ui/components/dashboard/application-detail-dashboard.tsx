@@ -513,7 +513,6 @@ export function ApplicationDetailDashboard({
           : t("detail.fallbackSubtitle")
       }
       username={username}
-      isLive={false}
       headerActions={
         <Link
           href="/applications"

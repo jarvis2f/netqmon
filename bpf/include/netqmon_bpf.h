@@ -2,16 +2,23 @@
 #ifndef NETQMON_BPF_H
 #define NETQMON_BPF_H
 
+#include "netqmon_classid.h"
+
 #define __uint(name, value) int (*name)[value]
 #define __type(name, value) value *name
+#define __array(name, value) typeof(value) *name[]
 #define SEC(name) __attribute__((section(name), used))
 #define __always_inline inline __attribute__((always_inline))
 
 #define BPF_MAP_TYPE_LRU_HASH 9
 #define BPF_MAP_TYPE_ARRAY 2
+#define BPF_MAP_TYPE_ARRAY_OF_MAPS 12
+#define BPF_MAP_TYPE_LPM_TRIE 11
 #define BPF_MAP_TYPE_PERCPU_ARRAY 6
 #define BPF_MAP_TYPE_RINGBUF 27
 #define BPF_NOEXIST 1
+#define BPF_F_RDONLY_PROG 128
+#define BPF_F_NO_PREALLOC 1
 #define MAX_FLOW_VERDICT_ENTRIES 16384
 
 #define TC_ACT_OK 0
@@ -19,6 +26,8 @@
 
 #define NETQMON_HOOK_INGRESS 1
 #define NETQMON_HOOK_EGRESS 2
+/* Read-only observation immediately before the QoS egress class rewrite. */
+#define NETQMON_HOOK_QOS_EGRESS_PRE 3
 #define NETQMON_VERDICT_BLOCK 1
 #define NETQMON_VERDICT_SHAPE 2
 #define NETQMON_APPLICATION_MARK_SHIFT 25

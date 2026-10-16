@@ -118,54 +118,6 @@ pub(super) fn inspect_ownership(topology: &PolicyTopology, state_path: &Path) ->
     FeatureSupport::supported()
 }
 
-pub(super) fn capacity_bps(interface: &str) -> Result<u64, String> {
-    let speed_path = format!("/sys/class/net/{interface}/speed");
-    let speed_mbps = std::fs::read_to_string(&speed_path)
-        .map_err(|error| format!("unsupported_interface_speed: cannot read {speed_path}: {error}"))?
-        .trim()
-        .parse::<u64>()
-        .map_err(|_| {
-            format!("unsupported_interface_speed: {interface} has no measured link speed")
-        })?;
-    let capacity = speed_mbps
-        .checked_mul(1_000_000)
-        .ok_or_else(|| "unsupported_interface_speed: link speed overflows bps".to_owned())?;
-    if !(64_000..=1_000_000_000).contains(&capacity) {
-        return Err(format!(
-            "unsupported_interface_speed: {interface} reports {speed_mbps} Mbps; only measured links up to 1 Gbps are supported"
-        ));
-    }
-    Ok(capacity)
-}
-
-pub(super) fn effective_capacity_bps(
-    interface: &str,
-    configured: Option<u64>,
-) -> Result<(u64, &'static str), String> {
-    resolve_capacity(capacity_bps(interface).ok(), configured)
-}
-
-fn resolve_capacity(
-    measured: Option<u64>,
-    configured: Option<u64>,
-) -> Result<(u64, &'static str), String> {
-    if configured.is_some_and(|value| !(64_000..=1_000_000_000).contains(&value)) {
-        return Err(
-            "unsupported_interface_speed: configured capacity is outside 64000..1000000000 bps"
-                .to_owned(),
-        );
-    }
-    match (measured, configured) {
-        (Some(link), Some(cap)) => Ok((link.min(cap), "configured_and_link")),
-        (Some(link), None) => Ok((link, "link")),
-        (None, Some(cap)) => Ok((cap, "configured")),
-        (None, None) => Err(
-            "unsupported_interface_speed: link speed is unavailable and no capacity is configured"
-                .to_owned(),
-        ),
-    }
-}
-
 pub(super) fn prepare_state(
     desired: &ShapingState,
     previous: Option<&ShapingState>,
@@ -2350,6 +2302,75 @@ fn is_tunnel_interface(interface: &str) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
+    #[ignore = "requires root in an isolated Linux network namespace"]
+    fn live_multigig_shared_root_keeps_one_mbit_application_budget() {
+        assert!(nix::unistd::geteuid().is_root());
+        assert_ne!(
+            fs::read_link("/proc/self/ns/net").unwrap(),
+            fs::read_link("/proc/1/ns/net").unwrap()
+        );
+        run_output("ip", &["link", "add", "multi0", "type", "dummy"]).unwrap();
+        run_output("ip", &["link", "set", "multi0", "up"]).unwrap();
+        let ifindex = nix::net::if_::if_nametoindex("multi0").unwrap();
+        let mac = "02:00:00:00:00:01".to_owned();
+        let mut prior = None;
+        for capacity_bps in [2_500_000_000, 10_000_000_000] {
+            let clients = super::super::shaper::allocate_shared_client_classes(
+                "gw",
+                super::super::shaper::Direction::Download,
+                "multi0",
+                ifindex,
+                &BTreeMap::from([(mac.clone(), capacity_bps)]),
+                &[],
+            )
+            .unwrap();
+            let applications = super::super::shaper::allocate_application_classes(
+                "gw",
+                super::super::shaper::Direction::Download,
+                "multi0",
+                ifindex,
+                &BTreeMap::from([(("app".into(), mac.clone()), 1_000_000)]),
+                &clients,
+                &[],
+            )
+            .unwrap();
+            let desired = ShapingState {
+                schema_version: 2,
+                upload_interface: None,
+                download_interface: None,
+                shared_egress: Some(ManagedInterface {
+                    name: "multi0".into(),
+                    ifindex,
+                    capacity_bps,
+                    original_root_kind: String::new(),
+                    shared_egress: true,
+                    clients,
+                    application_classes: applications,
+                }),
+            };
+            let prepared = prepare_state(&desired, prior.as_ref()).unwrap();
+            apply(&prepared, prior.as_ref()).unwrap();
+            let classes = read_class_details("multi0").unwrap();
+            assert!(class_has_exact_rates(classes.get("51:1"), capacity_bps));
+            let application = &prepared.shared_egress.as_ref().unwrap().application_classes[0];
+            assert!(class_has_exact_rates(
+                classes.get(&format!("51:{}", application.class_minor)),
+                1_000_000
+            ));
+            println!(
+                "PASS: {capacity_bps} bps shared root with a separate 1 Mbps application ceiling"
+            );
+            prior = Some(prepared);
+        }
+        restore(&prior.unwrap()).unwrap();
+        assert_eq!(
+            root_kind(&inspect_root("multi0").unwrap()).as_deref(),
+            Some("noqueue")
+        );
+        run_output("ip", &["link", "del", "multi0"]).unwrap();
+    }
+
+    #[test]
     fn dynamic_fq_codel_classes_are_not_htb_ownership_entries() {
         let parsed = parse_class_details(
             "class htb 51:1 root rate 100Mbit ceil 100Mbit\nclass fq_codel 1223:9f parent 1223:\n",
@@ -2357,22 +2378,6 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed["51:1"].rate_bps, Some(100_000_000));
     }
-    #[test]
-    fn explicit_capacity_is_bounded_by_measured_link_when_available() {
-        assert_eq!(
-            super::resolve_capacity(None, Some(100_000_000)).unwrap(),
-            (100_000_000, "configured")
-        );
-        assert_eq!(
-            super::resolve_capacity(Some(10_000_000), Some(100_000_000))
-                .unwrap()
-                .0,
-            10_000_000
-        );
-        assert!(super::resolve_capacity(None, None).is_err());
-        assert!(super::resolve_capacity(None, Some(0)).is_err());
-    }
-
     #[test]
     #[ignore = "requires root in an isolated Linux network namespace"]
     fn live_router_client_to_application_migration_preserves_queues_and_rolls_back() {

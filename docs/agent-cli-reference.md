@@ -84,25 +84,37 @@ by the running Agent on its next reconciliation tick, when its eBPF writer is
 available. `status --json` includes aggregate-limit capability,
 its reason, and the saved shaping interfaces and client-class count.
 
-For virtual interfaces without a reported link speed, configure the physical
-egress capacity explicitly (64000 through 1000000000 bits per second):
+Egress capacity is detected automatically from the negotiated physical link
+speed, including multi-gigabit links. For a bridge with a default gateway, the
+Agent uses the gateway neighbour and bridge forwarding table to locate the
+physical port; it does not use a bridge or virtual member's synthetic speed.
+Single lower links (such as VLAN parents) are followed to the physical device.
+A bridge without a default gateway is detected only when it has one unambiguous
+physical attachment. Multiple unresolved paths require an explicit capacity.
+
+If automatic detection is unavailable, configure the egress capacity explicitly
+(at least 64000 bits per second, within the JSON safe integer range):
 
 ```toml
-policy_one_arm_return_path_verified = true
-
 [policy_interface_capacity_bps]
 eth1 = 100000000
 eth2 = 100000000
 ```
 
-The environment equivalents are `NETQMON_POLICY_ONE_ARM_RETURN_PATH_VERIFIED`
-and `NETQMON_POLICY_INTERFACE_CAPACITY_BPS='{"eth1":100000000,"eth2":100000000}'`.
+The environment equivalent is
+`NETQMON_POLICY_INTERFACE_CAPACITY_BPS='{"eth1":100000000,"eth2":100000000}'`.
 When both an explicit capacity and a measured link speed are available, the
-smaller value is used. `policies status --json` reports capacity and its source.
+smaller value is used. `policies status --json` reports capacity, its source and
+the physical link interfaces. Link capacity is distinct from the application's
+configured policy limit and is not an Internet bandwidth measurement.
 
-Only enable the return-path declaration after configuring and verifying that
-both directions of every enabled address family traverse the Agent. One-arm
-shaping also requires disabled ICMP redirects and flow offload. The Agent does
+One-arm policy enforcement is enabled by default, assuming both directions of
+every enabled address family traverse the Agent. Configure and verify this
+routing externally; the Agent cannot independently verify the upstream return
+path. Set `policy_one_arm_return_path_verified = false` in TOML to explicitly
+disable one-arm shaping when that routing is unavailable. This setting has no
+environment-variable override. One-arm shaping also requires disabled ICMP
+redirects and flow offload. The Agent does
 not configure NAT or upstream routes. A shared physical HTB root contains
 separate upload/download branches, client budgets and application subclasses.
 Application budgets aggregate connections per client, policy and direction;

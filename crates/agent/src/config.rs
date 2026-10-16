@@ -32,6 +32,10 @@ pub const DEFAULT_DIAGNOSTICS_ENABLED: bool = false;
 pub const DEFAULT_TC_PRIORITY: u32 = 49_152;
 pub const DEFAULT_TC_HANDLE: u32 = 0x4e51_4d01;
 pub const MAX_INTERFACES: usize = 32;
+pub(crate) const MIN_POLICY_CAPACITY_BPS: u64 = 64_000;
+// Keep capacities exactly representable in JSON diagnostics and bounded for
+// aggregate class arithmetic, independently of explicit policy rate limits.
+pub(crate) const MAX_POLICY_CAPACITY_BPS: u64 = netqmon_protocol::policy::MAX_SAFE_JSON_INTEGER;
 
 #[derive(Debug, Parser)]
 #[command(name = "netqmon-agent", version, about = "netqmon telemetry agent")]
@@ -226,7 +230,7 @@ impl Default for AgentConfig {
             policy_disabled_path: PathBuf::from(DEFAULT_POLICY_DISABLED_PATH),
             allow_insecure_policy_ws: true,
             policy_interface_capacity_bps: BTreeMap::new(),
-            policy_one_arm_return_path_verified: false,
+            policy_one_arm_return_path_verified: true,
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             batch_interval_ms: DEFAULT_BATCH_INTERVAL_MS,
             max_flows: DEFAULT_MAX_FLOWS,
@@ -354,7 +358,7 @@ impl AgentConfig {
             policy_interface_capacity_bps: env_string(&get_env, "NETQMON_POLICY_INTERFACE_CAPACITY_BPS")?
                 .map(|value| serde_json::from_str(&value).context("NETQMON_POLICY_INTERFACE_CAPACITY_BPS must be a JSON object of interface capacities"))
                 .transpose()?,
-            policy_one_arm_return_path_verified: env_bool(&get_env, "NETQMON_POLICY_ONE_ARM_RETURN_PATH_VERIFIED")?,
+            policy_one_arm_return_path_verified: None,
             poll_interval_ms: env_number(&get_env, "NETQMON_POLL_INTERVAL_MS")?,
             batch_interval_ms: env_number(&get_env, "NETQMON_BATCH_INTERVAL_MS")?,
             max_flows: env_number(&get_env, "NETQMON_MAX_FLOWS")?,
@@ -517,10 +521,10 @@ impl AgentConfig {
             if interface.is_empty()
                 || interface.len() > 15
                 || interface.bytes().any(|byte| byte == 0 || byte == b'/')
-                || !(64_000..=1_000_000_000).contains(capacity)
+                || !(MIN_POLICY_CAPACITY_BPS..=MAX_POLICY_CAPACITY_BPS).contains(capacity)
             {
                 bail!(
-                    "policy_interface_capacity_bps requires valid interface names and capacities between 64000 and 1000000000 bps"
+                    "policy_interface_capacity_bps requires valid interface names and capacities between {MIN_POLICY_CAPACITY_BPS} and {MAX_POLICY_CAPACITY_BPS} bps"
                 );
             }
         }
@@ -818,7 +822,7 @@ interface = "tun0"
         let config = AgentConfig::load_with_env(&cli(&[]), |_| None).unwrap();
         assert_eq!(config.interface, DEFAULT_INTERFACE);
         assert!(config.policy_interface_capacity_bps.is_empty());
-        assert!(!config.policy_one_arm_return_path_verified);
+        assert!(config.policy_one_arm_return_path_verified);
         assert_eq!(config.interfaces, [DEFAULT_INTERFACE]);
         assert_eq!(config.controller_url, DEFAULT_CONTROLLER_URL);
         assert_eq!(config.poll_interval_ms, DEFAULT_POLL_INTERVAL_MS);
@@ -848,24 +852,23 @@ interface = "tun0"
     }
 
     #[test]
-    fn policy_capacity_and_return_path_merge_and_validate() {
+    fn policy_capacity_merges_and_validates_with_explicit_return_path_override() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent.toml");
         fs::write(&path, "policy_one_arm_return_path_verified = false\n[policy_interface_capacity_bps]\neth1 = 100000000\n").unwrap();
         let config = AgentConfig::load_with_env(
             &cli(&["--config", path.to_str().unwrap()]),
             |key| match key {
-                "NETQMON_POLICY_ONE_ARM_RETURN_PATH_VERIFIED" => Some("true".into()),
                 "NETQMON_POLICY_INTERFACE_CAPACITY_BPS" => Some(r#"{"eth1":50000000}"#.into()),
                 _ => None,
             },
         )
         .unwrap();
-        assert!(config.policy_one_arm_return_path_verified);
+        assert!(!config.policy_one_arm_return_path_verified);
         assert_eq!(config.policy_interface_capacity_bps["eth1"], 50_000_000);
         for value in [
             r#"{"eth1":0}"#,
-            r#"{"eth1":1000000001}"#,
+            r#"{"eth1":9007199254740992}"#,
             r#"{"../bad":100000}"#,
             "[]",
             "bad",
@@ -876,6 +879,26 @@ interface = "tun0"
                     .then(|| value.into()))
                 .is_err()
             );
+        }
+        for rate in [2_500_000_000_u64, 10_000_000_000] {
+            let value = format!(r#"{{"eth1":{rate}}}"#);
+            let config = AgentConfig::load_with_env(&cli(&[]), |key| {
+                (key == "NETQMON_POLICY_INTERFACE_CAPACITY_BPS").then(|| value.clone().into())
+            })
+            .unwrap();
+            assert_eq!(config.policy_interface_capacity_bps["eth1"], rate);
+        }
+    }
+
+    #[test]
+    fn ignores_removed_one_arm_return_path_environment_variable() {
+        let expected = AgentConfig::load_with_env(&cli(&[]), |_| None).unwrap();
+        for value in ["false", "true", "invalid"] {
+            let config = AgentConfig::load_with_env(&cli(&[]), |key| {
+                (key == "NETQMON_POLICY_ONE_ARM_RETURN_PATH_VERIFIED").then(|| value.into())
+            })
+            .unwrap();
+            assert_eq!(config, expected);
         }
     }
 

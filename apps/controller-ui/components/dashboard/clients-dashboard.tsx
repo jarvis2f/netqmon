@@ -411,7 +411,6 @@ export function ClientsDashboard({
       title={tNav("clients")}
       subtitle={t("subtitle")}
       username={username}
-      isLive={streamConnected}
       toolbar={toolbar}
     >
       {error ? (

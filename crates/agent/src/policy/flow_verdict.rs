@@ -1,4 +1,3 @@
-use super::shaper::MAX_APPLICATION_TAG;
 use crate::flow::{FLOW_KEY_SIZE, FlowKey};
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
 use sha2::{Digest as _, Sha256};
@@ -111,7 +110,7 @@ impl FlowVerdictWriter {
         let tagged_aliases = aliases
             .iter()
             .cloned()
-            .map(|alias| (alias, 0))
+            .map(|alias| (alias, 0_u32))
             .collect::<Vec<_>>();
         let identity = VerdictIdentity {
             flow_hash: flow_identity_hash(policy_flow_id)?,
@@ -129,14 +128,15 @@ impl FlowVerdictWriter {
 
     pub(crate) fn install_shape(
         &self,
-        aliases: &[(FlowKey, u16)],
+        aliases: &[(FlowKey, u32)],
         policy_flow_id: &str,
         generation: u64,
         expires_monotonic_ns: u64,
     ) -> Result<usize, String> {
-        if aliases.iter().any(|(key, tag)| {
-            key.hook != 2 || !(1..=MAX_APPLICATION_TAG).contains(tag) || key.ifindex == 0
-        }) {
+        if aliases
+            .iter()
+            .any(|(key, classid)| key.ifindex == 0 || !valid_shape_tag(key.hook, *classid))
+        {
             return Err("application shape alias has no valid egress class tag".to_owned());
         }
         let identity = VerdictIdentity {
@@ -155,7 +155,7 @@ impl FlowVerdictWriter {
 
     fn install_verdict(
         &self,
-        aliases: &[(FlowKey, u16)],
+        aliases: &[(FlowKey, u32)],
         identity: VerdictIdentity,
         generation: u64,
         expires_monotonic_ns: u64,
@@ -167,12 +167,12 @@ impl FlowVerdictWriter {
         if aliases.is_empty() || aliases.len() > 4 {
             return Err("flow alias count is outside the supported range".to_owned());
         }
-        if aliases.iter().any(|(key, tag)| {
+        if aliases.iter().any(|(key, classid)| {
             !matches!(key.ip_version, 4 | 6)
                 || !matches!(key.protocol, 6 | 17)
                 || !matches!(key.hook, 1 | 2)
                 || key.ifindex == 0
-                || (verdict == VERDICT_SHAPE && !(1..=MAX_APPLICATION_TAG).contains(tag))
+                || (verdict == VERDICT_SHAPE && !valid_shape_tag(key.hook, *classid))
         }) {
             return Err("flow alias is not an exact supported on-wire key".to_owned());
         }
@@ -182,13 +182,13 @@ impl FlowVerdictWriter {
             .verdict_map
             .as_ref()
             .ok_or_else(|| "BPF verdict map is unavailable".to_owned())?;
-        for (alias, tag) in aliases {
+        for (alias, classid) in aliases {
             let key = alias.bpf_key_bytes();
             let value = encode_verdict(
                 expires_monotonic_ns,
                 generation,
                 identity,
-                u32::from(*tag),
+                *classid,
                 verdict,
             );
             let previous = verdict_map
@@ -326,6 +326,23 @@ pub(crate) fn policy_identity_hash(policy_id: &str) -> [u8; 16] {
     identity
 }
 
+fn valid_application_classid(hook: u8, classid: u32) -> bool {
+    let major = classid >> 16;
+    let minor = classid & 0xffff;
+    let expected_major = match hook {
+        1 => super::classid::UPLOAD_MAJOR,
+        2 => super::classid::DOWNLOAD_MAJOR,
+        _ => return false,
+    };
+    major == expected_major
+        && (super::classid::APPLICATION_FIRST..=super::classid::APPLICATION_LAST).contains(&minor)
+}
+
+fn valid_shape_tag(hook: u8, tag: u32) -> bool {
+    valid_application_classid(hook, tag)
+        || (hook == 2 && (1..=super::shaper::MAX_APPLICATION_TAG as u32).contains(&tag))
+}
+
 fn client_mac_identity(client_mac: &str) -> Result<[u8; 6], String> {
     if client_mac.len() != 17 || !client_mac.is_ascii() {
         return Err("client MAC must contain 48 bits".to_owned());
@@ -394,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn shape_verdict_carries_the_child_class_tag_in_the_existing_bpf_abi() {
+    fn shape_verdict_carries_the_application_classid_in_the_existing_bpf_abi() {
         let verdict = encode_verdict(
             500,
             12,
@@ -403,14 +420,23 @@ mod tests {
                 policy_hash: [0; 16],
                 client_mac: [0; 6],
             },
-            17,
+            0x0052_1001,
             VERDICT_SHAPE,
         );
         assert_eq!(&verdict[32..48], &[0; 16]);
         assert_eq!(&verdict[48..56], &[0; 8]);
-        assert_eq!(&verdict[56..60], &17_u32.to_ne_bytes());
+        assert_eq!(&verdict[56..60], &0x0052_1001_u32.to_ne_bytes());
         assert_eq!(verdict[60], VERDICT_SHAPE);
         assert_eq!(&verdict[61..], &[0; 3]);
+    }
+
+    #[test]
+    fn application_classid_must_match_hook_and_reserved_leaf_range() {
+        assert!(valid_application_classid(1, 0x0052_1001));
+        assert!(valid_application_classid(2, 0x0051_1001));
+        assert!(!valid_application_classid(1, 0x0051_1001));
+        assert!(!valid_application_classid(2, 0x0052_1001));
+        assert!(!valid_application_classid(2, 0x0051_fffe));
     }
 
     #[test]

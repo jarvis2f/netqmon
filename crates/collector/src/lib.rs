@@ -81,6 +81,7 @@ const MAX_FLOWS_PER_BATCH: usize = 10_000;
 const MAX_DISCOVERY_OBSERVATIONS_PER_BATCH: usize = 10_000;
 const MAX_PROBE_RESULTS_PER_BATCH: usize = 64;
 const MAX_HASHES_PER_FAVICON_RESULT: usize = 8;
+const MIN_UNAMBIGUOUS_SIGNATURE_CONFIDENCE: f64 = 0.80;
 const GATEWAY_REPLACEMENT_STALE_AFTER_MS: u64 = 5 * 60 * 1_000;
 const ROLLUP_INTERVAL: Duration = Duration::from_secs(60);
 const RETENTION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -101,6 +102,7 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 pub async fn run_from_env() -> Result<(), Box<dyn Error>> {
     let config = CollectorConfig::from_env()?;
     let dpi_enabled = dpi_enabled_from_env()?;
+    let flow_sample_matching_enabled = flow_sample_matching_enabled_from_env(dpi_enabled)?;
     if dpi_enabled && !dpi::native_available() {
         return Err(ConfigError("DPI enabled but nDPI 4.14 is unavailable; install libndpi and rebuild or set NETQMON_DPI_ENABLED=false".into()).into());
     }
@@ -151,6 +153,7 @@ pub async fn run_from_env() -> Result<(), Box<dyn Error>> {
         DeviceIdentifier::load(&config.mac_dataset_path),
         config.icon_cache_config,
         policy_service,
+        flow_sample_matching_enabled,
     )
     .map_err(|err| ConfigError(format!("failed to initialize collector state: {err}")))?;
     state.license.ensure_identity().map_err(ConfigError)?;
@@ -353,6 +356,7 @@ impl CollectorState {
             DeviceIdentifier::load(Path::new("/missing/netqmon-test-mac-prefixes.json")),
             IconCacheConfig::default(),
             policy_service,
+            false,
         )
         .map_err(|e| match e {
             StorageError::Sqlite(err) => err,
@@ -370,6 +374,7 @@ impl CollectorState {
         device_identifier: DeviceIdentifier,
         icon_cache_config: IconCacheConfig,
         policy_service: Arc<PolicyService>,
+        flow_sample_matching_enabled: bool,
     ) -> Result<Self, StorageError> {
         let signature_matcher = Arc::new(classifier::ClassifierdSignatureMatcher::new(
             classifier.clone(),
@@ -389,6 +394,8 @@ impl CollectorState {
             service_bindings: ServiceBindingCache::default(),
             favicon_endpoints: FaviconEndpointCache::default(),
             pending_probe_requests: Vec::new(),
+            policy_flow_contexts: policy::FlowContextCache::default(),
+            pending_flow_samples: policy::PendingFlowSamples::default(),
             realtime: RealtimeEngine::default(),
             accepted_batches: 0,
             dedupe_hits: 0,
@@ -398,7 +405,7 @@ impl CollectorState {
         let weak = Arc::downgrade(&inner);
         let callback_policy_hub = policy_hub.clone();
         let sampling = Arc::new(dpi::SamplingService::new(
-            !cfg!(test) && dpi_enabled_from_env().unwrap_or(false),
+            !cfg!(test) && flow_sample_matching_enabled,
             dpi::default_engine(),
             signature_matcher,
             move |cached| {
@@ -407,6 +414,11 @@ impl CollectorState {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let result = apply_sample_result(&mut inner, &cached);
+                    if result.as_ref().is_ok_and(|decisions| decisions.is_empty()) {
+                        inner
+                            .pending_flow_samples
+                            .defer(cached, std::time::Instant::now());
+                    }
                     drop(inner);
                     match result {
                         Ok(decisions) => {
@@ -627,6 +639,7 @@ impl CollectorState {
             &historical_evidence,
             &supplemental_evidence,
         );
+        let mut late_sample_decisions = Vec::new();
         let result = match inner.storage.persist_classified_batch(
             &effective_batch,
             &attributions,
@@ -638,6 +651,28 @@ impl CollectorState {
                 Ok(BatchDisposition::Duplicate)
             }
             PersistDisposition::Accepted => {
+                inner
+                    .policy_flow_contexts
+                    .observe(batch, std::time::Instant::now());
+                let ready_samples = {
+                    let CollectorInner {
+                        policy_flow_contexts,
+                        pending_flow_samples,
+                        ..
+                    } = &mut *inner;
+                    pending_flow_samples.take_ready(policy_flow_contexts, std::time::Instant::now())
+                };
+                for sample in ready_samples {
+                    match apply_sample_result(&mut inner, &sample) {
+                        Ok(mut decisions) => late_sample_decisions.append(&mut decisions),
+                        Err(error) => {
+                            tracing::warn!(%error, "deferred sample classification update failed");
+                            inner
+                                .pending_flow_samples
+                                .defer(sample, std::time::Instant::now());
+                        }
+                    }
+                }
                 self.sampling.observe_telemetry(batch);
                 let observed_at = if batch.sent_at == 0 {
                     unix_time_ms()
@@ -665,6 +700,13 @@ impl CollectorState {
         if matches!(&result, Ok(BatchDisposition::Accepted)) {
             drop(inner);
             queue_policy_flow_decisions(&self.policy_hub, batch, &attributions);
+            for (late_batch, attribution) in late_sample_decisions {
+                queue_policy_flow_decisions(
+                    &self.policy_hub,
+                    &late_batch,
+                    std::slice::from_ref(&attribution),
+                );
+            }
         }
         result
     }
@@ -747,6 +789,8 @@ struct CollectorInner {
     service_bindings: ServiceBindingCache,
     favicon_endpoints: FaviconEndpointCache,
     pending_probe_requests: Vec<ProbeRequest>,
+    policy_flow_contexts: policy::FlowContextCache,
+    pending_flow_samples: policy::PendingFlowSamples,
     accepted_batches: u64,
     dedupe_hits: u64,
     traffic_bytes: u64,
@@ -1154,6 +1198,9 @@ fn classify_batch(
                 .and_then(Option::as_ref)
                 .map(|analysis| analysis.signatures.clone())
                 .unwrap_or_default();
+            let ambiguous_signature_ids =
+                ambiguous_signature_application_ids(&signature_matches);
+            let ambiguous_signatures = !ambiguous_signature_ids.is_empty();
             let mut domain =
                 resolve_batch_domain(batch, &flow.client_ip, &flow.remote_ip, observed_at)
                     .map(str::to_owned)
@@ -1241,6 +1288,21 @@ fn classify_batch(
                     }
                 }
             }
+            // A single flow can contain multiplexed or colliding application
+            // signatures. Choosing the classifier's highest-ranked match would
+            // guess which application owns the whole flow, so leave it on the
+            // client's default budget and avoid endpoint-cache attribution too.
+            if ambiguous_signatures {
+                classification.application = None;
+                classification.traffic_class = None;
+                classification.traffic_role = None;
+                classification.evidence.retain(|evidence| {
+                    !matches!(
+                        evidence.evidence_type.as_str(),
+                        "payload_signature" | "domain_application"
+                    )
+                });
+            }
             let organization_id = classification
                 .organization
                 .as_ref()
@@ -1306,18 +1368,36 @@ fn classify_batch(
                 application_confidence,
                 protocol_confidence,
                 confidence,
-                reason: classification.evidence.first().map_or_else(
-                    || "no matching rule".to_owned(),
-                    |value| format!("{}:{}", value.evidence_type, value.value),
-                ),
+                reason: if ambiguous_signatures {
+                    format!(
+                        "ambiguous_application_signatures:{}",
+                        ambiguous_signature_ids.join(",")
+                    )
+                } else {
+                    classification.evidence.first().map_or_else(
+                        || "no matching rule".to_owned(),
+                        |value| format!("{}:{}", value.evidence_type, value.value),
+                    )
+                },
                 evidence_json,
             };
+            if ambiguous_signatures {
+                attribution.evidence_json = append_evidence(
+                    &attribution.evidence_json,
+                    json!({
+                        "type": "ambiguous_application_signatures",
+                        "value": ambiguous_signature_ids,
+                        "source": "payload_signature",
+                        "weight": 0.0
+                    }),
+                );
+            }
             let endpoint_key = ServiceBindingKey {
                 ip: remote_ip,
                 protocol: u8::try_from(flow.protocol).unwrap_or(0),
                 port: u16::try_from(flow.remote_port).unwrap_or(0),
             };
-            if attribution.application_id == "unknown" {
+            if attribution.application_id == "unknown" && !ambiguous_signatures {
                 if let Some(identity) = favicon_endpoints.identity(&endpoint_key, observed_at) {
                     attribution
                         .organization_id
@@ -1336,15 +1416,35 @@ fn classify_batch(
                         .clone_from(&identity.evidence_json);
                 }
             }
-            service_bindings.apply(
-                endpoint_key,
-                decode_ip(&flow.client_ip),
-                observed_at,
-                &mut attribution,
-            );
+            if !ambiguous_signatures {
+                service_bindings.apply(
+                    endpoint_key,
+                    decode_ip(&flow.client_ip),
+                    observed_at,
+                    &mut attribution,
+                );
+            }
             Ok(attribution)
         })
         .collect()
+}
+
+fn ambiguous_signature_application_ids(
+    signatures: &[dpi::SignatureApplicationMatch],
+) -> Vec<String> {
+    let mut ids = signatures
+        .iter()
+        .filter(|matched| {
+            matched.confidence.is_finite()
+                && matched.confidence >= MIN_UNAMBIGUOUS_SIGNATURE_CONFIDENCE
+                && !matched.application_id.is_empty()
+        })
+        .map(|matched| matched.application_id.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    if ids.len() > 1 { ids } else { Vec::new() }
 }
 
 /// Result of one Geo ASN lookup retained only for a single classification batch.
@@ -1855,6 +1955,22 @@ fn dpi_enabled_from_env() -> Result<bool, ConfigError> {
         )),
     }
 }
+
+fn flow_sample_matching_enabled_from_env(dpi_enabled: bool) -> Result<bool, ConfigError> {
+    match env::var("NETQMON_FLOW_SAMPLE_MATCHING_ENABLED") {
+        Ok(value) => match value.as_str() {
+            "true" | "1" => Ok(true),
+            "false" | "0" => Ok(false),
+            _ => Err(ConfigError(
+                "NETQMON_FLOW_SAMPLE_MATCHING_ENABLED must be true or false".into(),
+            )),
+        },
+        Err(env::VarError::NotPresent) => Ok(dpi_enabled),
+        Err(_) => Err(ConfigError(
+            "NETQMON_FLOW_SAMPLE_MATCHING_ENABLED is not valid Unicode".into(),
+        )),
+    }
+}
 async fn samples(
     State(state): State<CollectorState>,
     identity: AgentIdentity,
@@ -1918,19 +2034,33 @@ fn queue_policy_flow_decisions(
     let (application_block_supported, application_limit_supported) =
         hub.flow_capabilities(&batch.gateway_id);
     for (index, flow) in batch.flows.iter().enumerate() {
+        tracing::debug!(
+            target: "netqmon_collector::policy::flow_trace",
+            gateway_id = batch.gateway_id,
+            flow_scope = flow.scope,
+            flow_lifecycle = flow.lifecycle,
+            flow_packets = flow.packets,
+            flow_upload_bytes = flow.upload_bytes,
+            flow_download_bytes = flow.download_bytes,
+            policy_flow_id = %flow.policy_flow_id,
+            client_mac_bytes = flow.client_mac.len(),
+            "received policy flow context"
+        );
         let Some(policy_flow_id) =
             (!flow.policy_flow_id.is_empty()).then_some(flow.policy_flow_id.as_str())
         else {
             continue;
         };
-        // Idle lifecycle notifications carry the observation time rather than
+        // Active/idle lifecycle notifications carry the observation time rather than
         // the flow's original sampling interval. They have no new classifier
         // evidence and must not revoke a still-leased exact verdict merely
         // because the sample lookup cannot overlap that synthetic interval.
         // End notifications, real packet deltas, and late classifier results
         // continue through the normal evaluation/revocation path.
-        if flow.lifecycle == FlowLifecycle::Idle as i32
-            && flow.packets == 0
+        if matches!(
+            FlowLifecycle::try_from(flow.lifecycle),
+            Ok(FlowLifecycle::Active | FlowLifecycle::Idle)
+        ) && flow.packets == 0
             && flow.upload_bytes == 0
             && flow.download_bytes == 0
         {
@@ -2143,16 +2273,39 @@ fn apply_sample_result(
     inner
         .storage
         .reclassify_flow(&cached.gateway, &batch.flows[0], &attributions[0])?;
-    Ok(cached
-        .policy_flow_ids
-        .iter()
-        .take(dpi::MAX_POLICY_FLOW_IDENTITIES_PER_SAMPLE)
-        .map(|policy_flow_id| {
+    let contexts = inner
+        .policy_flow_contexts
+        .matching(cached, std::time::Instant::now())
+        .into_iter()
+        .map(|context| {
             let mut decision_batch = batch.clone();
-            decision_batch.flows[0]
-                .policy_flow_id
-                .clone_from(policy_flow_id);
+            decision_batch.flows[0] = context;
             (decision_batch, attributions[0].clone())
         })
-        .collect())
+        .collect::<Vec<_>>();
+    let context_flow_ids = contexts
+        .iter()
+        .flat_map(|(batch, _)| batch.flows.iter().map(|flow| flow.policy_flow_id.clone()))
+        .collect::<Vec<_>>();
+    tracing::debug!(
+        target: "netqmon_collector::policy::flow_trace",
+        gateway_id = cached.gateway,
+        boot_id = cached.boot,
+        flow_ids = ?cached.policy_flow_ids,
+        context_flow_ids = ?context_flow_ids,
+        sample_ip_version = cached.key.ip_version,
+        sample_protocol = cached.key.protocol,
+        sample_client_ip = ?cached.key.client_ip,
+        sample_client_port = cached.key.client_port,
+        sample_remote_ip = ?cached.key.remote_ip,
+        sample_remote_port = cached.key.remote_port,
+        sample_first_seen_unix_ms = cached.key.first_seen_unix_ms,
+        sample_last_packet_ms = cached.last_packet_ms,
+        context_count = contexts.len(),
+        application_id = %attributions[0].application_id,
+        application_confidence = attributions[0].application_confidence,
+        classification_reason = %attributions[0].reason,
+        "completed asynchronous flow sample classification"
+    );
+    Ok(contexts)
 }

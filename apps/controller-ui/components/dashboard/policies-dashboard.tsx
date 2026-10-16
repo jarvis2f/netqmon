@@ -86,11 +86,12 @@ const CAPABILITY_KEYS = [
   "application_block",
   "application_limit",
 ] as const;
-type PolicyTranslate = (
-  key: string,
-  values?: Record<string, string | number>,
-) => string;
-type GatewayStatus = "online" | "offline" | "degraded" | "loading";
+type PolicyTranslate = {
+  (key: string, values?: Record<string, string | number>): string;
+  has: (key: string) => boolean;
+};
+type DashboardConfirmation =
+  { kind: "toggle" | "delete"; record: PolicyRecord } | { kind: "republish" };
 
 class PolicyRequestError extends Error {
   constructor(
@@ -150,6 +151,17 @@ function defaultSpec(gatewayId: string): PolicySpecV1 {
 
 function apiErrorText(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function policyReasonText(
+  code: string | null,
+  message: string | null,
+  t: PolicyTranslate,
+) {
+  const key = `reasons.${code}`;
+  const description = code && t.has(key) ? t(key) : message;
+  if (!description) return code;
+  return code ? `${code}: ${description}` : description;
 }
 
 function selectorSummary(spec: PolicySpecV1, t: (key: string) => string) {
@@ -312,7 +324,6 @@ export function PoliciesDashboard({ username }: { username: string }) {
   const common = useTranslations("common");
   const [gatewayOptions, setGatewayOptions] = useState<PolicyOption[]>([]);
   const [gatewayId, setGatewayId] = useState("");
-  const [gatewayStatus, setGatewayStatus] = useState<GatewayStatus>("loading");
   const [pageData, setPageData] = useState<PolicyPage | null>(null);
   const [deployment, setDeployment] = useState<PolicyDeployment | null>(null);
   const [policies, setPolicies] = useState<PolicyRecord[]>([]);
@@ -329,10 +340,9 @@ export function PoliciesDashboard({ username }: { username: string }) {
   const [detail, setDetail] = useState<PolicyDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
-  const [deletingPolicy, setDeletingPolicy] = useState<PolicyRecord | null>(
-    null,
-  );
-  const [deletingPolicyPending, setDeletingPolicyPending] = useState(false);
+  const [confirmation, setConfirmation] =
+    useState<DashboardConfirmation | null>(null);
+  const [confirmationPending, setConfirmationPending] = useState(false);
   const [republishing, setRepublishing] = useState(false);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewInput, setPreviewInput] = useState<
@@ -468,38 +478,6 @@ export function PoliciesDashboard({ username }: { username: string }) {
     };
   }, [gatewayId]);
 
-  useEffect(() => {
-    if (!gatewayId) {
-      return;
-    }
-    let active = true;
-    requestData<{
-      gateway_status?: string;
-      gateway?: { status?: string };
-      realtime?: { gateway_health?: { status?: string } };
-    }>("/api/overview")
-      .then((overview) => {
-        const observed =
-          overview.gateway_status ??
-          overview.gateway?.status ??
-          overview.realtime?.gateway_health?.status;
-        if (active)
-          setGatewayStatus(
-            observed === "online" ||
-              observed === "offline" ||
-              observed === "degraded"
-              ? observed
-              : "degraded",
-          );
-      })
-      .catch(() => {
-        if (active) setGatewayStatus("degraded");
-      });
-    return () => {
-      active = false;
-    };
-  }, [gatewayId]);
-
   const filteredPolicies = useMemo(() => {
     const normalizedQuery = query.trim().toLocaleLowerCase();
     return policies.filter((record) => {
@@ -546,12 +524,6 @@ export function PoliciesDashboard({ username }: { username: string }) {
 
   const mutateEnabled = async (record: PolicyRecord) => {
     const nextEnabled = !record.spec.enabled;
-    if (
-      !window.confirm(
-        t(nextEnabled ? "confirm.enableRisk" : "confirm.disableRisk"),
-      )
-    )
-      return;
     try {
       await requestData(
         `/api/policies/${encodeURIComponent(record.id)}/enabled`,
@@ -578,17 +550,13 @@ export function PoliciesDashboard({ username }: { username: string }) {
     }
   };
 
-  const confirmRemovePolicy = async () => {
-    const record = deletingPolicy;
-    if (!record || deletingPolicyPending) return;
-    setDeletingPolicyPending(true);
+  const removePolicy = async (record: PolicyRecord) => {
     try {
       await requestData(`/api/policies/${encodeURIComponent(record.id)}`, {
         method: "DELETE",
         headers: { "if-match": `"rev:${pageData?.desired_revision ?? 0}"` },
       });
       setNotice(t("messages.deleted"));
-      setDeletingPolicy(null);
       await loadPolicies();
     } catch (error) {
       setNotice(
@@ -596,17 +564,13 @@ export function PoliciesDashboard({ username }: { username: string }) {
           ? t("messages.conflict")
           : apiErrorText(error),
       );
-      setDeletingPolicy(null);
       if (error instanceof PolicyRequestError && error.status === 409)
         await loadPolicies();
-    } finally {
-      setDeletingPolicyPending(false);
     }
   };
 
   const republishPolicies = async () => {
     if (!gatewayId || republishing) return;
-    if (!window.confirm(t("confirm.republish"))) return;
     setRepublishing(true);
     try {
       await requestData(
@@ -624,6 +588,27 @@ export function PoliciesDashboard({ username }: { username: string }) {
     }
   };
 
+  const confirmAction = async () => {
+    if (!confirmation || confirmationPending) return;
+    setConfirmationPending(true);
+    try {
+      if (confirmation.kind === "toggle")
+        await mutateEnabled(confirmation.record);
+      else if (confirmation.kind === "delete")
+        await removePolicy(confirmation.record);
+      else await republishPolicies();
+    } finally {
+      setConfirmationPending(false);
+      setConfirmation(null);
+    }
+  };
+  const confirmationAction =
+    confirmation?.kind === "toggle"
+      ? confirmation.record.spec.enabled
+        ? "disable"
+        : "enable"
+      : confirmation?.kind;
+
   const deploymentStatus = deployment?.status ?? "not_deployed";
 
   return (
@@ -631,14 +616,6 @@ export function PoliciesDashboard({ username }: { username: string }) {
       title={t("title")}
       subtitle={t("subtitle")}
       username={username}
-      gatewayName={
-        gatewayOptions.find((item) => item.id === gatewayId)?.name ??
-        (gatewayId || t("gatewayUnavailable"))
-      }
-      gatewayStatus={
-        loadingGateways ? "loading" : gatewayId ? gatewayStatus : "offline"
-      }
-      isLive={false}
       toolbar={
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
@@ -788,8 +765,11 @@ export function PoliciesDashboard({ username }: { username: string }) {
                         <p>{t(`deploymentStatusHint.${deploymentStatus}`)}</p>
                         {deployment?.last_error_code && (
                           <p className="text-warning">
-                            {deployment.last_error_code}:{" "}
-                            {deployment.last_error_message}
+                            {policyReasonText(
+                              deployment.last_error_code,
+                              deployment.last_error_message,
+                              t,
+                            )}
                           </p>
                         )}
                         {deployment?.capabilities && (
@@ -845,7 +825,7 @@ export function PoliciesDashboard({ username }: { username: string }) {
                   >
                     <button
                       type="button"
-                      onClick={() => void republishPolicies()}
+                      onClick={() => setConfirmation({ kind: "republish" })}
                       disabled={!gatewayId || republishing}
                       className="flex size-7 items-center justify-center rounded-md border border-border text-foreground-muted hover:bg-surface-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                       aria-label={
@@ -1048,27 +1028,37 @@ export function PoliciesDashboard({ username }: { username: string }) {
                             : t("permanent")}
                         </td>
                         <td className="px-4 py-4 align-top">
-                          <span
-                            className={cn(
-                              "inline-flex whitespace-nowrap rounded-full border px-2.5 py-1 text-[11px] font-semibold",
-                              statusClass(record.execution_status),
-                            )}
+                          <SimpleTooltip
+                            content={
+                              record.execution_message ||
+                              record.execution_reason_code ? (
+                                <p className="max-w-xs whitespace-normal text-left leading-4">
+                                  {policyReasonText(
+                                    record.execution_reason_code,
+                                    record.execution_message,
+                                    t,
+                                  )}
+                                </p>
+                              ) : null
+                            }
                           >
-                            {record.spec.enabled
-                              ? t(`execution.${record.execution_status}`)
-                              : t("disabled")}
-                          </span>
-                          {record.execution_message && (
-                            <p
-                              className="mt-1 max-w-[220px] text-[11px] leading-4 text-warning"
-                              title={record.execution_message}
+                            <span
+                              tabIndex={
+                                record.execution_message ||
+                                record.execution_reason_code
+                                  ? 0
+                                  : undefined
+                              }
+                              className={cn(
+                                "inline-flex whitespace-nowrap rounded-full border px-2.5 py-1 text-[11px] font-semibold focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
+                                statusClass(record.execution_status),
+                              )}
                             >
-                              {record.execution_reason_code
-                                ? `${record.execution_reason_code}: `
-                                : ""}
-                              {record.execution_message}
-                            </p>
-                          )}
+                              {record.spec.enabled
+                                ? t(`execution.${record.execution_status}`)
+                                : t("disabled")}
+                            </span>
+                          </SimpleTooltip>
                         </td>
                         <td className="px-4 py-4 align-top font-mono text-xs tabular-nums text-foreground-muted">
                           {record.spec.priority}
@@ -1088,14 +1078,18 @@ export function PoliciesDashboard({ username }: { username: string }) {
                             <button
                               type="button"
                               className="rounded-md px-2 py-1.5 text-xs font-medium text-foreground-muted hover:bg-surface-hover hover:text-foreground"
-                              onClick={() => void mutateEnabled(record)}
+                              onClick={() =>
+                                setConfirmation({ kind: "toggle", record })
+                              }
                             >
                               {record.spec.enabled ? t("disable") : t("enable")}
                             </button>
                             <button
                               type="button"
                               className="rounded-md px-2 py-1.5 text-xs font-medium text-danger hover:bg-danger-soft"
-                              onClick={() => setDeletingPolicy(record)}
+                              onClick={() =>
+                                setConfirmation({ kind: "delete", record })
+                              }
                             >
                               {t("delete")}
                             </button>
@@ -1188,43 +1182,84 @@ export function PoliciesDashboard({ username }: { username: string }) {
         onRun={() => void runPolicyPreview()}
         onClose={() => setPreviewOpen(false)}
       />
-      <Dialog
-        open={deletingPolicy !== null}
-        onOpenChange={(open) => {
-          if (!open && !deletingPolicyPending) setDeletingPolicy(null);
-        }}
-      >
-        <DialogContent showCloseButton={false}>
-          <DialogHeader>
-            <DialogTitle>{t("confirm.deleteTitle")}</DialogTitle>
-            {deletingPolicy && (
-              <DialogDescription>
-                {t("confirm.deleteRisk", {
-                  name: deletingPolicy.spec.name,
-                })}
-              </DialogDescription>
-            )}
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setDeletingPolicy(null)}
-              disabled={deletingPolicyPending}
-            >
-              {common("actions.cancel")}
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={() => void confirmRemovePolicy()}
-              disabled={deletingPolicyPending}
-              aria-busy={deletingPolicyPending}
-            >
-              {deletingPolicyPending ? t("editor.working") : t("delete")}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <PolicyConfirmationDialog
+        open={confirmation !== null}
+        title={
+          confirmationAction ? t(`confirm.${confirmationAction}Title`) : ""
+        }
+        description={
+          confirmation?.kind === "delete"
+            ? t("confirm.deleteRisk", { name: confirmation.record.spec.name })
+            : confirmationAction === "republish"
+              ? t("confirm.republish")
+              : confirmationAction
+                ? t(`confirm.${confirmationAction}Risk`)
+                : ""
+        }
+        confirmLabel={
+          confirmationAction === "republish"
+            ? t("confirm.republishAction")
+            : confirmationAction
+              ? t(confirmationAction)
+              : ""
+        }
+        destructive={confirmationAction === "delete"}
+        pending={confirmationPending}
+        onCancel={() => setConfirmation(null)}
+        onConfirm={() => void confirmAction()}
+      />
     </AppLayout>
+  );
+}
+
+function PolicyConfirmationDialog({
+  open,
+  title,
+  description,
+  confirmLabel,
+  pending = false,
+  destructive = false,
+  onCancel,
+  onConfirm,
+}: {
+  open: boolean;
+  title: string;
+  description: string;
+  confirmLabel: string;
+  pending?: boolean;
+  destructive?: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const t = useTranslations("policies");
+  const common = useTranslations("common.actions");
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (!next && !pending) onCancel();
+      }}
+    >
+      <DialogContent showCloseButton={false}>
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+          <DialogDescription>{description}</DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button variant="outline" onClick={onCancel} disabled={pending}>
+            {common("cancel")}
+          </Button>
+          <Button
+            variant={destructive ? "destructive" : "default"}
+            onClick={onConfirm}
+            disabled={pending}
+            aria-busy={pending}
+          >
+            {pending ? t("editor.working") : confirmLabel}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -1322,6 +1357,9 @@ function PolicyEditor({
   const [validation, setValidation] = useState<PolicyValidation | null>(null);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [confirmation, setConfirmation] = useState<"save" | "reload" | null>(
+    null,
+  );
   const [conflict, setConflict] = useState<{
     current: PolicyRecord | null;
     local: PolicySpecV1;
@@ -1425,9 +1463,9 @@ function PolicyEditor({
   };
 
   const save = async () => {
+    if (saving) return;
     const spec = currentSpec();
     if (!spec || !validation?.valid || !validation.normalized_spec) return;
-    if (record && !window.confirm(t("confirm.saveRisk"))) return;
     setSaving(true);
     setValidationError(null);
     try {
@@ -1495,8 +1533,7 @@ function PolicyEditor({
   };
 
   const reloadRemote = () => {
-    if (!conflict?.current || !window.confirm(t("confirm.reloadConflict")))
-      return;
+    if (!conflict?.current) return;
     setDraft(conflict.current.spec);
     setYaml(formatPolicyYaml(conflict.current.spec));
     setValidation(null);
@@ -1550,7 +1587,10 @@ function PolicyEditor({
               {t("editor.validate")}
             </Button>
             <Button
-              onClick={() => void save()}
+              onClick={() => {
+                if (record) setConfirmation("save");
+                else void save();
+              }}
               disabled={saving || !validation?.valid}
               className="gap-2"
             >
@@ -2209,7 +2249,11 @@ function PolicyEditor({
                     </pre>
                   </div>
                 </div>
-                <Button variant="outline" size="sm" onClick={reloadRemote}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setConfirmation("reload")}
+                >
                   {t("conflict.reload")}
                 </Button>
               </>
@@ -2221,6 +2265,35 @@ function PolicyEditor({
           </div>
         )}
       </div>
+      <PolicyConfirmationDialog
+        open={confirmation !== null}
+        title={t(
+          confirmation === "reload"
+            ? "confirm.reloadTitle"
+            : "confirm.saveTitle",
+        )}
+        description={t(
+          confirmation === "reload"
+            ? "confirm.reloadConflict"
+            : "confirm.saveRisk",
+        )}
+        confirmLabel={
+          confirmation === "reload"
+            ? t("conflict.reload")
+            : common("saveChanges")
+        }
+        pending={saving}
+        onCancel={() => setConfirmation(null)}
+        onConfirm={() => {
+          if (saving) return;
+          if (confirmation === "reload") {
+            reloadRemote();
+            setConfirmation(null);
+          } else {
+            void save().finally(() => setConfirmation(null));
+          }
+        }}
+      />
     </SidePanel>
   );
 }

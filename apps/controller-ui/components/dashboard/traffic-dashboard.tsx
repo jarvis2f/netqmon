@@ -394,7 +394,6 @@ export function TrafficDashboard({
       title={tNav("traffic")}
       subtitle={t("subtitle")}
       username={username}
-      isLive={false}
       toolbar={toolbar}
     >
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">

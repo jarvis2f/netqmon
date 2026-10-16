@@ -6,7 +6,7 @@ use netlink_packet_core::{
     NLM_F_DUMP, NLM_F_REQUEST, NetlinkHeader, NetlinkMessage, NetlinkPayload,
 };
 use netlink_packet_route::{
-    RouteNetlinkMessage,
+    AddressFamily, RouteNetlinkMessage,
     neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourMessage, NeighbourState},
 };
 use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_ROUTE};
@@ -20,6 +20,19 @@ pub(crate) struct NeighborEntry {
     pub(crate) mac: MacAddress,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BridgeFdbEntry {
+    pub(crate) ifindex: u32,
+    pub(crate) mac: MacAddress,
+}
+
+pub(crate) fn discover_bridge_fdb() -> Result<Vec<BridgeFdbEntry>, NeighborDiscoveryError> {
+    Ok(dump_neighbors(AddressFamily::Bridge)?
+        .iter()
+        .filter_map(parse_fdb_entry)
+        .collect())
+}
+
 pub(super) fn discover(ifindex: u32) -> Result<Vec<NeighborEntry>, NeighborDiscoveryError> {
     discover_matching(Some(ifindex))
 }
@@ -29,6 +42,16 @@ pub(crate) fn discover_all() -> Result<Vec<NeighborEntry>, NeighborDiscoveryErro
 }
 
 fn discover_matching(ifindex: Option<u32>) -> Result<Vec<NeighborEntry>, NeighborDiscoveryError> {
+    let mut entries = dump_neighbors(AddressFamily::Unspec)?
+        .iter()
+        .filter_map(|message| parse_entry(message, ifindex))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| (entry.mac, entry.ip));
+    entries.dedup();
+    Ok(entries)
+}
+
+fn dump_neighbors(family: AddressFamily) -> Result<Vec<NeighbourMessage>, NeighborDiscoveryError> {
     let mut socket = Socket::new(NETLINK_ROUTE).map_err(NeighborDiscoveryError::io)?;
     socket.bind_auto().map_err(NeighborDiscoveryError::io)?;
     socket
@@ -38,11 +61,11 @@ fn discover_matching(ifindex: Option<u32>) -> Result<Vec<NeighborEntry>, Neighbo
     let mut header = NetlinkHeader::default();
     header.flags = NLM_F_DUMP | NLM_F_REQUEST;
     header.sequence_number = 1;
+    let mut message = NeighbourMessage::default();
+    message.header.family = family;
     let mut request = NetlinkMessage::new(
         header,
-        NetlinkPayload::from(RouteNetlinkMessage::GetNeighbour(
-            NeighbourMessage::default(),
-        )),
+        NetlinkPayload::from(RouteNetlinkMessage::GetNeighbour(message)),
     );
     request.finalize();
     let mut bytes = vec![0; request.header.length as usize];
@@ -73,18 +96,36 @@ fn discover_matching(ifindex: Option<u32>) -> Result<Vec<NeighborEntry>, Neighbo
                     )));
                 }
                 NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(message)) => {
-                    if let Some(entry) = parse_entry(&message, ifindex) {
-                        entries.push(entry);
+                    if entries.len() >= 65_536 {
+                        return Err(NeighborDiscoveryError(
+                            "neighbour dump exceeds the entry limit".to_owned(),
+                        ));
                     }
+                    entries.push(message);
                 }
                 _ => {}
             }
             offset += align_netlink(length);
         }
     }
-    entries.sort_by_key(|entry| (entry.mac, entry.ip));
-    entries.dedup();
     Ok(entries)
+}
+
+fn parse_fdb_entry(message: &NeighbourMessage) -> Option<BridgeFdbEntry> {
+    if message.header.family != AddressFamily::Bridge || message.header.ifindex == 0 {
+        return None;
+    }
+    let mac = message
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            NeighbourAttribute::LinkLayerAddress(bytes) => MacAddress::from_bytes(bytes).ok(),
+            _ => None,
+        })?;
+    mac.is_unicast().then_some(BridgeFdbEntry {
+        ifindex: message.header.ifindex,
+        mac,
+    })
 }
 
 fn parse_entry(message: &NeighbourMessage, ifindex: Option<u32>) -> Option<NeighborEntry> {
@@ -156,6 +197,19 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn parses_bridge_fdb_without_requiring_a_cli_or_an_ip_destination() {
+        let mut entry = NeighbourMessage::default();
+        entry.header.family = AddressFamily::Bridge;
+        entry.header.ifindex = 9;
+        entry.attributes = vec![NeighbourAttribute::LinkLayerAddress(vec![2, 0, 0, 0, 0, 1])];
+        let parsed = parse_fdb_entry(&entry).unwrap();
+        assert_eq!(parsed.ifindex, 9);
+        assert_eq!(parsed.mac.to_string(), "02:00:00:00:00:01");
+        entry.header.family = AddressFamily::Inet;
+        assert!(parse_fdb_entry(&entry).is_none());
+    }
 
     #[test]
     fn parses_ipv4_arp_and_ipv6_ndp_entries() {

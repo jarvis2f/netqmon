@@ -274,24 +274,24 @@ pub(crate) fn inspect(config: &AgentConfig) -> PolicyTopology {
             report.lan_ifindex = nix::net::if_::if_nametoindex(interface.as_str())
                 .ok()
                 .filter(|index| *index > 0);
-            report.lan_capacity_bps = super::qdisc::effective_capacity_bps(
+            report.lan_capacity_bps = super::capacity::effective(
                 interface,
                 config.policy_interface_capacity_bps.get(interface).copied(),
             )
             .ok()
-            .map(|(bps, _)| bps);
+            .map(|capacity| capacity.bps);
         }
         if report.wan_interfaces.len() == 1 {
             let interface = &report.wan_interfaces[0];
             report.wan_ifindex = nix::net::if_::if_nametoindex(interface.as_str())
                 .ok()
                 .filter(|index| *index > 0);
-            report.wan_capacity_bps = super::qdisc::effective_capacity_bps(
+            report.wan_capacity_bps = super::capacity::effective(
                 interface,
                 config.policy_interface_capacity_bps.get(interface).copied(),
             )
             .ok()
-            .map(|(bps, _)| bps);
+            .map(|capacity| capacity.bps);
         }
         if one_arm_router {
             let (reason_code, reason) = one_arm_client_block_reason(

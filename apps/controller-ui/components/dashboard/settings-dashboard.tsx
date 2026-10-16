@@ -566,7 +566,6 @@ export function SettingsDashboard({ username }: { username: string }) {
       title={tNav("settings")}
       subtitle={t("subtitle")}
       username={username}
-      isLive={false}
     >
       <div className="max-w-6xl mx-auto space-y-6 pb-12">
         {/* Navigation pill bar for fast section jumping */}
