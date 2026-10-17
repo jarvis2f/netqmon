@@ -225,7 +225,7 @@ async fn run(
     };
     let mut retry_delay = MIN_RETRY;
     let mut startup_restore_checked = false;
-    let mut applied_flow_snapshot = None::<(String, u64)>;
+    let mut applied_flow_snapshot = None::<(String, u64, u64, String)>;
     let emergency_disable_applied = AtomicBool::new(false);
     loop {
         if let Err(error) = synchronize_emergency_disable(
@@ -341,7 +341,7 @@ async fn connect_and_run(
     flow_alias_cache: &Mutex<PolicyFlowAliasCache>,
     flow_verdict_writer: &mut FlowVerdictWriter,
     flow_bpf_ready: &AtomicBool,
-    applied_flow_snapshot: &mut Option<(String, u64)>,
+    applied_flow_snapshot: &mut Option<(String, u64, u64, String)>,
     emergency_disable_applied: &AtomicBool,
     shutdown: &AtomicBool,
     #[cfg(feature = "qos-client-priority")] priority_runtime: Option<Arc<Mutex<PriorityRuntime>>>,
@@ -433,6 +433,8 @@ async fn connect_and_run(
                         capabilities,
                         controller_epoch,
                         config_revision,
+                        bundle_generation,
+                        checksum,
                         ..
                     } = &acknowledgement
                     {
@@ -451,9 +453,9 @@ async fn connect_and_run(
                             netqmon_protocol::policy::PolicyAckStatus::Applied
                                 | netqmon_protocol::policy::PolicyAckStatus::Partial);
                         if accepted && flow_bpf_ready.load(Ordering::Acquire)
-                            && *applied_flow_snapshot != Some((controller_epoch.clone(), *config_revision)) {
+                            && *applied_flow_snapshot != Some((controller_epoch.clone(), *config_revision, *bundle_generation, checksum.clone())) {
                             match flow_verdict_writer.reset(*config_revision, has_flow_policy && flow_capability_supported) {
-                                Ok(()) => *applied_flow_snapshot = Some((controller_epoch.clone(), *config_revision)),
+                                Ok(()) => *applied_flow_snapshot = Some((controller_epoch.clone(), *config_revision, *bundle_generation, checksum.clone())),
                                 Err(error) => {
                                     flow_commands_enabled.store(false, Ordering::Release);
                                     return Err(anyhow!("could not restore BPF policy state: {error}"));
@@ -619,7 +621,7 @@ async fn handle_frame(
     flow_alias_cache: &Mutex<PolicyFlowAliasCache>,
     flow_verdict_writer: &mut FlowVerdictWriter,
     flow_bpf_ready: &AtomicBool,
-    applied_flow_snapshot: &mut Option<(String, u64)>,
+    applied_flow_snapshot: &mut Option<(String, u64, u64, String)>,
     emergency_disable_applied: &AtomicBool,
     #[cfg(feature = "qos-client-priority")] priority_runtime: Option<&Arc<Mutex<PriorityRuntime>>>,
 ) -> Result<()> {
@@ -728,7 +730,12 @@ async fn handle_frame(
                     .snapshot_identity()
                     .expect("snapshot was validated");
                 let revision = identity.2;
-                let new_identity = (identity.1.to_owned(), revision);
+                let new_identity = (
+                    identity.1.to_owned(),
+                    revision,
+                    identity.3,
+                    identity.4.to_owned(),
+                );
                 let capability_supported = matches!(
                     &acknowledgement,
                     PolicyWireFrame::PolicyAck { capabilities, .. }
@@ -747,6 +754,26 @@ async fn handle_frame(
                 }
                 if reset_result.is_ok() && flow_bpf_ready {
                     *applied_flow_snapshot = Some(new_identity);
+                    #[cfg(feature = "qos-client-priority")]
+                    if let Some(priority_runtime) = priority_runtime {
+                        let cleanup_result = priority_runtime
+                            .lock()
+                            .map_err(|_| anyhow!("priority runtime lock poisoned"))
+                            .and_then(|runtime| runtime.prune_unused_classes_after_flow_reset());
+                        if let Err(error) = cleanup_result {
+                            tracing::warn!(
+                                gateway_id = credentials.gateway_id,
+                                revision,
+                                %error,
+                                "could not remove unused Agent-owned priority classes"
+                            );
+                            mark_priority_class_cleanup_degraded(
+                                &mut acknowledgement,
+                                &snapshot,
+                                &format!("{error:#}"),
+                            );
+                        }
+                    }
                 } else if reset_result.is_err() {
                     *applied_flow_snapshot = None;
                 }
@@ -1293,6 +1320,54 @@ fn mark_flow_capability_unsupported(
     }
 }
 
+#[cfg(feature = "qos-client-priority")]
+fn mark_priority_class_cleanup_degraded(
+    acknowledgement: &mut PolicyWireFrame,
+    snapshot: &PolicyWireFrame,
+    error: &str,
+) {
+    use netqmon_protocol::policy::{
+        PolicyAckStatus, PolicyActionKind, PolicyResultStatus, PolicyWireFrame,
+    };
+
+    let PolicyWireFrame::PolicyAck {
+        status, results, ..
+    } = acknowledgement
+    else {
+        return;
+    };
+    let app_limit_policy_ids = match snapshot {
+        PolicyWireFrame::PolicySnapshot { policies, .. } => policies
+            .iter()
+            .filter(|policy| {
+                policy.spec.action.kind == PolicyActionKind::Limit
+                    && (!policy.spec.selectors.applications.is_empty()
+                        || !policy.spec.selectors.categories.is_empty())
+            })
+            .map(|policy| policy.id.as_str())
+            .collect::<std::collections::HashSet<_>>(),
+        _ => return,
+    };
+    if *status == PolicyAckStatus::Applied {
+        *status = PolicyAckStatus::Partial;
+    }
+    for result in results
+        .iter_mut()
+        .filter(|result| app_limit_policy_ids.contains(result.policy_id.as_str()))
+    {
+        if matches!(
+            result.status,
+            PolicyResultStatus::Applied | PolicyResultStatus::Disabled
+        ) {
+            result.status = PolicyResultStatus::Degraded;
+            result.reason_code = Some("priority_class_cleanup_failed".to_owned());
+            result.message = Some(format!(
+                "FlowVerdict state was reset, but an unused Agent-owned HTB class could not be removed: {error}"
+            ));
+        }
+    }
+}
+
 fn flow_command_policy_references_valid(
     state: Option<&super::state::PolicyState>,
     policy_ids: &[String],
@@ -1516,6 +1591,91 @@ mod tests {
         assert!(!super::application_verdict_capable(&capabilities));
         capabilities.application_limit = PolicyCapability::Supported;
         assert!(super::application_verdict_capable(&capabilities));
+    }
+
+    #[cfg(feature = "qos-client-priority")]
+    #[test]
+    fn failed_priority_class_cleanup_is_reported_as_degraded_limit_ack() {
+        use netqmon_protocol::policy::{
+            PolicyAckStatus, PolicyCapabilities, PolicyCapability, PolicyResult,
+            PolicyResultStatus, PolicySnapshotEntry, PolicyWireFrame,
+        };
+
+        let spec = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "gateway_id": "gw-test",
+            "name": "Application limit",
+            "enabled": false,
+            "selectors": {
+                "clients": ["AA:BB:CC:DD:EE:FF"],
+                "applications": ["netflix"],
+                "categories": [],
+                "min_application_confidence": 0.95
+            },
+            "network": { "scope": "internet", "direction": "both" },
+            "action": { "type": "limit", "upload_bps": 2000000, "download_bps": 4000000 },
+            "schedule": null
+        }))
+        .unwrap();
+        let policy_id = "00000000-0000-4000-8000-000000000001";
+        let snapshot = PolicyWireFrame::snapshot(
+            "gw-test".to_owned(),
+            "00000000-0000-4000-8000-000000000002".to_owned(),
+            27,
+            1,
+            1,
+            1_000_000,
+            vec![PolicySnapshotEntry {
+                id: policy_id.to_owned(),
+                spec,
+            }],
+            Vec::new(),
+        )
+        .unwrap();
+        let capabilities = PolicyCapabilities {
+            client_block: PolicyCapability::Supported,
+            client_limit: PolicyCapability::Supported,
+            application_block: PolicyCapability::Supported,
+            application_limit: PolicyCapability::Supported,
+        };
+        let mut acknowledgement = crate::policy::executor::priority_policy_ack(
+            &snapshot,
+            "boot-test",
+            capabilities,
+            PolicyAckStatus::Applied,
+            vec![PolicyResult {
+                policy_id: policy_id.to_owned(),
+                status: PolicyResultStatus::Disabled,
+                reason_code: None,
+                message: None,
+                details: None,
+            }],
+        );
+
+        super::mark_priority_class_cleanup_degraded(
+            &mut acknowledgement,
+            &snapshot,
+            "tc class del failed",
+        );
+
+        let PolicyWireFrame::PolicyAck {
+            status, results, ..
+        } = acknowledgement
+        else {
+            panic!("expected policy acknowledgement");
+        };
+        assert_eq!(status, PolicyAckStatus::Partial);
+        assert_eq!(results[0].status, PolicyResultStatus::Degraded);
+        assert_eq!(
+            results[0].reason_code.as_deref(),
+            Some("priority_class_cleanup_failed")
+        );
+        assert!(
+            results[0]
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("tc class del failed"))
+        );
     }
 
     use super::*;

@@ -1,8 +1,9 @@
-//! Private, netlink-only client total budget runtime.
+//! Opt-in, netlink-only client total budget runtime.
 //!
-//! This backend is deliberately enabled only by an explicit test config in an
-//! isolated `nqp-*` network namespace. It owns IFB 52:, LAN egress 51: roots,
-//! the client map publication, and the independent priority state/journal.
+//! Activation requires an explicit runtime config. Using real interfaces in
+//! the initial network namespace additionally requires an explicit config
+//! opt-in. It owns IFB 52:, LAN egress 51: roots, the client map publication,
+//! and the independent priority state/journal.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -27,6 +28,7 @@ use crate::{
     config::{AgentConfig, AttachBackend},
     policy::{
         classid,
+        priority_cleanup::{parse_classid_text, unused_priority_classes},
         priority_delivery::{self, DeliveryLayout, QueuePort},
         priority_plan::{ApplicationBudget, ClientBudget, PriorityPlan, QueueTree},
         priority_selection::PrioritySelection,
@@ -46,6 +48,8 @@ const MAX_STATE_BYTES: usize = 2 * 1024 * 1024;
 struct RuntimeConfig {
     ifb: String,
     output: PathBuf,
+    #[serde(default)]
+    allow_initial_namespace: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -76,10 +80,34 @@ struct ActiveApplicationClass {
     download_bps: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct OriginalQueueRoot {
+    kind: String,
+    options: Value,
+    mq_leaves: Vec<OriginalMqLeaf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct OriginalMqLeaf {
+    minor: String,
+    kind: String,
+    options: Value,
+}
+
+impl OriginalQueueRoot {
+    fn noqueue() -> Self {
+        Self {
+            kind: "noqueue".to_owned(),
+            options: Value::Null,
+            mq_leaves: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct OwnedPort {
     port: QueuePort,
-    original_root: String,
+    original_root: OriginalQueueRoot,
 }
 
 pub(crate) struct PriorityRuntime {
@@ -90,6 +118,7 @@ pub(crate) struct PriorityRuntime {
     ports: Vec<OwnedPort>,
     ifb_ifindex: u32,
     ifb_created: bool,
+    ifb_original_root: Option<OriginalQueueRoot>,
     owned_roots: BTreeSet<(String, u32)>,
     output: PathBuf,
     state_path: PathBuf,
@@ -100,6 +129,7 @@ pub(crate) struct PriorityRuntime {
     ifb_observer_attached: bool,
     clsact_created: BTreeSet<String>,
     active: Option<PriorityState>,
+    active_plan: Option<PriorityPlan>,
     force_reapply: bool,
     emergency_disabled: bool,
     shutdown_done: bool,
@@ -136,6 +166,29 @@ fn valid_test_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
+fn valid_interface_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 15
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
+fn valid_runtime_name(name: &str, allow_initial_namespace: bool) -> bool {
+    if allow_initial_namespace {
+        valid_interface_name(name)
+    } else {
+        valid_test_name(name)
+    }
+}
+
+fn require_namespace_opt_in(initial_namespace: bool, allow_initial_namespace: bool) -> Result<()> {
+    if initial_namespace && !allow_initial_namespace {
+        bail!("priority_private_namespace_required: initial namespace opt-in is missing");
+    }
+    Ok(())
+}
+
 fn incompatible_nft(value: &Value) -> bool {
     match value {
         Value::Array(values) => values.iter().any(incompatible_nft),
@@ -168,7 +221,7 @@ fn has_legacy_netqmon_mark_rule(value: &Value) -> bool {
     }
 }
 
-fn root_kind(qdiscs: &Value) -> Result<String> {
+fn capture_original_root(qdiscs: &Value) -> Result<OriginalQueueRoot> {
     let entries = qdiscs.as_array().context("qdisc dump is not an array")?;
     let roots = entries
         .iter()
@@ -177,11 +230,223 @@ fn root_kind(qdiscs: &Value) -> Result<String> {
     if roots.len() > 1 {
         bail!("priority_qdisc_conflict: multiple root qdiscs");
     }
-    match roots.first().and_then(|entry| entry["kind"].as_str()) {
-        None => Ok("noqueue".to_owned()),
-        Some("noqueue" | "fq_codel") => Ok(roots[0]["kind"].as_str().unwrap().to_owned()),
-        Some(kind) => bail!("priority_qdisc_conflict: unsupported root qdisc {kind}"),
+    let Some(root) = roots.first() else {
+        return Ok(OriginalQueueRoot::noqueue());
+    };
+    let kind = root["kind"]
+        .as_str()
+        .context("priority_qdisc_conflict: root qdisc kind is missing")?;
+    let options = root.get("options").cloned().unwrap_or(Value::Null);
+    match kind {
+        "noqueue" => Ok(OriginalQueueRoot::noqueue()),
+        "fq_codel" => Ok(OriginalQueueRoot {
+            kind: kind.to_owned(),
+            options: {
+                let _ = fq_codel_options(&options)?;
+                options
+            },
+            mq_leaves: Vec::new(),
+        }),
+        "mq" => {
+            let handle = root["handle"]
+                .as_str()
+                .context("priority_qdisc_conflict: mq root handle is missing")?;
+            let major = handle
+                .strip_suffix(':')
+                .context("priority_qdisc_conflict: invalid mq root handle")?;
+            let parent_prefix = if major.is_empty() || major == "0" {
+                ":".to_owned()
+            } else {
+                format!("{major}:")
+            };
+            let mut leaves = Vec::new();
+            for entry in entries {
+                if entry.get("root").and_then(Value::as_bool) == Some(true)
+                    || entry.get("kind").and_then(Value::as_str) == Some("clsact")
+                {
+                    continue;
+                }
+                let Some(parent) = entry.get("parent").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(minor) = parent.strip_prefix(&parent_prefix) else {
+                    continue;
+                };
+                if minor.is_empty()
+                    || !minor.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || leaves
+                        .iter()
+                        .any(|leaf: &OriginalMqLeaf| leaf.minor == minor)
+                {
+                    bail!("priority_qdisc_conflict: mq leaf parent is invalid or duplicated");
+                }
+                let leaf_kind = entry["kind"]
+                    .as_str()
+                    .context("priority_qdisc_conflict: mq leaf kind is missing")?;
+                if leaf_kind != "fq_codel" {
+                    bail!("priority_qdisc_conflict: unsupported mq leaf qdisc {leaf_kind}");
+                }
+                let leaf_options = entry
+                    .get("options")
+                    .cloned()
+                    .context("priority_qdisc_conflict: mq leaf options are missing")?;
+                let _ = fq_codel_options(&leaf_options)?;
+                leaves.push(OriginalMqLeaf {
+                    minor: minor.to_owned(),
+                    kind: leaf_kind.to_owned(),
+                    options: leaf_options,
+                });
+            }
+            leaves.sort_by(|left, right| left.minor.cmp(&right.minor));
+            Ok(OriginalQueueRoot {
+                kind: kind.to_owned(),
+                options,
+                mq_leaves: leaves,
+            })
+        }
+        _ => bail!("priority_qdisc_conflict: unsupported root qdisc {kind}"),
     }
+}
+
+fn fq_codel_options(options: &Value) -> Result<Vec<String>> {
+    let required_number = |name: &str| -> Result<String> {
+        options
+            .get(name)
+            .and_then(Value::as_u64)
+            .map(|value| value.to_string())
+            .with_context(|| format!("priority_qdisc_snapshot_incomplete: fq_codel {name}"))
+    };
+    let mut args = Vec::with_capacity(16);
+    if options.as_object().is_none_or(|object| {
+        object.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "limit"
+                    | "flows"
+                    | "quantum"
+                    | "target"
+                    | "interval"
+                    | "memory_limit"
+                    | "ecn"
+                    | "drop_batch"
+            )
+        })
+    }) {
+        bail!("priority_qdisc_snapshot_incomplete: unsupported fq_codel options");
+    }
+    for name in ["limit", "flows", "quantum"] {
+        args.extend([name.to_owned(), required_number(name)?]);
+    }
+    args.extend([
+        "target".to_owned(),
+        format!(
+            "{}us",
+            required_number("target")?
+                .parse::<u64>()?
+                .checked_add(1)
+                .context("priority_qdisc_snapshot_incomplete: target overflow")?
+        ),
+    ]);
+    args.extend([
+        "interval".to_owned(),
+        format!(
+            "{}us",
+            required_number("interval")?
+                .parse::<u64>()?
+                .checked_add(1)
+                .context("priority_qdisc_snapshot_incomplete: interval overflow")?
+        ),
+    ]);
+    args.extend([
+        "memory_limit".to_owned(),
+        format!("{}b", required_number("memory_limit")?),
+    ]);
+    args.push(match options.get("ecn").and_then(Value::as_bool) {
+        Some(true) => "ecn".to_owned(),
+        Some(false) => "noecn".to_owned(),
+        None => bail!("priority_qdisc_snapshot_incomplete: fq_codel ecn"),
+    });
+    args.extend(["drop_batch".to_owned(), required_number("drop_batch")?]);
+    Ok(args)
+}
+
+fn restore_original_root(dev: &str, original: &OriginalQueueRoot) -> Result<()> {
+    match original.kind.as_str() {
+        "noqueue" => {}
+        "fq_codel" => {
+            let mut args = vec![
+                "qdisc".to_owned(),
+                "replace".to_owned(),
+                "dev".to_owned(),
+                dev.to_owned(),
+                "root".to_owned(),
+                "fq_codel".to_owned(),
+            ];
+            args.extend(fq_codel_options(&original.options)?);
+            tc(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+        }
+        "mq" => {
+            tc(&["qdisc", "add", "dev", dev, "root", "mq"])?;
+            let qdiscs = parse_json(&tc(&["-j", "qdisc", "show", "dev", dev])?, "qdisc dump")?;
+            let roots = qdiscs
+                .as_array()
+                .context("restored mq qdisc dump is not an array")?
+                .iter()
+                .filter(|entry| entry.get("root").and_then(Value::as_bool) == Some(true))
+                .collect::<Vec<_>>();
+            if roots.len() != 1 || roots[0]["kind"] != "mq" {
+                bail!("priority_qdisc_restore_failed: mq root readback on {dev}");
+            }
+            let handle = roots[0]["handle"]
+                .as_str()
+                .context("priority_qdisc_restore_failed: mq root handle missing")?;
+            let major = handle
+                .strip_suffix(':')
+                .context("priority_qdisc_restore_failed: invalid mq root handle")?;
+            let prefix = if major.is_empty() || major == "0" {
+                ":".to_owned()
+            } else {
+                format!("{major}:")
+            };
+            for leaf in &original.mq_leaves {
+                if leaf.kind != "fq_codel" {
+                    bail!("priority_qdisc_restore_failed: unsupported saved mq leaf");
+                }
+                let parent = format!("{prefix}{}", leaf.minor);
+                let mut args = vec![
+                    "qdisc".to_owned(),
+                    "replace".to_owned(),
+                    "dev".to_owned(),
+                    dev.to_owned(),
+                    "parent".to_owned(),
+                    parent,
+                    "fq_codel".to_owned(),
+                ];
+                args.extend(fq_codel_options(&leaf.options)?);
+                tc(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+            }
+        }
+        kind => bail!("priority_qdisc_restore_failed: unsupported saved root {kind}"),
+    }
+    let restored = capture_original_root(&parse_json(
+        &tc(&["-j", "qdisc", "show", "dev", dev])?,
+        "restored qdisc dump",
+    )?)?;
+    if restored != *original {
+        bail!("priority_qdisc_restore_failed: restored tree differs on {dev}");
+    }
+    Ok(())
+}
+
+fn link_is_tcx_on(link: &libbpf_rs::query::LinkInfo, ifindex: u32) -> bool {
+    matches!(
+        &link.info,
+        libbpf_rs::query::LinkTypeInfo::Tcx(info) if info.ifindex == ifindex
+    )
+}
+
+fn has_tcx_attachment(ifindex: u32) -> bool {
+    libbpf_rs::query::LinkInfoIter::default().any(|link| link_is_tcx_on(&link, ifindex))
 }
 
 fn require_priority_transaction_recovered(policy_state_path: &Path) -> Result<()> {
@@ -212,6 +477,19 @@ fn class_edge(output: &str, class: &str, parent: Option<&str>) -> bool {
     })
 }
 
+fn empty_priority_plan(plan: &PriorityPlan) -> PriorityPlan {
+    let empty_tree = |tree: &QueueTree| {
+        let mut tree = tree.clone();
+        tree.clients.clear();
+        tree.applications.clear();
+        tree
+    };
+    PriorityPlan {
+        upload: empty_tree(&plan.upload),
+        downloads: plan.downloads.iter().map(empty_tree).collect(),
+    }
+}
+
 impl PriorityRuntime {
     pub(super) fn prepare(
         agent: &AgentConfig,
@@ -234,21 +512,24 @@ impl PriorityRuntime {
         if super::hardware_flow_offload_status() != netqmon_protocol::v1::OffloadStatus::Disabled {
             bail!("priority_offload_unknown: hardware flow offload is enabled or unspecified");
         }
-        if fs::read_link("/proc/self/ns/net")? == fs::read_link("/proc/1/ns/net")? {
-            bail!("priority_private_namespace_required: refusing the initial network namespace");
-        }
         let config: RuntimeConfig = serde_json::from_slice(&fs::read(path)?)?;
-        if !valid_test_name(&agent.interface) || !valid_test_name(&config.ifb) {
-            bail!("priority_private_interface_required: only nqp-* test interfaces are accepted");
+        let initial_namespace =
+            fs::read_link("/proc/self/ns/net")? == fs::read_link("/proc/1/ns/net")?;
+        require_namespace_opt_in(initial_namespace, config.allow_initial_namespace)?;
+        if !valid_runtime_name(&agent.interface, config.allow_initial_namespace)
+            || !valid_runtime_name(&config.ifb, config.allow_initial_namespace)
+        {
+            bail!("priority_private_interface_required: runtime interface opt-in is missing");
         }
-        if agent.interfaces.iter().any(|name| !valid_test_name(name))
+        if agent
+            .interfaces
+            .iter()
+            .any(|name| !valid_runtime_name(name, config.allow_initial_namespace))
             || observation_interfaces
                 .iter()
-                .any(|(name, _)| !valid_test_name(name))
+                .any(|(name, _)| !valid_runtime_name(name, config.allow_initial_namespace))
         {
-            bail!(
-                "priority_private_interface_required: observation is outside the isolated fixture"
-            );
+            bail!("priority_private_interface_required: observation interface opt-in is missing");
         }
         if !config.output.is_absolute()
             || !config.output.starts_with("/tmp")
@@ -298,15 +579,17 @@ impl PriorityRuntime {
             bail!("priority_conflict: nft priority writer or flowtable/offload is present");
         }
         for name in layout.egress_ports.iter().map(|port| &port.name) {
-            let attached = run("bpftool", &["net", "show", "dev", name])
-                .context("priority_attach_order_unverified: bpftool net inspection is required")?;
-            if attached.to_ascii_lowercase().contains("tcx") {
-                bail!(
-                    "priority_attach_order_unverified: a foreign TCX program is attached to {name}"
-                );
+            let ifindex = layout
+                .egress_ports
+                .iter()
+                .find(|port| &port.name == name)
+                .map(|port| port.ifindex)
+                .context("priority_attach_order_unverified: interface index is missing")?;
+            if has_tcx_attachment(ifindex) {
+                bail!("priority_attach_order_unverified: a TCX program is attached to {name}");
             }
             let qdiscs = parse_json(&tc(&["-j", "qdisc", "show", "dev", name])?, "qdisc dump")?;
-            let _ = root_kind(&qdiscs)?;
+            let _ = capture_original_root(&qdiscs)?;
             if tc(&["filter", "show", "dev", name, "ingress"])?.trim() != ""
                 || tc(&["filter", "show", "dev", name, "egress"])?.trim() != ""
             {
@@ -322,7 +605,7 @@ impl PriorityRuntime {
                 &tc(&["-j", "qdisc", "show", "dev", &port.name])?,
                 "LAN qdisc",
             )?;
-            let original_root = root_kind(&qdiscs)?;
+            let original_root = capture_original_root(&qdiscs)?;
             ports.push(OwnedPort {
                 port: port.clone(),
                 original_root,
@@ -348,12 +631,14 @@ impl PriorityRuntime {
             ports,
             ifb_ifindex,
             ifb_created: false,
+            ifb_original_root: None,
             owned_roots: BTreeSet::new(),
             priority,
             matcher_attached: Vec::new(),
             ifb_observer_attached: false,
             clsact_created: BTreeSet::new(),
             active: None,
+            active_plan: None,
             force_reapply: false,
             emergency_disabled: false,
             shutdown_done: false,
@@ -651,6 +936,12 @@ impl PriorityRuntime {
             fs::write(&ifb_ipv6, b"1\n")?;
         }
         ip(&["link", "set", &self.config.ifb, "up"])?;
+        let ifb_qdiscs = parse_json(
+            &tc(&["-j", "qdisc", "show", "dev", &self.config.ifb])?,
+            "IFB qdisc",
+        )?;
+        let ifb_original_root = capture_original_root(&ifb_qdiscs)?;
+        self.ifb_original_root = Some(ifb_original_root.clone());
         let offload = run("ethtool", &["-k", &self.config.ifb])
             .context("priority_offload_unknown: ethtool feature inspection is required")?;
         if offload
@@ -659,9 +950,20 @@ impl PriorityRuntime {
         {
             bail!("priority_offload_conflict: IFB hw-tc-offload is enabled");
         }
-        self.add_root(&self.config.ifb.clone(), classid::UPLOAD_MAJOR)?;
+        self.add_root(
+            &self.config.ifb.clone(),
+            classid::UPLOAD_MAJOR,
+            &ifb_original_root,
+        )?;
         for port in self.ports.clone() {
             let name = port.port.name.clone();
+            let current = parse_json(
+                &tc(&["-j", "qdisc", "show", "dev", &name])?,
+                "LAN qdisc before ownership",
+            )?;
+            if capture_original_root(&current)? != port.original_root {
+                bail!("priority_qdisc_conflict: {name} queue tree changed after prepare");
+            }
             let offload = run("ethtool", &["-k", &name])
                 .context("priority_offload_unknown: ethtool feature inspection is required")?;
             if offload
@@ -670,15 +972,27 @@ impl PriorityRuntime {
             {
                 bail!("priority_offload_conflict: hw-tc-offload is enabled on {name}");
             }
-            self.add_root(&name, classid::DOWNLOAD_MAJOR)?;
+            self.add_root(&name, classid::DOWNLOAD_MAJOR, &port.original_root)?;
         }
         Ok(())
     }
 
-    fn add_root(&mut self, name: &str, major: u32) -> Result<()> {
+    fn add_root(
+        &mut self,
+        name: &str,
+        major: u32,
+        expected_original: &OriginalQueueRoot,
+    ) -> Result<()> {
+        let current = parse_json(
+            &tc(&["-j", "qdisc", "show", "dev", name])?,
+            "qdisc before replacement",
+        )?;
+        if capture_original_root(&current)? != *expected_original {
+            bail!("priority_qdisc_conflict: {name} queue tree changed before replacement");
+        }
         let root = format!("{major:x}:");
         tc(&[
-            "qdisc", "add", "dev", name, "root", "handle", &root, "htb", "default", "fffe",
+            "qdisc", "replace", "dev", name, "root", "handle", &root, "htb", "default", "fffe",
         ])?;
         self.owned_roots.insert((name.to_owned(), major));
         self.install_tree_base(name, major)?;
@@ -853,14 +1167,15 @@ impl PriorityRuntime {
             errors.push(error.to_string());
         }
         for (name, major) in self.owned_roots.clone().into_iter().rev() {
+            let noqueue = OriginalQueueRoot::noqueue();
             let original = if major == classid::DOWNLOAD_MAJOR {
                 self.ports
                     .iter()
                     .find(|port| port.port.name == name)
-                    .map(|port| port.original_root.as_str())
-                    .unwrap_or("noqueue")
+                    .map(|port| &port.original_root)
+                    .unwrap_or(&noqueue)
             } else {
-                "noqueue"
+                self.ifb_original_root.as_ref().unwrap_or(&noqueue)
             };
             if let Err(error) = self.remove_owned_root(&name, major, original) {
                 errors.push(error.to_string());
@@ -1146,7 +1461,7 @@ impl PriorityRuntime {
         let mut changed = Vec::new();
         let install = self.install_plan(&plan, &mut changed);
         if let Err(error) = install {
-            let rollback = self.restore_rates(old.as_ref());
+            let rollback = self.restore_rates(old.as_ref(), &plan);
             if rollback.is_ok() {
                 let _ = fs::remove_file(&self.journal_path);
             }
@@ -1163,7 +1478,7 @@ impl PriorityRuntime {
         {
             Ok(previous) => previous,
             Err(error) => {
-                let rollback = self.restore_rates(old.as_ref());
+                let rollback = self.restore_rates(old.as_ref(), &plan);
                 if rollback.is_ok() {
                     let _ = fs::remove_file(&self.journal_path);
                 }
@@ -1181,7 +1496,7 @@ impl PriorityRuntime {
                 .lock()
                 .map_err(|_| anyhow!("priority map lock poisoned"))?
                 .restore(&previous);
-            let queue_rollback = self.restore_rates(old.as_ref());
+            let queue_rollback = self.restore_rates(old.as_ref(), &plan);
             if map_rollback.is_ok() && queue_rollback.is_ok() {
                 let _ = fs::remove_file(&self.journal_path);
             }
@@ -1190,6 +1505,7 @@ impl PriorityRuntime {
             ));
         }
         self.active = Some(next);
+        self.active_plan = Some(plan);
         self.layout = layout;
         self.force_reapply = false;
         if let Err(error) = fs::remove_file(&self.journal_path) {
@@ -1205,6 +1521,7 @@ impl PriorityRuntime {
         let trees = std::iter::once(&plan.upload).chain(plan.downloads.iter());
         for tree in trees {
             let dev = tree.port.name.as_str();
+            self.verify_owned_tree(tree)?;
             for class in tree.classes().map_err(anyhow::Error::msg)? {
                 let classid = classid_text(class.classid);
                 let parent = classid_text(class.parent);
@@ -1247,9 +1564,143 @@ impl PriorityRuntime {
         Ok(())
     }
 
-    fn restore_rates(&self, old: Option<&PriorityState>) -> Result<()> {
-        let Some(old) = old else {
+    fn verify_owned_tree(&self, tree: &QueueTree) -> Result<()> {
+        let dev = tree.port.name.as_str();
+        let owned_key = (dev.to_owned(), tree.major);
+        if !self.owned_roots.contains(&owned_key) {
+            bail!(
+                "priority_qdisc_ownership_unknown: {dev} handle {:x}:",
+                tree.major
+            );
+        }
+        let qdiscs = parse_json(
+            &tc(&["-j", "qdisc", "show", "dev", dev])?,
+            "owned priority qdisc",
+        )?;
+        let root_handle = format!("{:x}:", tree.major);
+        if !qdiscs.as_array().is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry.get("root").and_then(Value::as_bool) == Some(true)
+                    && entry.get("kind").and_then(Value::as_str) == Some("htb")
+                    && entry.get("handle").and_then(Value::as_str) == Some(root_handle.as_str())
+            })
+        }) {
+            bail!("priority_qdisc_ownership_changed: {dev} handle {root_handle}");
+        }
+        let classes = tc(&["class", "show", "dev", dev])?;
+        if !class_edge(&classes, &format!("{:x}:1", tree.major), None)
+            || !class_edge(
+                &classes,
+                &format!("{:x}:fffe", tree.major),
+                Some(&format!("{:x}:1", tree.major)),
+            )
+        {
+            bail!("priority_qdisc_ownership_changed: {dev} base classes");
+        }
+        Ok(())
+    }
+
+    fn remove_unused_priority_classes(&self, tree: &QueueTree) -> Result<()> {
+        let dev = tree.port.name.as_str();
+        let desired = tree
+            .classes()
+            .map_err(anyhow::Error::msg)?
+            .into_iter()
+            .map(|class| class.classid)
+            .collect::<BTreeSet<_>>();
+        let classes = parse_json(
+            &tc(&["-j", "class", "show", "dev", dev])?,
+            "priority class dump",
+        )?;
+        let stale = unused_priority_classes(&classes, tree.major, &desired)?;
+        if stale.is_empty() {
             return Ok(());
+        }
+
+        let stale_class_ids = stale.iter().map(|class| class.raw).collect::<BTreeSet<_>>();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let qdiscs = parse_json(
+                &tc(&["-s", "-j", "qdisc", "show", "dev", dev])?,
+                "priority qdisc stats",
+            )?;
+            let entries = qdiscs
+                .as_array()
+                .context("priority qdisc stats not array")?;
+            let drained = entries.iter().all(|entry| {
+                let parent = entry
+                    .get("parent")
+                    .and_then(Value::as_str)
+                    .and_then(parse_classid_text);
+                !parent.is_some_and(|parent| stale_class_ids.contains(&parent))
+                    || backlog_empty(entry)
+            });
+            if drained {
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!("priority_class_cleanup_backlog: {dev}");
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        for class in &stale {
+            let classid = classid_text(class.raw);
+            tc(&["class", "del", "dev", dev, "classid", &classid])?;
+        }
+
+        let remaining_classes = parse_json(
+            &tc(&["-j", "class", "show", "dev", dev])?,
+            "priority class cleanup readback",
+        )?;
+        let remaining_ids = remaining_classes
+            .as_array()
+            .context("priority class cleanup readback not an array")?
+            .iter()
+            .filter_map(|entry| entry.get("handle").and_then(Value::as_str))
+            .filter_map(parse_classid_text)
+            .collect::<BTreeSet<_>>();
+        if stale.iter().any(|class| remaining_ids.contains(&class.raw)) {
+            bail!("priority_class_cleanup_readback_failed: {dev}");
+        }
+        let stale_ids = stale.iter().map(|class| class.raw).collect::<BTreeSet<_>>();
+        let remaining_qdiscs = parse_json(
+            &tc(&["-j", "qdisc", "show", "dev", dev])?,
+            "priority qdisc cleanup readback",
+        )?;
+        if remaining_qdiscs.as_array().is_none_or(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .get("parent")
+                    .and_then(Value::as_str)
+                    .and_then(parse_classid_text)
+                    .is_some_and(|parent| stale_ids.contains(&parent))
+            })
+        }) {
+            bail!("priority_class_cleanup_qdisc_readback_failed: {dev}");
+        }
+        Ok(())
+    }
+
+    /// Remove stale Agent-owned classes only after the receiver has reset the
+    /// exact-flow verdict map for the newly applied policy revision. Shape
+    /// entries contain class IDs, so pruning before that reset can leave an
+    /// existing flow pointing at a class that has already been deleted.
+    pub(crate) fn prune_unused_classes_after_flow_reset(&self) -> Result<()> {
+        let Some(plan) = self.active_plan.as_ref() else {
+            return Ok(());
+        };
+        for tree in std::iter::once(&plan.upload).chain(plan.downloads.iter()) {
+            self.remove_unused_priority_classes(tree)?;
+        }
+        Ok(())
+    }
+
+    fn restore_rates(&self, old: Option<&PriorityState>, attempted: &PriorityPlan) -> Result<()> {
+        let Some(old) = old else {
+            let plan = empty_priority_plan(attempted);
+            let mut changed = Vec::new();
+            return self.install_plan(&plan, &mut changed);
         };
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1446,7 +1897,10 @@ impl PriorityRuntime {
             &serde_json::to_vec_pretty(&serde_json::json!({
                 "kind":"client_priority_runtime_evidence","phase":phase,"ifb":self.config.ifb,"ifb_ifindex":self.ifb_ifindex,
                 "lan":self.layout,"agent_hook_priority":self.agent.attach_order.tc_priority,"matcher_priority":self.priority,
-                "maps":maps,"classes":classes,"state_path":self.state_path,"journal_path":self.journal_path,
+                "maps":maps,"classes":classes,
+                "original_qdisc_roots":self.ports.iter().map(|port|serde_json::json!({"dev":&port.port.name,"ifindex":port.port.ifindex,"tree":&port.original_root})).collect::<Vec<_>>(),
+                "ifb_original_qdisc_root":&self.ifb_original_root,
+                "state_path":self.state_path,"journal_path":self.journal_path,
             }))?,
         )
     }
@@ -1535,6 +1989,10 @@ impl PriorityRuntime {
             }
         }
         if errors.is_empty() {
+            let ifb_original_root = self
+                .ifb_original_root
+                .clone()
+                .unwrap_or_else(OriginalQueueRoot::noqueue);
             for port in &self.ports {
                 if let Err(error) = self.remove_owned_root(
                     &port.port.name,
@@ -1545,7 +2003,7 @@ impl PriorityRuntime {
                 }
             }
             if let Err(error) =
-                self.remove_owned_root(&self.config.ifb, classid::UPLOAD_MAJOR, "noqueue")
+                self.remove_owned_root(&self.config.ifb, classid::UPLOAD_MAJOR, &ifb_original_root)
             {
                 errors.push(error.to_string());
             }
@@ -1657,7 +2115,7 @@ impl PriorityRuntime {
         }
     }
 
-    fn remove_owned_root(&self, dev: &str, major: u32, original: &str) -> Result<()> {
+    fn remove_owned_root(&self, dev: &str, major: u32, original: &OriginalQueueRoot) -> Result<()> {
         let qdiscs = parse_json(&tc(&["-j", "qdisc", "show", "dev", dev])?, "qdisc dump")?;
         if !qdiscs.as_array().is_some_and(|entries| {
             entries
@@ -1675,10 +2133,7 @@ impl PriorityRuntime {
             "handle",
             &format!("{major:x}:"),
         ])?;
-        if original == "fq_codel" {
-            tc(&["qdisc", "replace", "dev", dev, "root", "fq_codel"])?;
-        }
-        Ok(())
+        restore_original_root(dev, original)
     }
 }
 
@@ -1779,7 +2234,137 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod priority_recovery_gate_tests {
-    use super::{has_legacy_netqmon_mark_rule, require_priority_transaction_recovered};
+    use super::{
+        OriginalQueueRoot, RuntimeConfig, capture_original_root, fq_codel_options,
+        has_legacy_netqmon_mark_rule, require_namespace_opt_in,
+        require_priority_transaction_recovered, valid_runtime_name,
+    };
+
+    #[test]
+    fn initial_namespace_requires_an_explicit_runtime_config_opt_in() {
+        assert!(require_namespace_opt_in(false, false).is_ok());
+        assert!(require_namespace_opt_in(false, true).is_ok());
+        assert!(require_namespace_opt_in(true, false).is_err());
+        assert!(require_namespace_opt_in(true, true).is_ok());
+
+        assert!(valid_runtime_name("nqp-lan", false));
+        assert!(!valid_runtime_name("br-lan", false));
+        assert!(valid_runtime_name("br-lan", true));
+        assert!(!valid_runtime_name("br/lan", true));
+
+        let config: RuntimeConfig = serde_json::from_value(serde_json::json!({
+            "ifb": "nqp-ifb0",
+            "output": "/tmp/priority-evidence"
+        }))
+        .expect("legacy isolated config remains valid");
+        assert!(!config.allow_initial_namespace);
+    }
+
+    #[test]
+    fn mq_snapshot_preserves_each_fq_codel_leaf_for_restore() {
+        let options = serde_json::json!({
+            "limit": 10240,
+            "flows": 1024,
+            "quantum": 1514,
+            "target": 4999,
+            "interval": 99999,
+            "memory_limit": 33_554_432,
+            "ecn": true,
+            "drop_batch": 64
+        });
+        let qdiscs = serde_json::json!([
+            {"kind":"mq","handle":"0:","root":true,"options":{}},
+            {"kind":"fq_codel","handle":"0:","parent":":2","options":options.clone()},
+            {"kind":"fq_codel","handle":"0:","parent":":1","options":options},
+            {"kind":"clsact","handle":"ffff:","options":{}}
+        ]);
+
+        let root = capture_original_root(&qdiscs).expect("supported mq tree");
+
+        assert_eq!(root.kind, "mq");
+        assert_eq!(
+            root.mq_leaves
+                .iter()
+                .map(|leaf| leaf.minor.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "2"]
+        );
+        assert_eq!(
+            fq_codel_options(&root.mq_leaves[0].options).unwrap(),
+            [
+                "limit",
+                "10240",
+                "flows",
+                "1024",
+                "quantum",
+                "1514",
+                "target",
+                "5000us",
+                "interval",
+                "100000us",
+                "memory_limit",
+                "33554432b",
+                "ecn",
+                "drop_batch",
+                "64"
+            ]
+        );
+    }
+
+    #[test]
+    fn ifb_default_fq_codel_root_is_snapshotted_for_rollback() {
+        let options = serde_json::json!({
+            "limit": 10240,
+            "flows": 1024,
+            "quantum": 1514,
+            "target": 4999,
+            "interval": 99999,
+            "memory_limit": 33_554_432,
+            "ecn": true,
+            "drop_batch": 64
+        });
+        let qdiscs = serde_json::json!([
+            {"kind":"fq_codel","handle":"0:","root":true,"options":options}
+        ]);
+
+        let root = capture_original_root(&qdiscs).expect("supported IFB default qdisc");
+
+        assert_eq!(root.kind, "fq_codel");
+        assert_eq!(root.mq_leaves, Vec::new());
+        assert_eq!(
+            fq_codel_options(&root.options).unwrap(),
+            [
+                "limit",
+                "10240",
+                "flows",
+                "1024",
+                "quantum",
+                "1514",
+                "target",
+                "5000us",
+                "interval",
+                "100000us",
+                "memory_limit",
+                "33554432b",
+                "ecn",
+                "drop_batch",
+                "64"
+            ]
+        );
+    }
+
+    #[test]
+    fn unsupported_mq_leaf_does_not_become_an_incomplete_restore_snapshot() {
+        let qdiscs = serde_json::json!([
+            {"kind":"mq","handle":"8002:","root":true,"options":{}},
+            {"kind":"cake","handle":"0:","parent":"8002:1","options":{}}
+        ]);
+
+        let error = capture_original_root(&qdiscs).expect_err("unsupported leaf must fail closed");
+
+        assert!(error.to_string().contains("unsupported mq leaf qdisc cake"));
+        assert_eq!(OriginalQueueRoot::noqueue().kind, "noqueue");
+    }
 
     #[test]
     fn unfinished_priority_journal_is_preserved_and_blocks_startup() {
@@ -1804,7 +2389,7 @@ mod priority_recovery_gate_tests {
         let state = directory.path().join("policy-state.json");
         require_priority_transaction_recovered(&state).expect("no unfinished journal");
 
-        let passwall = serde_json::json!({"expr":[{"mangle":{"key":{"meta":{"key":"mark"}},"value":1347637042}}]});
+        let passwall = serde_json::json!({"expr":[{"mangle":{"key":{"meta":{"key":"mark"}},"value":1_347_637_042}}]});
         assert!(!has_legacy_netqmon_mark_rule(&passwall));
 
         let owned = serde_json::json!({"comment":"netqmon:shared:upload"});

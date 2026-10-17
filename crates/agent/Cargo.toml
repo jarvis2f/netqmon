@@ -12,7 +12,7 @@ repository.workspace = true
 qos-compatibility-poc = []
 # Stage 2 read-only packet-path evidence, never a policy capability.
 qos-client-path-probe = []
-# Experimental client backend; runtime activation remains gated in test netns.
+# Opt-in client backend; runtime activation requires an explicit runtime config.
 qos-client-priority = ["qos-client-path-probe"]
 
 [dependencies]
