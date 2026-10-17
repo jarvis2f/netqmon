@@ -144,12 +144,18 @@ pub(crate) fn evaluate_preview(
     });
     let verdict = winning_verdict.map_or_else(
         || "none".to_owned(),
-        |policy| match policy.spec.action.kind {
-            PolicyActionKind::Block if application_block_supported => "block".to_owned(),
-            PolicyActionKind::Allow if application_block_supported => "allow".to_owned(),
-            _ => {
-                unsupported_reasons.push("unsupported_application_block".to_owned());
-                "unsupported".to_owned()
+        |policy| {
+            if policy.spec.selectors.clients.is_empty() {
+                unsupported_reasons.push("application_client_selector_required".to_owned());
+                return "unsupported".to_owned();
+            }
+            match policy.spec.action.kind {
+                PolicyActionKind::Block if application_block_supported => "block".to_owned(),
+                PolicyActionKind::Allow if application_block_supported => "allow".to_owned(),
+                _ => {
+                    unsupported_reasons.push("unsupported_application_block".to_owned());
+                    "unsupported".to_owned()
+                }
             }
         },
     );
@@ -160,10 +166,10 @@ pub(crate) fn evaluate_preview(
         .filter(|policy| policy.spec.action.kind == PolicyActionKind::Limit)
     {
         let (status, reason_code) = if policy.spec.selectors.clients.is_empty() {
-            unsupported_reasons.push("unsupported_global_app_limit".to_owned());
+            unsupported_reasons.push("application_client_selector_required".to_owned());
             (
                 "unsupported",
-                Some("unsupported_global_app_limit".to_owned()),
+                Some("application_client_selector_required".to_owned()),
             )
         } else if !application_limit_supported {
             unsupported_reasons.push("unsupported_application_shaping".to_owned());
@@ -594,7 +600,7 @@ mod tests {
         assert!(
             result
                 .unsupported_reasons
-                .contains(&"unsupported_global_app_limit".to_owned())
+                .contains(&"application_client_selector_required".to_owned())
         );
         assert!(
             result

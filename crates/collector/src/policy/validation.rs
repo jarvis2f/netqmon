@@ -199,14 +199,24 @@ fn validate_network(spec: &PolicySpecV1, issues: &mut Vec<ValidationIssue>) {
 }
 
 fn validate_action(spec: &PolicySpecV1, issues: &mut Vec<ValidationIssue>) {
+    let application_policy =
+        !spec.selectors.applications.is_empty() || !spec.selectors.categories.is_empty();
+    if application_policy && spec.selectors.clients.is_empty() {
+        issue(
+            issues,
+            "selectors.clients",
+            "unsupported_selector",
+            "application block, allow, and limit policies require at least one client selector",
+        );
+    }
     match spec.action.kind {
         ActionKind::Limit => {
-            if spec.selectors.clients.is_empty() {
+            if spec.selectors.clients.is_empty() && !application_policy {
                 issue(
                     issues,
                     "selectors.clients",
                     "unsupported_selector",
-                    "application limits require at least one client; global application pools are unsupported",
+                    "client limits require at least one client selector",
                 );
             }
             validate_rate(spec.action.download_bps, "action.download_bps", issues);

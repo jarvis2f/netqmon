@@ -101,6 +101,7 @@ impl FlowVerdictWriter {
     pub(crate) fn install_block(
         &self,
         aliases: &[FlowKey],
+        command_id: &str,
         policy_flow_id: &str,
         policy_id: &str,
         client_mac: &str,
@@ -119,6 +120,8 @@ impl FlowVerdictWriter {
         };
         self.install_verdict(
             &tagged_aliases,
+            command_id,
+            policy_flow_id,
             identity,
             generation,
             expires_monotonic_ns,
@@ -129,6 +132,7 @@ impl FlowVerdictWriter {
     pub(crate) fn install_shape(
         &self,
         aliases: &[(FlowKey, u32)],
+        command_id: &str,
         policy_flow_id: &str,
         generation: u64,
         expires_monotonic_ns: u64,
@@ -146,6 +150,8 @@ impl FlowVerdictWriter {
         };
         self.install_verdict(
             aliases,
+            command_id,
+            policy_flow_id,
             identity,
             generation,
             expires_monotonic_ns,
@@ -156,6 +162,8 @@ impl FlowVerdictWriter {
     fn install_verdict(
         &self,
         aliases: &[(FlowKey, u32)],
+        command_id: &str,
+        policy_flow_id: &str,
         identity: VerdictIdentity,
         generation: u64,
         expires_monotonic_ns: u64,
@@ -182,6 +190,11 @@ impl FlowVerdictWriter {
             .verdict_map
             .as_ref()
             .ok_or_else(|| "BPF verdict map is unavailable".to_owned())?;
+        let hooks = aliases.iter().map(|(key, _)| key.hook).collect::<Vec<_>>();
+        let ifindices = aliases
+            .iter()
+            .map(|(key, _)| key.ifindex)
+            .collect::<Vec<_>>();
         for (alias, classid) in aliases {
             let key = alias.bpf_key_bytes();
             let value = encode_verdict(
@@ -191,9 +204,22 @@ impl FlowVerdictWriter {
                 *classid,
                 verdict,
             );
-            let previous = verdict_map
-                .lookup(&key, MapFlags::ANY)
-                .map_err(|error| format!("read previous BPF flow verdict: {error}"))?;
+            let previous = match verdict_map.lookup(&key, MapFlags::ANY) {
+                Ok(previous) => previous,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "netqmon_agent::policy::flow_trace",
+                        command_id,
+                        policy_flow_id,
+                        revision = generation,
+                        hook = alias.hook,
+                        ifindex = alias.ifindex,
+                        error = %error,
+                        "could not read prior BPF verdict while applying FlowCommand"
+                    );
+                    return Err(format!("read previous BPF flow verdict: {error}"));
+                }
+            };
             if let Err(error) = verdict_map.update(&key, &value, MapFlags::ANY) {
                 let mut rollback_errors = Vec::new();
                 for (rollback_key, previous_value) in previous_values.into_iter().rev() {
@@ -212,10 +238,32 @@ impl FlowVerdictWriter {
                 } else {
                     format!("; rollback failed: {}", rollback_errors.join("; "))
                 };
+                tracing::warn!(
+                    target: "netqmon_agent::policy::flow_trace",
+                    command_id,
+                    policy_flow_id,
+                    revision = generation,
+                    hook = alias.hook,
+                    ifindex = alias.ifindex,
+                    error = %error,
+                    rollback_failed = !rollback_errors.is_empty(),
+                    "BPF verdict map update failed"
+                );
                 return Err(format!("write BPF flow verdict: {error}{rollback_detail}"));
             }
             previous_values.push((key, previous));
         }
+        tracing::debug!(
+            target: "netqmon_agent::policy::flow_trace",
+            command_id,
+            policy_flow_id,
+            revision = generation,
+            verdict,
+            alias_count = previous_values.len(),
+            hooks = ?hooks,
+            ifindices = ?ifindices,
+            "BPF verdict map updated for FlowCommand"
+        );
         Ok(previous_values.len())
     }
 
@@ -223,6 +271,7 @@ impl FlowVerdictWriter {
         &self,
         aliases: &[FlowKey],
         expected_flow_id: Option<&str>,
+        command_id: &str,
     ) -> Result<usize, String> {
         if !self.ready {
             return Err("BPF policy map ABI does not match the Agent".to_owned());
@@ -237,17 +286,47 @@ impl FlowVerdictWriter {
             let key = alias.bpf_key_bytes();
             let value = verdict_map
                 .lookup(&key, MapFlags::ANY)
-                .map_err(|error| format!("look up BPF flow verdict: {error}"))?
+                .map_err(|error| {
+                    tracing::warn!(
+                        target: "netqmon_agent::policy::flow_trace",
+                        command_id,
+                        policy_flow_id = expected_flow_id.unwrap_or(""),
+                        hook = alias.hook,
+                        ifindex = alias.ifindex,
+                        error = %error,
+                        "could not read BPF verdict while revoking FlowCommand"
+                    );
+                    format!("look up BPF flow verdict: {error}")
+                })?
                 .filter(|value| {
                     expected_hash.is_none_or(|expected| value.get(16..32) == Some(&expected))
                 });
             if value.is_some() {
-                verdict_map
-                    .delete(&key)
-                    .map_err(|error| format!("delete BPF flow verdict: {error}"))?;
+                verdict_map.delete(&key).map_err(|error| {
+                    tracing::warn!(
+                        target: "netqmon_agent::policy::flow_trace",
+                        command_id,
+                        policy_flow_id = expected_flow_id.unwrap_or(""),
+                        hook = alias.hook,
+                        ifindex = alias.ifindex,
+                        error = %error,
+                        "could not delete BPF verdict while revoking FlowCommand"
+                    );
+                    format!("delete BPF flow verdict: {error}")
+                })?;
                 removed += 1;
             }
         }
+        tracing::debug!(
+            target: "netqmon_agent::policy::flow_trace",
+            command_id,
+            policy_flow_id = expected_flow_id.unwrap_or(""),
+            alias_count = aliases.len(),
+            removed,
+            hooks = ?aliases.iter().map(|alias| alias.hook).collect::<Vec<_>>(),
+            ifindices = ?aliases.iter().map(|alias| alias.ifindex).collect::<Vec<_>>(),
+            "BPF verdict aliases cleared for FlowCommand"
+        );
         Ok(removed)
     }
 

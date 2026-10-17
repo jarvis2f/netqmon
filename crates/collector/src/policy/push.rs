@@ -628,6 +628,9 @@ impl PolicyHub {
             command_id,
             boot_id,
             policy_flow_id,
+            config_revision,
+            issued_at_ms,
+            operation,
             ..
         } = &frame
         else {
@@ -651,14 +654,31 @@ impl PolicyHub {
             .entry(command_id.clone())
             .and_modify(|attempts| *attempts = attempts.saturating_add(1))
             .or_insert(1);
+        let attempt_number = *attempts;
+        let sent_at_ms = now_ms();
         state.flow_in_flight.insert(
             command_id.clone(),
             InFlightFlowCommand {
                 key: flow_command_key(boot_id, policy_flow_id),
                 frame,
                 sent_at: Instant::now(),
-                attempts: *attempts,
+                attempts: attempt_number,
             },
+        );
+        drop(gateways);
+        tracing::debug!(
+            target: "netqmon_collector::policy::flow_trace",
+            gateway_id = session.gateway_id,
+            boot_id,
+            command_id,
+            policy_flow_id,
+            config_revision,
+            ?operation,
+            attempt = attempt_number,
+            command_issued_at_ms = issued_at_ms,
+            collector_sent_at_ms = sent_at_ms,
+            collector_queue_delay_ms = sent_at_ms.saturating_sub(*issued_at_ms),
+            "sent application FlowCommand to Agent"
         );
     }
 
@@ -1504,6 +1524,7 @@ fn handle_agent_frame(
             if agent_boot_id.as_deref() != Some(boot_id.as_str()) {
                 return false;
             }
+            let collector_received_at_ms = now_ms();
             if !hub.acknowledge_flow_command(
                 session,
                 &gateway_id,
@@ -1525,7 +1546,8 @@ fn handle_agent_frame(
                 ?status,
                 reason_code = reason_code.as_deref().unwrap_or(""),
                 alias_count,
-                reported_at_ms,
+                agent_reported_at_ms = reported_at_ms,
+                collector_received_at_ms,
                 "agent acknowledged an application flow command"
             );
             true

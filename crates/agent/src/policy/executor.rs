@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
+#[cfg(feature = "qos-client-priority")]
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use netqmon_protocol::policy::{
@@ -12,6 +14,8 @@ use netqmon_protocol::policy::{
 use sha2::{Digest as _, Sha256};
 
 use crate::config::AgentConfig;
+#[cfg(feature = "qos-client-priority")]
+use crate::linux::qos_priority_runtime::PriorityRuntime;
 
 use super::capabilities::{self, PolicyTopology};
 use super::flow_verdict::{self, FlowVerdictWriter};
@@ -786,9 +790,68 @@ pub(crate) fn traffic_metrics_frames(
         sampled_at_ms,
         &classes,
     );
+    metrics_frames(
+        gateway_id,
+        boot_id,
+        sampled_at_ms,
+        metrics.into_values().collect(),
+    )
+}
+
+#[cfg(feature = "qos-client-priority")]
+pub(crate) fn traffic_metrics_frames_priority(
+    gateway_id: &str,
+    boot_id: &str,
+    flow_verdict_writer: &FlowVerdictWriter,
+    priority_runtime: &Arc<Mutex<PriorityRuntime>>,
+) -> Vec<PolicyWireFrame> {
+    let snapshot = match priority_runtime.lock() {
+        Ok(runtime) => runtime.metrics_snapshot(),
+        Err(_) => {
+            tracing::error!(
+                target: "netqmon_agent::policy::metrics",
+                "Priority Runtime lock is poisoned; policy metrics are unavailable"
+            );
+            return Vec::new();
+        }
+    };
+    let Some((snapshot, class_metrics)) = snapshot else {
+        return Vec::new();
+    };
+    let Some((policies, intervals, valid_until_ms)) = snapshot_parts(&snapshot) else {
+        return Vec::new();
+    };
+    let Some(sampled_at_ms) = now_ms().filter(|value| *value >= 0) else {
+        return Vec::new();
+    };
+    let mut metrics = BTreeMap::<(String, String), PolicyClientMetrics>::new();
+    append_block_policy_metrics(
+        &mut metrics,
+        policies,
+        intervals,
+        valid_until_ms,
+        sampled_at_ms,
+        flow_verdict_writer,
+    );
+    match class_metrics {
+        Ok(classes) => append_priority_class_metrics(&mut metrics, classes),
+        Err(error) => tracing::warn!(%error, "could not read Priority Runtime HTB policy metrics"),
+    }
+    metrics_frames(
+        gateway_id,
+        boot_id,
+        sampled_at_ms,
+        metrics.into_values().collect(),
+    )
+}
+
+fn metrics_frames(
+    gateway_id: &str,
+    boot_id: &str,
+    sampled_at_ms: i64,
+    metrics: Vec<PolicyClientMetrics>,
+) -> Vec<PolicyWireFrame> {
     metrics
-        .into_values()
-        .collect::<Vec<_>>()
         .chunks(256)
         .map(|chunk| PolicyWireFrame::PolicyMetrics {
             wire_version: POLICY_WIRE_VERSION,
@@ -798,6 +861,39 @@ pub(crate) fn traffic_metrics_frames(
             metrics: chunk.to_vec(),
         })
         .collect()
+}
+
+#[cfg(feature = "qos-client-priority")]
+fn append_priority_class_metrics(
+    metrics: &mut BTreeMap<(String, String), PolicyClientMetrics>,
+    classes: Vec<crate::linux::qos_priority_runtime::PriorityClassMetrics>,
+) {
+    for class in classes {
+        let item = metrics
+            .entry((class.policy_id.clone(), class.mac.clone()))
+            .or_insert_with(|| PolicyClientMetrics {
+                policy_id: class.policy_id,
+                mac: class.mac,
+                upload: None,
+                download: None,
+            });
+        let direction = PolicyDirectionMetrics {
+            interface: class.interface,
+            bytes: class.bytes.filter(|value| *value <= MAX_SAFE_JSON_INTEGER),
+            packets: class
+                .packets
+                .filter(|value| *value <= MAX_SAFE_JSON_INTEGER),
+            drops: class.drops.filter(|value| *value <= MAX_SAFE_JSON_INTEGER),
+            overlimits: class
+                .overlimits
+                .filter(|value| *value <= MAX_SAFE_JSON_INTEGER),
+        };
+        if class.upload {
+            item.upload = Some(direction);
+        } else {
+            item.download = Some(direction);
+        }
+    }
 }
 
 fn append_block_policy_metrics(
@@ -978,7 +1074,20 @@ pub(crate) fn health_frame_with_flow_capability(
 pub(crate) fn status_json(config: &AgentConfig) -> serde_json::Value {
     let state = state::load_any(&config.policy_state_path).ok().flatten();
     let topology = capabilities::inspect(config);
+    #[cfg(feature = "qos-client-priority")]
+    let policy_backend = match std::env::var_os("NETQMON_QOS_PRIORITY_CONFIG") {
+        None => "legacy",
+        Some(_) => "priority",
+    };
+    #[cfg(not(feature = "qos-client-priority"))]
+    let policy_backend = if std::env::var_os("NETQMON_QOS_PRIORITY_CONFIG").is_some() {
+        "unavailable"
+    } else {
+        "legacy"
+    };
     serde_json::json!({
+        "policy_backend": policy_backend,
+        "policy_backend_status_source": "agent_runtime_startup_selection",
         "gateway_id": state.as_ref().map(|state| state.gateway_id.as_str()),
         "config_revision": state.as_ref().map_or(0, |state| state.config_revision),
         "bundle_generation": state.as_ref().map_or(0, |state| state.bundle_generation),
@@ -1999,13 +2108,14 @@ fn is_application_policy(policy: &PolicySnapshotEntry) -> bool {
 }
 
 fn unsupported_reason(policy: &PolicySnapshotEntry, topology: &PolicyTopology) -> (String, String) {
+    if is_application_policy(policy) && policy.spec.selectors.clients.is_empty() {
+        return (
+            "application_client_selector_required".to_owned(),
+            "application block, allow, and limit policies require at least one client selector"
+                .to_owned(),
+        );
+    }
     if is_application_policy(policy) && policy.spec.action.kind == PolicyActionKind::Limit {
-        if policy.spec.selectors.clients.is_empty() {
-            return (
-                "unsupported_global_app_limit".to_owned(),
-                "global application bandwidth pools are not supported".to_owned(),
-            );
-        }
         return (
             "unsupported_application_shaping".to_owned(),
             "aggregate application shaping requires verified child classes and egress marks"

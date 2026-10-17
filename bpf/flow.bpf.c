@@ -149,19 +149,26 @@ static __always_inline int apply_flow_policy(struct __sk_buff *skb,
     if (verdict->verdict == NETQMON_VERDICT_SHAPE) {
 #ifdef NETQMON_QOS_PRIORITY
         __u32 ifindex = skb->ifindex;
-        if (bpf_map_lookup_elem(&qos_priority_roots, &ifindex)) {
-            __u32 major = verdict->policy_tag >> 16;
-            __u32 minor = verdict->policy_tag & 0xffff;
-            if (((key->hook == NETQMON_HOOK_INGRESS &&
-                  major == NETQMON_QOS_UPLOAD_MAJOR) ||
-                 (key->hook == NETQMON_HOOK_EGRESS &&
-                  major == NETQMON_QOS_DOWNLOAD_MAJOR)) &&
-                minor >= NETQMON_QOS_APPLICATION_FIRST &&
-                minor <= NETQMON_QOS_APPLICATION_LAST)
-                skb->priority = verdict->policy_tag;
+        __u32 zero = 0;
+        __u32 *priority_ifb = bpf_map_lookup_elem(&qos_priority_ifb, &zero);
+        if (priority_ifb && *priority_ifb) {
+            if (bpf_map_lookup_elem(&qos_priority_roots, &ifindex)) {
+                __u32 major = verdict->policy_tag >> 16;
+                __u32 minor = verdict->policy_tag & 0xffff;
+                if (((key->hook == NETQMON_HOOK_INGRESS &&
+                      major == NETQMON_QOS_UPLOAD_MAJOR) ||
+                     (key->hook == NETQMON_HOOK_EGRESS &&
+                      major == NETQMON_QOS_DOWNLOAD_MAJOR)) &&
+                    minor >= NETQMON_QOS_APPLICATION_FIRST &&
+                    minor <= NETQMON_QOS_APPLICATION_LAST)
+                    skb->priority = verdict->policy_tag;
+            }
         } else if (key->hook == NETQMON_HOOK_EGRESS &&
                    verdict->policy_tag > 0 &&
                    verdict->policy_tag <= NETQMON_APPLICATION_MARK_MAX_TAG) {
+            /* The priority feature can still be built into a Legacy-mode
+             * Agent. Marks are available only when the priority runtime has
+             * not published its active IFB configuration. */
             skb->mark = (skb->mark & ~NETQMON_APPLICATION_MARK_MASK) |
                         ((verdict->policy_tag << NETQMON_APPLICATION_MARK_SHIFT) &
                          NETQMON_APPLICATION_MARK_MASK);

@@ -89,6 +89,17 @@ impl PrioritySelection {
                 selection.results.push(result);
                 continue;
             }
+            let is_application_policy = !policy.spec.selectors.applications.is_empty()
+                || !policy.spec.selectors.categories.is_empty();
+            if is_application_policy
+                && matches!(
+                    policy.spec.action.kind,
+                    PolicyActionKind::Block | PolicyActionKind::Allow | PolicyActionKind::Limit
+                )
+                && policy.spec.selectors.clients.is_empty()
+            {
+                return Err("application_client_selector_required".to_owned());
+            }
             let total = is_client_total_spec(&policy.spec);
             let application_limit = policy.spec.action.kind == PolicyActionKind::Limit
                 && policy.spec.network.scope == "internet"

@@ -80,6 +80,26 @@ struct ActiveApplicationClass {
     download_bps: Option<u64>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PriorityClassMetrics {
+    pub policy_id: String,
+    pub mac: String,
+    pub upload: bool,
+    pub interface: String,
+    pub bytes: Option<u64>,
+    pub packets: Option<u64>,
+    pub drops: Option<u64>,
+    pub overlimits: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ParsedPriorityClassMetrics {
+    bytes: Option<u64>,
+    packets: Option<u64>,
+    drops: Option<u64>,
+    overlimits: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct OriginalQueueRoot {
     kind: String,
@@ -124,6 +144,7 @@ pub(crate) struct PriorityRuntime {
     state_path: PathBuf,
     journal_path: PathBuf,
     pin_dir: PathBuf,
+    pin_dir_owned: bool,
     priority: u32,
     matcher_attached: Vec<QueuePort>,
     ifb_observer_attached: bool,
@@ -625,6 +646,7 @@ impl PriorityRuntime {
                 .policy_state_path
                 .with_extension("priority-journal.json"),
             pin_dir: PathBuf::from(format!("/sys/fs/bpf/nqp-priority-{}", std::process::id())),
+            pin_dir_owned: false,
             config,
             maps,
             layout,
@@ -654,6 +676,101 @@ impl PriorityRuntime {
         self.active.as_ref().is_some_and(|state| {
             crate::policy::snapshot_has_enabled_application_verdicts(&state.snapshot)
         })
+    }
+
+    pub(crate) fn metrics_snapshot(
+        &self,
+    ) -> Option<(PolicyWireFrame, Result<Vec<PriorityClassMetrics>, String>)> {
+        let active = self.active.as_ref()?;
+        if self.emergency_disabled {
+            return None;
+        }
+        let result = self.read_policy_class_metrics(active);
+        Some((active.snapshot.clone(), result))
+    }
+
+    fn read_policy_class_metrics(
+        &self,
+        active: &PriorityState,
+    ) -> Result<Vec<PriorityClassMetrics>, String> {
+        let plan = self
+            .active_plan
+            .as_ref()
+            .ok_or_else(|| "priority_metrics_plan_unavailable".to_owned())?;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+            .ok_or_else(|| "priority_metrics_clock_unavailable".to_owned())?;
+        let selection =
+            PrioritySelection::from_snapshot(&active.snapshot, &active.gateway_id, Some(now_ms))?;
+        let mut metrics = Vec::new();
+        let trees = std::iter::once((&plan.upload, true))
+            .chain(plan.downloads.iter().map(|tree| (tree, false)));
+        for (tree, upload) in trees {
+            let output = tc(&["-s", "class", "show", "dev", &tree.port.name])
+                .map_err(|error| format!("priority_metrics_tc_read_failed: {error:#}"))?;
+            let counters = parse_priority_class_metrics(&output);
+            for client in &tree.clients {
+                let Some(rates) = selection.totals.get(&client.mac) else {
+                    continue;
+                };
+                let classid = format!("{:x}:{:x}", tree.major, client.default_minor);
+                let value = counters.get(&classid).copied().unwrap_or_default();
+                for policy_id in &rates.policy_ids {
+                    metrics.push(PriorityClassMetrics {
+                        policy_id: policy_id.clone(),
+                        mac: client.mac.clone(),
+                        upload,
+                        interface: tree.port.name.clone(),
+                        bytes: value.bytes,
+                        packets: value.packets,
+                        drops: value.drops,
+                        overlimits: value.overlimits,
+                    });
+                }
+            }
+            for application in &tree.applications {
+                if !selection.application_limits.iter().any(|selected| {
+                    selected.policy_id == application.policy_id
+                        && selected.mac.eq_ignore_ascii_case(&application.mac)
+                }) {
+                    continue;
+                }
+                let classid = format!("{:x}:{:x}", tree.major, application.minor);
+                let value = counters.get(&classid).copied().unwrap_or_default();
+                metrics.push(PriorityClassMetrics {
+                    policy_id: application.policy_id.clone(),
+                    mac: application.mac.clone(),
+                    upload,
+                    interface: tree.port.name.clone(),
+                    bytes: value.bytes,
+                    packets: value.packets,
+                    drops: value.drops,
+                    overlimits: value.overlimits,
+                });
+            }
+        }
+        Ok(metrics)
+    }
+
+    pub(crate) fn controls_flow_hook(&self, hook: u8, ifindex: u32) -> bool {
+        if ifindex == 0 {
+            return false;
+        }
+        match hook {
+            1 => self
+                .layout
+                .ingress_ports
+                .iter()
+                .any(|port| port.ifindex == ifindex),
+            2 => self
+                .layout
+                .egress_ports
+                .iter()
+                .any(|port| port.ifindex == ifindex),
+            _ => false,
+        }
     }
 
     /// Return the class leaf only when the exact FlowCommand names an active
@@ -838,75 +955,129 @@ impl PriorityRuntime {
                 )),
             };
         }
-        let matcher_handle = ProgramHandle::try_from(matcher)?;
-        let observer_handle = ProgramHandle::try_from(ifb_observer)?;
-        fs::create_dir(&self.pin_dir).context("create priority BPF pin directory")?;
+        let matcher_handle = match ProgramHandle::try_from(matcher) {
+            Ok(handle) => handle,
+            Err(error) => {
+                let error = anyhow!(error).context("get priority matcher program handle");
+                return match self.rollback_prepare() {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(error).context(format!(
+                        "matcher handle setup failed; queue rollback also failed: {rollback:#}"
+                    )),
+                };
+            }
+        };
+        let observer_handle = match ProgramHandle::try_from(ifb_observer) {
+            Ok(handle) => handle,
+            Err(error) => {
+                let error = anyhow!(error).context("get priority IFB observer program handle");
+                return match self.rollback_prepare() {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(error).context(format!(
+                        "observer handle setup failed; queue rollback also failed: {rollback:#}"
+                    )),
+                };
+            }
+        };
+        if self.pin_dir.exists() {
+            let error = anyhow!(
+                "priority_pin_directory_exists_unverified: refusing to remove or reuse {}",
+                self.pin_dir.display()
+            );
+            return match self.rollback_prepare() {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(error).context(format!(
+                    "priority pin path is unverified; queue rollback also failed: {rollback:#}"
+                )),
+            };
+        }
+        if let Err(error) =
+            fs::create_dir(&self.pin_dir).context("create priority BPF pin directory")
+        {
+            return match self.rollback_prepare() {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(error).context(format!(
+                    "priority pin directory creation failed; queue rollback also failed: {rollback:#}"
+                )),
+            };
+        }
+        self.pin_dir_owned = true;
         let matcher_pin = self.pin_dir.join("matcher");
         let observer_pin = self.pin_dir.join("ifb-observer");
-        matcher_handle.pin(&matcher_pin)?;
-        observer_handle.pin(&observer_pin)?;
-        for port in self.layout.ingress_ports.clone() {
-            self.ensure_clsact(&port.name)?;
-            let priority = self.priority.to_string();
-            let result = tc(&[
+        let activation = (|| -> Result<()> {
+            matcher_handle.pin(&matcher_pin)?;
+            observer_handle.pin(&observer_pin)?;
+            for port in self.layout.ingress_ports.clone() {
+                self.ensure_clsact(&port.name)?;
+                let priority = self.priority.to_string();
+                tc(&[
+                    "filter",
+                    "add",
+                    "dev",
+                    &port.name,
+                    "ingress",
+                    "protocol",
+                    "all",
+                    "prio",
+                    &priority,
+                    "handle",
+                    MATCHER_HANDLE,
+                    "bpf",
+                    "pinned",
+                    matcher_pin.to_str().context("invalid matcher pin path")?,
+                    "action",
+                    "mirred",
+                    "egress",
+                    "redirect",
+                    "dev",
+                    &self.config.ifb,
+                ])
+                .context("attach priority classifier and IFB redirect")?;
+                self.matcher_attached.push(port);
+            }
+            self.ensure_clsact(&self.config.ifb.clone())?;
+            let ifb_priority = self
+                .agent
+                .attach_order
+                .tc_priority
+                .checked_add(2)
+                .filter(|value| *value <= u16::MAX.into())
+                .context("priority_order_unverified: no IFB observer priority")?
+                .to_string();
+            tc(&[
                 "filter",
                 "add",
                 "dev",
-                &port.name,
-                "ingress",
+                &self.config.ifb,
+                "egress",
                 "protocol",
                 "all",
                 "prio",
-                &priority,
+                &ifb_priority,
                 "handle",
-                MATCHER_HANDLE,
+                IFB_OBSERVER_HANDLE,
                 "bpf",
+                "da",
                 "pinned",
-                matcher_pin.to_str().context("invalid matcher pin path")?,
-                "action",
-                "mirred",
-                "egress",
-                "redirect",
-                "dev",
-                &self.config.ifb,
-            ]);
-            if let Err(error) = result {
-                let _ = self.detach_matchers();
-                return Err(error).context("attach priority classifier and IFB redirect");
-            }
-            self.matcher_attached.push(port);
+                observer_pin
+                    .to_str()
+                    .context("invalid IFB observer pin path")?,
+            ])?;
+            self.ifb_observer_attached = true;
+            observed_ifindexes.update(&self.ifb_ifindex.to_ne_bytes(), &[1], MapFlags::ANY)?;
+            self.write_evidence("active")?;
+            Ok(())
+        })();
+        if let Err(error) = activation {
+            return match self.rollback_activation() {
+                Ok(()) => {
+                    Err(error).context("priority runtime activation failed and was rolled back")
+                }
+                Err(rollback) => Err(error).context(format!(
+                    "priority runtime activation failed; rollback incomplete: {rollback:#}"
+                )),
+            };
         }
-        self.ensure_clsact(&self.config.ifb.clone())?;
-        let ifb_priority = self
-            .agent
-            .attach_order
-            .tc_priority
-            .checked_add(2)
-            .filter(|value| *value <= u16::MAX.into())
-            .context("priority_order_unverified: no IFB observer priority")?
-            .to_string();
-        tc(&[
-            "filter",
-            "add",
-            "dev",
-            &self.config.ifb,
-            "egress",
-            "protocol",
-            "all",
-            "prio",
-            &ifb_priority,
-            "handle",
-            IFB_OBSERVER_HANDLE,
-            "bpf",
-            "da",
-            "pinned",
-            observer_pin
-                .to_str()
-                .context("invalid IFB observer pin path")?,
-        ])?;
-        self.ifb_observer_attached = true;
-        observed_ifindexes.update(&self.ifb_ifindex.to_ne_bytes(), &[1], MapFlags::ANY)?;
-        self.write_evidence("active")?;
         eprintln!(
             "QoS priority client runtime active on IFB {} and {} LAN egress ports",
             self.config.ifb,
@@ -1196,6 +1367,141 @@ impl PriorityRuntime {
         } else {
             bail!("{}", errors.join("; "))
         }
+    }
+
+    fn rollback_activation(&mut self) -> Result<()> {
+        let mut errors = Vec::new();
+        if let Err(error) = self.detach_matchers() {
+            errors.push(format!("detach priority matcher filters: {error:#}"));
+        }
+        if let Err(error) = self.detach_ifb_observer() {
+            errors.push(format!("detach priority IFB observer: {error:#}"));
+        }
+        if self.matcher_attached.is_empty() && !self.ifb_observer_attached {
+            if let Err(error) = self.cleanup_pins() {
+                errors.push(format!("unpin priority BPF programs: {error:#}"));
+            }
+        }
+        if errors.is_empty() {
+            for name in self.clsact_created.clone() {
+                let ingress = match tc(&["filter", "show", "dev", &name, "ingress"]) {
+                    Ok(filters) => filters,
+                    Err(error) => {
+                        errors.push(format!(
+                            "priority_clsact_ownership_unverified: could not inspect {name} ingress filters: {error:#}"
+                        ));
+                        continue;
+                    }
+                };
+                let egress = match tc(&["filter", "show", "dev", &name, "egress"]) {
+                    Ok(filters) => filters,
+                    Err(error) => {
+                        errors.push(format!(
+                            "priority_clsact_ownership_unverified: could not inspect {name} egress filters: {error:#}"
+                        ));
+                        continue;
+                    }
+                };
+                if ingress.trim().is_empty() && egress.trim().is_empty() {
+                    match tc(&["qdisc", "del", "dev", &name, "clsact"]) {
+                        Ok(_) => {
+                            self.clsact_created.remove(&name);
+                        }
+                        Err(error) => errors.push(format!(
+                            "priority_clsact_cleanup_failed: could not remove owned clsact on {name}: {error:#}"
+                        )),
+                    }
+                } else {
+                    errors.push(format!(
+                        "priority_clsact_ownership_changed: left {name} in place because filters remain"
+                    ));
+                }
+            }
+        }
+        if errors.is_empty()
+            && let Err(error) = self.rollback_prepare()
+        {
+            errors.push(format!("rollback priority queues and IFB: {error:#}"));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            bail!("{}", errors.join("; "))
+        }
+    }
+
+    fn detach_ifb_observer(&mut self) -> Result<()> {
+        if !self.ifb_observer_attached {
+            return Ok(());
+        }
+        let priority = self
+            .agent
+            .attach_order
+            .tc_priority
+            .checked_add(2)
+            .filter(|value| *value <= u16::MAX.into())
+            .context("priority_order_unverified: no IFB observer priority")?
+            .to_string();
+        tc(&[
+            "filter",
+            "del",
+            "dev",
+            &self.config.ifb,
+            "egress",
+            "prio",
+            &priority,
+            "handle",
+            IFB_OBSERVER_HANDLE,
+            "bpf",
+        ])?;
+        self.ifb_observer_attached = false;
+        Ok(())
+    }
+
+    fn cleanup_pins(&mut self) -> Result<()> {
+        if !self.pin_dir_owned {
+            return Ok(());
+        }
+        if !self.matcher_attached.is_empty() || self.ifb_observer_attached {
+            bail!("priority_pin_still_referenced: TC filter attachments remain");
+        }
+        for entry in fs::read_dir(&self.pin_dir).context("read owned priority BPF pin directory")? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name != "matcher" && name != "ifb-observer" {
+                bail!(
+                    "priority_pin_directory_contains_unowned_entry: {}",
+                    entry.path().display()
+                );
+            }
+        }
+        for name in ["matcher", "ifb-observer"] {
+            let path = self.pin_dir.join(name);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("unpin priority BPF program {}", path.display()));
+                }
+            }
+        }
+        match fs::remove_dir(&self.pin_dir) {
+            Ok(()) => self.pin_dir_owned = false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.pin_dir_owned = false;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "remove priority BPF pin directory {}",
+                        self.pin_dir.display()
+                    )
+                });
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn apply_snapshot(
@@ -1922,31 +2228,20 @@ impl PriorityRuntime {
         if let Err(error) = self.detach_matchers() {
             errors.push(format!("detach redirect filters: {error:#}"));
         }
-        if self.ifb_observer_attached {
-            if let Err(error) = tc(&[
-                "filter",
-                "del",
-                "dev",
-                &self.config.ifb,
-                "egress",
-                "prio",
-                &self
-                    .agent
-                    .attach_order
-                    .tc_priority
-                    .saturating_add(2)
-                    .to_string(),
-                "handle",
-                IFB_OBSERVER_HANDLE,
-                "bpf",
-            ]) {
-                errors.push(format!("detach IFB observer: {error:#}"));
-            } else {
-                self.ifb_observer_attached = false;
-            }
+        if let Err(error) = self.detach_ifb_observer() {
+            errors.push(format!("detach IFB observer: {error:#}"));
         }
-        if let Err(error) = self.clear_classifier_maps() {
-            errors.push(format!("clear classifier maps: {error:#}"));
+        if self.matcher_attached.is_empty() && !self.ifb_observer_attached {
+            if let Err(error) = self.clear_classifier_maps() {
+                errors.push(format!("clear classifier maps: {error:#}"));
+            }
+            if let Err(error) = self.cleanup_pins() {
+                errors.push(format!("unpin priority BPF programs: {error:#}"));
+            }
+        } else {
+            errors.push(
+                "priority_classifier_state_preserved: TC attachments remain, so classifier maps and pins were left in place".to_owned(),
+            );
         }
         if let Ok(classes) = self.wait_for_queue_drain() {
             if !classes {
@@ -2018,12 +2313,16 @@ impl PriorityRuntime {
                 }
             }
         }
-        let _ = fs::write(
-            self.output.with_extension("priority-cleanup.json"),
-            serde_json::to_vec_pretty(
-                &serde_json::json!({"cleanup_ok":errors.is_empty(),"errors":errors}),
-            )?,
-        );
+        let cleanup_path = self.output.with_extension("priority-cleanup.json");
+        let cleanup_record = serde_json::json!({"cleanup_ok":errors.is_empty(),"errors":&errors});
+        match serde_json::to_vec_pretty(&cleanup_record) {
+            Ok(bytes) => {
+                if let Err(error) = fs::write(&cleanup_path, bytes) {
+                    errors.push(format!("write priority cleanup result: {error}"));
+                }
+            }
+            Err(error) => errors.push(format!("encode priority cleanup result: {error}")),
+        }
         if errors.is_empty() {
             self.shutdown_done = true;
             Ok(())
@@ -2182,12 +2481,73 @@ impl Drop for PriorityRuntime {
         if let Err(error) = self.detach_matchers() {
             eprintln!("priority cleanup incomplete: {error:#}");
         }
+        if let Err(error) = self.detach_ifb_observer() {
+            eprintln!("priority cleanup incomplete while detaching IFB observer: {error:#}");
+        }
+        if self.matcher_attached.is_empty() && !self.ifb_observer_attached {
+            if let Err(error) = self.clear_classifier_maps() {
+                eprintln!("priority classifier map cleanup incomplete: {error:#}");
+            }
+            if let Err(error) = self.cleanup_pins() {
+                eprintln!("priority BPF unpin incomplete: {error:#}");
+            }
+        }
         let _ = self.write_evidence("drop");
     }
 }
 
 fn classid_text(raw: u32) -> String {
     format!("{:x}:{:x}", raw >> 16, raw & 0xffff)
+}
+
+fn parse_priority_class_metrics(output: &str) -> BTreeMap<String, ParsedPriorityClassMetrics> {
+    let mut counters = BTreeMap::new();
+    let mut current = None::<String>;
+    for line in output.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.first() == Some(&"class") {
+            current = fields.get(2).map(|value| value.to_ascii_lowercase());
+            if let Some(classid) = &current {
+                counters.entry(classid.clone()).or_default();
+            }
+            continue;
+        }
+        let Some(classid) = current.as_ref() else {
+            continue;
+        };
+        let Some(sent) = fields.iter().position(|field| *field == "Sent") else {
+            continue;
+        };
+        let bytes = fields.get(sent + 1).and_then(|value| value.parse().ok());
+        let packets = fields
+            .iter()
+            .position(|field| *field == "bytes")
+            .and_then(|index| fields.get(index + 1))
+            .and_then(|value| value.parse().ok());
+        let drops = fields
+            .iter()
+            .position(|field| {
+                field.trim_matches(|character: char| !character.is_ascii_alphanumeric())
+                    == "dropped"
+            })
+            .and_then(|index| fields.get(index + 1))
+            .and_then(|value| value.trim_end_matches(',').parse().ok());
+        let overlimits = fields
+            .iter()
+            .position(|field| *field == "overlimits")
+            .and_then(|index| fields.get(index + 1))
+            .and_then(|value| value.trim_end_matches(',').parse().ok());
+        counters.insert(
+            classid.clone(),
+            ParsedPriorityClassMetrics {
+                bytes,
+                packets,
+                drops,
+                overlimits,
+            },
+        );
+    }
+    counters
 }
 
 fn backlog_empty(qdisc: &Value) -> bool {

@@ -381,6 +381,14 @@ async fn connect_and_run(
     let priority_runtime_active = priority_runtime.is_some();
     #[cfg(not(feature = "qos-client-priority"))]
     let priority_runtime_active = false;
+    tracing::info!(
+        policy_backend = if priority_runtime_active {
+            "priority"
+        } else {
+            "legacy"
+        },
+        "policy execution backend selected"
+    );
     send_frame(
         &mut socket,
         &health_frame_for_runtime(
@@ -489,12 +497,30 @@ async fn connect_and_run(
                         }
                     }
                 }
-                for metrics in executor::traffic_metrics_frames(
+                #[cfg(feature = "qos-client-priority")]
+                let metric_frames = if let Some(runtime) = priority_runtime.as_ref() {
+                    executor::traffic_metrics_frames_priority(
+                        &credentials.gateway_id,
+                        boot_id,
+                        flow_verdict_writer,
+                        runtime,
+                    )
+                } else {
+                    executor::traffic_metrics_frames(
+                        config,
+                        &credentials.gateway_id,
+                        boot_id,
+                        flow_verdict_writer,
+                    )
+                };
+                #[cfg(not(feature = "qos-client-priority"))]
+                let metric_frames = executor::traffic_metrics_frames(
                     config,
                     &credentials.gateway_id,
                     boot_id,
                     flow_verdict_writer,
-                ) {
+                );
+                for metrics in metric_frames {
                     send_frame(&mut socket, &metrics).await?;
                 }
             }
@@ -669,22 +695,7 @@ async fn handle_frame(
                 let mut runtime = priority_runtime
                     .lock()
                     .map_err(|_| anyhow!("priority runtime lock poisoned"))?;
-                if runtime.should_handle(&snapshot) {
-                    runtime.apply_snapshot(
-                        &snapshot,
-                        &credentials.gateway_id,
-                        boot_id,
-                        flow_bpf_ready,
-                    )
-                } else {
-                    executor::process_snapshot_with_flow_capability(
-                        config,
-                        &credentials.gateway_id,
-                        boot_id,
-                        &snapshot,
-                        flow_bpf_ready,
-                    )
-                }
+                runtime.apply_snapshot(&snapshot, &credentials.gateway_id, boot_id, flow_bpf_ready)
             } else {
                 executor::process_snapshot_with_flow_capability(
                     config,
@@ -868,6 +879,11 @@ fn apply_flow_command(
                 )
             });
     let alias_count = u32::try_from(aliases.len()).unwrap_or(u32::MAX);
+    let hooks = aliases.iter().map(|alias| alias.hook).collect::<Vec<_>>();
+    let ifindices = aliases
+        .iter()
+        .map(|alias| alias.ifindex)
+        .collect::<Vec<_>>();
     let protocol = aliases.first().map(|key| key.protocol);
     let stale_command = flow_alias_cache.lock().map_or(true, |cache| {
         cache.command_is_stale(&policy_flow_id, issued_at_ms)
@@ -1023,6 +1039,7 @@ fn apply_flow_command(
                     {
                         match flow_verdict_writer.install_block(
                             &aliases,
+                            &command_id,
                             &policy_flow_id,
                             policy_id,
                             client_mac,
@@ -1030,11 +1047,6 @@ fn apply_flow_command(
                             deadline,
                         ) {
                             Ok(_) => {
-                                if config.log_level >= crate::config::LogLevel::Debug {
-                                    eprintln!(
-                                        "application block verdict installed: flow={policy_flow_id} policy={policy_id} client={client_mac} generation={config_revision} aliases={aliases:?}"
-                                    );
-                                }
                                 if let Ok(mut cache) = flow_alias_cache.lock() {
                                     cache.record_command(&policy_flow_id, issued_at_ms);
                                 }
@@ -1053,7 +1065,11 @@ fn apply_flow_command(
                     }
                 }
                 (FlowCommandOperation::Upsert, Some(FlowVerdict::Allow)) => {
-                    match flow_verdict_writer.clear_aliases(&aliases, Some(&policy_flow_id)) {
+                    match flow_verdict_writer.clear_aliases(
+                        &aliases,
+                        Some(&policy_flow_id),
+                        &command_id,
+                    ) {
                         Ok(_) => {
                             if let Ok(mut cache) = flow_alias_cache.lock() {
                                 cache.record_command(&policy_flow_id, issued_at_ms);
@@ -1119,6 +1135,7 @@ fn apply_flow_command(
                             .saturating_add(remaining_ms.saturating_mul(1_000_000));
                         match flow_verdict_writer.install_shape(
                             &tags,
+                            &command_id,
                             &policy_flow_id,
                             config_revision,
                             deadline,
@@ -1135,33 +1152,44 @@ fn apply_flow_command(
                             ),
                         }
                     } else {
-                        if config.log_level >= crate::config::LogLevel::Debug {
-                            eprintln!(
-                                "application class unresolved: flow={policy_flow_id} client={client_mac:?} policies={policy_ids:?} aliases={aliases:?} directions={:?} classes={:?}",
+                        let controlled_hook = {
+                            #[cfg(feature = "qos-client-priority")]
+                            if let Some(priority_runtime) = priority_runtime {
+                                priority_runtime.lock().is_ok_and(|runtime| {
+                                    aliases.iter().any(|alias| {
+                                        runtime.controls_flow_hook(alias.hook, alias.ifindex)
+                                    })
+                                })
+                            } else {
                                 aliases
                                     .iter()
-                                    .map(|alias| flow_alias_cache
-                                        .lock()
-                                        .ok()
-                                        .and_then(|cache| cache.direction(&policy_flow_id, alias)))
-                                    .collect::<Vec<_>>(),
-                                saved
-                                    .as_ref()
-                                    .and_then(|state| state.shaping_state.as_ref())
-                                    .map(|shaping| shaping
-                                        .interfaces()
-                                        .flat_map(|interface| &interface.application_classes)
-                                        .collect::<Vec<_>>())
-                            );
-                        }
+                                    .any(|alias| alias.ifindex != 0 && alias.hook == 2)
+                            }
+                            #[cfg(not(feature = "qos-client-priority"))]
+                            aliases
+                                .iter()
+                                .any(|alias| alias.ifindex != 0 && alias.hook == 2)
+                        };
+                        let flow_direction_known =
+                            aliases.iter().any(|alias| direction(alias).is_some());
                         (
                             FlowAckStatus::Unsupported,
-                            Some("application_class_unresolved".to_owned()),
+                            Some(if !controlled_hook {
+                                "traffic_not_on_controlled_hook".to_owned()
+                            } else if client_mac.is_none() || !flow_direction_known {
+                                "flow_identity_or_alias_mismatch".to_owned()
+                            } else {
+                                "application_class_unresolved".to_owned()
+                            }),
                         )
                     }
                 }
                 (FlowCommandOperation::Revoke, None) => {
-                    match flow_verdict_writer.clear_aliases(&aliases, Some(&policy_flow_id)) {
+                    match flow_verdict_writer.clear_aliases(
+                        &aliases,
+                        Some(&policy_flow_id),
+                        &command_id,
+                    ) {
                         Ok(_) => {
                             if let Ok(mut cache) = flow_alias_cache.lock() {
                                 cache.record_command(&policy_flow_id, issued_at_ms);
@@ -1190,6 +1218,70 @@ fn apply_flow_command(
         status = FlowAckStatus::Partial;
         reason_code = Some("partial_coverage".to_owned());
     }
+    let reported_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(now_ms, |duration| {
+            duration.as_millis().min(i64::MAX as u128) as i64
+        });
+    let failure_class = match reason_code.as_deref() {
+        Some("expired" | "stale_flow_command") => "classification_or_command_late",
+        Some(
+            "flow_identity_unresolved"
+            | "flow_identity_partial"
+            | "flow_identity_or_alias_mismatch",
+        ) => "flow_identity_or_alias_mismatch",
+        Some("bpf_map_write_failed") => "bpf_map_write_failure",
+        Some("traffic_not_on_controlled_hook") => "traffic_not_on_controlled_hook",
+        Some(_) => "flow_command_rejected",
+        None => "none",
+    };
+    let command_processing_ms = reported_at_ms.saturating_sub(now_ms);
+    let command_age_ms = reported_at_ms.saturating_sub(issued_at_ms);
+    if matches!(status, FlowAckStatus::Applied | FlowAckStatus::Partial) {
+        tracing::debug!(
+            target: "netqmon_agent::policy::flow_trace",
+            command_id,
+            policy_flow_id,
+            config_revision,
+            ?operation,
+            ?verdict,
+            policy_ids = ?policy_ids,
+            alias_count,
+            hooks = ?hooks,
+            ifindices = ?ifindices,
+            client_identity_present = client_mac.is_some(),
+            command_issued_at_ms = issued_at_ms,
+            command_received_at_ms = now_ms,
+            command_reported_at_ms = reported_at_ms,
+            command_age_ms,
+            command_processing_ms,
+            ?status,
+            "FlowCommand execution completed"
+        );
+    } else {
+        tracing::warn!(
+            target: "netqmon_agent::policy::flow_trace",
+            command_id,
+            policy_flow_id,
+            config_revision,
+            ?operation,
+            ?verdict,
+            policy_ids = ?policy_ids,
+            alias_count,
+            hooks = ?hooks,
+            ifindices = ?ifindices,
+            client_identity_present = client_mac.is_some(),
+            command_issued_at_ms = issued_at_ms,
+            command_received_at_ms = now_ms,
+            command_reported_at_ms = reported_at_ms,
+            command_age_ms,
+            command_processing_ms,
+            failure_class,
+            reason_code = reason_code.as_deref().unwrap_or(""),
+            ?status,
+            "FlowCommand execution rejected"
+        );
+    }
     PolicyWireFrame::FlowAck {
         wire_version: POLICY_WIRE_VERSION,
         gateway_id: gateway_id.to_owned(),
@@ -1201,7 +1293,7 @@ fn apply_flow_command(
         status,
         reason_code,
         alias_count,
-        reported_at_ms: now_ms,
+        reported_at_ms,
     }
 }
 
