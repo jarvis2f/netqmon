@@ -13,6 +13,7 @@ use tokio::time::{Duration, Instant};
 
 use super::compiler::compile_snapshot;
 use super::service::PolicyService;
+use super::{PolicyPreviewRequest, evaluate_preview, flow_verdict_expiry};
 
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 const ACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -21,6 +22,7 @@ const FLOW_COMMAND_STATE_CAPACITY: usize = 16_384;
 const FLOW_COMMAND_IN_FLIGHT_CAPACITY: usize = 64;
 const FLOW_COMMAND_RETRY_AFTER: Duration = Duration::from_secs(5);
 const FLOW_COMMAND_MAX_ATTEMPTS: u8 = 3;
+const FLOW_EVALUATION_CONTEXT_TTL_MS: i64 = 300_000;
 
 #[derive(Clone)]
 pub(crate) struct PolicyHub {
@@ -30,6 +32,7 @@ pub(crate) struct PolicyHub {
 struct PolicyHubInner {
     controller_epoch: String,
     next_session_id: AtomicU64,
+    next_flow_context_generation: AtomicU64,
     gateways: Mutex<HashMap<String, GatewayState>>,
 }
 
@@ -43,10 +46,21 @@ struct GatewayState {
     flow_queue: VecDeque<String>,
     flow_queued: HashSet<String>,
     flow_states: HashMap<String, PolicyWireFrame>,
+    flow_evaluation_contexts: HashMap<String, FlowEvaluationContext>,
     flow_in_flight: HashMap<String, InFlightFlowCommand>,
     flow_attempts: HashMap<String, u8>,
     flow_notify: Arc<Notify>,
     flow_capabilities: Option<(u64, bool, bool)>,
+}
+
+#[derive(Clone)]
+struct FlowEvaluationContext {
+    generation: u64,
+    boot_id: String,
+    policy_flow_id: String,
+    protocol: u32,
+    request: PolicyPreviewRequest,
+    expires_at_ms: i64,
 }
 
 struct InFlightFlowCommand {
@@ -87,6 +101,7 @@ impl PolicyHub {
             inner: Arc::new(PolicyHubInner {
                 controller_epoch: uuid::Uuid::new_v4().to_string(),
                 next_session_id: AtomicU64::new(1),
+                next_flow_context_generation: AtomicU64::new(1),
                 gateways: Mutex::new(HashMap::new()),
             }),
         }
@@ -216,16 +231,152 @@ impl PolicyHub {
         revision: u64,
         capabilities: &netqmon_protocol::policy::PolicyCapabilities,
     ) {
+        let now = now_ms();
+        let (bundle, contexts, block_supported, limit_supported) = {
+            let Ok(mut gateways) = self.inner.gateways.lock() else {
+                return;
+            };
+            let state = gateway_state(&mut gateways, gateway_id);
+            let block_supported = capabilities.application_block
+                != netqmon_protocol::policy::PolicyCapability::Unsupported;
+            let limit_supported = capabilities.application_limit
+                == netqmon_protocol::policy::PolicyCapability::Supported;
+            state
+                .flow_evaluation_contexts
+                .retain(|_, context| context.expires_at_ms > now);
+            let Some(bundle) = state.bundle.clone().filter(|bundle| {
+                bundle
+                    .frame
+                    .snapshot_identity()
+                    .is_some_and(|identity| identity.2 == revision)
+            }) else {
+                return;
+            };
+            state.flow_capabilities = Some((revision, block_supported, limit_supported));
+            (
+                bundle,
+                state
+                    .flow_evaluation_contexts
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                block_supported,
+                limit_supported,
+            )
+        };
+
+        for context in contexts {
+            if let Some(command) =
+                flow_command_for_context(&bundle, &context, block_supported, limit_supported, now)
+            {
+                if let PolicyWireFrame::FlowCommand {
+                    config_revision,
+                    command_id,
+                    policy_flow_id,
+                    verdict,
+                    policy_ids,
+                    issued_at_ms,
+                    ..
+                } = &command
+                {
+                    let verdict = match verdict {
+                        Some(netqmon_protocol::policy::FlowVerdict::Block) => "Block",
+                        Some(netqmon_protocol::policy::FlowVerdict::Allow) => "Allow",
+                        Some(netqmon_protocol::policy::FlowVerdict::Shape) => "Shape",
+                        None => "None",
+                    };
+                    tracing::debug!(
+                        gateway_id,
+                        boot_id = context.boot_id,
+                        config_revision,
+                        command_id,
+                        policy_flow_id,
+                        verdict,
+                        policy_ids = ?policy_ids,
+                        issued_at_ms,
+                        "re-evaluated active flow after policy acknowledgement"
+                    );
+                }
+                if let Err(error) = self.queue_flow_command_for_context(command, context.generation)
+                {
+                    tracing::warn!(gateway_id, policy_flow_id = context.policy_flow_id, %error,
+                        "could not re-evaluate active flow after policy acknowledgement");
+                }
+            }
+        }
+    }
+
+    pub(crate) fn remember_flow_context(
+        &self,
+        gateway_id: &str,
+        boot_id: &str,
+        policy_flow_id: &str,
+        protocol: u32,
+        request: PolicyPreviewRequest,
+        now: i64,
+    ) -> Option<u64> {
+        let key = flow_command_key(boot_id, policy_flow_id);
+        let mut generation = self
+            .inner
+            .next_flow_context_generation
+            .load(Ordering::Relaxed);
+        let generation = loop {
+            let next = generation.checked_add(1)?;
+            match self
+                .inner
+                .next_flow_context_generation
+                .compare_exchange_weak(generation, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break generation,
+                Err(current) => generation = current,
+            }
+        };
         let Ok(mut gateways) = self.inner.gateways.lock() else {
-            return;
+            return None;
         };
         let state = gateway_state(&mut gateways, gateway_id);
-        state.flow_capabilities = Some((
-            revision,
-            capabilities.application_block
-                != netqmon_protocol::policy::PolicyCapability::Unsupported,
-            capabilities.application_limit == netqmon_protocol::policy::PolicyCapability::Supported,
-        ));
+        if state
+            .flow_boot_id
+            .as_deref()
+            .is_some_and(|current| current != boot_id)
+        {
+            state.clear_flow_commands();
+        }
+        state.flow_boot_id = Some(boot_id.to_owned());
+        state
+            .flow_evaluation_contexts
+            .retain(|_, context| context.expires_at_ms > now);
+        if !state.flow_evaluation_contexts.contains_key(&key)
+            && state.flow_evaluation_contexts.len() >= FLOW_COMMAND_STATE_CAPACITY
+        {
+            return None;
+        }
+        state.flow_evaluation_contexts.insert(
+            key,
+            FlowEvaluationContext {
+                generation,
+                boot_id: boot_id.to_owned(),
+                policy_flow_id: policy_flow_id.to_owned(),
+                protocol,
+                request,
+                expires_at_ms: now.saturating_add(FLOW_EVALUATION_CONTEXT_TTL_MS),
+            },
+        );
+        Some(generation)
+    }
+
+    pub(crate) fn forget_flow_context(
+        &self,
+        gateway_id: &str,
+        boot_id: &str,
+        policy_flow_id: &str,
+    ) {
+        let key = flow_command_key(boot_id, policy_flow_id);
+        if let Ok(mut gateways) = self.inner.gateways.lock()
+            && let Some(state) = gateways.get_mut(gateway_id)
+        {
+            state.flow_evaluation_contexts.remove(&key);
+        }
     }
 
     pub(crate) fn flow_capabilities(&self, gateway_id: &str) -> (bool, bool) {
@@ -247,25 +398,52 @@ impl PolicyHub {
     }
 
     pub(crate) fn queue_flow_command(&self, mut frame: PolicyWireFrame) -> Result<(), String> {
+        self.queue_flow_command_inner(&mut frame, None)
+    }
+
+    pub(crate) fn queue_flow_command_for_context(
+        &self,
+        mut frame: PolicyWireFrame,
+        context_generation: u64,
+    ) -> Result<(), String> {
+        self.queue_flow_command_inner(&mut frame, Some(context_generation))
+    }
+
+    fn queue_flow_command_inner(
+        &self,
+        frame: &mut PolicyWireFrame,
+        expected_context_generation: Option<u64>,
+    ) -> Result<(), String> {
         frame.validate()?;
-        let (gateway_id, boot_id, policy_flow_id, requested_issued_at, requested_expires_at) =
-            match &frame {
-                PolicyWireFrame::FlowCommand {
-                    gateway_id,
-                    boot_id,
-                    policy_flow_id,
-                    issued_at_ms,
-                    expires_at_ms,
-                    ..
-                } => (
-                    gateway_id.clone(),
-                    boot_id.clone(),
-                    policy_flow_id.clone(),
-                    *issued_at_ms,
-                    *expires_at_ms,
-                ),
-                _ => return Err("expected a flow_command frame".to_owned()),
-            };
+        let (
+            gateway_id,
+            boot_id,
+            controller_epoch,
+            config_revision,
+            policy_flow_id,
+            requested_issued_at,
+            requested_expires_at,
+        ) = match &*frame {
+            PolicyWireFrame::FlowCommand {
+                gateway_id,
+                boot_id,
+                controller_epoch,
+                config_revision,
+                policy_flow_id,
+                issued_at_ms,
+                expires_at_ms,
+                ..
+            } => (
+                gateway_id.clone(),
+                boot_id.clone(),
+                controller_epoch.clone(),
+                *config_revision,
+                policy_flow_id.clone(),
+                *issued_at_ms,
+                *expires_at_ms,
+            ),
+            _ => return Err("expected a flow_command frame".to_owned()),
+        };
         let key = flow_command_key(&boot_id, &policy_flow_id);
         let mut gateways = self
             .inner
@@ -273,6 +451,32 @@ impl PolicyHub {
             .lock()
             .map_err(|_| "policy hub is unavailable".to_owned())?;
         let state = gateway_state(&mut gateways, &gateway_id);
+        if let Some(bundle) = &state.bundle {
+            let Some((expected_gateway, expected_epoch, expected_revision, _, _)) =
+                bundle.frame.snapshot_identity()
+            else {
+                return Err("current policy bundle has no snapshot identity".to_owned());
+            };
+            if expected_gateway != gateway_id.as_str()
+                || expected_epoch != controller_epoch.as_str()
+                || expected_revision != config_revision
+            {
+                return Err("stale_flow_command_snapshot".to_owned());
+            }
+        }
+        if let Some(generation) = expected_context_generation {
+            if state.flow_boot_id.as_deref() != Some(boot_id.as_str())
+                || state
+                    .flow_evaluation_contexts
+                    .get(&key)
+                    .map(|context| context.generation)
+                    != Some(generation)
+            {
+                // A newer packet, agent boot, or snapshot has superseded this
+                // asynchronous decision; it must not replace current flow state.
+                return Ok(());
+            }
+        }
         if state
             .flow_boot_id
             .as_deref()
@@ -297,7 +501,7 @@ impl PolicyHub {
                 issued_at_ms,
                 expires_at_ms,
                 ..
-            } = &mut frame
+            } = &mut *frame
             {
                 *issued_at_ms = (*issued_at_ms).max(previous_issued.saturating_add(1));
                 *expires_at_ms = issued_at_ms.saturating_add(ttl);
@@ -310,7 +514,7 @@ impl PolicyHub {
             return Err("flow_command_backpressure".to_owned());
         }
         state.flow_states.insert(key.clone(), frame.clone());
-        state.flow_pending.insert(key.clone(), frame);
+        state.flow_pending.insert(key.clone(), frame.clone());
         state.fill_flow_queue();
         let notify = Arc::clone(&state.flow_notify);
         drop(gateways);
@@ -352,13 +556,27 @@ impl PolicyHub {
         if !is_active {
             return Ok(false);
         }
+        let command_id = uuid::Uuid::new_v4().to_string();
+        tracing::debug!(
+            target: "netqmon_collector::policy::flow_trace",
+            gateway_id,
+            boot_id,
+            config_revision,
+            command_id,
+            policy_flow_id,
+            verdict = "None",
+            policy_ids = ?Vec::<String>::new(),
+            issued_at_ms = now,
+            operation = "Revoke",
+            "re-evaluated active flow after policy acknowledgement"
+        );
         self.queue_flow_command(PolicyWireFrame::FlowCommand {
             wire_version: netqmon_protocol::policy::POLICY_WIRE_VERSION,
             gateway_id: gateway_id.to_owned(),
             boot_id: boot_id.to_owned(),
             controller_epoch: controller_epoch.to_owned(),
             config_revision,
-            command_id: uuid::Uuid::new_v4().to_string(),
+            command_id,
             policy_flow_id: policy_flow_id.to_owned(),
             operation: FlowCommandOperation::Revoke,
             verdict: None,
@@ -651,6 +869,7 @@ fn gateway_state<'a>(
             flow_queue: VecDeque::new(),
             flow_queued: HashSet::new(),
             flow_states: HashMap::new(),
+            flow_evaluation_contexts: HashMap::new(),
             flow_in_flight: HashMap::new(),
             flow_attempts: HashMap::new(),
             flow_notify: Arc::new(Notify::new()),
@@ -665,6 +884,7 @@ impl GatewayState {
         self.flow_queue.clear();
         self.flow_queued.clear();
         self.flow_states.clear();
+        self.flow_evaluation_contexts.clear();
         self.flow_in_flight.clear();
         self.flow_attempts.clear();
     }
@@ -749,13 +969,27 @@ impl GatewayState {
             })
             .collect::<Vec<_>>();
         for (key, gateway_id, boot_id, policy_flow_id) in active {
+            let command_id = uuid::Uuid::new_v4().to_string();
+            tracing::debug!(
+                target: "netqmon_collector::policy::flow_trace",
+                gateway_id,
+                boot_id,
+                config_revision = revision,
+                command_id,
+                policy_flow_id,
+                verdict = "None",
+                policy_ids = ?Vec::<String>::new(),
+                issued_at_ms = now,
+                operation = "Revoke",
+                "re-evaluated active flow after policy acknowledgement"
+            );
             let frame = PolicyWireFrame::FlowCommand {
                 wire_version: netqmon_protocol::policy::POLICY_WIRE_VERSION,
                 gateway_id,
                 boot_id,
                 controller_epoch: epoch.to_owned(),
                 config_revision: revision,
-                command_id: uuid::Uuid::new_v4().to_string(),
+                command_id,
                 policy_flow_id,
                 operation: FlowCommandOperation::Revoke,
                 verdict: None,
@@ -773,6 +1007,57 @@ impl GatewayState {
             self.flow_notify.notify_one();
         }
     }
+}
+
+fn flow_command_for_context(
+    bundle: &PublishedBundle,
+    context: &FlowEvaluationContext,
+    application_block_supported: bool,
+    application_limit_supported: bool,
+    now: i64,
+) -> Option<PolicyWireFrame> {
+    let PolicyWireFrame::PolicySnapshot {
+        controller_epoch,
+        config_revision,
+        policies,
+        ..
+    } = &bundle.frame
+    else {
+        return None;
+    };
+    if context.expires_at_ms <= now {
+        return None;
+    }
+    let mut request = context.request.clone();
+    request.at_ms = now;
+    let evaluated = evaluate_preview(
+        &request,
+        policies,
+        application_block_supported,
+        application_limit_supported,
+    );
+    let (verdict, policy_ids) = super::evaluator::flow_command_decision(&evaluated);
+    let verdict = verdict.filter(|_| !policy_ids.is_empty() && policy_ids.len() <= 16)?;
+    let ttl_ms = match context.protocol {
+        17 => 30_000,
+        6 => 120_000,
+        _ => return None,
+    };
+    let expires_at_ms = flow_verdict_expiry(&bundle.frame, &policy_ids, now, ttl_ms)?;
+    Some(PolicyWireFrame::FlowCommand {
+        wire_version: netqmon_protocol::policy::POLICY_WIRE_VERSION,
+        gateway_id: request.gateway_id,
+        boot_id: context.boot_id.clone(),
+        controller_epoch: controller_epoch.clone(),
+        config_revision: *config_revision,
+        command_id: uuid::Uuid::new_v4().to_string(),
+        policy_flow_id: context.policy_flow_id.clone(),
+        operation: FlowCommandOperation::Upsert,
+        verdict: Some(verdict),
+        policy_ids,
+        expires_at_ms,
+        issued_at_ms: now,
+    })
 }
 
 fn flow_command_key(boot_id: &str, policy_flow_id: &str) -> String {
@@ -1085,6 +1370,9 @@ fn handle_agent_frame(
             gateway_id,
             boot_id,
             last_applied_revision,
+            controller_epoch,
+            bundle_generation,
+            checksum,
             capabilities,
             emergency_disabled,
             reported_at_ms,
@@ -1108,6 +1396,22 @@ fn handle_agent_frame(
                 )
                 .is_ok()
             {
+                if let Some(bundle) = hub.current_bundle(&session.gateway_id)
+                    && let Some((
+                        expected_gateway,
+                        expected_epoch,
+                        revision,
+                        generation,
+                        expected_checksum,
+                    )) = bundle.frame.snapshot_identity()
+                    && expected_gateway == session.gateway_id
+                    && last_applied_revision == revision
+                    && controller_epoch.as_deref() == Some(expected_epoch)
+                    && bundle_generation == Some(generation)
+                    && checksum.as_deref() == Some(expected_checksum)
+                {
+                    hub.record_flow_capabilities(&session.gateway_id, revision, &capabilities);
+                }
                 *agent_boot_id = Some(boot_id);
                 true
             } else {
@@ -1217,6 +1521,7 @@ fn handle_agent_frame(
                 boot_id,
                 command_id,
                 policy_flow_id,
+                config_revision,
                 ?status,
                 reason_code = reason_code.as_deref().unwrap_or(""),
                 alias_count,
@@ -1296,13 +1601,98 @@ mod tests {
             frame,
         }));
         for number in 128..256 {
-            hub.queue_flow_command(flow_command(&hub, number, 2, false))
-                .unwrap();
+            assert_eq!(
+                hub.queue_flow_command(flow_command(&hub, number, 2, false)),
+                Err("stale_flow_command_snapshot".to_owned())
+            );
         }
         let current = flow_command(&hub, 256, 1, false);
         hub.queue_flow_command(current.clone()).unwrap();
         assert_eq!(hub.take_flow_command(&session, 1), Some(current));
         assert!(hub.take_flow_command(&session, 1).is_none());
+    }
+
+    #[test]
+    fn stale_flow_context_cannot_replace_a_newer_same_revision_decision() {
+        let service = PolicyService::open_in_memory().unwrap();
+        let hub = PolicyHub::new();
+        hub.refresh_gateway(&service, "gw-test", false).unwrap();
+        let now = now_ms();
+        let request = |application_id: &str| PolicyPreviewRequest {
+            gateway_id: "gw-test".to_owned(),
+            client_mac: "02:00:00:00:00:01".to_owned(),
+            application_id: application_id.to_owned(),
+            category_id: "streaming".to_owned(),
+            application_confidence: 0.99,
+            scope: "internet".to_owned(),
+            at_ms: now,
+        };
+        let flow_id = "00000000000000000000000000000001";
+        let old_generation = hub
+            .remember_flow_context("gw-test", "boot-test", flow_id, 6, request("old-app"), now)
+            .unwrap();
+        let new_generation = hub
+            .remember_flow_context(
+                "gw-test",
+                "boot-test",
+                flow_id,
+                6,
+                request("new-app"),
+                now + 1,
+            )
+            .unwrap();
+        let session = hub.register("gw-test").unwrap();
+        let old = flow_command(&hub, 1, 0, false);
+        hub.queue_flow_command_for_context(old, old_generation)
+            .unwrap();
+        assert!(hub.take_flow_command(&session, 0).is_none());
+
+        let current = flow_command(&hub, 1, 0, false);
+        let current_id = flow_command_id(&current).unwrap().to_owned();
+        hub.queue_flow_command_for_context(current, new_generation)
+            .unwrap();
+        let late_old = flow_command(&hub, 1, 0, true);
+        hub.queue_flow_command_for_context(late_old, old_generation)
+            .unwrap();
+        let states = hub.inner.gateways.lock().unwrap();
+        let saved = &states["gw-test"].flow_states[&flow_command_key("boot-test", flow_id)];
+        assert_eq!(flow_command_id(saved), Some(current_id.as_str()));
+    }
+
+    #[test]
+    fn flow_command_from_an_old_snapshot_is_rejected_before_queueing() {
+        let hub = PolicyHub::new();
+        hub.refresh_gateway(&PolicyService::open_in_memory().unwrap(), "gw-test", false)
+            .unwrap();
+        let next = compile_snapshot(
+            "gw-test",
+            &hub.inner.controller_epoch,
+            2,
+            now_ms(),
+            1,
+            Vec::new(),
+        )
+        .unwrap();
+        hub.inner
+            .gateways
+            .lock()
+            .unwrap()
+            .get_mut("gw-test")
+            .unwrap()
+            .bundle = Some(Arc::new(PublishedBundle {
+            bytes: Arc::new(next.encode().unwrap()),
+            frame: next,
+        }));
+
+        assert_eq!(
+            hub.queue_flow_command(flow_command(&hub, 1, 0, false)),
+            Err("stale_flow_command_snapshot".to_owned())
+        );
+        assert!(
+            hub.inner.gateways.lock().unwrap()["gw-test"]
+                .flow_states
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1388,7 +1778,7 @@ mod tests {
         hub.record_flow_capabilities("gw-test", 0, &capabilities);
         assert_eq!(hub.flow_capabilities("gw-test"), (true, false));
         hub.record_flow_capabilities("gw-test", 1, &capabilities);
-        assert_eq!(hub.flow_capabilities("gw-test"), (false, false));
+        assert_eq!(hub.flow_capabilities("gw-test"), (true, false));
         capabilities.application_block = PolicyCapability::Unsupported;
         hub.record_flow_capabilities("gw-test", 0, &capabilities);
         assert_eq!(hub.flow_capabilities("gw-test"), (false, false));

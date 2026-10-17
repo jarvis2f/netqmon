@@ -90,8 +90,33 @@ fn has_enabled_application_flow_policy(
         .is_some_and(|saved| super::snapshot_has_enabled_application_verdicts(&saved.snapshot))
 }
 
+fn health_frame_for_runtime(
+    config: &AgentConfig,
+    gateway_id: &str,
+    boot_id: &str,
+    flow_bpf_ready: bool,
+    priority_runtime_active: bool,
+) -> PolicyWireFrame {
+    let mut frame =
+        executor::health_frame_with_flow_capability(config, gateway_id, boot_id, flow_bpf_ready);
+    if priority_runtime_active
+        && let PolicyWireFrame::PolicyHealth { capabilities, .. } = &mut frame
+    {
+        *capabilities =
+            executor::priority_runtime_capabilities(flow_bpf_ready, capabilities.client_block);
+    }
+    frame
+}
+
 fn flow_identity_tracking_enabled(flow_bpf_ready: bool, emergency_disabled: bool) -> bool {
     flow_bpf_ready && !emergency_disabled
+}
+
+fn no_app_verdicts_for_empty_alias_revoke(
+    saved_snapshot_has_app_verdicts: bool,
+    priority_runtime_has_app_verdicts: Option<bool>,
+) -> bool {
+    !priority_runtime_has_app_verdicts.unwrap_or(saved_snapshot_has_app_verdicts)
 }
 
 impl PolicyReceiver {
@@ -352,13 +377,18 @@ async fn connect_and_run(
     )
     .await
     .context("policy WebSocket connection timed out")??;
+    #[cfg(feature = "qos-client-priority")]
+    let priority_runtime_active = priority_runtime.is_some();
+    #[cfg(not(feature = "qos-client-priority"))]
+    let priority_runtime_active = false;
     send_frame(
         &mut socket,
-        &executor::health_frame_with_flow_capability(
+        &health_frame_for_runtime(
             config,
             &credentials.gateway_id,
             boot_id,
             flow_bpf_ready.load(Ordering::Acquire),
+            priority_runtime_active,
         ),
     )
     .await?;
@@ -381,7 +411,13 @@ async fn connect_and_run(
                 }
             }
             _ = heartbeat.tick() => {
-                send_frame(&mut socket, &executor::health_frame_with_flow_capability(config, &credentials.gateway_id, boot_id, flow_bpf_ready.load(Ordering::Acquire))).await?;
+                send_frame(&mut socket, &health_frame_for_runtime(
+                    config,
+                    &credentials.gateway_id,
+                    boot_id,
+                    flow_bpf_ready.load(Ordering::Acquire),
+                    priority_runtime_active,
+                )).await?;
             }
             _ = policy_tick.tick() => {
                 if let Some(acknowledgement) = reconcile_saved(
@@ -913,9 +949,21 @@ fn apply_flow_command(
             Some("stale_flow_command".to_owned()),
         )
     } else if alias_count == 0 {
-        let no_app_verdicts = saved.as_ref().is_some_and(|state| {
-            !super::snapshot_has_enabled_application_verdicts(&state.snapshot)
+        let saved_snapshot_has_app_verdicts = saved
+            .as_ref()
+            .is_some_and(|state| super::snapshot_has_enabled_application_verdicts(&state.snapshot));
+        #[cfg(feature = "qos-client-priority")]
+        let priority_runtime_has_app_verdicts = priority_runtime.map(|runtime| {
+            runtime.lock().map_or(true, |runtime| {
+                runtime.has_enabled_application_flow_policy()
+            })
         });
+        #[cfg(not(feature = "qos-client-priority"))]
+        let priority_runtime_has_app_verdicts = None;
+        let no_app_verdicts = no_app_verdicts_for_empty_alias_revoke(
+            saved_snapshot_has_app_verdicts,
+            priority_runtime_has_app_verdicts,
+        );
         if operation == FlowCommandOperation::Revoke && no_app_verdicts {
             (FlowAckStatus::Applied, None)
         } else {
@@ -1393,6 +1441,20 @@ fn jitter(delay: Duration) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn empty_alias_revoke_uses_the_current_priority_snapshot() {
+        assert!(super::no_app_verdicts_for_empty_alias_revoke(
+            true,
+            Some(false)
+        ));
+        assert!(!super::no_app_verdicts_for_empty_alias_revoke(
+            false,
+            Some(true)
+        ));
+        assert!(!super::no_app_verdicts_for_empty_alias_revoke(true, None));
+        assert!(super::no_app_verdicts_for_empty_alias_revoke(false, None));
+    }
+
     #[test]
     fn exact_flow_identity_tracking_does_not_require_an_active_app_policy() {
         // The exact-flow map can track identities while empty. The Collector needs those IDs

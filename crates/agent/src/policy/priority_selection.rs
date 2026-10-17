@@ -100,6 +100,11 @@ impl PrioritySelection {
                 && !policy.spec.selectors.clients.is_empty()
                 && (!policy.spec.selectors.applications.is_empty()
                     || !policy.spec.selectors.categories.is_empty());
+            let application_allow = policy.spec.action.kind == PolicyActionKind::Allow
+                && policy.spec.network.scope == "internet"
+                && !policy.spec.selectors.clients.is_empty()
+                && (!policy.spec.selectors.applications.is_empty()
+                    || !policy.spec.selectors.categories.is_empty());
             let internet_decision = policy.spec.network.scope == "internet"
                 && policy.spec.network.direction == "both"
                 && !policy.spec.selectors.clients.is_empty()
@@ -109,7 +114,12 @@ impl PrioritySelection {
                     policy.spec.action.kind,
                     PolicyActionKind::Block | PolicyActionKind::Allow
                 );
-            if !total && !internet_decision && !application_limit && !application_block {
+            if !total
+                && !internet_decision
+                && !application_limit
+                && !application_block
+                && !application_allow
+            {
                 return Err("priority_policy_shape_not_verified".to_owned());
             }
             if policy.spec.schedule.is_some() {
@@ -179,6 +189,10 @@ impl PrioritySelection {
                 } else if application_block {
                     // The client lease is needed to validate exact FlowCommand
                     // identities; this does not block the entire client.
+                    selection.clients.insert(mac);
+                } else if application_allow {
+                    // Allow is enforced by the exact FlowVerdict path. Retain
+                    // the client's identity lease without removing its limits.
                     selection.clients.insert(mac);
                 } else if block_decided.insert(mac.clone())
                     && policy.spec.action.kind == PolicyActionKind::Block
@@ -319,6 +333,42 @@ mod tests {
         assert!(selection.totals.is_empty());
         assert!(selection.application_limits.is_empty());
         assert!(selection.clients.contains("02:00:00:00:aa:01"));
+    }
+
+    #[test]
+    fn application_allow_preserves_independent_client_and_application_limits() {
+        let total = policy("total", "agent", "limit", 100);
+        let mut app_block = policy("app-block", "internet", "block", 10);
+        app_block.spec.selectors.applications = vec!["netqmon_qos_test".to_owned()];
+        let mut app_allow = policy("app-allow", "internet", "allow", 5);
+        app_allow.spec.selectors.applications = vec!["netqmon_qos_test".to_owned()];
+        let mut app_limit = policy("app-limit", "internet", "limit", 20);
+        app_limit.spec.selectors.applications = vec!["netqmon_qos_test".to_owned()];
+        app_limit.spec.action.upload_bps = Some(2_000_000);
+        app_limit.spec.action.download_bps = Some(4_000_000);
+
+        let selected = PrioritySelection::from_snapshot(
+            &snapshot(vec![app_allow, app_block, app_limit, total], vec![]),
+            "gw-test",
+            Some(NOW),
+        )
+        .unwrap();
+
+        assert!(selected.clients.contains("02:00:00:00:aa:01"));
+        assert!(selected.blocked_macs.is_empty());
+        assert_eq!(
+            selected.totals["02:00:00:00:aa:01"].upload_bps,
+            Some(8_000_000)
+        );
+        assert_eq!(
+            selected.totals["02:00:00:00:aa:01"].download_bps,
+            Some(16_000_000)
+        );
+        assert_eq!(selected.application_limits.len(), 1);
+        assert_eq!(selected.application_limits[0].policy_id, "app-limit");
+        assert_eq!(selected.application_limits[0].upload_bps, Some(2_000_000));
+        assert_eq!(selected.application_limits[0].download_bps, Some(4_000_000));
+        assert_eq!(selected.results.len(), 4);
     }
 
     #[test]

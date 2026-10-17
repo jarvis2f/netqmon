@@ -263,7 +263,11 @@ impl PolicyService {
                  reported_revision = CASE WHEN controller_epoch IS NOT ?2 OR agent_boot_id IS NOT ?1 THEN 0 ELSE reported_revision END,
                  acknowledged_status = CASE WHEN controller_epoch IS NOT ?2 OR agent_boot_id IS NOT ?1 THEN NULL ELSE acknowledged_status END,
                  agent_applied_revision = MAX(agent_applied_revision, ?3),
-                 capabilities_json = ?4, last_heartbeat_at_ms = ?5,
+                 capabilities_json = CASE
+                     WHEN controller_epoch = ?2 AND agent_boot_id = ?1
+                          AND ?3 < reported_revision THEN capabilities_json
+                     ELSE ?4 END,
+                 last_heartbeat_at_ms = ?5,
                  last_error_code = ?6, last_error_message = ?7,
                  status = CASE WHEN ?8 = 1 THEN 'failed'
                                WHEN (controller_epoch IS NOT ?2 OR agent_boot_id IS NOT ?1) AND desired_revision > 0 THEN 'pending'
@@ -1873,6 +1877,68 @@ mod tests {
         assert_eq!(blocked.interface, "policy-block");
         assert_eq!(blocked.packets, Some(3));
         assert_eq!(blocked.drops, Some(3));
+    }
+
+    #[test]
+    fn stale_health_capabilities_do_not_replace_a_newer_policy_ack() {
+        let service = PolicyService::open_in_memory().unwrap();
+        let policy = service
+            .create(&spec(true), "user-1", 0)
+            .unwrap()
+            .policy
+            .unwrap();
+        let epoch = "00000000-0000-4000-8000-000000000001";
+        let unsupported = WireCapabilities::unsupported();
+        service
+            .record_health("gw-1", "boot-1", epoch, 0, &unsupported, false, now_ms())
+            .unwrap();
+        let supported = WireCapabilities {
+            client_block: netqmon_protocol::policy::PolicyCapability::Supported,
+            client_limit: netqmon_protocol::policy::PolicyCapability::Supported,
+            application_block: netqmon_protocol::policy::PolicyCapability::Supported,
+            application_limit: netqmon_protocol::policy::PolicyCapability::Supported,
+        };
+        service
+            .record_ack(
+                "gw-1",
+                "boot-1",
+                epoch,
+                1,
+                1,
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                PolicyAckStatus::Applied,
+                &supported,
+                &[PolicyResult {
+                    policy_id: policy.id,
+                    status: netqmon_protocol::policy::PolicyResultStatus::Applied,
+                    reason_code: None,
+                    message: None,
+                    details: None,
+                }],
+                now_ms(),
+            )
+            .unwrap();
+
+        service
+            .record_health(
+                "gw-1",
+                "boot-1",
+                epoch,
+                0,
+                &unsupported,
+                false,
+                now_ms().saturating_add(1),
+            )
+            .unwrap();
+
+        assert_eq!(
+            service
+                .deployment("gw-1")
+                .unwrap()
+                .capabilities
+                .application_limit,
+            "supported"
+        );
     }
 
     #[test]

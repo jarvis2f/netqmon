@@ -18,7 +18,7 @@ use std::{
 use anyhow::{Context as _, Result, anyhow, bail};
 use libbpf_rs::{MapCore as _, MapFlags, ProgramHandle, ProgramMut};
 use netqmon_protocol::policy::{
-    PolicyAckStatus, PolicyCapabilities, PolicyCapability, PolicyResultStatus, PolicyWireFrame,
+    PolicyAckStatus, PolicyCapability, PolicyResultStatus, PolicyWireFrame,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -923,24 +923,14 @@ impl PriorityRuntime {
                 crate::policy::executor::priority_policy_ack(
                     snapshot,
                     boot_id,
-                    PolicyCapabilities {
-                        client_block: if client_block_degraded {
+                    crate::policy::executor::priority_runtime_capabilities(
+                        flow_bpf_ready,
+                        if client_block_degraded {
                             PolicyCapability::Degraded
                         } else {
                             PolicyCapability::Supported
                         },
-                        client_limit: PolicyCapability::Supported,
-                        application_block: if flow_bpf_ready {
-                            PolicyCapability::Supported
-                        } else {
-                            PolicyCapability::Unsupported
-                        },
-                        application_limit: if flow_bpf_ready {
-                            PolicyCapability::Supported
-                        } else {
-                            PolicyCapability::Unsupported
-                        },
-                    },
+                    ),
                     if selection.results.iter().any(|result| {
                         matches!(
                             result.status,

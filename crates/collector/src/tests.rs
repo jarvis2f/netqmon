@@ -2,6 +2,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE};
 use axum::http::{Request, StatusCode};
 use futures_util::StreamExt;
+use netqmon_protocol::policy::FlowVerdict;
 use netqmon_protocol::v1::probe_result::Outcome as ProbeOutcome;
 use netqmon_protocol::v1::{
     AgentHealth, CounterSanityStatus, DeviceDiscoveryObservation, Direction, DnsObservation,
@@ -213,6 +214,163 @@ fn late_dpi_recovers_exact_client_context_and_queues_block() {
     );
 }
 
+#[test]
+fn policy_revision_re_evaluates_active_flow_with_allow_and_keeps_matching_limit() {
+    use netqmon_protocol::policy::{PolicyCapabilities, PolicyCapability};
+
+    let service = policy::PolicyService::open_in_memory().unwrap();
+    let gateway = "gw-flow-revision";
+    let mac = "02:00:00:00:01:23";
+    let block = serde_json::from_value(serde_json::json!({
+        "schema_version": 1,
+        "gateway_id": gateway,
+        "name": "Block target app",
+        "description": "",
+        "enabled": true,
+        "priority": 20,
+        "selectors": {"clients": [mac], "applications": ["netqmon_qos_test"],
+            "categories": [], "min_application_confidence": 0.95},
+        "network": {"scope": "internet", "direction": "both"},
+        "action": {"type": "block", "download_bps": null, "upload_bps": null},
+        "schedule": null
+    }))
+    .unwrap();
+    let block = service.create(&block, "test", 0).unwrap();
+    let limit = serde_json::from_value(serde_json::json!({
+        "schema_version": 1,
+        "gateway_id": gateway,
+        "name": "Limit target app",
+        "description": "",
+        "enabled": true,
+        "priority": 50,
+        "selectors": {"clients": [mac], "applications": ["netqmon_qos_test"],
+            "categories": [], "min_application_confidence": 0.95},
+        "network": {"scope": "internet", "direction": "both"},
+        "action": {"type": "limit", "download_bps": 4_000_000, "upload_bps": 2_000_000},
+        "schedule": null
+    }))
+    .unwrap();
+    let limit_mutation = service.create(&limit, "test", block.revision).unwrap();
+    let limit_revision = limit_mutation.revision;
+    let limit = limit_mutation.policy.unwrap();
+
+    let hub = PolicyHub::new();
+    let bundle = hub.refresh_gateway(&service, gateway, false).unwrap();
+    let revision = bundle.frame.snapshot_identity().unwrap().2;
+    let session = hub.register(gateway).unwrap();
+    let capabilities = PolicyCapabilities {
+        application_block: PolicyCapability::Supported,
+        application_limit: PolicyCapability::Supported,
+        ..PolicyCapabilities::unsupported()
+    };
+    hub.record_flow_capabilities(gateway, revision, &capabilities);
+
+    let flow_id = "000000000000000000000000000000af";
+    let flow = FlowDelta {
+        ip_version: 4,
+        protocol: 6,
+        client_ip: vec![192, 0, 2, 1],
+        client_port: 50_000,
+        remote_ip: vec![198, 51, 100, 1],
+        remote_port: 443,
+        client_mac: vec![2, 0, 0, 0, 1, 35],
+        scope: FlowScope::Internet as i32,
+        lifecycle: FlowLifecycle::Active as i32,
+        direction: Direction::Upload as i32,
+        packets: 3,
+        upload_bytes: 500,
+        first_seen_unix_ms: 1_000,
+        last_seen_unix_ms: 1_100,
+        policy_flow_id: flow_id.to_owned(),
+        ..Default::default()
+    };
+    let batch = TelemetryBatch {
+        gateway_id: gateway.to_owned(),
+        boot_id: "boot-flow-revision".to_owned(),
+        flows: vec![flow],
+        ..Default::default()
+    };
+    queue_policy_flow_decisions(
+        &hub,
+        &batch,
+        &[strong_self_host_attribution("netqmon_qos_test")],
+    );
+    assert!(matches!(
+        hub.take_flow_command(&session, revision),
+        Some(PolicyWireFrame::FlowCommand {
+            policy_flow_id,
+            verdict: Some(FlowVerdict::Block),
+            ..
+        }) if policy_flow_id == flow_id
+    ));
+
+    let allow = serde_json::from_value(serde_json::json!({
+        "schema_version": 1,
+        "gateway_id": gateway,
+        "name": "Allow target app",
+        "description": "",
+        "enabled": true,
+        "priority": 10,
+        "selectors": {"clients": [mac], "applications": ["netqmon_qos_test"],
+            "categories": [], "min_application_confidence": 0.95},
+        "network": {"scope": "internet", "direction": "both"},
+        "action": {"type": "allow", "download_bps": null, "upload_bps": null},
+        "schedule": null
+    }))
+    .unwrap();
+    let allow = service
+        .create(&allow, "test", limit_revision)
+        .unwrap()
+        .policy
+        .unwrap();
+    let bundle = hub.refresh_gateway(&service, gateway, false).unwrap();
+    let next_revision = bundle.frame.snapshot_identity().unwrap().2;
+    hub.record_flow_capabilities(gateway, next_revision, &capabilities);
+    let re_evaluated = hub.take_flow_command(&session, next_revision).unwrap();
+    assert!(matches!(
+        re_evaluated,
+        PolicyWireFrame::FlowCommand {
+            operation: FlowCommandOperation::Upsert,
+            policy_flow_id,
+            verdict: Some(FlowVerdict::Shape),
+            ref policy_ids,
+            config_revision,
+            ..
+        } if policy_flow_id == flow_id && policy_ids == &[limit.id.clone()] && config_revision == next_revision
+    ));
+
+    let PolicyWireFrame::PolicySnapshot { policies, .. } = &bundle.frame else {
+        unreachable!();
+    };
+    let preview = policy::evaluate_preview(
+        &policy::PolicyPreviewRequest {
+            gateway_id: gateway.to_owned(),
+            client_mac: mac.to_owned(),
+            application_id: "netqmon_qos_test".to_owned(),
+            category_id: "streaming".to_owned(),
+            application_confidence: 0.99,
+            scope: "internet".to_owned(),
+            at_ms: policy::push::now_ms(),
+        },
+        policies,
+        true,
+        true,
+    );
+    assert_eq!(preview.selected_block_verdict, "allow");
+    assert!(
+        preview
+            .matched_policies
+            .iter()
+            .any(|row| row.policy_id == allow.id && row.selected)
+    );
+    assert!(
+        preview
+            .active_limits
+            .iter()
+            .any(|row| row.policy_id == limit.id && row.status == "supported")
+    );
+}
+
 fn strong_self_host_attribution(application_id: &str) -> FlowAttribution {
     FlowAttribution {
         organization_id: "self_host_org".to_owned(),
@@ -226,6 +384,159 @@ fn strong_self_host_attribution(application_id: &str) -> FlowAttribution {
         ),
         ..FlowAttribution::default()
     }
+}
+
+#[test]
+fn initial_allow_and_limit_evaluation_sends_shape_for_the_active_limit() {
+    use netqmon_protocol::policy::{PolicyCapabilities, PolicyCapability};
+
+    let service = policy::PolicyService::open_in_memory().unwrap();
+    let gateway = "gw-allow-limit-initial";
+    let mac = "02:00:00:00:01:23";
+    let create = |name: &str, priority: u16, action: serde_json::Value| {
+        serde_json::from_value(serde_json::json!({
+            "schema_version":1,"gateway_id":gateway,"name":name,"description":"",
+            "enabled":true,"priority":priority,
+            "selectors":{"clients":[mac],"applications":["netqmon_qos_test"],
+                "categories":[],"min_application_confidence":0.95},
+            "network":{"scope":"internet","direction":"both"},
+            "action":action,"schedule":null
+        }))
+        .unwrap()
+    };
+    let block = service
+        .create(
+            &create(
+                "Block app",
+                20,
+                serde_json::json!({
+            "type":"block","download_bps":null,"upload_bps":null}),
+            ),
+            "test",
+            0,
+        )
+        .unwrap()
+        .policy
+        .unwrap();
+    let limit = service
+        .create(
+            &create(
+                "Limit app",
+                50,
+                serde_json::json!({
+            "type":"limit","download_bps":4_000_000,"upload_bps":2_000_000}),
+            ),
+            "test",
+            1,
+        )
+        .unwrap()
+        .policy
+        .unwrap();
+    let allow = service
+        .create(
+            &create(
+                "Allow app",
+                10,
+                serde_json::json!({
+            "type":"allow","download_bps":null,"upload_bps":null}),
+            ),
+            "test",
+            2,
+        )
+        .unwrap()
+        .policy
+        .unwrap();
+
+    let hub = PolicyHub::new();
+    let bundle = hub.refresh_gateway(&service, gateway, false).unwrap();
+    let revision = bundle.frame.snapshot_identity().unwrap().2;
+    let session = hub.register(gateway).unwrap();
+    hub.record_flow_capabilities(
+        gateway,
+        revision,
+        &PolicyCapabilities {
+            application_block: PolicyCapability::Supported,
+            application_limit: PolicyCapability::Supported,
+            ..PolicyCapabilities::unsupported()
+        },
+    );
+    let flow = FlowDelta {
+        ip_version: 4,
+        protocol: 6,
+        client_ip: vec![192, 0, 2, 2],
+        client_port: 48_016,
+        remote_ip: vec![203, 0, 113, 9],
+        remote_port: 7_000,
+        client_mac: vec![2, 0, 0, 0, 1, 35],
+        scope: FlowScope::Internet as i32,
+        lifecycle: FlowLifecycle::Active as i32,
+        direction: Direction::Download as i32,
+        packets: 3,
+        download_bytes: 1_024,
+        first_seen_unix_ms: 1_000,
+        last_seen_unix_ms: 1_100,
+        policy_flow_id: "000000000000000000000000000000af".to_owned(),
+        ..Default::default()
+    };
+    let batch = TelemetryBatch {
+        gateway_id: gateway.to_owned(),
+        boot_id: "boot-allow-limit-initial".to_owned(),
+        flows: vec![flow.clone()],
+        ..Default::default()
+    };
+
+    queue_policy_flow_decisions(
+        &hub,
+        &batch,
+        &[strong_self_host_attribution("netqmon_qos_test")],
+    );
+
+    assert!(matches!(
+        hub.take_flow_command(&session,revision),
+        Some(PolicyWireFrame::FlowCommand {
+            operation:FlowCommandOperation::Upsert,
+            policy_flow_id,
+            verdict:Some(FlowVerdict::Shape),
+            ref policy_ids,
+            ..
+        }) if policy_flow_id == flow.policy_flow_id && policy_ids == &[limit.id.clone()]
+    ));
+    let PolicyWireFrame::PolicySnapshot { policies, .. } = &bundle.frame else {
+        unreachable!();
+    };
+    let preview = policy::evaluate_preview(
+        &policy::PolicyPreviewRequest {
+            gateway_id: gateway.to_owned(),
+            client_mac: mac.to_owned(),
+            application_id: "netqmon_qos_test".to_owned(),
+            category_id: "streaming".to_owned(),
+            application_confidence: 0.99,
+            scope: "internet".to_owned(),
+            at_ms: policy::push::now_ms(),
+        },
+        policies,
+        true,
+        true,
+    );
+    assert_eq!(preview.selected_block_verdict, "allow");
+    assert!(
+        preview
+            .matched_policies
+            .iter()
+            .any(|row| row.policy_id == allow.id && row.selected)
+    );
+    assert!(
+        preview
+            .matched_policies
+            .iter()
+            .any(|row| row.policy_id == block.id)
+    );
+    assert!(
+        preview
+            .active_limits
+            .iter()
+            .any(|row| row.policy_id == limit.id && row.status == "supported")
+    );
 }
 
 #[test]

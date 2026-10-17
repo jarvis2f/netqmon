@@ -1,6 +1,8 @@
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use chrono_tz::Tz;
-use netqmon_protocol::policy::{PolicyActionKind, PolicySnapshotEntry, PolicyWireFrame};
+use netqmon_protocol::policy::{
+    FlowVerdict, PolicyActionKind, PolicySnapshotEntry, PolicyWireFrame,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize)]
@@ -41,6 +43,56 @@ pub(crate) struct PolicyPreviewLimit {
     pub upload_bps: Option<u64>,
     pub status: String,
     pub reason_code: Option<String>,
+}
+
+/// Translate the Preview evaluation into the exact verdict the FlowCommand
+/// executor should apply. An Allow clears an application Block, while a
+/// supported Limit still needs a Shape command so the Agent installs its HTB
+/// class tag for the same flow.
+pub(crate) fn flow_command_decision(
+    evaluation: &PolicyPreviewResult,
+) -> (Option<FlowVerdict>, Vec<String>) {
+    let selected_policy = || {
+        evaluation
+            .matched_policies
+            .iter()
+            .find(|policy| policy.selected)
+            .map(|policy| policy.policy_id.clone())
+    };
+    let supported_limits = || {
+        evaluation
+            .active_limits
+            .iter()
+            .filter(|limit| limit.status == "supported")
+            .map(|limit| limit.policy_id.clone())
+            .collect::<Vec<_>>()
+    };
+
+    match evaluation.selected_block_verdict.as_str() {
+        "block" => (
+            Some(FlowVerdict::Block),
+            selected_policy().into_iter().collect(),
+        ),
+        "allow" => {
+            let limits = supported_limits();
+            if limits.is_empty() {
+                (
+                    Some(FlowVerdict::Allow),
+                    selected_policy().into_iter().collect(),
+                )
+            } else {
+                (Some(FlowVerdict::Shape), limits)
+            }
+        }
+        _ => {
+            let limits = supported_limits();
+            if limits.is_empty() {
+                (None, Vec::new())
+            } else {
+                (Some(FlowVerdict::Shape), limits)
+            }
+        }
+    }
 }
 
 pub(crate) fn evaluate_preview(
@@ -451,6 +503,61 @@ mod tests {
         assert_eq!(result.active_limits[0].policy_id, "application-limit");
         assert_eq!(result.active_limits[0].status, "supported");
         assert!(result.unsupported_reasons.is_empty());
+        assert_eq!(
+            flow_command_decision(&result),
+            (
+                Some(FlowVerdict::Shape),
+                vec!["application-limit".to_owned()]
+            )
+        );
+    }
+
+    #[test]
+    fn allow_does_not_hide_an_unsupported_application_limit() {
+        let policies = [
+            policy(
+                "application-block",
+                10,
+                PolicyActionKind::Block,
+                vec!["02:00:00:00:00:01"],
+                vec!["video"],
+                vec![],
+            ),
+            policy(
+                "application-allow",
+                5,
+                PolicyActionKind::Allow,
+                vec!["02:00:00:00:00:01"],
+                vec!["video"],
+                vec![],
+            ),
+            policy(
+                "application-limit",
+                20,
+                PolicyActionKind::Limit,
+                vec!["02:00:00:00:00:01"],
+                vec!["video"],
+                vec![],
+            ),
+        ];
+
+        let result = evaluate_preview(&request("video", "streaming"), &policies, true, false);
+
+        assert_eq!(result.selected_block_verdict, "allow");
+        assert_eq!(result.active_limits.len(), 1);
+        assert_eq!(result.active_limits[0].status, "unsupported");
+        assert!(
+            result
+                .unsupported_reasons
+                .contains(&"unsupported_application_shaping".to_owned())
+        );
+        assert_eq!(
+            flow_command_decision(&result),
+            (
+                Some(FlowVerdict::Allow),
+                vec!["application-allow".to_owned()]
+            )
+        );
     }
 
     #[test]

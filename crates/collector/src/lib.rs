@@ -39,9 +39,7 @@ use getrandom::fill;
 #[cfg(test)]
 use netqmon_geo::DisabledGeoProvider;
 use netqmon_geo::{DEFAULT_GEO_DIRECTORY, GeoProvider, LocalDbProvider};
-use netqmon_protocol::policy::{
-    FlowCommandOperation, FlowVerdict, POLICY_WIRE_VERSION, PolicyWireFrame,
-};
+use netqmon_protocol::policy::{FlowCommandOperation, POLICY_WIRE_VERSION, PolicyWireFrame};
 use netqmon_protocol::v1::probe_request::Target as ProbeTarget;
 use netqmon_protocol::v1::probe_result::Outcome as ProbeOutcome;
 use netqmon_protocol::v1::{
@@ -2069,6 +2067,7 @@ fn queue_policy_flow_decisions(
         let is_ended = flow.lifecycle == FlowLifecycle::Ended as i32;
         let is_internet = flow.scope == FlowScope::Internet as i32;
         let Some(client_mac) = canonical_mac(&flow.client_mac) else {
+            hub.forget_flow_context(&batch.gateway_id, &batch.boot_id, policy_flow_id);
             if is_ended || !is_internet {
                 let _ = hub.revoke_flow_if_active(
                     &batch.gateway_id,
@@ -2082,6 +2081,7 @@ fn queue_policy_flow_decisions(
             continue;
         };
         if is_ended || !is_internet {
+            hub.forget_flow_context(&batch.gateway_id, &batch.boot_id, policy_flow_id);
             let _ = hub.revoke_flow_if_active(
                 &batch.gateway_id,
                 &batch.boot_id,
@@ -2118,6 +2118,14 @@ fn queue_policy_flow_decisions(
             scope: "internet".to_owned(),
             at_ms: now,
         };
+        let context_generation = hub.remember_flow_context(
+            &batch.gateway_id,
+            &batch.boot_id,
+            policy_flow_id,
+            flow.protocol,
+            request.clone(),
+            now,
+        );
         // This evaluation selects the intended rule. The Agent still verifies its
         // runtime capability and policy revision before applying any command.
         let evaluated = policy::evaluate_preview(
@@ -2126,39 +2134,7 @@ fn queue_policy_flow_decisions(
             application_block_supported,
             application_limit_supported,
         );
-        let (verdict, policy_ids) = match evaluated.selected_block_verdict.as_str() {
-            "block" => (
-                Some(FlowVerdict::Block),
-                evaluated
-                    .matched_policies
-                    .iter()
-                    .find(|policy| policy.selected)
-                    .map(|policy| vec![policy.policy_id.clone()])
-                    .unwrap_or_default(),
-            ),
-            "allow" => (
-                Some(FlowVerdict::Allow),
-                evaluated
-                    .matched_policies
-                    .iter()
-                    .find(|policy| policy.selected)
-                    .map(|policy| vec![policy.policy_id.clone()])
-                    .unwrap_or_default(),
-            ),
-            _ => {
-                let policy_ids = evaluated
-                    .active_limits
-                    .iter()
-                    .filter(|limit| limit.status == "supported")
-                    .map(|limit| limit.policy_id.clone())
-                    .collect::<Vec<_>>();
-                if policy_ids.is_empty() {
-                    (None, Vec::new())
-                } else {
-                    (Some(FlowVerdict::Shape), policy_ids)
-                }
-            }
-        };
+        let (verdict, policy_ids) = policy::flow_command_decision(&evaluated);
         if let Some(verdict) = verdict.filter(|_| !policy_ids.is_empty() && policy_ids.len() <= 16)
             && let Some(ttl_ms) = match flow.protocol {
                 17 => Some(30_000),
@@ -2181,6 +2157,8 @@ fn queue_policy_flow_decisions(
                 protocol = flow.protocol,
                 direction = flow.direction,
                 ?verdict,
+                operation = "Upsert",
+                policy_ids = ?policy_ids,
                 "evaluated application flow command"
             );
             let command = PolicyWireFrame::FlowCommand {
@@ -2197,7 +2175,11 @@ fn queue_policy_flow_decisions(
                 expires_at_ms,
                 issued_at_ms: now,
             };
-            if let Err(error) = hub.queue_flow_command(command) {
+            let queued = context_generation.map_or_else(
+                || Err("flow evaluation context backpressure".to_owned()),
+                |generation| hub.queue_flow_command_for_context(command, generation),
+            );
+            if let Err(error) = queued {
                 tracing::warn!(gateway_id = batch.gateway_id, policy_flow_id, %error, "could not queue application flow command");
             }
         } else if let Err(error) = hub.revoke_flow_if_active(

@@ -141,6 +141,23 @@ fn runtime_topology(config: &AgentConfig, flow_bpf_ready: bool) -> PolicyTopolog
     topology
 }
 
+pub(crate) fn priority_runtime_capabilities(
+    flow_bpf_ready: bool,
+    client_block: PolicyCapability,
+) -> PolicyCapabilities {
+    let application_capability = if flow_bpf_ready {
+        PolicyCapability::Supported
+    } else {
+        PolicyCapability::Unsupported
+    };
+    PolicyCapabilities {
+        client_block,
+        client_limit: PolicyCapability::Supported,
+        application_block: application_capability,
+        application_limit: application_capability,
+    }
+}
+
 trait NftRunner {
     fn clear_owned(&mut self) -> Result<(), String>;
     fn is_installed(&mut self) -> Result<bool, String>;
@@ -2236,6 +2253,19 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn priority_runtime_uses_one_flow_readiness_source_for_ack_and_health() {
+        let supported = priority_runtime_capabilities(true, PolicyCapability::Supported);
+        let unsupported = priority_runtime_capabilities(false, PolicyCapability::Degraded);
+
+        assert_eq!(supported.application_block, PolicyCapability::Supported);
+        assert_eq!(supported.application_limit, PolicyCapability::Supported);
+        assert_eq!(supported.client_limit, PolicyCapability::Supported);
+        assert_eq!(unsupported.application_block, PolicyCapability::Unsupported);
+        assert_eq!(unsupported.application_limit, PolicyCapability::Unsupported);
+        assert_eq!(unsupported.client_block, PolicyCapability::Degraded);
+    }
 
     #[test]
     fn application_block_metrics_reuse_per_client_policy_metrics() {
