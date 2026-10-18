@@ -15,6 +15,7 @@ export function ApplicationIdentity({
   icon,
   showProtocolDescription = true,
   hideUnknownCategory = false,
+  unknownUsesCategory = false,
 }: {
   id: string;
   name?: string | null;
@@ -22,17 +23,21 @@ export function ApplicationIdentity({
   icon?: IconMetadata | null;
   showProtocolDescription?: boolean;
   hideUnknownCategory?: boolean;
+  unknownUsesCategory?: boolean;
 }) {
   const t = useTranslations("applications");
   const unknown = id === "unknown";
+  const hasCategory = Boolean(category && category !== "unknown");
   const protocol = protocolFromApplicationId(id);
   const secondaryLabel = protocol
     ? showProtocolDescription
       ? t("protocolApplicationDescription")
       : null
-    : hideUnknownCategory && category === "unknown"
+    : unknown && unknownUsesCategory
       ? null
-      : category || "Unknown category";
+      : hideUnknownCategory && category === "unknown"
+        ? null
+        : category || "Unknown category";
   return (
     <div className="flex min-w-0 items-center gap-2.5">
       {protocol ? (
@@ -50,7 +55,9 @@ export function ApplicationIdentity({
           {protocol
             ? protocolApplicationName(id)
             : unknown
-              ? "Unknown"
+              ? unknownUsesCategory && hasCategory && category
+                ? formatIdentifier(category)
+                : "Unknown"
               : name || formatIdentifier(id)}
         </div>
         {secondaryLabel && (

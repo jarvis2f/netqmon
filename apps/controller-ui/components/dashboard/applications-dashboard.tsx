@@ -201,6 +201,7 @@ export function ApplicationsDashboard({
           icon={row.icon}
           showProtocolDescription={false}
           hideUnknownCategory
+          unknownUsesCategory
         />
       ),
     },
