@@ -19,6 +19,7 @@ impl SignatureMatcher for FixtureMatcher {
             vec![SignatureApplicationMatch {
                 application_id: "honor_of_kings".into(),
                 confidence: 0.95,
+                signature_hits: 1,
             }]
         } else {
             Vec::new()

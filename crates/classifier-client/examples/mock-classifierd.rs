@@ -232,6 +232,7 @@ fn mock_signature_matches(
             matches.push(netqmon_classifier_client::FlowSampleApplicationMatch {
                 application_id: application_id.to_owned(),
                 confidence: 0.95,
+                signature_hits: 1,
             });
         }
     }
@@ -641,6 +642,7 @@ mod tests {
             application_id: "honor_of_kings".to_owned(),
             source: "payload_signature".to_owned(),
             confidence: 0.95,
+            signature_hits: 1,
         }];
         let response = response_for(
             ClientRequest::ClassifyBatch {

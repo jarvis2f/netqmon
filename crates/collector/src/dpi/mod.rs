@@ -112,6 +112,9 @@ struct EndingWindow {
 pub struct SignatureApplicationMatch {
     pub application_id: String,
     pub confidence: f64,
+    /// Independent signatures that matched this application. Older
+    /// classifierd responses omit it and leave the wire default of one.
+    pub signature_hits: u32,
 }
 
 /// Matches the bounded packets of a flow sample against Pro payload

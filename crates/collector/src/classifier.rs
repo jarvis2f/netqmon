@@ -15,8 +15,8 @@ use netqmon_classifier_client::{
     ApplicationSignatureEvidence, ClassificationBatchRequest, ClassificationRequest,
     ClassifierClient, ClassifierClientConfig, ClassifierEntitlement, DeviceEvidenceInput,
     DeviceEvidenceResult, DpiEvidence as WireDpiEvidence, EntitlementLease, EntityKind,
-    EntityMetadata as WireMetadata, FlowSampleMatchRequest, SamplePacketDirection,
-    SamplePacketInput as WireSamplePacketInput,
+    EntityMetadata as WireMetadata, FlowSampleApplicationMatch as WireFlowSampleApplicationMatch,
+    FlowSampleMatchRequest, SamplePacketDirection, SamplePacketInput as WireSamplePacketInput,
 };
 
 use crate::dpi::{SignatureApplicationMatch, SignatureMatcher};
@@ -505,10 +505,7 @@ impl ClassifierHandle {
         Ok(result
             .matches
             .into_iter()
-            .map(|matched| SignatureApplicationMatch {
-                application_id: matched.application_id,
-                confidence: matched.confidence,
-            })
+            .map(map_signature_match)
             .collect())
     }
 
@@ -868,6 +865,14 @@ fn ip_text(bytes: &[u8]) -> String {
     }
 }
 
+fn map_signature_match(matched: WireFlowSampleApplicationMatch) -> SignatureApplicationMatch {
+    SignatureApplicationMatch {
+        application_id: matched.application_id,
+        confidence: matched.confidence,
+        signature_hits: matched.signature_hits,
+    }
+}
+
 fn signature_evidence(
     signatures: &[SignatureApplicationMatch],
 ) -> Vec<ApplicationSignatureEvidence> {
@@ -877,6 +882,7 @@ fn signature_evidence(
             application_id: matched.application_id.clone(),
             source: "payload_signature".to_owned(),
             confidence: matched.confidence,
+            signature_hits: matched.signature_hits,
         })
         .collect()
 }
@@ -892,6 +898,7 @@ fn fixture_signature_matches(request: &FlowSampleMatchRequest) -> Vec<SignatureA
         vec![SignatureApplicationMatch {
             application_id: "honor_of_kings".to_owned(),
             confidence: 0.95,
+            signature_hits: 1,
         }]
     } else {
         Vec::new()
@@ -935,5 +942,33 @@ fn map_metadata(value: WireMetadata) -> EntityMetadata {
             fallback_domains: value.fallback_domains,
             local_fallback: value.local_fallback,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signature_evidence_forwards_independent_hit_counts() {
+        let evidence = signature_evidence(&[SignatureApplicationMatch {
+            application_id: "sig_beta".to_owned(),
+            confidence: 0.9,
+            signature_hits: 3,
+        }]);
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].application_id, "sig_beta");
+        assert_eq!(evidence[0].signature_hits, 3);
+    }
+
+    #[test]
+    fn wire_signature_matches_preserve_hit_counts() {
+        let mapped = map_signature_match(WireFlowSampleApplicationMatch {
+            application_id: "sig_beta".to_owned(),
+            confidence: 0.9,
+            signature_hits: 3,
+        });
+        assert_eq!(mapped.application_id, "sig_beta");
+        assert_eq!(mapped.signature_hits, 3);
     }
 }
