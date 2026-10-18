@@ -185,6 +185,9 @@ pub struct EntityMetadata {
     pub fallback_domains: Vec<String>,
     /// Local fallback icon identifier, when one is packaged with the client.
     pub local_fallback: Option<String>,
+    /// Organization that owns the application, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_id: Option<String>,
 }
 
 /// A batch result whose entries align by `entry_id`, not positional order.
@@ -1424,6 +1427,7 @@ mod tests {
                     icon_domain: None,
                     fallback_domains: vec![],
                     local_fallback: None,
+                    organization_id: None,
                 }),
             },
             ClientRequest::ApplyEntitlement {

@@ -680,12 +680,10 @@ impl CollectorState {
         let inner = self.lock();
         let application = inner.classifier.application_metadata(id);
         let organization = application.as_ref().and_then(|metadata| {
-            inner
-                .classifier
-                .application_organization_id(&metadata.id)
-                .and_then(|organization_id| {
-                    inner.classifier.organization_metadata(&organization_id)
-                })
+            metadata
+                .organization_id
+                .as_ref()
+                .and_then(|organization_id| inner.classifier.organization_metadata(organization_id))
         });
         (application, organization)
     }

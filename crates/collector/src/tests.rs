@@ -881,6 +881,61 @@ async fn unknown_application_does_not_associate_organization_from_flow_sessions(
 }
 
 #[tokio::test]
+async fn application_aggregate_falls_back_to_classifier_organization_metadata() {
+    let state = query_state();
+    {
+        let inner = state.lock();
+        let connection = inner.storage.connection();
+        let gateway_id: String = connection
+            .query_row("SELECT id FROM gateways LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        // Only the 30-day minute aggregate retains this application; its
+        // flow_sessions rows are gone, so the SQL organization lookup is empty.
+        connection
+            .execute(
+                "INSERT INTO traffic_application_minute
+                 (timestamp, gateway_id, application_id, category_id, upload_bytes, download_bytes, packets, flow_count)
+                 VALUES (1700000000000, ?1, 'xiaohongshu', 'social', 700, 300, 12, 2)",
+                [&gateway_id],
+            )
+            .unwrap();
+        let retained_flows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM flow_sessions WHERE application_id = 'xiaohongshu'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_flows, 0, "fixture must not keep matching flows");
+    }
+
+    let router = internal_router(state);
+    let list_response = parse_json(
+        router
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/applications?limit=50&offset=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let items = list_response["data"].as_array().unwrap();
+    let application = items
+        .iter()
+        .find(|item| item["application_id"] == "xiaohongshu")
+        .expect("xiaohongshu application item");
+    assert_eq!(application["name"], "Xiaohongshu");
+    assert_eq!(
+        application["organization_id"], "xingyin",
+        "metadata fallback should supply the organization id"
+    );
+    assert_eq!(application["organization_name"], "Xingyin");
+}
+
+#[tokio::test]
 async fn traffic_scope_and_direction_filter_metrics_chart_and_breakdown_together() {
     let state = query_state();
     {

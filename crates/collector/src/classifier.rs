@@ -64,6 +64,7 @@ pub struct EntityMetadata {
     pub id: String,
     pub name: String,
     pub icon: IconMetadata,
+    pub organization_id: Option<String>,
 }
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 pub struct RuleDiagnostics {
@@ -476,10 +477,6 @@ impl ClassifierHandle {
     pub fn organization_metadata(&self, id: &str) -> Option<EntityMetadata> {
         self.metadata(EntityKind::Organization, id)
     }
-    #[allow(clippy::unused_self)]
-    pub fn application_organization_id(&self, _id: &str) -> Option<String> {
-        None
-    }
     fn metadata(&self, kind: EntityKind, id: &str) -> Option<EntityMetadata> {
         #[cfg(test)]
         if self.test_mode {
@@ -769,9 +766,11 @@ fn fixture_classification(input: &ClassificationInput<'_>) -> ClassificationResu
 
 #[cfg(test)]
 fn fixture_metadata(kind: EntityKind, id: &str) -> Option<EntityMetadata> {
-    let (name, icon_domain, local_fallback) = match (kind, id) {
-        (EntityKind::Application, "xiaohongshu") => ("Xiaohongshu", None, Some("xiaohongshu")),
-        (EntityKind::Organization, "xingyin") => ("Xingyin", Some("xiaohongshu.com"), None),
+    let (name, icon_domain, local_fallback, organization_id) = match (kind, id) {
+        (EntityKind::Application, "xiaohongshu") => {
+            ("Xiaohongshu", None, Some("xiaohongshu"), Some("xingyin"))
+        }
+        (EntityKind::Organization, "xingyin") => ("Xingyin", Some("xiaohongshu.com"), None, None),
         _ => return None,
     };
     Some(EntityMetadata {
@@ -782,6 +781,7 @@ fn fixture_metadata(kind: EntityKind, id: &str) -> Option<EntityMetadata> {
             fallback_domains: Vec::new(),
             local_fallback: local_fallback.map(str::to_owned),
         },
+        organization_id: organization_id.map(str::to_owned),
     })
 }
 
@@ -942,6 +942,7 @@ fn map_metadata(value: WireMetadata) -> EntityMetadata {
             fallback_domains: value.fallback_domains,
             local_fallback: value.local_fallback,
         },
+        organization_id: value.organization_id,
     }
 }
 

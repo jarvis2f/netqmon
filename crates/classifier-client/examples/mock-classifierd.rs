@@ -439,6 +439,7 @@ fn metadata(kind: EntityKind, id: &str) -> Option<EntityMetadata> {
         icon_domain: icon_domain.map(str::to_owned),
         fallback_domains: fallback_domains.into_iter().map(str::to_owned).collect(),
         local_fallback: None,
+        organization_id: None,
     })
 }
 
