@@ -696,6 +696,7 @@ export function ApplicationDetailDashboard({
               value={initialTab}
               onValueChange={(val) => setTab(val as Tab)}
               variant="pill"
+              className="w-auto"
             >
               <TabsList className="h-8 p-0.5 bg-surface-subtle/80">
                 {tabs.map((tab) => (
