@@ -64,6 +64,10 @@ ip netns exec "${namespace}" ip link set "${peer}" up
 "${agent}" --interface "${interface}" >"${output_file}" 2>&1 &
 agent_pid=$!
 
+# Previous tests may leave map IDs visible briefly during kernel cleanup.
+# Wait for this agent to create its maps and attach before choosing an ID.
+wait_for_hooks
+
 map_id=
 for _ in $(seq 1 100); do
   if ! kill -0 "${agent_pid}" 2>/dev/null; then
@@ -81,7 +85,6 @@ print(max((item["id"] for item in maps), default=""))
   sleep 0.05
 done
 [[ -n ${map_id} ]] || fail "flow_map was not created"
-wait_for_hooks
 
 host_mac=$(cat "/sys/class/net/${interface}/address")
 peer_mac=$(ip netns exec "${namespace}" cat "/sys/class/net/${peer}/address")
