@@ -30,9 +30,12 @@ RUN mkdir -p /tmp/target-pkgs && cd /tmp/target-pkgs && \
     rm -rf /tmp/target-pkgs
 
 # 3. Create target gcc wrapper to ensure -lzstd -lz are linked with -lelf
-RUN mv /usr/local/bin/arm-linux-musleabihf-gcc /usr/local/bin/arm-linux-musleabihf-gcc.real && \
-    printf '#!/bin/sh\nfor arg in "$@"; do\n  if [ "$arg" = "-c" ] || [ "$arg" = "-E" ] || [ "$arg" = "-S" ]; then\n    exec /usr/local/bin/arm-linux-musleabihf-gcc.real "$@"\n  fi\ndone\nexec /usr/local/bin/arm-linux-musleabihf-gcc.real "$@" -lzstd -lz\n' > /usr/local/bin/arm-linux-musleabihf-gcc && \
-    chmod +x /usr/local/bin/arm-linux-musleabihf-gcc
+RUN target_cc="$(command -v "${CC_armv7_unknown_linux_musleabihf}")" && \
+    printf '#!/bin/sh\nfor arg in "$@"; do\n  if [ "$arg" = "-c" ] || [ "$arg" = "-E" ] || [ "$arg" = "-S" ]; then\n    exec "%s" "$@"\n  fi\ndone\nexec "%s" "$@" -lzstd -lz\n' "$target_cc" "$target_cc" > /usr/local/bin/netqmon-armv7hf-gcc && \
+    chmod +x /usr/local/bin/netqmon-armv7hf-gcc
+
+ENV CC_armv7_unknown_linux_musleabihf="/usr/local/bin/netqmon-armv7hf-gcc"
+ENV CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER="/usr/local/bin/netqmon-armv7hf-gcc"
 
 # 4. Smoke check target static libraries
 RUN file /usr/local/arm-linux-musleabihf/usr/lib/libelf.a && \
@@ -41,7 +44,7 @@ RUN file /usr/local/arm-linux-musleabihf/usr/lib/libelf.a && \
 
 # 5. Compile and link minimal probe test using target cross compiler
 RUN printf '#include <libelf.h>\n#include <zlib.h>\nint main(void) { return elf_version(EV_CURRENT) == EV_NONE; }\n' > /tmp/test_target.c && \
-    /usr/local/bin/arm-linux-musleabihf-gcc -I/usr/local/arm-linux-musleabihf/usr/include /tmp/test_target.c -L/usr/local/arm-linux-musleabihf/usr/lib -lelf -lz -o /tmp/test_target && \
+    /usr/local/bin/netqmon-armv7hf-gcc -I/usr/local/arm-linux-musleabihf/usr/include /tmp/test_target.c -L/usr/local/arm-linux-musleabihf/usr/lib -lelf -lz -o /tmp/test_target && \
     file /tmp/test_target && \
     rm -f /tmp/test_target.c /tmp/test_target
 
