@@ -196,9 +196,9 @@ export function TrafficDashboard({
       (data?.points ?? []).map((point) => ({
         timestamp: point.timestamp,
         downloadBps:
-          point.download_bytes * 8 * (60_000 / (data?.bucket_ms ?? 60_000)),
+          point.download_bytes * 8 * (1_000 / (data?.bucket_ms ?? 60_000)),
         uploadBps:
-          point.upload_bytes * 8 * (60_000 / (data?.bucket_ms ?? 60_000)),
+          point.upload_bytes * 8 * (1_000 / (data?.bucket_ms ?? 60_000)),
       })),
     [data],
   );

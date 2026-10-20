@@ -227,6 +227,35 @@ impl ClassifierHandle {
         })
     }
 
+    /// Resolve a domain identity without letting ASN, address or DPI matches
+    /// masquerade as a domain rule.
+    pub fn classify_domain(&self, domain: &str) -> Result<ClassificationResult, String> {
+        #[cfg(test)]
+        if self.test_mode {
+            return Ok(fixture_classification(&ClassificationInput {
+                domain: Some(domain),
+                remote_ip: "0.0.0.0".parse().unwrap(),
+                remote_asn: None,
+                remote_port: 0,
+                protocol: 0,
+                dpi: None,
+                signatures: Vec::new(),
+            }));
+        }
+        self.classify_request(ClassificationRequest {
+            entry_id: "collector-domain".to_owned(),
+            domain: Some(domain.to_owned()),
+            remote_ip: None,
+            remote_asn: None,
+            remote_port: None,
+            protocol: None,
+            favicon_sha256: None,
+            dpi_evidence: None,
+            device_evidence: Vec::new(),
+            signature_evidence: Vec::new(),
+        })
+    }
+
     pub fn health(&self) -> Result<(), String> {
         #[cfg(test)]
         if self.test_mode {
@@ -713,7 +742,7 @@ fn fixture_classification(input: &ClassificationInput<'_>) -> ClassificationResu
             || domain.contains("openai.com"))
     {
         evidence.push(ClassificationEvidence {
-            evidence_type: "domain_application".to_owned(),
+            evidence_type: "domain_suffix".to_owned(),
             value: domain,
             source: "test-fixture".to_owned(),
             weight: 1.0,
@@ -730,7 +759,7 @@ fn fixture_classification(input: &ClassificationInput<'_>) -> ClassificationResu
         });
     } else if !domain.is_empty() && (domain.contains("tracker") || domain.contains("hdtime.org")) {
         evidence.push(ClassificationEvidence {
-            evidence_type: "domain_application".to_owned(),
+            evidence_type: "domain_suffix".to_owned(),
             value: domain,
             source: "test-fixture".to_owned(),
             weight: 1.0,

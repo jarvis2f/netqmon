@@ -1968,7 +1968,7 @@ fn asn_test_flow(remote_ip: Vec<u8>, client_port: u32, timestamp: u64) -> FlowDe
 fn collector_forwards_batch_local_geo_asns_to_classifier_and_late_dpi() {
     let temp = tempfile::tempdir().unwrap();
     let socket_path = temp.path().join("asn-classifier.sock");
-    let server = spawn_asn_classifier_server(socket_path.clone(), 11);
+    let server = spawn_asn_classifier_server(socket_path.clone(), 13);
     let classifier = crate::classifier::ClassifierHandle::connect(socket_path).unwrap();
     let state = CollectorState::with_storage(
         ENROLLMENT_TOKEN,
@@ -4353,4 +4353,60 @@ async fn insights_detect_first_batch_of_low_cost_enhancements() {
     assert_eq!(fanouts[0].code, "destination.fanout_spike");
     assert_eq!(fanouts[0].category, "destination");
     assert!(fanouts[0].params["count"].as_i64().unwrap() >= 55);
+}
+
+#[test]
+fn same_batch_dns_links_dual_stack_addresses_without_cross_device_leakage() {
+    let mac = vec![2, 0, 0, 0, 0, 1];
+    let ipv4 = vec![192, 0, 2, 1];
+    let ipv6 = vec![0x20; 16];
+    let mut batch = TelemetryBatch {
+        device_observations: vec![
+            netqmon_protocol::v1::DeviceObservation {
+                mac: mac.clone(),
+                ip: ipv4.clone(),
+                last_seen_unix_ms: 1_000,
+                ..Default::default()
+            },
+            netqmon_protocol::v1::DeviceObservation {
+                mac: mac.clone(),
+                ip: ipv6.clone(),
+                last_seen_unix_ms: 1_000,
+                ..Default::default()
+            },
+        ],
+        dns_observations: vec![DnsObservation {
+            client_ip: ipv6,
+            answer_ip: vec![198, 51, 100, 1],
+            domain: "video.example.test".into(),
+            ttl_seconds: 60,
+            observed_at_unix_ms: 1_000,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        resolve_batch_domain(&batch, &ipv4, &[198, 51, 100, 1], 1_001),
+        Some("video.example.test")
+    );
+    assert_eq!(
+        resolve_batch_domain(&batch, &ipv4, &[198, 51, 100, 1], 61_000),
+        None
+    );
+    assert_eq!(
+        resolve_batch_domain(&batch, &[192, 0, 2, 2], &[198, 51, 100, 1], 1_001),
+        None
+    );
+    batch
+        .device_observations
+        .push(netqmon_protocol::v1::DeviceObservation {
+            mac: vec![2, 0, 0, 0, 0, 2],
+            ip: ipv4.clone(),
+            last_seen_unix_ms: 1_000,
+            ..Default::default()
+        });
+    assert_eq!(
+        resolve_batch_domain(&batch, &ipv4, &[198, 51, 100, 1], 1_001),
+        None
+    );
 }

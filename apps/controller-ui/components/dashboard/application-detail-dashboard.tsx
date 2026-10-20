@@ -301,11 +301,11 @@ export function ApplicationDetailDashboard({
         downloadBps:
           point.download_bytes *
           8 *
-          (60_000 / (data?.traffic.bucket_ms ?? 60_000)),
+          (1_000 / (data?.traffic.bucket_ms ?? 60_000)),
         uploadBps:
           point.upload_bytes *
           8 *
-          (60_000 / (data?.traffic.bucket_ms ?? 60_000)),
+          (1_000 / (data?.traffic.bucket_ms ?? 60_000)),
       })),
     [data],
   );

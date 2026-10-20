@@ -323,11 +323,11 @@ export function ClientDetailDashboard({
         downloadBps:
           point.download_bytes *
           8 *
-          (60_000 / (data?.traffic.bucket_ms ?? 60_000)),
+          (1_000 / (data?.traffic.bucket_ms ?? 60_000)),
         uploadBps:
           point.upload_bytes *
           8 *
-          (60_000 / (data?.traffic.bucket_ms ?? 60_000)),
+          (1_000 / (data?.traffic.bucket_ms ?? 60_000)),
       })),
     [data],
   );
@@ -686,7 +686,7 @@ export function ClientDetailDashboard({
             }}
           >
             <SelectTrigger className="h-8 w-32 text-xs">
-              <SelectValue />
+              <SelectValue>{t(`detail.scopes.${scope}`)}</SelectValue>
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="internet">

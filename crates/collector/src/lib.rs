@@ -638,7 +638,9 @@ impl CollectorState {
             let policy = inner.storage.load_retention_policy()?;
             inner.storage.run_retention(unix_time_ms(), policy)
         } else {
-            inner.storage.roll_up_hour_and_day(unix_time_ms())
+            let now = unix_time_ms();
+            inner.storage.roll_up_hour_and_day(now)?;
+            inner.storage.prune_reclassification(now)
         }
     }
 
@@ -1112,19 +1114,21 @@ fn classify_batch(
                 .unwrap_or_default();
             let mut domain =
                 resolve_batch_domain(batch, &flow.client_ip, &flow.remote_ip, observed_at)
-                    .map(str::to_owned)
-                    .or(storage.resolve_domain(
-                        &batch.gateway_id,
-                        &flow.client_ip,
-                        &flow.remote_ip,
-                        observed_at,
-                    )?)
-                    .or_else(|| {
-                        dpi_result
-                            .and_then(|r| r.metadata.get("hostname"))
-                            .filter(|host| !host.is_empty())
-                            .cloned()
-                    });
+                    .map(str::to_owned);
+            if domain.is_none() {
+                domain = storage.resolve_domain(
+                    &batch.gateway_id,
+                    &flow.client_ip,
+                    &flow.remote_ip,
+                    observed_at,
+                )?;
+            }
+            if domain.is_none() {
+                domain = dpi_result
+                    .and_then(|r| r.metadata.get("hostname"))
+                    .filter(|host| !host.is_empty())
+                    .cloned();
+            }
             let Some(remote_ip) = decode_ip(&flow.remote_ip) else {
                 return Ok(FlowAttribution {
                     domain,
@@ -1156,15 +1160,17 @@ fn classify_batch(
                 .map_err(TelemetryIngestError::ClassifierUnavailable)?;
             // A DNS attribution can be a generic CDN name. Still run SNI/Host through
             // the same domain rules, while retaining an already matched DNS application.
-            if !classification
-                .evidence
-                .iter()
-                .any(|e| e.evidence_type == "domain_application")
+            if let Some(hostname) = dpi_result
+                .and_then(|r| r.metadata.get("hostname"))
+                .filter(|h| !h.is_empty() && domain.as_ref() != Some(h))
             {
-                if let Some(hostname) = dpi_result
-                    .and_then(|r| r.metadata.get("hostname"))
-                    .filter(|h| !h.is_empty() && domain.as_ref() != Some(h))
-                {
+                // Ask for domain-only identities: domain evidence can describe
+                // an organization while the application came from unrelated DPI.
+                // This also avoids depending on private evidence type names.
+                let dns_identity = classifier
+                    .classify_domain(domain.as_deref().unwrap_or_default())
+                    .map_err(TelemetryIngestError::ClassifierUnavailable)?;
+                if dns_identity.application.is_none() {
                     let host_input = ClassificationInput {
                         domain: Some(hostname),
                         ..input.clone()
@@ -1172,11 +1178,10 @@ fn classify_batch(
                     let host_result = classifier
                         .classify(&host_input)
                         .map_err(TelemetryIngestError::ClassifierUnavailable)?;
-                    if host_result
-                        .evidence
-                        .iter()
-                        .any(|e| e.evidence_type == "domain_application")
-                    {
+                    let host_identity = classifier
+                        .classify_domain(hostname)
+                        .map_err(TelemetryIngestError::ClassifierUnavailable)?;
+                    if host_identity.application.is_some() {
                         classification = host_result;
                         domain = Some(hostname.clone());
                     }
@@ -1349,7 +1354,8 @@ fn resolve_batch_domain<'a>(
         .dns_observations
         .iter()
         .filter(|observation| {
-            observation.client_ip == client_ip
+            (observation.client_ip == client_ip
+                || same_batch_device(batch, client_ip, &observation.client_ip, at_ms))
                 && observation.answer_ip == answer_ip
                 && observation.observed_at_unix_ms <= at_ms
                 && observation
@@ -1359,6 +1365,35 @@ fn resolve_batch_domain<'a>(
         })
         .max_by_key(|observation| observation.observed_at_unix_ms)
         .map(|observation| observation.domain.as_str())
+}
+
+// Link DNS across IPv4/IPv6 only when this batch identifies both addresses
+// unambiguously by the same MAC. An answer shared by other clients is insufficient.
+fn same_batch_device(batch: &TelemetryBatch, left: &[u8], right: &[u8], at_ms: u64) -> bool {
+    let owners = |ip: &[u8]| {
+        let mut macs = batch
+            .device_observations
+            .iter()
+            .filter(|item| item.ip == ip && item.last_seen_unix_ms.abs_diff(at_ms) <= 300_000)
+            .map(|item| item.mac.as_slice())
+            .chain(
+                batch
+                    .flows
+                    .iter()
+                    .filter(|flow| {
+                        flow.client_ip == ip
+                            && flow.first_seen_unix_ms <= at_ms
+                            && flow.last_seen_unix_ms >= at_ms
+                    })
+                    .map(|flow| flow.client_mac.as_slice()),
+            )
+            .filter(|mac| mac.len() == 6 && mac[0] & 1 == 0 && mac.iter().any(|byte| *byte != 0))
+            .collect::<Vec<_>>();
+        macs.sort_unstable();
+        macs.dedup();
+        (macs.len() == 1).then(|| macs[0])
+    };
+    owners(left).is_some_and(|mac| owners(right) == Some(mac))
 }
 
 fn decode_ip(bytes: &[u8]) -> Option<IpAddr> {

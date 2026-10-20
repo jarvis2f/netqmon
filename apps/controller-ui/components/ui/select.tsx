@@ -41,6 +41,26 @@ const ITEM_VARIANTS: Variants = {
 
 type Placement = "bottom" | "top";
 
+function extractLabels(
+  children: React.ReactNode,
+  map: Map<string, React.ReactNode>,
+) {
+  React.Children.forEach(children, (child) => {
+    if (!React.isValidElement(child)) return;
+    const props = child.props as Record<string, unknown> | undefined;
+    if (
+      props &&
+      typeof props.value === "string" &&
+      props.children !== undefined
+    ) {
+      map.set(props.value, props.children as React.ReactNode);
+    }
+    if (props && props.children) {
+      extractLabels(props.children as React.ReactNode, map);
+    }
+  });
+}
+
 interface SelectContextValue {
   value: string | undefined;
   open: boolean;
@@ -122,6 +142,12 @@ function Select({
   const labelsRef = React.useRef<Map<string, React.ReactNode>>(new Map());
   const [, forceUpdate] = React.useReducer((x) => x + 1, 0);
 
+  const extractedLabels = React.useMemo(() => {
+    const map = new Map<string, React.ReactNode>();
+    extractLabels(children, map);
+    return map;
+  }, [children]);
+
   const setOpen = React.useCallback(
     (next: boolean) => {
       if (!isControlledOpen) setUncontrolledOpen(next);
@@ -149,9 +175,11 @@ function Select({
   }, []);
 
   const labelFor = React.useCallback(
-    (val: string | undefined) =>
-      val !== undefined ? labelsRef.current.get(val) : undefined,
-    [],
+    (val: string | undefined) => {
+      if (val === undefined) return undefined;
+      return labelsRef.current.get(val) ?? extractedLabels.get(val);
+    },
+    [extractedLabels],
   );
 
   // Close on Escape or click outside
@@ -333,7 +361,7 @@ function SelectValue({ placeholder, className, children }: SelectValueProps) {
   const ctx = useSelectContext("SelectValue");
   const registeredLabel = ctx.labelFor(ctx.value);
   const displayContent =
-    registeredLabel ?? children ?? ctx.value ?? placeholder;
+    children ?? registeredLabel ?? ctx.value ?? placeholder;
 
   return (
     <span
@@ -488,7 +516,6 @@ function SelectItem({
 
   React.useEffect(() => {
     ctx.register(value, children);
-    return () => ctx.unregister(value);
   }, [ctx, value, children]);
 
   return (

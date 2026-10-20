@@ -826,6 +826,7 @@ fn retention_removes_expired_rows_but_keeps_day_rollups() {
     for table in [
         "dns_observations",
         "flow_sessions",
+        "flow_rollup_contributions",
         "traffic_total_minute",
         "traffic_total_hour",
     ] {
@@ -933,3 +934,495 @@ fn late_transport_dpi_preserves_application_and_tracker_identity() {
     assert_eq!(current.traffic_role, "tracker_service");
     assert!((current.confidence - 1.0).abs() < f64::EPSILON);
 }
+
+fn service_attribution() -> FlowAttribution {
+    FlowAttribution {
+        domain: Some("video.example.test".into()),
+        application_id: "video-app".into(),
+        application_confidence: 0.88,
+        category_id: "streaming".into(),
+        confidence: 0.88,
+        ..Default::default()
+    }
+}
+fn transport_attribution() -> FlowAttribution {
+    FlowAttribution {
+        protocol_id: "tls".into(),
+        protocol_confidence: 1.0,
+        confidence: 1.0,
+        ..Default::default()
+    }
+}
+fn metrics(connection: &Connection, table: &str, predicate: &str) -> (i64, i64, i64, i64) {
+    connection.query_row(&format!("SELECT COALESCE(SUM(upload_bytes),0),COALESCE(SUM(download_bytes),0),COALESCE(SUM(packets),0),COALESCE(SUM(flow_count),0) FROM {table} WHERE {predicate}"),[],
+        |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap()
+}
+
+#[test]
+fn application_promotion_reassigns_prior_minutes_and_survives_weaker_batches() {
+    let mut storage = setup();
+    let mut first = batch(1, FlowLifecycle::Active);
+    first.flows[0].download_bytes = 100_000_000;
+    storage
+        .persist_classified_batch(&first, &[transport_attribution()], &[], NOW)
+        .unwrap();
+    let mut second = batch(2, FlowLifecycle::Active);
+    second.sent_at += 60_000;
+    second.flows[0].download_bytes = 1;
+    storage
+        .persist_classified_batch(&second, &[service_attribution()], &[], NOW + 2_000)
+        .unwrap();
+    let mut third = batch(3, FlowLifecycle::Ended);
+    third.sent_at += 60_000;
+    let weak = FlowAttribution {
+        application_id: "competing-app".into(),
+        application_confidence: 0.5,
+        protocol_id: "tls".into(),
+        protocol_confidence: 1.0,
+        confidence: 1.0,
+        ..Default::default()
+    };
+    storage
+        .persist_classified_batch(&third, &[weak], &[], NOW + 3_000)
+        .unwrap();
+    let c = storage.connection();
+    let expected = (300, 100_000_051, 9, 3);
+    for table in [
+        "traffic_total_minute",
+        "traffic_device_minute",
+        "traffic_destination_minute",
+        "traffic_application_minute",
+        "traffic_domain_minute",
+        "traffic_scope_minute",
+    ] {
+        assert_eq!(metrics(c, table, "1=1"), expected, "{table}");
+    }
+    for table in ["traffic_application_minute", "traffic_scope_minute"] {
+        assert_eq!(metrics(c, table, "application_id='video-app'"), expected);
+        assert_eq!(
+            metrics(c, table, "application_id!='video-app'"),
+            (0, 0, 0, 0)
+        );
+    }
+    let identity: (String, String, f64) = c
+        .query_row(
+            "SELECT application_id,protocol_id,classification_confidence FROM flow_sessions",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(identity, ("video-app".into(), "tls".into(), 0.88));
+}
+
+#[test]
+fn late_application_after_reopen_reassigns_all_resolutions_exactly_once() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("late.db");
+    let input = batch(1, FlowLifecycle::Ended);
+    {
+        let mut storage = SqliteStorage::open(&path).unwrap();
+        storage
+            .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
+            .unwrap();
+        storage
+            .persist_classified_batch(&input, &[transport_attribution()], &[], NOW)
+            .unwrap();
+        storage
+            .roll_up_hour_and_day(NOW + 2 * DAY_MS as u64)
+            .unwrap();
+    }
+    let mut storage = Storage::sqlite(SqliteStorage::open(&path).unwrap());
+    let late = FlowAttribution {
+        protocol_id: "other-transport".into(),
+        protocol_confidence: 0.8,
+        ..service_attribution()
+    };
+    for _ in 0..3 {
+        storage
+            .reclassify_flow_at("gateway-1", &input.flows[0], &late, NOW + 2_000)
+            .unwrap();
+    }
+    let c = storage.connection();
+    for resolution in ["minute", "hour", "day"] {
+        for dimension in ["total", "device", "destination", "application", "domain"] {
+            let table = format!("traffic_{dimension}_{resolution}");
+            assert_eq!(metrics(c, &table, "1=1"), (100, 50, 3, 1), "{table}");
+        }
+        assert_eq!(
+            metrics(
+                c,
+                &format!("traffic_application_{resolution}"),
+                "application_id='video-app'"
+            ),
+            (100, 50, 3, 1)
+        );
+        assert_eq!(
+            metrics(
+                c,
+                &format!("traffic_domain_{resolution}"),
+                "domain='video.example.test'"
+            ),
+            (100, 50, 3, 1)
+        );
+    }
+    assert_eq!(
+        metrics(
+            c,
+            "traffic_scope_minute",
+            "application_id='video-app' AND protocol_id='tls'"
+        ),
+        (100, 50, 3, 1)
+    );
+    let identity: (String, String) = c
+        .query_row(
+            "SELECT application_id,protocol_id FROM flow_sessions",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(identity, ("video-app".into(), "tls".into()));
+}
+
+#[test]
+fn reclassification_tracks_only_materialized_hour_day_contributions() {
+    let mut storage = setup();
+    let first = batch(1, FlowLifecycle::Active);
+    storage
+        .persist_classified_batch(&first, &[transport_attribution()], &[], NOW)
+        .unwrap();
+    storage
+        .roll_up_hour_and_day(NOW + 2 * DAY_MS as u64)
+        .unwrap();
+    let second = batch(2, FlowLifecycle::Ended);
+    storage
+        .persist_classified_batch(&second, &[transport_attribution()], &[], NOW + 2_000)
+        .unwrap();
+    let mut storage = Storage::sqlite(storage);
+    storage
+        .reclassify_flow_at(
+            "gateway-1",
+            &first.flows[0],
+            &service_attribution(),
+            NOW + 12_000,
+        )
+        .unwrap();
+    assert_eq!(
+        metrics(
+            storage.connection(),
+            "traffic_application_minute",
+            "application_id='video-app'"
+        ),
+        (200, 100, 6, 2)
+    );
+    for tier in ["hour", "day"] {
+        assert_eq!(
+            metrics(
+                storage.connection(),
+                &format!("traffic_application_{tier}"),
+                "application_id='video-app'"
+            ),
+            (100, 50, 3, 1)
+        );
+    }
+    if let Storage::Sqlite(s) = &mut storage {
+        s.roll_up_hour_and_day(NOW + 2 * DAY_MS as u64).unwrap();
+    }
+    for tier in ["hour", "day"] {
+        assert_eq!(
+            metrics(
+                storage.connection(),
+                &format!("traffic_application_{tier}"),
+                "1=1"
+            ),
+            (200, 100, 6, 2)
+        );
+    }
+}
+
+#[test]
+fn reclassification_failure_rolls_back_ledger_rollups_and_memory() {
+    let mut storage = setup();
+    let input = batch(1, FlowLifecycle::Active);
+    storage
+        .persist_classified_batch(
+            &input,
+            &[transport_attribution()],
+            &[],
+            NOW + FLOW_CHECKPOINT_MS as u64,
+        )
+        .unwrap();
+    storage.connection().execute_batch("CREATE TRIGGER reject_classification BEFORE UPDATE ON flow_sessions BEGIN SELECT RAISE(ABORT,'test rollback'); END;").unwrap();
+    let mut storage = Storage::sqlite(storage);
+    assert!(
+        storage
+            .reclassify_flow_at(
+                "gateway-1",
+                &input.flows[0],
+                &service_attribution(),
+                NOW + FLOW_CHECKPOINT_MS as u64 + 1_000
+            )
+            .is_err()
+    );
+    assert_eq!(
+        metrics(
+            storage.connection(),
+            "traffic_application_minute",
+            "application_id='protocol:tls'"
+        ),
+        (100, 50, 3, 1)
+    );
+    if let Storage::Sqlite(s) = &storage {
+        assert_eq!(
+            s.active_flows
+                .values()
+                .next()
+                .unwrap()
+                .attribution
+                .application_id,
+            "unknown"
+        );
+        let attr: String = s
+            .connection()
+            .query_row(
+                "SELECT attribution_json FROM flow_rollup_sessions",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<FlowAttribution>(&attr)
+                .unwrap()
+                .application_id,
+            "unknown"
+        );
+    }
+}
+
+#[test]
+fn pre_ledger_history_is_preserved_without_guessing() {
+    let mut storage = setup();
+    storage
+        .persist_classified_batch(
+            &batch(1, FlowLifecycle::Active),
+            &[transport_attribution()],
+            &[],
+            NOW,
+        )
+        .unwrap();
+    // Simulate a contribution ingested before migration 6.
+    storage
+        .connection()
+        .execute("DELETE FROM flow_rollup_contributions", [])
+        .unwrap();
+    storage
+        .persist_classified_batch(
+            &batch(2, FlowLifecycle::Ended),
+            &[service_attribution()],
+            &[],
+            NOW + 2_000,
+        )
+        .unwrap();
+    assert_eq!(
+        metrics(
+            storage.connection(),
+            "traffic_application_minute",
+            "application_id='protocol:tls'"
+        ),
+        (100, 50, 3, 1)
+    );
+    assert_eq!(
+        metrics(
+            storage.connection(),
+            "traffic_application_minute",
+            "application_id='video-app'"
+        ),
+        (100, 50, 3, 1)
+    );
+}
+
+#[test]
+fn dual_stack_dns_requires_fresh_unambiguous_device_identity_and_ttl() {
+    let mut storage = setup();
+    let mut input = batch(1, FlowLifecycle::Ended);
+    let ipv4 = input.flows[0].client_ip.clone();
+    let ipv6 = vec![0x20; 16];
+    let mac = input.flows[0].client_mac.clone();
+    input.device_observations = vec![
+        DeviceObservation {
+            mac: mac.clone(),
+            ip: ipv4.clone(),
+            last_seen_unix_ms: NOW,
+            ..Default::default()
+        },
+        DeviceObservation {
+            mac: mac.clone(),
+            ip: ipv6.clone(),
+            last_seen_unix_ms: NOW,
+            ..Default::default()
+        },
+        DeviceObservation {
+            mac: vec![2, 0, 0, 0, 0, 2],
+            ip: vec![192, 0, 2, 99],
+            last_seen_unix_ms: NOW,
+            ..Default::default()
+        },
+    ];
+    input.dns_observations[0].client_ip = ipv6;
+    storage.persist_batch(&input, NOW).unwrap();
+    let answer = &input.flows[0].remote_ip;
+    assert_eq!(
+        storage
+            .resolve_domain("gateway-1", &ipv4, answer, NOW + 1_000)
+            .unwrap()
+            .as_deref(),
+        Some("example.com")
+    );
+    assert!(
+        storage
+            .resolve_domain("gateway-1", &[192, 0, 2, 99], answer, NOW + 1_000)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        storage
+            .resolve_domain("gateway-1", &ipv4, answer, NOW + 60_000)
+            .unwrap()
+            .is_none()
+    );
+    let mut reassigned = batch(2, FlowLifecycle::Ended);
+    reassigned.flows.clear();
+    reassigned.dns_observations.clear();
+    reassigned.device_observations = vec![DeviceObservation {
+        mac: vec![2, 0, 0, 0, 0, 2],
+        ip: ipv4.clone(),
+        last_seen_unix_ms: NOW + 2_000,
+        ..Default::default()
+    }];
+    storage.persist_batch(&reassigned, NOW + 2_000).unwrap();
+    assert!(
+        storage
+            .resolve_domain("gateway-1", &ipv4, answer, NOW + 3_000)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn restart_before_session_checkpoint_recovers_classification_and_bytes() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("early-restart.db");
+    {
+        let mut storage = SqliteStorage::open(&path).unwrap();
+        storage
+            .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
+            .unwrap();
+        storage
+            .persist_classified_batch(
+                &batch(1, FlowLifecycle::Active),
+                &[service_attribution()],
+                &[],
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(
+            storage
+                .connection()
+                .query_row("SELECT COUNT(*) FROM flow_sessions", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    let mut storage = SqliteStorage::open(&path).unwrap();
+    storage
+        .persist_classified_batch(
+            &batch(2, FlowLifecycle::Ended),
+            &[transport_attribution()],
+            &[],
+            NOW + 2_000,
+        )
+        .unwrap();
+    assert_eq!(
+        metrics(
+            storage.connection(),
+            "traffic_application_minute",
+            "application_id='video-app'"
+        ),
+        (200, 100, 6, 2)
+    );
+    let session: (String, i64, i64) = storage
+        .connection()
+        .query_row(
+            "SELECT application_id,upload_bytes,download_bytes FROM flow_sessions",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(session, ("video-app".into(), 200, 100));
+}
+
+#[test]
+fn late_dpi_is_time_scoped_and_reclassifies_both_directions() {
+    let mut storage = setup();
+    let mut first = batch(1, FlowLifecycle::Ended);
+    let mut download = first.flows[0].clone();
+    download.direction = Direction::Download as i32;
+    first.flows.push(download);
+    storage
+        .persist_classified_batch(
+            &first,
+            &[transport_attribution(), transport_attribution()],
+            &[],
+            NOW,
+        )
+        .unwrap();
+    let mut reused = batch(2, FlowLifecycle::Ended);
+    reused.flows[0].first_seen_unix_ms = NOW + 10_000;
+    reused.flows[0].last_seen_unix_ms = NOW + 11_000;
+    storage
+        .persist_classified_batch(&reused, &[transport_attribution()], &[], NOW + 11_000)
+        .unwrap();
+    let mut storage = Storage::sqlite(storage);
+    storage
+        .reclassify_flow_at(
+            "other-gateway",
+            &first.flows[0],
+            &service_attribution(),
+            NOW + 12_000,
+        )
+        .unwrap();
+    assert_eq!(
+        metrics(
+            storage.connection(),
+            "traffic_application_minute",
+            "application_id='video-app'"
+        ),
+        (0, 0, 0, 0)
+    );
+    storage
+        .reclassify_flow_at(
+            "gateway-1",
+            &first.flows[0],
+            &service_attribution(),
+            NOW + 12_000,
+        )
+        .unwrap();
+    assert_eq!(
+        metrics(
+            storage.connection(),
+            "traffic_application_minute",
+            "application_id='video-app'"
+        ),
+        (200, 100, 6, 2)
+    );
+    assert_eq!(
+        metrics(
+            storage.connection(),
+            "traffic_application_minute",
+            "application_id='protocol:tls'"
+        ),
+        (100, 50, 3, 1)
+    );
+}
+
+mod bounded;
