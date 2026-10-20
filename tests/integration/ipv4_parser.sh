@@ -102,7 +102,9 @@ counter_frame_length=$(ip netns exec "${namespace}" \
 expected_counter_bytes=$((counter_packets * counter_frame_length))
 
 for _ in $(seq 1 100); do
-  if "${bpftool_command}" -j map dump id "${map_id}" | python3 -c '
+  map_dump=$("${bpftool_command}" -j map dump id "${map_id}") || \
+    fail "bpftool could not dump flow_map: ${map_dump}"
+  if python3 -c '
 import json, sys
 
 def octets(key):
@@ -159,7 +161,7 @@ sys.exit(
     and counter_ok and tcp_flags_ok
     else 1
 )
-' "${counter_packets}" "${expected_counter_bytes}"; then
+' "${counter_packets}" "${expected_counter_bytes}" <<<"${map_dump}"; then
     parsed=true
     break
   fi

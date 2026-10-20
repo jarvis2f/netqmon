@@ -97,7 +97,9 @@ ip netns exec "${namespace}" python3 tests/integration/ipv6_traffic.py \
   raw fragment "${peer}" "${peer_mac}" "${host_mac}"
 
 for _ in $(seq 1 100); do
-  if "${bpftool_command}" -j map dump id "${map_id}" | python3 -c '
+  map_dump=$("${bpftool_command}" -j map dump id "${map_id}") || \
+    fail "bpftool could not dump flow_map: ${map_dump}"
+  if python3 -c '
 import json, sys
 
 def octets(key):
@@ -118,7 +120,7 @@ has_fragment_udp = any(
 sys.exit(
     0 if has_tcp and has_udp and has_extension_udp and has_fragment_udp else 1
 )
-'; then
+' <<<"${map_dump}"; then
     parsed=true
     break
   fi
