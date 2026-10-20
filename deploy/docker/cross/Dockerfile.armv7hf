@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
 
 # 2. Download and unpack reliable, musl-patched target static C libraries from Alpine Linux (armv7)
 # Note: Alpine armv7 is ARMv7-A with VFPv3-D16 / hard-float (armhf ABI)
-RUN mkdir -p /tmp/target-pkgs && cd /tmp/target-pkgs && \
+RUN mkdir -p /tmp/target-pkgs /usr/local/arm-linux-musleabihf && cd /tmp/target-pkgs && \
     curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/armv7/elfutils-dev-0.191-r0.apk -o elfutils-dev.apk && \
     curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/armv7/zlib-dev-1.3.2-r1.apk -o zlib-dev.apk && \
     curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/armv7/zlib-static-1.3.2-r1.apk -o zlib-static.apk && \
@@ -25,7 +25,7 @@ RUN mkdir -p /tmp/target-pkgs && cd /tmp/target-pkgs && \
     curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/armv7/zstd-static-1.5.6-r2.apk -o zstd-static.apk && \
     curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/armv7/libbpf-dev-1.5.0-r0.apk -o libbpf-dev.apk && \
     for f in *.apk; do \
-        tar -xzf "$f" -C /usr/local/arm-linux-musleabihf 2>/dev/null || true; \
+        tar -xzf "$f" -C /usr/local/arm-linux-musleabihf; \
     done && \
     rm -rf /tmp/target-pkgs
 
@@ -38,7 +38,10 @@ ENV CC_armv7_unknown_linux_musleabihf="/usr/local/bin/netqmon-armv7hf-gcc"
 ENV CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER="/usr/local/bin/netqmon-armv7hf-gcc"
 
 # 4. Smoke check target static libraries
-RUN file /usr/local/arm-linux-musleabihf/usr/lib/libelf.a && \
+RUN test -f /usr/local/arm-linux-musleabihf/usr/lib/libelf.a && \
+    test -f /usr/local/arm-linux-musleabihf/usr/lib/libz.a && \
+    test -f /usr/local/arm-linux-musleabihf/usr/lib/libbpf.a && \
+    file /usr/local/arm-linux-musleabihf/usr/lib/libelf.a && \
     file /usr/local/arm-linux-musleabihf/usr/lib/libz.a && \
     file /usr/local/arm-linux-musleabihf/usr/lib/libbpf.a
 
