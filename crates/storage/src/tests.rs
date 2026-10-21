@@ -1266,6 +1266,47 @@ fn pre_ledger_history_is_preserved_without_guessing() {
 }
 
 #[test]
+fn same_device_dns_miss_does_not_scan_unrelated_answer_history() {
+    let mut storage = setup();
+    let mut input = batch(1, FlowLifecycle::Ended);
+    input.device_observations[0].ip = input.flows[0].client_ip.clone();
+    storage.persist_batch(&input, NOW).unwrap();
+    storage
+        .connection()
+        .execute_batch(
+            "WITH RECURSIVE history(n) AS (
+                SELECT 1 UNION ALL SELECT n+1 FROM history WHERE n<4000
+             )
+             INSERT INTO dns_observations(
+                gateway_id, client_ip, domain, answer_ip, record_type, ttl,
+                observed_at, expires_at
+             ) SELECT gateway_id, client_ip, domain, answer_ip, record_type, ttl,
+                      observed_at, expires_at
+               FROM dns_observations CROSS JOIN history;",
+        )
+        .unwrap();
+    let mut statement = storage.connection().prepare(SAME_DEVICE_DNS_QUERY).unwrap();
+    let missing_answer = [203_u8, 0, 113, 99];
+    let domain: Option<String> = statement
+        .query_row(
+            params![
+                "gateway-1",
+                input.flows[0].client_ip,
+                missing_answer.as_slice(),
+                to_i64(NOW + 1_000)
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert!(domain.is_none());
+    // VM work is deterministic and does not depend on machine speed. A lookup
+    // for an absent answer must not visit the thousands of unrelated answers.
+    let steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+    assert!(steps < 200, "DNS miss executed {steps} SQLite VM steps");
+}
+
+#[test]
 fn dual_stack_dns_requires_fresh_unambiguous_device_identity_and_ttl() {
     let mut storage = setup();
     let mut input = batch(1, FlowLifecycle::Ended);

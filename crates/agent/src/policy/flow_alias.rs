@@ -178,6 +178,29 @@ impl PolicyFlowAliasCache {
             .map(|entry| entry.keys.as_slice())
     }
 
+    /// Broader endpoint leases must use the original client-ingress tuple.
+    /// Never generalize a translated WAN tuple or a local proxy's socket.
+    pub(crate) fn endpoint_block_aliases(&self, id: &str) -> Vec<FlowKey> {
+        let Some(entry) = self.entries.get(id) else {
+            return Vec::new();
+        };
+        if entry.client_identity_conflict || entry.client_mac.is_none() {
+            return Vec::new();
+        }
+        entry
+            .keys
+            .iter()
+            .filter(|key| {
+                key.hook == 1
+                    && Some(key.ifindex) == entry.default_client_ifindex
+                    && entry.verified.contains(*key)
+                    && entry.directions.get(*key) == Some(&AliasDirection::Upload)
+                    && key.addresses().map(|(source, _)| source) == entry.client_ip
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Persist a proxy-return alias resolved from an exact conntrack entry so
     /// later Allow/Revoke commands clear the same key.
     pub(crate) fn insert_proxy_return(
@@ -719,6 +742,80 @@ fn ip_bytes(ip: std::net::IpAddr) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_blocks_learn_only_verified_client_ingress_and_survive_flow_end() {
+        let observed = key(1, 2);
+        let mut cache = PolicyFlowAliasCache::default();
+        cache
+            .observe_with_client(
+                "flow",
+                observed.clone(),
+                Some("aa:bb:cc:dd:ee:ff"),
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(cache.endpoint_block_aliases("flow").is_empty());
+        cache.observe_direction(
+            "flow",
+            &observed,
+            crate::normalization::Direction::Upload,
+            Some("192.0.2.1".parse().unwrap()),
+            Some((3, 2)),
+            None,
+        );
+        assert_eq!(cache.endpoint_block_aliases("flow"), vec![observed.clone()]);
+        cache.mark_ended("flow");
+        // Revoking the exact flow must still leave enough identity to clear
+        // an endpoint explicitly, but must not itself expire the cached block.
+        assert_eq!(cache.endpoint_block_aliases("flow"), vec![observed]);
+    }
+
+    #[test]
+    fn endpoint_blocks_reject_shared_nat_tuple_and_conflicting_client_identity() {
+        let mut wan = key(2, 3);
+        wan.source_address = ip_bytes("203.0.113.254".parse().unwrap());
+        let mut cache = PolicyFlowAliasCache::default();
+        cache
+            .observe_with_client(
+                "wan",
+                wan.clone(),
+                Some("aa:bb:cc:dd:ee:ff"),
+                Instant::now(),
+            )
+            .unwrap();
+        cache.observe_direction(
+            "wan",
+            &wan,
+            crate::normalization::Direction::Upload,
+            Some("192.0.2.1".parse().unwrap()),
+            Some((3, 2)),
+            None,
+        );
+        assert!(cache.endpoint_block_aliases("wan").is_empty());
+
+        let client = key(1, 2);
+        cache
+            .observe_with_client(
+                "client",
+                client.clone(),
+                Some("aa:bb:cc:dd:ee:ff"),
+                Instant::now(),
+            )
+            .unwrap();
+        cache.observe_direction(
+            "client",
+            &client,
+            crate::normalization::Direction::Upload,
+            Some("192.0.2.1".parse().unwrap()),
+            Some((3, 2)),
+            None,
+        );
+        cache
+            .observe_with_client("client", client, Some("aa:bb:cc:dd:ee:00"), Instant::now())
+            .unwrap();
+        assert!(cache.endpoint_block_aliases("client").is_empty());
+    }
 
     #[test]
     fn rejected_aliases_cannot_grow_direction_metadata() {

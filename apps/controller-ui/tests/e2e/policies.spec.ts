@@ -199,7 +199,7 @@ test.describe("traffic policies", () => {
         "  categories: []",
         "  min_application_confidence: 0.9",
         "network:",
-        "  scope: internet",
+        "  scope: agent",
         "  direction: both",
         "action:",
         "  type: limit",
@@ -219,16 +219,163 @@ test.describe("traffic policies", () => {
     await expect(editor.getByLabel("Priority")).toHaveValue("275");
     await expect(
       editor.getByLabel("Minimum application confidence"),
-    ).toHaveValue("0.9");
+    ).toHaveCount(0);
     await expect(editor.getByLabel("Action")).toHaveText("Limit");
     await expect(editor.getByLabel("Download ceiling")).toHaveValue("7.5");
     await expect(editor.getByLabel("Upload ceiling")).toHaveValue("1.5");
+    await expect(
+      editor.getByText("Client total · Both directions"),
+    ).toBeVisible();
 
     await editor.getByRole("tab", { name: "Advanced YAML" }).click();
     await expect(yaml).toHaveValue(/priority: 275/);
     await expect(yaml).toHaveValue(/download_bps: 7500000/);
     await expect(yaml).toHaveValue(/upload_bps: 1500000/);
     await expect(yaml).toHaveValue(/min_application_confidence: 0.9/);
+    await expect(yaml).toHaveValue(/scope: agent/);
+    await editor.getByRole("button", { name: "Validate" }).click();
+    await expect(editor.getByText("Policy is valid")).toBeVisible();
+    const creation = page.waitForRequest(
+      (request) =>
+        request.method() === "POST" &&
+        new URL(request.url()).pathname === "/api/policies",
+    );
+    await editor.getByRole("button", { name: "Save", exact: true }).click();
+    expect((await creation).postDataJSON().network.scope).toBe("agent");
+    const row = page.getByRole("row", { name: /YAML round-trip policy/ });
+    await row.getByRole("button", { name: "Edit", exact: true }).click();
+    const reopened = page.getByRole("dialog", { name: "Edit traffic policy" });
+    await expect(reopened.getByLabel("Download ceiling")).toHaveValue("7.5");
+    await expect(
+      reopened.getByText("Client total · Both directions"),
+    ).toBeVisible();
+    await reopened.getByLabel("Description").fill("Updated client total");
+    await reopened.getByRole("button", { name: "Validate" }).click();
+    await expect(reopened.getByText("Policy is valid")).toBeVisible();
+    await reopened.getByRole("button", { name: "Save Changes" }).click();
+    const update = page.waitForRequest(
+      (request) =>
+        request.method() === "PUT" &&
+        new URL(request.url()).pathname.startsWith("/api/policies/"),
+    );
+    await page
+      .getByRole("dialog", { name: "Save policy changes?" })
+      .getByRole("button", { name: "Save Changes" })
+      .click();
+    expect((await update).postDataJSON().network.scope).toBe("agent");
+  });
+
+  test("selects client-total or Internet scope when visual selectors and actions change", async ({
+    page,
+  }) => {
+    await openPolicies(page);
+    await page.getByRole("button", { name: "New policy" }).first().click();
+    const editor = page.getByRole("dialog");
+    await editor.getByLabel("Policy name").fill("Visual client total");
+    const client = editor
+      .getByRole("group", { name: "Clients" })
+      .getByLabel(/Office Laptop/);
+    await client.check();
+    const action = editor.getByLabel("Action", { exact: true });
+    const selectAction = async (name: string) => {
+      await action.click();
+      await page.getByRole("option", { name, exact: true }).click();
+    };
+    const validateScope = async (scope: "agent" | "internet") => {
+      const response = page.waitForResponse(
+        (response) =>
+          response.request().method() === "POST" &&
+          new URL(response.url()).pathname === "/api/policies/validate",
+      );
+      await editor.getByRole("button", { name: "Validate" }).click();
+      expect((await response).request().postDataJSON().spec.network.scope).toBe(
+        scope,
+      );
+      await expect(editor.getByText("Policy is valid")).toBeVisible();
+    };
+    await selectAction("Limit");
+    await editor.getByLabel("Download ceiling").fill("20");
+    await editor.getByLabel("Upload ceiling").fill("5");
+    await expect(
+      editor.getByText("Client total · Both directions"),
+    ).toBeVisible();
+    await validateScope("agent");
+    const app = editor
+      .getByRole("group", { name: "Applications", exact: true })
+      .getByLabel("YouTube", { exact: true });
+    await app.check();
+    await expect(editor.getByText("Internet · Both directions")).toBeVisible();
+    await validateScope("internet");
+    await app.uncheck();
+    await validateScope("agent");
+    const category = editor
+      .getByRole("group", { name: "Categories", exact: true })
+      .getByLabel("Streaming", { exact: true });
+    await category.check();
+    await validateScope("internet");
+    await category.uncheck();
+    await validateScope("agent");
+    await selectAction("Block");
+    await validateScope("internet");
+    await selectAction("Allow");
+    await validateScope("internet");
+    await selectAction("Limit");
+    await editor.getByLabel("Download ceiling").fill("20");
+    await validateScope("agent");
+    await client.uncheck();
+    await expect(editor.getByText("Internet · Both directions")).toBeVisible();
+    await client.check();
+    await validateScope("agent");
+  });
+
+  test("rejects Agent scope outside client-only aggregate limits", async ({
+    page,
+  }) => {
+    await openPolicies(page);
+    await page.getByRole("button", { name: "New policy" }).first().click();
+    const editor = page.getByRole("dialog");
+    await editor.getByRole("tab", { name: "Advanced YAML" }).click();
+    const yaml = editor.getByLabel("Advanced policy YAML editor");
+    const base = {
+      schema_version: 1,
+      gateway_id: gatewayId,
+      name: "Invalid Agent scope",
+      description: "",
+      enabled: false,
+      priority: 500,
+      selectors: {
+        clients: ["AA:BB:CC:DD:EE:01"],
+        applications: [],
+        categories: [],
+        min_application_confidence: 0.8,
+      },
+      network: { scope: "agent", direction: "both" },
+      action: { type: "limit", download_bps: 20000000, upload_bps: null },
+      schedule: null,
+    };
+    let validations = 0;
+    page.on("request", (request) => {
+      if (new URL(request.url()).pathname === "/api/policies/validate")
+        validations++;
+    });
+    for (const spec of [
+      { ...base, action: { ...base.action, type: "block" } },
+      { ...base, action: { ...base.action, type: "allow" } },
+      { ...base, selectors: { ...base.selectors, clients: [] } },
+      { ...base, selectors: { ...base.selectors, applications: ["youtube"] } },
+      { ...base, selectors: { ...base.selectors, categories: ["streaming"] } },
+    ]) {
+      await yaml.fill(JSON.stringify(spec));
+      await editor.getByRole("button", { name: "Validate" }).click();
+      await expect(editor.getByRole("alert")).toContainText(
+        "The YAML does not match PolicySpecV1.",
+      );
+      await editor.getByRole("tab", { name: "Visual configuration" }).click();
+      await expect(
+        editor.getByRole("tab", { name: "Advanced YAML" }),
+      ).toHaveAttribute("aria-selected", "true");
+    }
+    expect(validations).toBe(0);
   });
 
   test("preserves the visual draft after a policy save failure", async ({
@@ -276,7 +423,15 @@ test.describe("traffic policies", () => {
     page,
   }) => {
     await openPolicies(page);
+    const creation = page.waitForRequest(
+      (request) =>
+        request.method() === "POST" &&
+        new URL(request.url()).pathname === "/api/policies",
+    );
     await createPolicy(page, "Evening TV policy");
+    expect(
+      (await creation).postDataJSON().selectors.min_application_confidence,
+    ).toBe(0.8);
     await expect(
       page.getByRole("button", { name: "Evening TV policy" }),
     ).toBeVisible();

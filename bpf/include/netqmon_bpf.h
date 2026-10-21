@@ -196,6 +196,18 @@ struct flow_verdict {
     __u8 reserved[3];
 };
 
+/* Original client -> remote endpoint, independent of the ephemeral port,
+ * interface and flow lifetime. MAC binding prevents address-reuse spillover. */
+struct endpoint_block_key {
+    __u8 ip_version;
+    __u8 protocol;
+    __be16 remote_port;
+    __u8 client_address[16];
+    __u8 remote_address[16];
+    __u8 client_mac[6];
+    __u8 reserved[2];
+};
+
 struct policy_drop_value {
     __u64 packets;
     __u64 bytes;
@@ -296,6 +308,7 @@ _Static_assert(sizeof(struct sample_budget) == 32, "sample_budget ABI changed");
 _Static_assert(sizeof(struct sample_event) == 4176, "sample_event ABI changed");
 _Static_assert(sizeof(struct flow_policy_state) == 16, "flow_policy_state ABI changed");
 _Static_assert(sizeof(struct flow_verdict) == 64, "flow_verdict ABI changed");
+_Static_assert(sizeof(struct endpoint_block_key) == 44, "endpoint_block_key ABI changed");
 _Static_assert(sizeof(struct policy_drop_value) == 16, "policy_drop_value ABI changed");
 _Static_assert(sizeof(struct policy_drop_key) == 24, "policy_drop_key ABI changed");
 

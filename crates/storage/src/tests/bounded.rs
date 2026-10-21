@@ -398,11 +398,15 @@ fn v5_upgrade_preserves_history_and_enables_correction_for_new_traffic() {
         .execute_batch(
             "DROP TABLE flow_rollup_contributions;
          DROP TABLE flow_rollup_sessions;
-         DELETE FROM schema_migrations WHERE version=6;",
+         DROP INDEX dns_observations_answer_lookup;
+         DELETE FROM schema_migrations WHERE version>=6;",
         )
         .unwrap();
     let storage = SqliteStorage::from_connection(storage.connection).unwrap();
-    assert_eq!(count(&storage, "schema_migrations"), 6);
+    assert_eq!(
+        count(&storage, "schema_migrations"),
+        i64::try_from(MIGRATIONS.len()).unwrap()
+    );
     assert_eq!(count(&storage, "flow_rollup_sessions"), 0);
     assert_eq!(count(&storage, "flow_rollup_contributions"), 0);
     let session: (i64, i64, i64) = storage

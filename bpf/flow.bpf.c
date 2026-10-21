@@ -27,6 +27,15 @@ struct {
     __type(value, struct flow_verdict);
 } flow_verdict_map SEC(".maps");
 
+/* Bounded learned endpoint leases. Only a validated application Block may
+ * populate this map; packet hits never refresh its expiry. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 8192);
+    __type(key, struct endpoint_block_key);
+    __type(value, struct flow_verdict);
+} endpoint_blocks SEC(".maps");
+
 /* Per-policy, per-client drop totals; LRU eviction can affect reporting only. */
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -138,13 +147,47 @@ static __always_inline void record_policy_drop(const __u8 policy_identity_hash[1
     }
 }
 
-static __always_inline int apply_flow_policy(struct __sk_buff *skb,
-                                             struct flow_key *key)
+/* Verify this subprogram independently: inlining the endpoint lookup into all
+ * IPv4/IPv6 parser paths exceeds the supported kernel's verifier state budget. */
+__attribute__((noinline)) int apply_flow_policy(struct __sk_buff *skb,
+                                               struct flow_key *key)
 {
+    /* Older verifiers do not accept a global subprogram's generic memory
+     * argument as a map key. Copy the bounded BTF argument onto our stack. */
+    struct flow_key local_key;
+    if (!key)
+        return TC_ACT_OK;
+    __builtin_memcpy(&local_key, key, sizeof(local_key));
+    key = &local_key;
     struct flow_verdict *verdict = active_flow_verdict(key);
 
-    if (!verdict)
-        return TC_ACT_OK;
+    if (!verdict) {
+        struct endpoint_block_key endpoint = {};
+        __u8 ethernet_addresses[12];
+        if (bpf_skb_load_bytes(skb, 0, ethernet_addresses, sizeof(ethernet_addresses)) != 0)
+            return TC_ACT_OK;
+        endpoint.ip_version = key->ip_version;
+        endpoint.protocol = key->protocol;
+        if (key->hook == NETQMON_HOOK_INGRESS) {
+            endpoint.remote_port = key->destination_port;
+            __builtin_memcpy(endpoint.client_address, key->source_address, 16);
+            __builtin_memcpy(endpoint.remote_address, key->destination_address, 16);
+            __builtin_memcpy(endpoint.client_mac, ethernet_addresses + 6, 6);
+        } else {
+            endpoint.remote_port = key->source_port;
+            __builtin_memcpy(endpoint.client_address, key->destination_address, 16);
+            __builtin_memcpy(endpoint.remote_address, key->source_address, 16);
+            __builtin_memcpy(endpoint.client_mac, ethernet_addresses, 6);
+        }
+        verdict = bpf_map_lookup_elem(&endpoint_blocks, &endpoint);
+        if (!verdict)
+            return TC_ACT_OK;
+        if (verdict->expires_monotonic_ns <= bpf_ktime_get_ns() ||
+            verdict->policy_generation != flow_policy_state.generation) {
+            bpf_map_delete_elem(&endpoint_blocks, &endpoint);
+            return TC_ACT_OK;
+        }
+    }
 
     if (verdict->verdict == NETQMON_VERDICT_SHAPE) {
 #ifdef NETQMON_QOS_PRIORITY

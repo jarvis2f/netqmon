@@ -41,6 +41,7 @@ import {
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
   SelectTrigger,
   SelectValue,
@@ -141,7 +142,7 @@ function defaultSpec(gatewayId: string): PolicySpecV1 {
       clients: [],
       applications: [],
       categories: [],
-      min_application_confidence: 0.85,
+      min_application_confidence: 0.8,
     },
     network: { scope: "internet", direction: "both" },
     action: { type: "block", download_bps: null, upload_bps: null },
@@ -304,7 +305,8 @@ function isPolicySpec(value: unknown): value is PolicySpecV1 {
     Array.isArray(spec.selectors.applications) &&
     Array.isArray(spec.selectors.categories) &&
     typeof spec.selectors.min_application_confidence === "number" &&
-    spec.network?.scope === "internet" &&
+    (spec.network?.scope === "internet" ||
+      (spec.network?.scope === "agent" && isClientTotalLimit(spec))) &&
     spec.network?.direction === "both" &&
     ACTIONS.includes(spec.action?.type) &&
     (spec.schedule === null ||
@@ -317,6 +319,25 @@ function isPolicySpec(value: unknown): value is PolicySpecV1 {
             typeof window.end === "string",
         )))
   );
+}
+
+function isClientTotalLimit(spec: PolicySpecV1) {
+  return (
+    spec.action?.type === "limit" &&
+    spec.selectors.clients.length > 0 &&
+    spec.selectors.applications.length === 0 &&
+    spec.selectors.categories.length === 0
+  );
+}
+
+function withVisualScope(spec: PolicySpecV1): PolicySpecV1 {
+  return {
+    ...spec,
+    network: {
+      ...spec.network,
+      scope: isClientTotalLimit(spec) ? "agent" : "internet",
+    },
+  };
 }
 
 export function PoliciesDashboard({ username }: { username: string }) {
@@ -1376,14 +1397,14 @@ function PolicyEditor({
   const [conflictLoading, setConflictLoading] = useState(false);
 
   const setVisual = (update: (current: PolicySpecV1) => PolicySpecV1) => {
-    setDraft((current) => update(current));
+    setDraft((current) => withVisualScope(update(current)));
     setValidation(null);
     setValidationError(null);
   };
 
   const switchToYaml = () => {
     if (mode === "visual") {
-      setYaml(formatPolicyYaml(draft));
+      setYaml(formatPolicyYaml(withVisualScope(draft)));
       setYamlError(null);
       setConversionError(null);
       setMode("yaml");
@@ -1405,7 +1426,7 @@ function PolicyEditor({
           setConversionError(t("yaml.visualUnsupported", { path: "spec" }));
           return;
         }
-        setDraft(parsed);
+        setDraft(withVisualScope(parsed));
         setYamlError(null);
         setValidation(null);
         setConversionError(null);
@@ -1421,7 +1442,7 @@ function PolicyEditor({
   };
 
   const currentSpec = (): PolicySpecV1 | null => {
-    if (mode === "visual") return draft;
+    if (mode === "visual") return withVisualScope(draft);
     try {
       const parsed = parsePolicyYaml(yaml);
       if (!isPolicySpec(parsed))
@@ -1567,6 +1588,15 @@ function PolicyEditor({
   };
 
   const warningText = t("editor.notAppliedWarning");
+  const editorScope = useMemo(() => {
+    if (mode === "visual") return withVisualScope(draft).network.scope;
+    try {
+      const parsed = parsePolicyYaml(yaml);
+      return isPolicySpec(parsed) ? parsed.network.scope : null;
+    } catch {
+      return null;
+    }
+  }, [draft, mode, yaml]);
 
   return (
     <SidePanel
@@ -1626,9 +1656,11 @@ function PolicyEditor({
               {gatewayId}
             </p>
           </div>
-          <span className="rounded-full border border-border bg-surface px-2.5 py-1 text-[11px] font-semibold text-foreground-muted">
-            {t("scopeInternet")}
-          </span>
+          {editorScope && (
+            <span className="rounded-full border border-border bg-surface px-2.5 py-1 text-[11px] font-semibold text-foreground-muted">
+              {t(editorScope === "agent" ? "scopeAgent" : "scopeInternet")}
+            </span>
+          )}
         </div>
         <div
           className="inline-flex rounded-lg border border-border bg-surface-subtle p-1"
@@ -1764,28 +1796,6 @@ function PolicyEditor({
                   }
                 />
               </div>
-              <Field
-                label={t("fields.confidence")}
-                help={t("fields.confidenceHelp")}
-              >
-                <Input
-                  type="number"
-                  min={0.8}
-                  max={1}
-                  step={0.01}
-                  value={draft.selectors.min_application_confidence}
-                  onChange={(event) =>
-                    setVisual((current) => ({
-                      ...current,
-                      selectors: {
-                        ...current.selectors,
-                        min_application_confidence: Number(event.target.value),
-                      },
-                    }))
-                  }
-                  className="max-w-40"
-                />
-              </Field>
             </div>
 
             <div className="grid gap-4 rounded-xl border border-border p-4 sm:grid-cols-2">
@@ -1815,11 +1825,13 @@ function PolicyEditor({
                     </SelectValue>
                   </SelectTrigger>
                   <SelectContent>
-                    {ACTIONS.map((action) => (
-                      <SelectItem key={action} value={action}>
-                        {t(`actions.${action}`)}
-                      </SelectItem>
-                    ))}
+                    <SelectGroup>
+                      {ACTIONS.map((action) => (
+                        <SelectItem key={action} value={action}>
+                          {t(`actions.${action}`)}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
                   </SelectContent>
                 </Select>
               </div>
@@ -1830,6 +1842,11 @@ function PolicyEditor({
               </Field>
               {draft.action.type === "limit" && (
                 <>
+                  {editorScope === "agent" && (
+                    <p className="text-xs text-foreground-muted sm:col-span-2">
+                      {t("fields.clientTotalHelp")}
+                    </p>
+                  )}
                   <Field
                     label={t("fields.downloadLimit")}
                     help={t("fields.mbpsHelp")}

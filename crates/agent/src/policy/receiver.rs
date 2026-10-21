@@ -890,6 +890,7 @@ fn apply_flow_command(
     else {
         unreachable!("only flow commands are rejected here")
     };
+    let received_monotonic_ns = crate::linux::monotonic_ns();
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| {
@@ -1002,6 +1003,10 @@ fn apply_flow_command(
             });
     let proxy_unresolved = proxy_resolution.expected
         && (proxy_resolution.aliases.is_empty() || proxy_resolution.unresolved);
+    let endpoint_aliases = flow_alias_cache
+        .lock()
+        .map(|cache| cache.endpoint_block_aliases(&policy_flow_id))
+        .unwrap_or_default();
     let alias_count = u32::try_from(aliases.len()).unwrap_or(u32::MAX);
     let hooks = aliases.iter().map(|alias| alias.hook).collect::<Vec<_>>();
     let ifindices = aliases
@@ -1151,25 +1156,75 @@ fn apply_flow_command(
             match (operation, verdict) {
                 (FlowCommandOperation::Upsert, Some(FlowVerdict::Block)) => {
                     let remaining_ms = expires_at_ms.saturating_sub(now_ms).max(0) as u64;
-                    let deadline = crate::linux::monotonic_ns()
+                    let deadline = received_monotonic_ns
                         .saturating_add(remaining_ms.saturating_mul(1_000_000));
                     if let (Some(policy_id), Some(client_mac)) =
                         (policy_ids.first(), client_mac.as_deref())
                     {
+                        let endpoint_expiry = {
+                            #[cfg(feature = "qos-client-priority")]
+                            if let Some(runtime) = priority_runtime {
+                                runtime.lock().ok().and_then(|runtime| {
+                                    runtime.endpoint_block_expiry(
+                                        &policy_ids,
+                                        client_mac,
+                                        issued_at_ms,
+                                        now_ms,
+                                    )
+                                })
+                            } else {
+                                saved.as_ref().and_then(|state| {
+                                    super::endpoint_block::expires_at_ms(
+                                        &state.snapshot,
+                                        &policy_ids,
+                                        client_mac,
+                                        issued_at_ms,
+                                        now_ms,
+                                    )
+                                })
+                            }
+                            #[cfg(not(feature = "qos-client-priority"))]
+                            saved.as_ref().and_then(|state| {
+                                super::endpoint_block::expires_at_ms(
+                                    &state.snapshot,
+                                    &policy_ids,
+                                    client_mac,
+                                    issued_at_ms,
+                                    now_ms,
+                                )
+                            })
+                        };
                         // A FlowCommand may only contain the client-to-server
                         // alias. For a block, also install the exact reverse
                         // tuple so the response direction is covered even when
                         // the download-side alias was not observed.
                         let block_aliases = block_reverse_aliases(&aliases);
-                        match flow_verdict_writer.install_block(
-                            &block_aliases,
-                            &command_id,
-                            &policy_flow_id,
-                            policy_id,
-                            client_mac,
-                            config_revision,
-                            deadline,
-                        ) {
+                        match flow_verdict_writer
+                            .install_block(
+                                &block_aliases,
+                                &command_id,
+                                &policy_flow_id,
+                                policy_id,
+                                client_mac,
+                                config_revision,
+                                deadline,
+                            )
+                            .and_then(|count| {
+                                if let Some(expiry) = endpoint_expiry {
+                                    let remaining_ms = expiry.saturating_sub(now_ms) as u64;
+                                    let endpoint_deadline = received_monotonic_ns
+                                        .saturating_add(remaining_ms.saturating_mul(1_000_000));
+                                    flow_verdict_writer.remember_endpoint_blocks(
+                                        &endpoint_aliases,
+                                        &policy_flow_id,
+                                        policy_id,
+                                        client_mac,
+                                        config_revision,
+                                        endpoint_deadline,
+                                    )?;
+                                }
+                                Ok(count)
+                            }) {
                             Ok(_) => {
                                 if let Ok(mut cache) = flow_alias_cache.lock() {
                                     cache.record_command(&policy_flow_id, issued_at_ms);
@@ -1194,11 +1249,15 @@ fn apply_flow_command(
                 }
                 (FlowCommandOperation::Upsert, Some(FlowVerdict::Allow)) => {
                     let installed_aliases = block_reverse_aliases(&aliases);
-                    match flow_verdict_writer.clear_aliases(
-                        &installed_aliases,
-                        Some(&policy_flow_id),
-                        &command_id,
-                    ) {
+                    match flow_verdict_writer
+                        .clear_aliases(&installed_aliases, Some(&policy_flow_id), &command_id)
+                        .and_then(|count| {
+                            if let Some(client_mac) = client_mac.as_deref() {
+                                flow_verdict_writer
+                                    .forget_endpoint_blocks(&endpoint_aliases, client_mac)?;
+                            }
+                            Ok(count)
+                        }) {
                         Ok(_) => {
                             if let Ok(mut cache) = flow_alias_cache.lock() {
                                 cache.record_command(&policy_flow_id, issued_at_ms);

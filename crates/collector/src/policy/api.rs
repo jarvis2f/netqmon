@@ -1119,7 +1119,7 @@ fn validate_spec(
     if !spec.selectors.clients.is_empty()
         && spec.selectors.applications.is_empty()
         && spec.selectors.categories.is_empty()
-        && spec.selectors.min_application_confidence.to_bits() != 0.85_f64.to_bits()
+        && spec.selectors.min_application_confidence.to_bits() != 0.8_f64.to_bits()
     {
         warnings
             .push("min_application_confidence is ignored for client-only selectors.".to_owned());

@@ -61,7 +61,7 @@ pub struct PolicySelectors {
 }
 
 fn default_confidence() -> f64 {
-    0.85
+    0.8
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

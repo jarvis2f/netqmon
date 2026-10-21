@@ -3,6 +3,8 @@ use libbpf_rs::{MapCore, MapFlags, MapHandle};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 
+use super::endpoint_block;
+
 const VERDICT_VALUE_SIZE: usize = 64;
 const POLICY_STATE_VALUE_SIZE: usize = 16;
 const MAX_VERDICT_ENTRIES: usize = 16_384;
@@ -21,6 +23,7 @@ struct VerdictIdentity {
 
 pub(crate) struct FlowVerdictWriter {
     verdict_map: Option<MapHandle>,
+    endpoint_map: Option<MapHandle>,
     policy_state_map: Option<MapHandle>,
     policy_drop_map: Option<MapHandle>,
     policy_drop_map_ready: bool,
@@ -30,6 +33,7 @@ pub(crate) struct FlowVerdictWriter {
 impl FlowVerdictWriter {
     pub(crate) fn new(
         verdict_map: MapHandle,
+        endpoint_map: MapHandle,
         policy_state_map: MapHandle,
         policy_drop_map: Option<MapHandle>,
     ) -> Self {
@@ -38,6 +42,10 @@ impl FlowVerdictWriter {
             && verdict_map.max_entries() as usize == MAX_VERDICT_ENTRIES
             && policy_state_map.key_size() == 4
             && policy_state_map.value_size() as usize == POLICY_STATE_VALUE_SIZE;
+        let ready = ready
+            && endpoint_map.key_size() as usize == endpoint_block::KEY_SIZE
+            && endpoint_map.value_size() as usize == VERDICT_VALUE_SIZE
+            && endpoint_map.max_entries() as usize == endpoint_block::MAX_ENTRIES;
         let policy_drop_map_ready = policy_drop_map.as_ref().is_some_and(|map| {
             policy_drop_map_abi_matches(
                 map.key_size() as usize,
@@ -47,6 +55,7 @@ impl FlowVerdictWriter {
         });
         Self {
             verdict_map: Some(verdict_map),
+            endpoint_map: Some(endpoint_map),
             policy_state_map: Some(policy_state_map),
             policy_drop_map,
             policy_drop_map_ready,
@@ -57,6 +66,7 @@ impl FlowVerdictWriter {
     pub(crate) fn unavailable() -> Self {
         Self {
             verdict_map: None,
+            endpoint_map: None,
             policy_state_map: None,
             policy_drop_map: None,
             policy_drop_map_ready: false,
@@ -85,6 +95,13 @@ impl FlowVerdictWriter {
         for key in keys {
             if let Err(error) = verdict_map.delete(&key) {
                 errors.push(format!("clear BPF flow verdict: {error}"));
+            }
+        }
+        if let Some(map) = &self.endpoint_map {
+            for key in map.keys().collect::<Vec<_>>() {
+                if let Err(error) = map.delete(&key) {
+                    errors.push(format!("clear BPF endpoint block: {error}"));
+                }
             }
         }
         let next_enabled = enabled && errors.is_empty();
@@ -127,6 +144,87 @@ impl FlowVerdictWriter {
             expires_monotonic_ns,
             VERDICT_BLOCK,
         )
+    }
+
+    pub(crate) fn remember_endpoint_blocks(
+        &self,
+        aliases: &[FlowKey],
+        policy_flow_id: &str,
+        policy_id: &str,
+        client_mac: &str,
+        generation: u64,
+        expires_monotonic_ns: u64,
+    ) -> Result<usize, String> {
+        if !self.ready {
+            return Err("BPF policy map ABI does not match the Agent".to_owned());
+        }
+        let map = self
+            .endpoint_map
+            .as_ref()
+            .ok_or_else(|| "BPF endpoint block map is unavailable".to_owned())?;
+        let client_mac = client_mac_identity(client_mac)?;
+        let value = encode_verdict(
+            expires_monotonic_ns,
+            generation,
+            VerdictIdentity {
+                flow_hash: flow_identity_hash(policy_flow_id)?,
+                policy_hash: policy_identity_hash(policy_id),
+                client_mac,
+            },
+            0,
+            VERDICT_BLOCK,
+        );
+        let mut previous_values: Vec<([u8; endpoint_block::KEY_SIZE], Option<Vec<u8>>)> =
+            Vec::new();
+        for alias in aliases {
+            let key = endpoint_block::key(alias, client_mac);
+            let previous = map
+                .lookup(&key, MapFlags::ANY)
+                .map_err(|error| format!("read BPF endpoint block: {error}"))?;
+            if let Err(error) = map.update(&key, &value, MapFlags::ANY) {
+                let mut rollback_errors = Vec::new();
+                for (key, previous) in previous_values.iter().rev() {
+                    let rollback = match previous {
+                        Some(value) => map.update(key, value, MapFlags::ANY),
+                        None => map.delete(key),
+                    };
+                    if let Err(error) = rollback {
+                        rollback_errors.push(error.to_string());
+                    }
+                }
+                return Err(format!(
+                    "write BPF endpoint block: {error}; rollback errors: {rollback_errors:?}"
+                ));
+            }
+            previous_values.push((key, previous));
+        }
+        Ok(previous_values.len())
+    }
+
+    /// Explicit Allow invalidates the endpoint decision. Ordinary Revoke (flow
+    /// end or loss of classifier evidence) must not forget a valid block lease.
+    pub(crate) fn forget_endpoint_blocks(
+        &self,
+        aliases: &[FlowKey],
+        client_mac: &str,
+    ) -> Result<(), String> {
+        let map = self
+            .endpoint_map
+            .as_ref()
+            .ok_or_else(|| "BPF endpoint block map is unavailable".to_owned())?;
+        let client_mac = client_mac_identity(client_mac)?;
+        for alias in aliases {
+            let key = endpoint_block::key(alias, client_mac);
+            if map
+                .lookup(&key, MapFlags::ANY)
+                .map_err(|error| format!("read BPF endpoint block: {error}"))?
+                .is_some()
+            {
+                map.delete(&key)
+                    .map_err(|error| format!("delete BPF endpoint block: {error}"))?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn install_shape(
@@ -461,6 +559,226 @@ fn encode_policy_state(enabled: bool, generation: u64) -> [u8; POLICY_STATE_VALU
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires Linux BPF privileges; run on the Debian test server"]
+    fn endpoint_blocks_enforce_reconnects_and_expire_in_the_kernel() {
+        use libbpf_rs::skel::{OpenSkel as _, SkelBuilder as _};
+        let mut open_object = std::mem::MaybeUninit::uninit();
+        let builder = crate::bpf::FlowSkelBuilder::default();
+        let open = builder.open(&mut open_object).unwrap();
+        let skeleton = open
+            .load()
+            .expect("kernel must verify all datapath programs");
+        let writer = FlowVerdictWriter::new(
+            MapHandle::try_from(&skeleton.maps.flow_verdict_map).unwrap(),
+            MapHandle::try_from(&skeleton.maps.endpoint_blocks).unwrap(),
+            MapHandle::try_from(&skeleton.maps.bss).unwrap(),
+            Some(MapHandle::try_from(&skeleton.maps.policy_drop_counters).unwrap()),
+        );
+        let mac = "aa:bb:cc:dd:ee:ff";
+        let flow_id = "00112233445566778899aabbccddeeff";
+        for version in [4, 6] {
+            for protocol in [6, 17] {
+                writer.reset(7, true).unwrap();
+                let mut alias = FlowKey {
+                    ip_version: version,
+                    protocol,
+                    direction: 1,
+                    hook: 1,
+                    ifindex: 1,
+                    source_address: [0; 16],
+                    destination_address: [0; 16],
+                    source_port: 50_000,
+                    destination_port: 443,
+                };
+                if version == 4 {
+                    alias.source_address[..4].copy_from_slice(&[192, 0, 2, 1]);
+                    alias.destination_address[..4].copy_from_slice(&[198, 51, 100, 1]);
+                } else {
+                    alias.source_address = "2001:db8::1"
+                        .parse::<std::net::Ipv6Addr>()
+                        .unwrap()
+                        .octets();
+                    alias.destination_address = "2001:db8::2"
+                        .parse::<std::net::Ipv6Addr>()
+                        .unwrap()
+                        .octets();
+                }
+                let packet = endpoint_test_packet(&alias, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+                let run_ingress = |packet: &[u8]| {
+                    skeleton
+                        .progs
+                        .netqmon_ingress
+                        .test_run(libbpf_rs::ProgramInput {
+                            data_in: Some(packet),
+                            ..Default::default()
+                        })
+                        .unwrap()
+                        .return_value
+                };
+                assert_eq!(run_ingress(&packet), 0);
+                let now = crate::linux::monotonic_ns();
+                let flow_expiry = now + 30_000_000_000;
+                let expiry = now + super::endpoint_block::CACHE_TTL_MS as u64 * 1_000_000;
+                writer
+                    .install_block(
+                        &[alias.clone()],
+                        "block",
+                        flow_id,
+                        "p-1",
+                        mac,
+                        7,
+                        flow_expiry,
+                    )
+                    .unwrap();
+                writer
+                    .remember_endpoint_blocks(&[alias.clone()], flow_id, "p-1", mac, 7, expiry)
+                    .unwrap();
+                if version == 4 && protocol == 17 {
+                    // Exercise real kernel time: the original UDP verdict has
+                    // expired, while the independent endpoint lease still blocks.
+                    std::thread::sleep(std::time::Duration::from_secs(31));
+                    assert_eq!(run_ingress(&packet), 2);
+                }
+                // Flow end clears only the exact verdict. A fresh ephemeral
+                // port still hits the independent client/endpoint lease.
+                writer
+                    .clear_aliases(&[alias.clone()], Some(flow_id), "revoke")
+                    .unwrap();
+                let mut reconnect = alias.clone();
+                reconnect.source_port = 60_000;
+                let reconnect_packet =
+                    endpoint_test_packet(&reconnect, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+                assert_eq!(run_ingress(&reconnect_packet), 2);
+                let mut reverse = reconnect.clone();
+                std::mem::swap(
+                    &mut reverse.source_address,
+                    &mut reverse.destination_address,
+                );
+                std::mem::swap(&mut reverse.source_port, &mut reverse.destination_port);
+                let mut response = endpoint_test_packet(&reverse, [0x11; 6]);
+                response[..6].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+                assert_eq!(
+                    skeleton
+                        .progs
+                        .netqmon_egress
+                        .test_run(libbpf_rs::ProgramInput {
+                            data_in: Some(&response),
+                            ..Default::default()
+                        })
+                        .unwrap()
+                        .return_value,
+                    2
+                );
+                // Same IP assigned to another MAC must not inherit the block.
+                assert_eq!(run_ingress(&endpoint_test_packet(&reconnect, [0x22; 6])), 0);
+                for variant in 0..4 {
+                    let mut other = reconnect.clone();
+                    match variant {
+                        0 => other.destination_port = 8443,
+                        1 => other.protocol = if protocol == 6 { 17 } else { 6 },
+                        2 => other.source_address[0] ^= 1,
+                        _ => other.destination_address[0] ^= 1,
+                    }
+                    assert_eq!(
+                        run_ingress(&endpoint_test_packet(
+                            &other,
+                            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]
+                        )),
+                        0
+                    );
+                }
+                let cache_key = endpoint_block::key(&alias, client_mac_identity(mac).unwrap());
+                let value = skeleton
+                    .maps
+                    .endpoint_blocks
+                    .lookup(&cache_key, MapFlags::ANY)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    &value[..8],
+                    &expiry.to_ne_bytes(),
+                    "cache hits cannot extend the lease"
+                );
+                writer
+                    .forget_endpoint_blocks(&[alias.clone()], mac)
+                    .unwrap();
+                assert_eq!(run_ingress(&reconnect_packet), 0);
+                writer
+                    .remember_endpoint_blocks(&[alias.clone()], flow_id, "p-1", mac, 7, 1)
+                    .unwrap();
+                assert_eq!(
+                    run_ingress(&reconnect_packet),
+                    0,
+                    "expired endpoint must pass"
+                );
+                writer
+                    .remember_endpoint_blocks(&[alias.clone()], flow_id, "p-1", mac, 7, expiry)
+                    .unwrap();
+                writer.write_policy_state(true, 8).unwrap();
+                assert_eq!(
+                    run_ingress(&reconnect_packet),
+                    0,
+                    "old policy generation must pass"
+                );
+                writer
+                    .remember_endpoint_blocks(&[alias.clone()], flow_id, "p-1", mac, 8, expiry)
+                    .unwrap();
+                // A rule edit must clear cached blocks even while application
+                // enforcement remains enabled; disabling clears them as well.
+                writer.reset(9, true).unwrap();
+                assert!(skeleton.maps.endpoint_blocks.keys().next().is_none());
+                assert_eq!(run_ingress(&reconnect_packet), 0);
+                writer
+                    .remember_endpoint_blocks(&[alias], flow_id, "p-1", mac, 9, expiry)
+                    .unwrap();
+                writer.reset(10, false).unwrap();
+                assert!(skeleton.maps.endpoint_blocks.keys().next().is_none());
+                assert_eq!(run_ingress(&reconnect_packet), 0);
+            }
+        }
+    }
+
+    fn endpoint_test_packet(alias: &FlowKey, source_mac: [u8; 6]) -> Vec<u8> {
+        let network_length = if alias.ip_version == 4 { 20 } else { 40 };
+        let transport_length = if alias.protocol == 6 { 20 } else { 8 };
+        let mut packet = vec![0; 14 + network_length + transport_length];
+        packet[..6].fill(0x11);
+        packet[6..12].copy_from_slice(&source_mac);
+        let ether_type: u16 = if alias.ip_version == 4 {
+            0x0800
+        } else {
+            0x86dd
+        };
+        packet[12..14].copy_from_slice(&ether_type.to_be_bytes());
+        let ip = &mut packet[14..];
+        if alias.ip_version == 4 {
+            ip[0] = 0x45;
+            ip[2..4].copy_from_slice(&((network_length + transport_length) as u16).to_be_bytes());
+            ip[8] = 64;
+            ip[9] = alias.protocol;
+            ip[12..16].copy_from_slice(&alias.source_address[..4]);
+            ip[16..20].copy_from_slice(&alias.destination_address[..4]);
+        } else {
+            ip[0] = 0x60;
+            ip[4..6].copy_from_slice(&(transport_length as u16).to_be_bytes());
+            ip[6] = alias.protocol;
+            ip[7] = 64;
+            ip[8..24].copy_from_slice(&alias.source_address);
+            ip[24..40].copy_from_slice(&alias.destination_address);
+        }
+        let transport = &mut ip[network_length..];
+        transport[..2].copy_from_slice(&alias.source_port.to_be_bytes());
+        transport[2..4].copy_from_slice(&alias.destination_port.to_be_bytes());
+        if alias.protocol == 6 {
+            transport[12] = 0x50;
+            transport[13] = 2;
+        } else {
+            transport[4..6].copy_from_slice(&(transport_length as u16).to_be_bytes());
+        }
+        packet
+    }
 
     #[test]
     fn verdict_and_control_abis_use_native_integer_layout() {

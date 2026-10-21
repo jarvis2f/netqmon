@@ -436,21 +436,24 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
     };
     let flow_verdict_writer = match (
         MapHandle::try_from(&skeleton.maps.flow_verdict_map),
+        MapHandle::try_from(&skeleton.maps.endpoint_blocks),
         MapHandle::try_from(&skeleton.maps.bss),
     ) {
-        (Ok(verdict_map), Ok(policy_state_map)) => {
+        (Ok(verdict_map), Ok(endpoint_map), Ok(policy_state_map)) => {
             crate::policy::flow_verdict::FlowVerdictWriter::new(
                 verdict_map,
+                endpoint_map,
                 policy_state_map,
                 policy_drop_map,
             )
         }
-        (verdict_result, state_result) => {
+        (verdict_result, endpoint_result, state_result) => {
             log_warn(
                 log_level,
                 format_args!(
-                    "application flow verdict maps are unavailable: verdict_map={:?}; policy_state_map={:?}",
+                    "application flow verdict maps are unavailable: verdict_map={:?}; endpoint_map={:?}; policy_state_map={:?}",
                     verdict_result.err(),
+                    endpoint_result.err(),
                     state_result.err()
                 ),
             );
@@ -770,11 +773,14 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                                 aliases.clear();
                             }
                             let mut cleanup_errors = Vec::new();
-                            let flow_verdict_keys =
-                                skeleton.maps.flow_verdict_map.keys().collect::<Vec<_>>();
-                            for key in flow_verdict_keys {
-                                if let Err(error) = skeleton.maps.flow_verdict_map.delete(&key) {
-                                    cleanup_errors.push(error.to_string());
+                            for map in [
+                                &skeleton.maps.flow_verdict_map,
+                                &skeleton.maps.endpoint_blocks,
+                            ] {
+                                for key in map.keys().collect::<Vec<_>>() {
+                                    if let Err(error) = map.delete(&key) {
+                                        cleanup_errors.push(error.to_string());
+                                    }
                                 }
                             }
                             let observed_ifindex_keys =
@@ -907,11 +913,14 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                             aliases.clear();
                         }
                         let mut cleanup_errors = Vec::new();
-                        let flow_verdict_keys =
-                            skeleton.maps.flow_verdict_map.keys().collect::<Vec<_>>();
-                        for key in flow_verdict_keys {
-                            if let Err(error) = skeleton.maps.flow_verdict_map.delete(&key) {
-                                cleanup_errors.push(error.to_string());
+                        for map in [
+                            &skeleton.maps.flow_verdict_map,
+                            &skeleton.maps.endpoint_blocks,
+                        ] {
+                            for key in map.keys().collect::<Vec<_>>() {
+                                if let Err(error) = map.delete(&key) {
+                                    cleanup_errors.push(error.to_string());
+                                }
                             }
                         }
                         if !cleanup_errors.is_empty() {

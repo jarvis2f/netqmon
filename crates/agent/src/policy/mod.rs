@@ -2,6 +2,7 @@ mod capabilities;
 #[cfg(target_os = "linux")]
 mod capacity;
 pub(crate) mod classid;
+pub(crate) mod endpoint_block;
 #[cfg(target_os = "linux")]
 pub(crate) mod executor;
 pub(crate) mod flow_alias;

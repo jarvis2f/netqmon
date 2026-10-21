@@ -242,7 +242,7 @@ export interface PolicySpecV1 {
     categories: string[];
     min_application_confidence: number;
   };
-  network: { scope: "internet"; direction: "both" };
+  network: { scope: "internet" | "agent"; direction: "both" };
   action: {
     type: PolicyActionKind;
     download_bps: number | null;

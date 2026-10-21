@@ -21,7 +21,7 @@ const PROTOCOL_ONLY_APPLICATION_MIGRATION: &str =
     include_str!("../../../migrations/sqlite/0004_protocol_only_app_rollup.sql");
 const PROTOCOL_APPLICATION_ROLLUP_MIGRATION: &str =
     include_str!("../../../migrations/sqlite/0005_protocol_application_rollup.sql");
-const MIGRATIONS: [(i64, &str); 6] = [
+const MIGRATIONS: [(i64, &str); 7] = [
     (1, INITIAL_MIGRATION),
     (2, PROTOCOL_MIGRATION),
     (3, SCOPE_TIMESTAMP_MIGRATION),
@@ -31,7 +31,28 @@ const MIGRATIONS: [(i64, &str); 6] = [
         6,
         include_str!("../../../migrations/sqlite/0006_flow_rollup_contributions.sql"),
     ),
+    (
+        7,
+        include_str!("../../../migrations/sqlite/0007_dns_answer_lookup.sql"),
+    ),
 ];
+const SAME_DEVICE_DNS_QUERY: &str =
+    "SELECT dns.domain FROM device_addresses client
+     JOIN devices d ON d.id=client.device_id
+     JOIN device_addresses source ON source.device_id=d.id
+     JOIN dns_observations dns ON dns.gateway_id=d.gateway_id AND dns.client_ip=source.ip
+     WHERE d.gateway_id=?1 AND client.ip=?2 AND dns.answer_ip = ?3
+       AND dns.observed_at <= ?4 AND dns.expires_at > ?4
+       AND client.first_seen<=?4 AND client.last_seen>=?4-300000
+           AND source.first_seen<=dns.observed_at AND source.last_seen>=dns.observed_at-300000
+           AND NOT EXISTS (
+             SELECT 1 FROM device_addresses other JOIN devices od ON od.id=other.device_id
+             WHERE od.gateway_id=?1 AND other.device_id!=d.id AND (
+               (other.ip=?2 AND other.first_seen<=?4 AND other.last_seen>=?4-300000) OR
+               (other.ip=dns.client_ip AND other.first_seen<=dns.observed_at AND other.last_seen>=dns.observed_at-300000)
+             )
+           )
+     ORDER BY dns.observed_at DESC, dns.id DESC LIMIT 1";
 pub(crate) const PROTOCOL_APPLICATION_PREFIX: &str = "protocol:";
 const MINUTE_MS: i64 = 60 * 1_000;
 const HOUR_MS: i64 = 60 * MINUTE_MS;
@@ -852,22 +873,7 @@ impl SqliteStorage {
         }
         self.connection
             .query_row(
-                "SELECT dns.domain FROM device_addresses client
-                 JOIN devices d ON d.id=client.device_id
-                 JOIN device_addresses source ON source.device_id=d.id
-                 JOIN dns_observations dns ON dns.gateway_id=d.gateway_id AND dns.client_ip=source.ip
-                 WHERE d.gateway_id=?1 AND client.ip=?2 AND dns.answer_ip = ?3
-                   AND dns.observed_at <= ?4 AND dns.expires_at > ?4
-                   AND client.first_seen<=?4 AND client.last_seen>=?4-300000
-                       AND source.first_seen<=dns.observed_at AND source.last_seen>=dns.observed_at-300000
-                       AND NOT EXISTS (
-                         SELECT 1 FROM device_addresses other JOIN devices od ON od.id=other.device_id
-                         WHERE od.gateway_id=?1 AND other.device_id!=d.id AND (
-                           (other.ip=?2 AND other.first_seen<=?4 AND other.last_seen>=?4-300000) OR
-                           (other.ip=dns.client_ip AND other.first_seen<=dns.observed_at AND other.last_seen>=dns.observed_at-300000)
-                         )
-                       )
-                 ORDER BY dns.observed_at DESC, dns.id DESC LIMIT 1",
+                SAME_DEVICE_DNS_QUERY,
                 params![gateway_id, client_ip, answer_ip, to_i64(at_ms)],
                 |row| row.get(0),
             )

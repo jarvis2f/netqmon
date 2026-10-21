@@ -745,7 +745,7 @@ pub(crate) fn reconcile_saved_with_flow_capability(
         return None;
     }
     if let Some((policies, intervals, valid_until_ms)) = snapshot_parts(&saved.snapshot) {
-        let topology = discover_runtime_topology_with_flow_capability(config, flow_bpf_ready);
+        let topology = runtime_topology(config, flow_bpf_ready);
         if topology.supported || !policies.iter().any(is_supported_client_policy) {
             let mut plan = build_plan(policies, intervals, valid_until_ms, now_ms(), &topology);
             let previous_shape = saved.shaping_state.as_ref();

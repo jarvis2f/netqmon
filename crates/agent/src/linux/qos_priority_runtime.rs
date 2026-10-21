@@ -2519,6 +2519,28 @@ impl PriorityRuntime {
             })
     }
 
+    pub(crate) fn endpoint_block_expiry(
+        &self,
+        policy_ids: &[String],
+        client_mac: &str,
+        issued_at_ms: i64,
+        now_ms: i64,
+    ) -> Option<i64> {
+        let active = self.active.as_ref()?;
+        if self.emergency_disabled {
+            return None;
+        }
+        crate::policy::endpoint_block::expires_at_ms(
+            &active.snapshot,
+            policy_ids,
+            client_mac,
+            issued_at_ms,
+            now_ms,
+        )
+        .map(|expiry| expiry.min(active.expires_at_ms))
+        .filter(|expiry| *expiry > now_ms)
+    }
+
     pub(crate) fn flow_revision_matches(&self, controller_epoch: &str, revision: u64) -> bool {
         self.active
             .as_ref()
