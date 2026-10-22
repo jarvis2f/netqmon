@@ -108,9 +108,9 @@ jobs:
           sudo apt-get install --no-install-recommends --yes \
             clang \
             autoconf automake libtool pkg-config \
-            bpftool iproute2 iperf3 jq netcat-openbsd nftables ripgrep \
+            iproute2 iperf3 jq netcat-openbsd nftables ripgrep \
             libelf-dev \
-            linux-tools-generic \
+            linux-tools-common linux-tools-generic \
             zlib1g-dev
 
       - name: Build pinned nDPI
