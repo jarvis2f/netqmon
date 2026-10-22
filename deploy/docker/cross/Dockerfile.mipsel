@@ -35,9 +35,14 @@ ENV CC=mipsel-linux-muslsf-gcc
 ENV AR=mipsel-linux-muslsf-ar
 ENV RANLIB=mipsel-linux-muslsf-ranlib
 
-# 2. Build target zlib static library
+# 2. Build target zlib static library from the upstream release asset.
+# Verify the archive before extracting it; the fossils mirror has returned HTML
+# with HTTP 200, which curl --fail alone cannot detect.
 RUN mkdir -p /tmp/build && cd /tmp/build && \
-    curl -fsSL https://zlib.net/fossils/zlib-1.3.1.tar.gz -o zlib-1.3.1.tar.gz && \
+    curl -fsSL --retry 5 --retry-connrefused --connect-timeout 15 \
+      https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz \
+      -o zlib-1.3.1.tar.gz && \
+    echo '9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23  zlib-1.3.1.tar.gz' | sha256sum -c - && \
     tar -xzf zlib-1.3.1.tar.gz && cd zlib-1.3.1 && \
     CC="${TARGET_TRIPLE}-gcc" AR="${TARGET_TRIPLE}-ar" RANLIB="${TARGET_TRIPLE}-ranlib" \
     ./configure --prefix=${TOOLCHAIN_DIR} --static && \

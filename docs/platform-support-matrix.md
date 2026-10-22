@@ -28,6 +28,17 @@
 | **mipsel_74kc** | `mipsel-unknown-linux-musl` | `netqmon-agent_mipsel32r2` | MIPS32r2 O32 Soft-Float static | ipk, apk | **Experimental** |
 | **mipsel_24kc_24kf** | `mipsel-unknown-linux-musl` | `netqmon-agent_mipsel32r2` | MIPS32r2 O32 Soft-Float static | ipk, apk | **Compatibility Test** |
 
+RISC-V APK 使用 OpenWrt `25.12.6` 的官方 `d1/generic` SDK，并校验归档 SHA-256、保留
+`feeds.conf.default` 中固定的 feed 提交。Snapshot SDK 的 `ucode` FFI 模块曾引用 RISC-V
+libffi 不提供的复数类型，导致 Agent 二进制成功后，LuCI APK 仍然构建失败；重试同一个
+snapshot 不能解决此问题。APK 的包架构为 `riscv64_generic`，24.10 IPK 仍为
+`riscv64_riscv64`，清单分别记录，不能通过重命名将两者混用。固定 SDK 只影响打包环境，
+不要求设备为此升级固件。
+
+MIPS 交叉编译使用 zlib 上游 GitHub Release 归档，并在解压前校验固定 SHA-256，避免
+下载端返回 HTTP 200 的 HTML 页面时继续解压。生成二进制后仍须通过静态链接、
+MIPS32r2 soft-float ABI 和 QEMU 版本启动检查；实验及兼容性测试级别不因此提升。
+
 ---
 
 ## 3. 运行环境与内核依赖要求

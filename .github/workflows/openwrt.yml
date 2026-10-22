@@ -363,20 +363,17 @@ jobs:
           cp -r packaging/openwrt/netqmon/bin/* packaging/openwrt/bin/
           echo "CONFIG_PACKAGE_netqmon-agent=m" > .config
           echo "CONFIG_PACKAGE_luci-app-netqmon=m" >> .config
+          version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            version="${GITHUB_REF_NAME#v}"
-            cargo_version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
-            test "${version}" = "${cargo_version}"
-            package_version="${version}"
-            if [ "${{ matrix.ver }}" = "apk" ] && [[ "${version}" == *-* ]]; then
-              # apk accepts a numeric release version with an optional commit hash suffix.
-              # Keep IPK metadata identical to the Cargo/tag version, but make prereleases
-              # valid APK versions that sort before the corresponding final release.
-              package_version="${version%%-*}~${GITHUB_SHA}"
-            fi
-            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${package_version}/" packaging/openwrt/netqmon/Makefile
-            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${package_version}/" packaging/openwrt/luci-app-netqmon/Makefile
+            test "${GITHUB_REF_NAME#v}" = "${version}"
           fi
+          package_version="${version}"
+          if [ "${{ matrix.ver }}" = "apk" ] && [[ "${version}" == *-* ]]; then
+            # Normalize prereleases for both tag releases and manual validation builds.
+            package_version="${version%%-*}~${GITHUB_SHA}"
+          fi
+          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${package_version}/" packaging/openwrt/netqmon/Makefile
+          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${package_version}/" packaging/openwrt/luci-app-netqmon/Makefile
 
       - name: Build with OpenWrt SDK
         if: matrix.sdk_ver != 'snapshots'
@@ -489,8 +486,12 @@ jobs:
             status: "Compatibility Test"
 
           # --- snapshots (apk) ---
-          - platform: riscv64_riscv64
-            sdk_ver: snapshots
+          - platform: riscv64_generic
+            # Snapshot ucode's FFI module assumes complex-number support that
+            # RISC-V libffi lacks. Use a matching release SDK and pinned feeds.
+            sdk_ver: 25.12.6
+            sdk_archive: openwrt-sdk-25.12.6-d1-generic_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+            sdk_sha256: 6cdb2e5ccdf061d61e7e5bbbdeae7daaa9205f130d2a82621b2c09c65fe8e390
             ver: "apk"
             arch: riscv64
             status: "Candidate Official"
@@ -529,23 +530,44 @@ jobs:
           cp -r packaging/openwrt/netqmon/bin/* packaging/openwrt/bin/
           echo "CONFIG_PACKAGE_netqmon-agent=m" > .config
           echo "CONFIG_PACKAGE_luci-app-netqmon=m" >> .config
+          version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            version="${GITHUB_REF_NAME#v}"
-            cargo_version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
-            test "${version}" = "${cargo_version}"
-            package_version="${version}"
-            if [ "${{ matrix.ver }}" = "apk" ] && [[ "${version}" == *-* ]]; then
-              # apk accepts a numeric release version with an optional commit hash suffix.
-              # Keep IPK metadata identical to the Cargo/tag version, but make prereleases
-              # valid APK versions that sort before the corresponding final release.
-              package_version="${version%%-*}~${GITHUB_SHA}"
-            fi
-            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${package_version}/" packaging/openwrt/netqmon/Makefile
-            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${package_version}/" packaging/openwrt/luci-app-netqmon/Makefile
+            test "${GITHUB_REF_NAME#v}" = "${version}"
           fi
+          package_version="${version}"
+          if [ "${{ matrix.ver }}" = "apk" ] && [[ "${version}" == *-* ]]; then
+            # Normalize prereleases for both tag releases and manual validation builds.
+            package_version="${version%%-*}~${GITHUB_SHA}"
+          fi
+          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${package_version}/" packaging/openwrt/netqmon/Makefile
+          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${package_version}/" packaging/openwrt/luci-app-netqmon/Makefile
+
+      - name: Build with pinned OpenWrt release SDK
+        if: matrix.sdk_archive
+        shell: bash
+        env:
+          SDK_ARCHIVE: ${{ matrix.sdk_archive }}
+          SDK_SHA256: ${{ matrix.sdk_sha256 }}
+          SDK_VERSION: ${{ matrix.sdk_ver }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential gawk gettext libncurses-dev libssl-dev \
+            python3-setuptools rsync unzip zstd
+          sdk_dir="${RUNNER_TEMP}/openwrt-riscv-sdk"
+          archive="${RUNNER_TEMP}/${SDK_ARCHIVE}"
+          curl -fsSL --retry 5 --retry-connrefused --connect-timeout 15 \
+            "https://downloads.openwrt.org/releases/${SDK_VERSION}/targets/d1/generic/${SDK_ARCHIVE}" \
+            -o "$archive"
+          printf '%s  %s\n' "$SDK_SHA256" "$archive" | sha256sum -c -
+          mkdir -p "$sdk_dir"
+          tar --zstd -xf "$archive" -C "$sdk_dir" --strip-components=1
+          bash scripts/release/build-openwrt-sdk.sh \
+            "$sdk_dir" "$GITHUB_WORKSPACE/packaging/openwrt" "$GITHUB_WORKSPACE"
 
       - name: Build with OpenWrt SDK
-        if: matrix.sdk_ver != 'snapshots'
+        if: matrix.sdk_ver != 'snapshots' && !matrix.sdk_archive
         uses: openwrt/gh-action-sdk@main
         env:
           ARCH: ${{ matrix.sdk_ver == 'snapshots' && matrix.platform || format('{0}-{1}', matrix.platform, matrix.sdk_ver) }}

@@ -142,6 +142,21 @@ class OpenWrtManifestTests(unittest.TestCase):
             self.assertEqual(agent_records[1]["sha256"], hashlib.sha256(apk.read_bytes()).hexdigest())
             self.assertTrue(agent_records[1]["url"].endswith("netqmon-agent-1.0.0-r1_x86_64.apk"))
 
+    def test_manifest_preserves_riscv_architecture_for_each_package_format(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_ipk(root / "agent.ipk", "netqmon-agent", "riscv64_riscv64", "1.1.0-beta.1-r1")
+            make_ipk(root / "luci.ipk", "luci-app-netqmon", "all", "1.1.0-beta.1-r1")
+            make_apk_artifact(root, "netqmon-agent", "riscv64_generic", "1.1.0~03d585d-r1")
+
+            manifest = create_manifest("jarvis2f/netqmon", [f"beta:v1.1.0-beta.1:{root}"])
+            records = [
+                (record["package_format"], record["openwrt_arch"])
+                for record in manifest["channels"]["beta"]["packages"]
+                if record["name"] == "netqmon-agent"
+            ]
+            self.assertEqual(records, [("ipk", "riscv64_riscv64"), ("apk", "riscv64_generic")])
+
     def test_beta_apk_urls_match_github_normalized_asset_names(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
