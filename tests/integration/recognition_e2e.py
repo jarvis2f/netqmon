@@ -103,7 +103,7 @@ def main():
         for cmd in [['link','set','lo','up'],['link','set','nqm-peer','up'],['addr','add','192.0.2.2/24','dev','nqm-peer'],['-6','addr','add','fd42:6e71::2/64','dev','nqm-peer','nodad'],['route','add','default','via','192.0.2.1']]:
             run(ns+['ip']+cmd)
         run(['ip','addr','add','198.51.100.1/32','dev','lo'])
-        env = dict(os.environ, NETQMON_COLLECTOR_PUBLIC_ADDR='0.0.0.0:18090', NETQMON_COLLECTOR_INTERNAL_ADDR='127.0.0.1:18091', NETQMON_COLLECTOR_ENROLLMENT_TOKEN='recognition-test', NETQMON_COLLECTOR_DATABASE_PATH=str(work/'test.db'), NETQMON_COLLECTOR_GEO_DIR=str(work/'geo'), NETQMON_DPI_ENABLED='true')
+        env = dict(os.environ, NETQMON_COLLECTOR_PUBLIC_ADDR='0.0.0.0:18090', NETQMON_COLLECTOR_INTERNAL_ADDR='127.0.0.1:18091', NETQMON_COLLECTOR_ENROLLMENT_TOKEN='recognition-test', NETQMON_COLLECTOR_DATABASE_PATH=str(work/'test.db'), NETQMON_POLICY_DATABASE_PATH=str(work/'policies.db'), NETQMON_COLLECTOR_GEO_DIR=str(work/'geo'), NETQMON_DPI_ENABLED='true')
         collector = spawn([str(root/'target/debug/netqmon-collector')], 'collector.log', env)
         import urllib.request
         for _ in range(100):

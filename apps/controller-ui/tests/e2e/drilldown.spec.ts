@@ -59,7 +59,12 @@ test("opens an application side panel and drills into full application details",
   await expect(page.getByRole("heading", { name: "youtube" })).toBeVisible();
   await page.getByRole("link", { name: "Open full details" }).click();
 
-  await expect(page).toHaveURL(/\/applications\/youtube\?category=streaming$/);
+  await expect(page).toHaveURL(
+    (url) =>
+      url.pathname === "/applications/youtube" &&
+      url.searchParams.get("category") === "streaming" &&
+      url.searchParams.get("range") === "24h",
+  );
   await expect(
     page.getByRole("heading", { name: "Classification" }),
   ).toBeVisible();
@@ -69,7 +74,11 @@ test("opens an application side panel and drills into full application details",
 
   await page.getByRole("tab", { name: "Flows" }).click();
   await expect(page).toHaveURL(
-    /\/applications\/youtube\?tab=flows&category=streaming$/,
+    (url) =>
+      url.pathname === "/applications/youtube" &&
+      url.searchParams.get("tab") === "flows" &&
+      url.searchParams.get("category") === "streaming" &&
+      url.searchParams.get("range") === "24h",
   );
   await expect(
     page.getByRole("row", { name: /video.youtube.com/ }),
@@ -88,7 +97,10 @@ test("keeps duplicate unknown applications scoped to their traffic category", as
 
   await page.getByRole("link", { name: "Open full details" }).click();
   await expect(page).toHaveURL(
-    /\/applications\/unknown\?category=communication$/,
+    (url) =>
+      url.pathname === "/applications/unknown" &&
+      url.searchParams.get("category") === "communication" &&
+      url.searchParams.get("range") === "24h",
   );
   await expect(page.getByText(/communication/).first()).toBeVisible();
 });

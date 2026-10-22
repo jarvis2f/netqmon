@@ -46,6 +46,7 @@ NETQMON_COLLECTOR_PUBLIC_ADDR=${public_address} \
 NETQMON_COLLECTOR_INTERNAL_ADDR=${internal_address} \
 NETQMON_COLLECTOR_ENROLLMENT_TOKEN=${enrollment_token} \
 NETQMON_COLLECTOR_DATABASE_PATH=${database_path} \
+NETQMON_POLICY_DATABASE_PATH=${temporary_directory}/netqmon-policies.db \
 NETQMON_CLASSIFIER_SOCKET=${classifier_socket} \
 NETQMON_LICENSE_STATE_PATH=${temporary_directory}/license.json \
   "${collector}" >"${log_file}" 2>&1 &
@@ -123,7 +124,9 @@ NETQMON_COLLECTOR_PUBLIC_ADDR=${public_address} \
 NETQMON_COLLECTOR_INTERNAL_ADDR=${internal_address} \
 NETQMON_COLLECTOR_ENROLLMENT_TOKEN=${enrollment_token} \
 NETQMON_COLLECTOR_DATABASE_PATH=${database_path} \
+NETQMON_POLICY_DATABASE_PATH=${temporary_directory}/netqmon-policies.db \
 NETQMON_CLASSIFIER_SOCKET=${classifier_socket} \
+NETQMON_LICENSE_STATE_PATH=${temporary_directory}/license.json \
   "${collector}" >>"${log_file}" 2>&1 &
 collector_pid=$!
 
