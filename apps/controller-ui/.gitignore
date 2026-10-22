@@ -15,6 +15,7 @@
 
 # next.js
 /.next/
+/.next-demo/
 /out/
 
 # production
@@ -40,3 +41,5 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+/test-results-demo/

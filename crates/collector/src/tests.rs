@@ -2,6 +2,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE};
 use axum::http::{Request, StatusCode};
 use futures_util::StreamExt;
+use netqmon_protocol::policy::FlowVerdict;
 use netqmon_protocol::v1::probe_result::Outcome as ProbeOutcome;
 use netqmon_protocol::v1::{
     AgentHealth, CounterSanityStatus, DeviceDiscoveryObservation, Direction, DnsObservation,
@@ -17,6 +18,455 @@ use super::*;
 
 const ENROLLMENT_TOKEN: &str = "test-enrollment-token";
 
+#[test]
+fn dns_history_is_scoped_by_client_and_answer_ip() {
+    let batch = TelemetryBatch {
+        gateway_id: "gw-test".to_owned(),
+        sent_at: 20_000,
+        dns_observations: vec![DnsObservation {
+            client_ip: vec![192, 168, 2, 88],
+            answer_ip: vec![101, 70, 9, 104],
+            domain: "api-play.amemv.com".to_owned(),
+            observed_at_unix_ms: 1_000,
+            ttl_seconds: 10,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut cache = DnsDomainCache::default();
+    cache.observe(&batch);
+    assert_eq!(
+        cache.resolve("gw-test", &[192, 168, 2, 88], &[101, 70, 9, 104], 20_000),
+        Some("api-play.amemv.com")
+    );
+    assert_eq!(
+        cache.resolve("gw-test", &[192, 168, 2, 89], &[101, 70, 9, 104], 20_000),
+        None
+    );
+}
+
+#[test]
+fn expired_dns_history_classifies_quic_without_sni() {
+    let state = test_state_with_repository_rules();
+    let inner = state.lock();
+    let mut dns_domains = DnsDomainCache::default();
+    dns_domains.observe(&TelemetryBatch {
+        gateway_id: "gw-test".to_owned(),
+        sent_at: 1_000,
+        dns_observations: vec![DnsObservation {
+            client_ip: vec![192, 168, 2, 88],
+            answer_ip: vec![198, 51, 100, 1],
+            domain: "www.youtube.com".to_owned(),
+            observed_at_unix_ms: 1_000,
+            ttl_seconds: 10,
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let batch = TelemetryBatch {
+        gateway_id: "gw-test".to_owned(),
+        sent_at: 20_000,
+        flows: vec![FlowDelta {
+            client_ip: vec![192, 168, 2, 88],
+            remote_ip: vec![198, 51, 100, 1],
+            protocol: 17,
+            remote_port: 443,
+            last_seen_unix_ms: 20_000,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let dpi = dpi::engine::DpiResult {
+        protocol: "quic".into(),
+        source: "ndpi".into(),
+        confidence: 1.0,
+        metadata: std::collections::BTreeMap::new(),
+    };
+    let result = classify_batch(
+        &inner.storage,
+        &inner.classifier,
+        inner.geo_provider.as_ref(),
+        &mut ServiceBindingCache::default(),
+        &dns_domains,
+        &FaviconEndpointCache::default(),
+        &batch,
+        &[Some(dpi::SampleAnalysis {
+            dpi: Some(dpi),
+            signatures: Vec::new(),
+        })],
+        false,
+    )
+    .unwrap();
+    assert_eq!(result[0].application_id, "youtube");
+}
+
+#[test]
+fn ambiguous_high_confidence_application_signatures_fall_back_to_default() {
+    use crate::dpi::SignatureApplicationMatch;
+
+    let signatures = vec![
+        SignatureApplicationMatch {
+            application_id: "netqmon_qos_test".to_owned(),
+            confidence: 0.99,
+            signature_hits: 1,
+        },
+        SignatureApplicationMatch {
+            application_id: "netqmon_qos_ambiguous".to_owned(),
+            confidence: 0.99,
+            signature_hits: 1,
+        },
+    ];
+    assert_eq!(
+        ambiguous_signature_application_ids(&signatures),
+        ["netqmon_qos_ambiguous", "netqmon_qos_test"]
+    );
+
+    let same_application = vec![
+        SignatureApplicationMatch {
+            application_id: "netqmon_qos_test".to_owned(),
+            confidence: 0.99,
+            signature_hits: 1,
+        },
+        SignatureApplicationMatch {
+            application_id: "netqmon_qos_test".to_owned(),
+            confidence: 0.95,
+            signature_hits: 1,
+        },
+    ];
+    assert!(ambiguous_signature_application_ids(&same_application).is_empty());
+
+    let low_confidence_collision = vec![
+        SignatureApplicationMatch {
+            application_id: "netqmon_qos_test".to_owned(),
+            confidence: 0.99,
+            signature_hits: 1,
+        },
+        SignatureApplicationMatch {
+            application_id: "weak_candidate".to_owned(),
+            confidence: 0.79,
+            signature_hits: 1,
+        },
+    ];
+    assert!(ambiguous_signature_application_ids(&low_confidence_collision).is_empty());
+}
+
+#[test]
+fn lifecycle_without_new_evidence_keeps_a_flow_verdict_but_end_revokes_it() {
+    let service = policy::PolicyService::open_in_memory().unwrap();
+    let hub = PolicyHub::new();
+    let bundle = hub.refresh_gateway(&service, "gw-test", false).unwrap();
+    let epoch = bundle.frame.snapshot_identity().unwrap().1.to_owned();
+    let session = hub.register("gw-test").unwrap();
+    let now = policy::push::now_ms();
+    let flow_id = "00000000000000000000000000000001";
+    hub.queue_flow_command(PolicyWireFrame::FlowCommand {
+        wire_version: POLICY_WIRE_VERSION,
+        gateway_id: "gw-test".to_owned(),
+        boot_id: "boot-test".to_owned(),
+        controller_epoch: epoch,
+        config_revision: 0,
+        command_id: uuid::Uuid::new_v4().to_string(),
+        policy_flow_id: flow_id.to_owned(),
+        operation: FlowCommandOperation::Upsert,
+        verdict: Some(FlowVerdict::Block),
+        policy_ids: vec!["00000000-0000-4000-8000-000000000001".to_owned()],
+        issued_at_ms: now,
+        expires_at_ms: now + 120_000,
+    })
+    .unwrap();
+    assert!(
+        hub.take_flow_command(&session, 0, Some("boot-test"))
+            .is_some()
+    );
+    let mut batch = TelemetryBatch {
+        gateway_id: "gw-test".to_owned(),
+        boot_id: "boot-test".to_owned(),
+        flows: vec![FlowDelta {
+            policy_flow_id: flow_id.to_owned(),
+            lifecycle: FlowLifecycle::Idle as i32,
+            scope: FlowScope::Internet as i32,
+            client_mac: vec![2, 0, 0, 0, 1, 35],
+            protocol: 6,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    for lifecycle in [FlowLifecycle::Active, FlowLifecycle::Idle] {
+        batch.flows[0].lifecycle = lifecycle as i32;
+        queue_policy_flow_decisions(&hub, &batch, &[FlowAttribution::default()]);
+        assert!(
+            hub.take_flow_command(&session, 0, Some("boot-test"))
+                .is_none()
+        );
+    }
+    batch.flows[0].lifecycle = FlowLifecycle::Ended as i32;
+    queue_policy_flow_decisions(&hub, &batch, &[FlowAttribution::default()]);
+    assert!(matches!(
+        hub.take_flow_command(&session, 0, Some("boot-test")),
+        Some(PolicyWireFrame::FlowCommand {
+            operation: FlowCommandOperation::Revoke,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn late_dpi_recovers_exact_client_context_and_queues_block() {
+    let state = test_state_with_repository_rules();
+    let gateway = "gw-late";
+    let mac = vec![2, 0, 0, 0, 1, 35];
+    let spec = serde_json::from_value(serde_json::json!({
+        "schema_version": 1, "gateway_id": gateway, "name": "Block YouTube", "description": "", "enabled": true, "priority": 500,
+        "selectors": {"clients": ["02:00:00:00:01:23"], "applications": ["youtube"], "categories": [], "min_application_confidence": 0.85},
+        "network": {"scope": "internet", "direction": "both"},
+        "action": {"type": "block", "download_bps": null, "upload_bps": null}, "schedule": null
+    })).unwrap();
+    state.policy_service.create(&spec, "admin", 0).unwrap();
+    let bundle = state
+        .policy_hub
+        .refresh_gateway(&state.policy_service, gateway, false)
+        .unwrap();
+    let session = state.policy_hub.register(gateway).unwrap();
+    state.policy_hub.record_flow_capabilities(
+        &session,
+        bundle.frame.snapshot_identity().unwrap().2,
+        &netqmon_protocol::policy::PolicyCapabilities {
+            application_block: netqmon_protocol::policy::PolicyCapability::Degraded,
+            ..netqmon_protocol::policy::PolicyCapabilities::unsupported()
+        },
+    );
+    let flow = FlowDelta {
+        ip_version: 4,
+        protocol: 6,
+        client_ip: vec![192, 0, 2, 1],
+        client_port: 50_000,
+        remote_ip: vec![198, 51, 100, 1],
+        remote_port: 443,
+        client_mac: mac,
+        scope: FlowScope::Internet as i32,
+        lifecycle: FlowLifecycle::Active as i32,
+        direction: Direction::Upload as i32,
+        packets: 3,
+        upload_bytes: 500,
+        first_seen_unix_ms: 1_000,
+        last_seen_unix_ms: 1_100,
+        policy_flow_id: "00000000000000000000000000000001".into(),
+        ..Default::default()
+    };
+    let batch = TelemetryBatch {
+        gateway_id: gateway.into(),
+        boot_id: "boot-late".into(),
+        flows: vec![flow.clone()],
+        ..Default::default()
+    };
+    state
+        .lock()
+        .policy_flow_contexts
+        .observe(&batch, std::time::Instant::now());
+    let mut sample = dpi::CachedResult::for_test(
+        gateway.into(),
+        batch.boot_id.clone(),
+        netqmon_protocol::v1::FlowSampleKey {
+            ip_version: 4,
+            protocol: 6,
+            client_ip: flow.client_ip.clone(),
+            client_port: flow.client_port,
+            remote_ip: flow.remote_ip.clone(),
+            remote_port: flow.remote_port,
+            first_seen_unix_ms: 1_000,
+        },
+        1_100,
+        Some(dpi::engine::DpiResult {
+            protocol: "tls".into(),
+            confidence: 1.0,
+            source: "ndpi".into(),
+            metadata: std::collections::BTreeMap::from([(
+                "hostname".into(),
+                "www.youtube.com".into(),
+            )]),
+        }),
+    );
+    sample.policy_flow_ids.push(flow.policy_flow_id.clone());
+    let decisions = apply_sample_result(&mut state.lock(), &sample).unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].1.application_id, "youtube");
+    queue_policy_flow_decisions(
+        &state.policy_hub,
+        &decisions[0].0,
+        std::slice::from_ref(&decisions[0].1),
+    );
+    assert!(
+        matches!(state.policy_hub.take_flow_command(&session, 1, Some("boot-late")), Some(PolicyWireFrame::FlowCommand {
+        operation: FlowCommandOperation::Upsert, verdict: Some(FlowVerdict::Block), policy_flow_id, ..
+    }) if policy_flow_id == flow.policy_flow_id)
+    );
+    sample.boot = "another-boot".into();
+    assert!(
+        apply_sample_result(&mut state.lock(), &sample)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn policy_revision_re_evaluates_active_flow_with_allow_and_keeps_matching_limit() {
+    use netqmon_protocol::policy::{PolicyCapabilities, PolicyCapability};
+
+    let service = policy::PolicyService::open_in_memory().unwrap();
+    let gateway = "gw-flow-revision";
+    let mac = "02:00:00:00:01:23";
+    let block = serde_json::from_value(serde_json::json!({
+        "schema_version": 1,
+        "gateway_id": gateway,
+        "name": "Block target app",
+        "description": "",
+        "enabled": true,
+        "priority": 20,
+        "selectors": {"clients": [mac], "applications": ["netqmon_qos_test"],
+            "categories": [], "min_application_confidence": 0.95},
+        "network": {"scope": "internet", "direction": "both"},
+        "action": {"type": "block", "download_bps": null, "upload_bps": null},
+        "schedule": null
+    }))
+    .unwrap();
+    let block = service.create(&block, "test", 0).unwrap();
+    let limit = serde_json::from_value(serde_json::json!({
+        "schema_version": 1,
+        "gateway_id": gateway,
+        "name": "Limit target app",
+        "description": "",
+        "enabled": true,
+        "priority": 50,
+        "selectors": {"clients": [mac], "applications": ["netqmon_qos_test"],
+            "categories": [], "min_application_confidence": 0.95},
+        "network": {"scope": "internet", "direction": "both"},
+        "action": {"type": "limit", "download_bps": 4_000_000, "upload_bps": 2_000_000},
+        "schedule": null
+    }))
+    .unwrap();
+    let limit_mutation = service.create(&limit, "test", block.revision).unwrap();
+    let limit_revision = limit_mutation.revision;
+    let limit = limit_mutation.policy.unwrap();
+
+    let hub = PolicyHub::new();
+    let bundle = hub.refresh_gateway(&service, gateway, false).unwrap();
+    let revision = bundle.frame.snapshot_identity().unwrap().2;
+    let session = hub.register(gateway).unwrap();
+    let capabilities = PolicyCapabilities {
+        application_block: PolicyCapability::Supported,
+        application_limit: PolicyCapability::Supported,
+        ..PolicyCapabilities::unsupported()
+    };
+    hub.record_flow_capabilities(&session, revision, &capabilities);
+
+    let flow_id = "000000000000000000000000000000af";
+    let flow = FlowDelta {
+        ip_version: 4,
+        protocol: 6,
+        client_ip: vec![192, 0, 2, 1],
+        client_port: 50_000,
+        remote_ip: vec![198, 51, 100, 1],
+        remote_port: 443,
+        client_mac: vec![2, 0, 0, 0, 1, 35],
+        scope: FlowScope::Internet as i32,
+        lifecycle: FlowLifecycle::Active as i32,
+        direction: Direction::Upload as i32,
+        packets: 3,
+        upload_bytes: 500,
+        first_seen_unix_ms: 1_000,
+        last_seen_unix_ms: 1_100,
+        policy_flow_id: flow_id.to_owned(),
+        ..Default::default()
+    };
+    let batch = TelemetryBatch {
+        gateway_id: gateway.to_owned(),
+        boot_id: "boot-flow-revision".to_owned(),
+        flows: vec![flow],
+        ..Default::default()
+    };
+    queue_policy_flow_decisions(
+        &hub,
+        &batch,
+        &[strong_self_host_attribution("netqmon_qos_test")],
+    );
+    assert!(matches!(
+        hub.take_flow_command(&session, revision, Some("boot-flow-revision")),
+        Some(PolicyWireFrame::FlowCommand {
+            policy_flow_id,
+            verdict: Some(FlowVerdict::Block),
+            ..
+        }) if policy_flow_id == flow_id
+    ));
+
+    let allow = serde_json::from_value(serde_json::json!({
+        "schema_version": 1,
+        "gateway_id": gateway,
+        "name": "Allow target app",
+        "description": "",
+        "enabled": true,
+        "priority": 10,
+        "selectors": {"clients": [mac], "applications": ["netqmon_qos_test"],
+            "categories": [], "min_application_confidence": 0.95},
+        "network": {"scope": "internet", "direction": "both"},
+        "action": {"type": "allow", "download_bps": null, "upload_bps": null},
+        "schedule": null
+    }))
+    .unwrap();
+    let allow = service
+        .create(&allow, "test", limit_revision)
+        .unwrap()
+        .policy
+        .unwrap();
+    let bundle = hub.refresh_gateway(&service, gateway, false).unwrap();
+    let next_revision = bundle.frame.snapshot_identity().unwrap().2;
+    hub.record_flow_capabilities(&session, next_revision, &capabilities);
+    let re_evaluated = hub
+        .take_flow_command(&session, next_revision, Some("boot-flow-revision"))
+        .unwrap();
+    assert!(matches!(
+        re_evaluated,
+        PolicyWireFrame::FlowCommand {
+            operation: FlowCommandOperation::Upsert,
+            policy_flow_id,
+            verdict: Some(FlowVerdict::Shape),
+            ref policy_ids,
+            config_revision,
+            ..
+        } if policy_flow_id == flow_id && policy_ids == &[limit.id.clone()] && config_revision == next_revision
+    ));
+
+    let PolicyWireFrame::PolicySnapshot { policies, .. } = &bundle.frame else {
+        unreachable!();
+    };
+    let preview = policy::evaluate_preview(
+        &policy::PolicyPreviewRequest {
+            gateway_id: gateway.to_owned(),
+            client_mac: mac.to_owned(),
+            application_id: "netqmon_qos_test".to_owned(),
+            category_id: "streaming".to_owned(),
+            application_confidence: 0.99,
+            scope: "internet".to_owned(),
+            at_ms: policy::push::now_ms(),
+        },
+        policies,
+        true,
+        true,
+    );
+    assert_eq!(preview.selected_block_verdict, "allow");
+    assert!(
+        preview
+            .matched_policies
+            .iter()
+            .any(|row| row.policy_id == allow.id && row.selected)
+    );
+    assert!(
+        preview
+            .active_limits
+            .iter()
+            .any(|row| row.policy_id == limit.id && row.status == "supported")
+    );
+}
+
 fn strong_self_host_attribution(application_id: &str) -> FlowAttribution {
     FlowAttribution {
         organization_id: "self_host_org".to_owned(),
@@ -30,6 +480,159 @@ fn strong_self_host_attribution(application_id: &str) -> FlowAttribution {
         ),
         ..FlowAttribution::default()
     }
+}
+
+#[test]
+fn initial_allow_and_limit_evaluation_sends_shape_for_the_active_limit() {
+    use netqmon_protocol::policy::{PolicyCapabilities, PolicyCapability};
+
+    let service = policy::PolicyService::open_in_memory().unwrap();
+    let gateway = "gw-allow-limit-initial";
+    let mac = "02:00:00:00:01:23";
+    let create = |name: &str, priority: u16, action: serde_json::Value| {
+        serde_json::from_value(serde_json::json!({
+            "schema_version":1,"gateway_id":gateway,"name":name,"description":"",
+            "enabled":true,"priority":priority,
+            "selectors":{"clients":[mac],"applications":["netqmon_qos_test"],
+                "categories":[],"min_application_confidence":0.95},
+            "network":{"scope":"internet","direction":"both"},
+            "action":action,"schedule":null
+        }))
+        .unwrap()
+    };
+    let block = service
+        .create(
+            &create(
+                "Block app",
+                20,
+                serde_json::json!({
+            "type":"block","download_bps":null,"upload_bps":null}),
+            ),
+            "test",
+            0,
+        )
+        .unwrap()
+        .policy
+        .unwrap();
+    let limit = service
+        .create(
+            &create(
+                "Limit app",
+                50,
+                serde_json::json!({
+            "type":"limit","download_bps":4_000_000,"upload_bps":2_000_000}),
+            ),
+            "test",
+            1,
+        )
+        .unwrap()
+        .policy
+        .unwrap();
+    let allow = service
+        .create(
+            &create(
+                "Allow app",
+                10,
+                serde_json::json!({
+            "type":"allow","download_bps":null,"upload_bps":null}),
+            ),
+            "test",
+            2,
+        )
+        .unwrap()
+        .policy
+        .unwrap();
+
+    let hub = PolicyHub::new();
+    let bundle = hub.refresh_gateway(&service, gateway, false).unwrap();
+    let revision = bundle.frame.snapshot_identity().unwrap().2;
+    let session = hub.register(gateway).unwrap();
+    hub.record_flow_capabilities(
+        &session,
+        revision,
+        &PolicyCapabilities {
+            application_block: PolicyCapability::Supported,
+            application_limit: PolicyCapability::Supported,
+            ..PolicyCapabilities::unsupported()
+        },
+    );
+    let flow = FlowDelta {
+        ip_version: 4,
+        protocol: 6,
+        client_ip: vec![192, 0, 2, 2],
+        client_port: 48_016,
+        remote_ip: vec![203, 0, 113, 9],
+        remote_port: 7_000,
+        client_mac: vec![2, 0, 0, 0, 1, 35],
+        scope: FlowScope::Internet as i32,
+        lifecycle: FlowLifecycle::Active as i32,
+        direction: Direction::Download as i32,
+        packets: 3,
+        download_bytes: 1_024,
+        first_seen_unix_ms: 1_000,
+        last_seen_unix_ms: 1_100,
+        policy_flow_id: "000000000000000000000000000000af".to_owned(),
+        ..Default::default()
+    };
+    let batch = TelemetryBatch {
+        gateway_id: gateway.to_owned(),
+        boot_id: "boot-allow-limit-initial".to_owned(),
+        flows: vec![flow.clone()],
+        ..Default::default()
+    };
+
+    queue_policy_flow_decisions(
+        &hub,
+        &batch,
+        &[strong_self_host_attribution("netqmon_qos_test")],
+    );
+
+    assert!(matches!(
+        hub.take_flow_command(&session, revision, Some("boot-allow-limit-initial")),
+        Some(PolicyWireFrame::FlowCommand {
+            operation:FlowCommandOperation::Upsert,
+            policy_flow_id,
+            verdict:Some(FlowVerdict::Shape),
+            ref policy_ids,
+            ..
+        }) if policy_flow_id == flow.policy_flow_id && policy_ids == &[limit.id.clone()]
+    ));
+    let PolicyWireFrame::PolicySnapshot { policies, .. } = &bundle.frame else {
+        unreachable!();
+    };
+    let preview = policy::evaluate_preview(
+        &policy::PolicyPreviewRequest {
+            gateway_id: gateway.to_owned(),
+            client_mac: mac.to_owned(),
+            application_id: "netqmon_qos_test".to_owned(),
+            category_id: "streaming".to_owned(),
+            application_confidence: 0.99,
+            scope: "internet".to_owned(),
+            at_ms: policy::push::now_ms(),
+        },
+        policies,
+        true,
+        true,
+    );
+    assert_eq!(preview.selected_block_verdict, "allow");
+    assert!(
+        preview
+            .matched_policies
+            .iter()
+            .any(|row| row.policy_id == allow.id && row.selected)
+    );
+    assert!(
+        preview
+            .matched_policies
+            .iter()
+            .any(|row| row.policy_id == block.id)
+    );
+    assert!(
+        preview
+            .active_limits
+            .iter()
+            .any(|row| row.policy_id == limit.id && row.status == "supported")
+    );
 }
 
 #[test]
@@ -878,6 +1481,61 @@ async fn unknown_application_does_not_associate_organization_from_flow_sessions(
     assert_eq!(detail_response["data"]["application_id"], "unknown");
     assert_eq!(detail_response["data"]["organization_id"], "unknown");
     assert!(detail_response["data"]["organization_name"].is_null());
+}
+
+#[tokio::test]
+async fn application_aggregate_falls_back_to_classifier_organization_metadata() {
+    let state = query_state();
+    {
+        let inner = state.lock();
+        let connection = inner.storage.connection();
+        let gateway_id: String = connection
+            .query_row("SELECT id FROM gateways LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        // Only the 30-day minute aggregate retains this application; its
+        // flow_sessions rows are gone, so the SQL organization lookup is empty.
+        connection
+            .execute(
+                "INSERT INTO traffic_application_minute
+                 (timestamp, gateway_id, application_id, category_id, upload_bytes, download_bytes, packets, flow_count)
+                 VALUES (1700000000000, ?1, 'xiaohongshu', 'social', 700, 300, 12, 2)",
+                [&gateway_id],
+            )
+            .unwrap();
+        let retained_flows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM flow_sessions WHERE application_id = 'xiaohongshu'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_flows, 0, "fixture must not keep matching flows");
+    }
+
+    let router = internal_router(state);
+    let list_response = parse_json(
+        router
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/applications?limit=50&offset=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let items = list_response["data"].as_array().unwrap();
+    let application = items
+        .iter()
+        .find(|item| item["application_id"] == "xiaohongshu")
+        .expect("xiaohongshu application item");
+    assert_eq!(application["name"], "Xiaohongshu");
+    assert_eq!(
+        application["organization_id"], "xingyin",
+        "metadata fallback should supply the organization id"
+    );
+    assert_eq!(application["organization_name"], "Xingyin");
 }
 
 #[tokio::test]
@@ -1913,7 +2571,7 @@ fn asn_test_flow(remote_ip: Vec<u8>, client_port: u32, timestamp: u64) -> FlowDe
 fn collector_forwards_batch_local_geo_asns_to_classifier_and_late_dpi() {
     let temp = tempfile::tempdir().unwrap();
     let socket_path = temp.path().join("asn-classifier.sock");
-    let server = spawn_asn_classifier_server(socket_path.clone(), 11);
+    let server = spawn_asn_classifier_server(socket_path.clone(), 13);
     let classifier = crate::classifier::ClassifierHandle::connect(socket_path).unwrap();
     let state = CollectorState::with_storage(
         ENROLLMENT_TOKEN,
@@ -2508,10 +3166,12 @@ fn default_mac_dataset_path_uses_database_directory() {
 
 #[test]
 fn default_geo_directory_uses_database_directory() {
-    assert_eq!(
-        default_geo_directory(Path::new("/var/lib/netqmon/netqmon.db")),
-        PathBuf::from("/var/lib/netqmon/geo")
-    );
+    let actual = default_geo_directory(Path::new("/var/lib/netqmon/netqmon.db"));
+    if Path::new(DEFAULT_GEO_DIRECTORY).is_dir() || Path::new("/data").is_dir() {
+        assert_eq!(actual, PathBuf::from(DEFAULT_GEO_DIRECTORY));
+    } else {
+        assert_eq!(actual, PathBuf::from("/var/lib/netqmon/geo"));
+    }
 }
 
 #[tokio::test]
@@ -3561,6 +4221,7 @@ async fn sample_endpoint_enforces_auth_gateway_and_limits() {
         protocol_version: 1,
         samples: vec![FlowSample {
             flow_id: "flow".into(),
+            policy_flow_id: String::new(),
             key: Some(FlowSampleKey {
                 ip_version: 4,
                 protocol: 17,
@@ -3729,6 +4390,7 @@ async fn real_sample_ingestion_updates_ended_flow_without_persisting_payload() {
         protocol_version: 1,
         samples: vec![FlowSample {
             flow_id: "flow".into(),
+            policy_flow_id: String::new(),
             key: Some(FlowSampleKey {
                 ip_version: 4,
                 protocol: 6,
@@ -3897,6 +4559,7 @@ async fn signature_sample_match_reclassifies_flow_without_dpi() {
         protocol_version: 1,
         samples: vec![FlowSample {
             flow_id: "flow".into(),
+            policy_flow_id: String::new(),
             key: Some(FlowSampleKey {
                 ip_version: 4,
                 protocol: 6,
@@ -4080,12 +4743,14 @@ fn hostname_domain_rules_fill_unknown_dns_without_overriding_dns_applications() 
             &inner.classifier,
             inner.geo_provider.as_ref(),
             &mut ServiceBindingCache::default(),
+            &DnsDomainCache::default(),
             &FaviconEndpointCache::default(),
             &batch,
             &[Some(dpi::SampleAnalysis {
                 dpi: Some(dpi),
                 signatures: Vec::new(),
             })],
+            false,
         )
         .unwrap();
         assert_eq!(result[0].application_id, expected);
@@ -4126,12 +4791,14 @@ fn local_hostname_does_not_identify_selfhost_or_bind_reverse_proxy_port() {
         &inner.classifier,
         inner.geo_provider.as_ref(),
         &mut bindings,
+        &DnsDomainCache::default(),
         &FaviconEndpointCache::default(),
         &batch,
         &[Some(dpi::SampleAnalysis {
             dpi: Some(dpi),
             signatures: Vec::new(),
         })],
+        false,
     )
     .unwrap();
     assert_eq!(identified[0].application_id, "unknown");
@@ -4141,9 +4808,11 @@ fn local_hostname_does_not_identify_selfhost_or_bind_reverse_proxy_port() {
         &inner.classifier,
         inner.geo_provider.as_ref(),
         &mut bindings,
+        &DnsDomainCache::default(),
         &FaviconEndpointCache::default(),
         &batch,
         &[None],
+        false,
     )
     .unwrap();
     assert_eq!(without_hostname[0].application_id, "unknown");
@@ -4383,4 +5052,60 @@ async fn demo_overview_returns_online_fallback_when_no_gateway() {
     assert_eq!(body["data"]["gateway"]["name"], "Demo Gateway");
     assert_eq!(body["data"]["gateway"]["status"], "online");
     assert!(body["data"]["gateway"]["last_seen"].as_i64().unwrap() > 0);
+}
+
+#[test]
+fn same_batch_dns_links_dual_stack_addresses_without_cross_device_leakage() {
+    let mac = vec![2, 0, 0, 0, 0, 1];
+    let ipv4 = vec![192, 0, 2, 1];
+    let ipv6 = vec![0x20; 16];
+    let mut batch = TelemetryBatch {
+        device_observations: vec![
+            netqmon_protocol::v1::DeviceObservation {
+                mac: mac.clone(),
+                ip: ipv4.clone(),
+                last_seen_unix_ms: 1_000,
+                ..Default::default()
+            },
+            netqmon_protocol::v1::DeviceObservation {
+                mac: mac.clone(),
+                ip: ipv6.clone(),
+                last_seen_unix_ms: 1_000,
+                ..Default::default()
+            },
+        ],
+        dns_observations: vec![DnsObservation {
+            client_ip: ipv6,
+            answer_ip: vec![198, 51, 100, 1],
+            domain: "video.example.test".into(),
+            ttl_seconds: 60,
+            observed_at_unix_ms: 1_000,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        resolve_batch_domain(&batch, &ipv4, &[198, 51, 100, 1], 1_001),
+        Some("video.example.test")
+    );
+    assert_eq!(
+        resolve_batch_domain(&batch, &ipv4, &[198, 51, 100, 1], 61_000),
+        None
+    );
+    assert_eq!(
+        resolve_batch_domain(&batch, &[192, 0, 2, 2], &[198, 51, 100, 1], 1_001),
+        None
+    );
+    batch
+        .device_observations
+        .push(netqmon_protocol::v1::DeviceObservation {
+            mac: vec![2, 0, 0, 0, 0, 2],
+            ip: ipv4.clone(),
+            last_seen_unix_ms: 1_000,
+            ..Default::default()
+        });
+    assert_eq!(
+        resolve_batch_domain(&batch, &ipv4, &[198, 51, 100, 1], 1_001),
+        None
+    );
 }

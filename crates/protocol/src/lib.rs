@@ -1,6 +1,7 @@
 //! Versioned protobuf messages and wire encoding shared by netqmon components.
 
 mod codec;
+pub mod policy;
 mod sample;
 mod validation;
 

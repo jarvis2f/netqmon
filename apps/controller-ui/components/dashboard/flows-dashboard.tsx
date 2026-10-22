@@ -719,7 +719,6 @@ export function FlowsDashboard(props: Props) {
       title={tNav("flows")}
       subtitle={t("subtitle")}
       username={props.username}
-      isLive={false}
       toolbar={toolbar}
     >
       {error ? (

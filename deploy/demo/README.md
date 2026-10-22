@@ -8,7 +8,9 @@ Demo Mode transforms the Netqmon Controller into a secure, read-only public demo
 - **Pre-seeded SQLite Data**: Populates dashboards using a 100% synthetic SQLite database generated from code.
 - **Built-in Time Freshness**: `netqmon-collector` automatically shifts historical database timestamps on startup and periodically in the background so the most recent data is always fresh in the current window.
 - **Realtime Simulation**: Generates live SSE throughput snapshots and 15-minute history curves without modifying the database.
-- **Full Read-Only Protection**: Blocks mutation API methods (`POST`, `PUT`, `DELETE`, `PATCH`) with HTTP 403 `demo_read_only` at both Next.js proxy and backend internal API layers.
+- **Full Read-Only Protection**: Blocks changes (`POST`, `PUT`, `DELETE`, `PATCH`) with HTTP 403 `demo_read_only` at both the Next.js proxy and internal API. The only POST exception is `/policies/preview`, a bounded, side-effect-free policy evaluation; the public proxy also requires a same-origin request.
+- **Traffic Policy Examples**: Shows device rate limits, application blocking, application allow rules and a disabled client block in an isolated in-memory policy store. Visitors can inspect rules and preview decisions; create, edit, toggle, delete and republish actions are disabled. Status is explicitly marked Demo, with no fabricated Agent connection, delivery or ACK. `NETQMON_POLICY_DATABASE_PATH` is ignored in Demo Mode.
+- **Demo Metadata**: Application names, icons and organization labels are provided locally for synthetic data, without classifier IPC or changes to live-mode metadata lookup.
 - **Bypassed Auth**: Visitors access the dashboard immediately without login; settings navigation and mutating pages are hidden and redirected.
 - **Isolated Network Footprint**: Exposes only port `3000` (Next.js). Ingestion listener port `8090` is disabled.
 
@@ -79,3 +81,23 @@ export NETQMON_DEMO_MODE=true
 export NETQMON_COLLECTOR_DATABASE_PATH=./netqmon-demo-template.db
 cargo run --package netqmon-collector
 ```
+
+## Regression verification
+
+The dedicated demo browser suite uses the real Collector, a newly generated synthetic
+SQLite database and a standalone Next.js build. It runs on loopback ports 3101/8101,
+uses `.next-demo` instead of a running development build, and cleans up its own
+processes and temporary database. Existing local databases are never loaded.
+
+From the repository root:
+
+```bash
+# On macOS, prefix this command with NETQMON_DEMO_LIBRARY_PATH=/opt/homebrew/lib
+# when required by the local nDPI installation.
+pnpm --filter @netqmon/controller-ui e2e:demo
+```
+
+This verifies anonymous policy reads, detail inspection, disabled mutation controls,
+same-origin preview evaluation, rejected writes/cross-origin previews and Chinese
+read-only messaging. Collector unit tests also cover direct internal API requests,
+idempotent example initialization and unchanged policy revisions after preview.

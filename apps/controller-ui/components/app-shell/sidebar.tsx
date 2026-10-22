@@ -13,6 +13,7 @@ import {
   Globe2,
   Network,
   Lightbulb,
+  SlidersHorizontal,
   Settings,
   X,
   ChevronLeft,
@@ -37,6 +38,7 @@ export interface NavItem {
     | "destinations"
     | "flows"
     | "insights"
+    | "policies"
     | "settings";
   href: string;
   icon: React.ComponentType<{ className?: string }>;
@@ -51,6 +53,7 @@ const NAV_ITEMS: NavItem[] = [
   { key: "destinations", href: "/destinations", icon: Globe2 },
   { key: "flows", href: "/flows", icon: Network },
   { key: "insights", href: "/insights", icon: Lightbulb },
+  { key: "policies", href: "/policies", icon: SlidersHorizontal },
   { key: "settings", href: "/settings", icon: Settings },
 ];
 

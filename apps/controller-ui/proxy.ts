@@ -23,7 +23,14 @@ export async function proxy(request: NextRequest) {
     }
     if (path.startsWith("/api/")) {
       const method = request.method.toUpperCase();
-      if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
+      const policyPreview =
+        method === "POST" && path === "/api/policies/preview";
+      if (
+        method !== "GET" &&
+        method !== "HEAD" &&
+        method !== "OPTIONS" &&
+        !policyPreview
+      ) {
         return Response.json(
           {
             error: {

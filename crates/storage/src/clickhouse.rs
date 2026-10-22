@@ -377,13 +377,21 @@ impl ClickHouseStorage {
         // DPI samples identify the bidirectional 5-tuple but do not carry the
         // telemetry direction. Match every direction and the sample's time
         // range; session IDs also include the lifetime start time now.
-        let sql=format!("INSERT INTO flow_sessions SELECT * REPLACE ('{protocol_id}' AS protocol_id,{protocol_confidence} AS protocol_confidence,
+        let sql=format!("INSERT INTO flow_sessions SELECT * REPLACE (
+            if('{organization}'='unknown',organization_id,'{organization}') AS organization_id,
+            greatest(organization_confidence,{organization_confidence}) AS organization_confidence,
+            if('{application}'='unknown',application_id,'{application}') AS application_id,
+            greatest(application_confidence,{application_confidence}) AS application_confidence,
+            '{protocol_id}' AS protocol_id,{protocol_confidence} AS protocol_confidence,
             if('{category}'='unknown',category_id,'{category}') AS category_id,if('{role}'='unknown',traffic_role,'{role}') AS traffic_role,greatest(classification_confidence,{confidence}) AS classification_confidence,
             '{reason}' AS classification_reason,'{evidence}' AS classification_evidence_json,
             greatest(checkpointed_at+1,toUnixTimestamp64Milli(now64(3))) AS checkpointed_at)
             FROM flow_sessions FINAL WHERE gateway_id='{gateway}' AND ip_version={ip_version} AND protocol={protocol}
             AND client_ip='{client_ip}' AND client_port={client_port} AND remote_ip='{remote_ip}' AND remote_port={remote_port}
-            AND started_at<={last} AND last_seen_at>={first} AND protocol_confidence<={protocol_confidence}",
+            AND started_at<={last} AND last_seen_at>={first}
+            AND (protocol_confidence<={protocol_confidence} OR ('{application}'!='unknown' AND application_confidence<={application_confidence}))",
+            organization=escape_sql(&attribution.organization_id),organization_confidence=attribution.organization_confidence,
+            application=escape_sql(&attribution.application_id),application_confidence=attribution.application_confidence,
             protocol_id=escape_sql(&attribution.protocol_id),protocol_confidence=attribution.protocol_confidence,
             category=escape_sql(&attribution.category_id),role=escape_sql(&attribution.traffic_role),confidence=attribution.confidence,
             reason=escape_sql(&attribution.reason),evidence=escape_sql(&attribution.evidence_json),gateway=escape_sql(gateway),

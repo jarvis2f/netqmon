@@ -1,7 +1,7 @@
 use std::fmt;
 use std::net::IpAddr;
 
-use crate::conntrack::{ConntrackContext, ConntrackEntry};
+use crate::conntrack::{ConntrackContext, ConntrackEntry, FlowTuple};
 use crate::flow::FlowKey;
 use crate::topology::{NetworkPrefix, SegmentRole, TopologyContext};
 
@@ -209,18 +209,49 @@ pub fn normalize_with_resolution(
     ))
 }
 
+/// The exact conntrack tuple orientation matched by a captured flow key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConntrackOrientation {
+    Original,
+    Reply,
+}
+
+/// Match a captured key against both conntrack tuples and their reversals.
+/// Only a complete tuple match is accepted: a partial field match (for example
+/// only the client address) is ambiguous under NAT/REDIRECT.
+pub(crate) fn conntrack_orientation(
+    key: &FlowKey,
+    entry: &ConntrackEntry,
+) -> Option<ConntrackOrientation> {
+    let (captured_source, captured_destination) = key.addresses()?;
+    let captured = FlowTuple {
+        protocol: key.protocol,
+        source: captured_source,
+        source_port: key.source_port,
+        destination: captured_destination,
+        destination_port: key.destination_port,
+    };
+    let original = captured == entry.original || captured == reverse_tuple(&entry.reply);
+    let reply = captured == entry.reply || captured == reverse_tuple(&entry.original);
+    match (original, reply) {
+        (true, false) => Some(ConntrackOrientation::Original),
+        (false, true) => Some(ConntrackOrientation::Reply),
+        // A symmetric tuple (for example the same address and port on both
+        // sides) cannot be oriented; do not guess.
+        _ => None,
+    }
+}
+
 fn original_orientation(key: &FlowKey, entry: ConntrackEntry) -> (IpAddr, u16, IpAddr, u16) {
-    let Some((captured_source, captured_destination)) = key.addresses() else {
+    if key.addresses().is_none() {
         return (
             entry.original.source,
             entry.original.source_port,
             entry.original.destination,
             entry.original.destination_port,
         );
-    };
-    let captured_is_reply =
-        captured_source == entry.reply.source || captured_destination == entry.reply.destination;
-    if captured_is_reply {
+    }
+    if conntrack_orientation(key, &entry) == Some(ConntrackOrientation::Reply) {
         (
             entry.original.destination,
             entry.original.destination_port,
@@ -234,6 +265,16 @@ fn original_orientation(key: &FlowKey, entry: ConntrackEntry) -> (IpAddr, u16, I
             entry.original.destination,
             entry.original.destination_port,
         )
+    }
+}
+
+pub(crate) fn reverse_tuple(tuple: &FlowTuple) -> FlowTuple {
+    FlowTuple {
+        protocol: tuple.protocol,
+        source: tuple.destination,
+        source_port: tuple.destination_port,
+        destination: tuple.source,
+        destination_port: tuple.source_port,
     }
 }
 
@@ -331,6 +372,88 @@ mod tests {
     }
 
     #[test]
+    fn partial_reply_tuple_match_does_not_flip_to_reply_orientation() {
+        use crate::conntrack::FlowTuple;
+
+        let entry = ConntrackEntry {
+            original: FlowTuple {
+                protocol: 6,
+                source: "192.168.2.100".parse().unwrap(),
+                source_port: 50_000,
+                destination: "1.1.1.1".parse().unwrap(),
+                destination_port: 443,
+            },
+            reply: FlowTuple {
+                protocol: 6,
+                source: "1.1.1.1".parse().unwrap(),
+                source_port: 443,
+                destination: "192.168.2.100".parse().unwrap(),
+                destination_port: 50_000,
+            },
+            source_nat: false,
+            destination_nat: false,
+        };
+        // The destination equals the reply destination (the client), but the
+        // source is a third party, so this is not the reply tuple.
+        let captured = key("203.0.113.5", 1_234, "192.168.2.100", 50_000);
+        assert_eq!(
+            original_orientation(&captured, entry),
+            (
+                entry.original.source,
+                entry.original.source_port,
+                entry.original.destination,
+                entry.original.destination_port,
+            )
+        );
+    }
+
+    #[test]
+    fn reverse_conntrack_tuples_match_the_opposite_orientation() {
+        use crate::conntrack::FlowTuple;
+
+        let entry = ConntrackEntry {
+            original: FlowTuple {
+                protocol: 6,
+                source: "192.168.2.100".parse().unwrap(),
+                source_port: 50_000,
+                destination: "198.51.100.1".parse().unwrap(),
+                destination_port: 443,
+            },
+            reply: FlowTuple {
+                protocol: 6,
+                source: "203.0.113.9".parse().unwrap(),
+                source_port: 8443,
+                destination: "192.168.2.100".parse().unwrap(),
+                destination_port: 50_000,
+            },
+            source_nat: false,
+            destination_nat: true,
+        };
+        // reverse(reply) is the post-DNAT original-direction tuple.
+        let post_dnat = key("192.168.2.100", 50_000, "203.0.113.9", 8_443);
+        assert_eq!(
+            original_orientation(&post_dnat, entry),
+            (
+                entry.original.source,
+                entry.original.source_port,
+                entry.original.destination,
+                entry.original.destination_port,
+            )
+        );
+        // reverse(original) is the pre-SNAT reply-direction tuple.
+        let pre_snat_reply = key("198.51.100.1", 443, "192.168.2.100", 50_000);
+        assert_eq!(
+            original_orientation(&pre_snat_reply, entry),
+            (
+                entry.original.destination,
+                entry.original.destination_port,
+                entry.original.source,
+                entry.original.source_port,
+            )
+        );
+    }
+
+    #[test]
     fn tproxy_preserved_tuple_needs_no_proxy_specific_metadata() {
         let flow = normalize(
             &key("8.8.8.8", 443, "192.168.2.100", 50_000),
@@ -423,6 +546,7 @@ mod tests {
             ip_version,
             protocol,
             direction: 0,
+            hook: 0,
             ifindex: 1,
             source_address,
             destination_address,

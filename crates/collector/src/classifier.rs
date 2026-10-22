@@ -15,8 +15,8 @@ use netqmon_classifier_client::{
     ApplicationSignatureEvidence, ClassificationBatchRequest, ClassificationRequest,
     ClassifierClient, ClassifierClientConfig, ClassifierEntitlement, DeviceEvidenceInput,
     DeviceEvidenceResult, DpiEvidence as WireDpiEvidence, EntitlementLease, EntityKind,
-    EntityMetadata as WireMetadata, FlowSampleMatchRequest, SamplePacketDirection,
-    SamplePacketInput as WireSamplePacketInput,
+    EntityMetadata as WireMetadata, FlowSampleApplicationMatch as WireFlowSampleApplicationMatch,
+    FlowSampleMatchRequest, SamplePacketDirection, SamplePacketInput as WireSamplePacketInput,
 };
 
 use crate::dpi::{SignatureApplicationMatch, SignatureMatcher};
@@ -64,6 +64,7 @@ pub struct EntityMetadata {
     pub id: String,
     pub name: String,
     pub icon: IconMetadata,
+    pub organization_id: Option<String>,
 }
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 pub struct RuleDiagnostics {
@@ -103,6 +104,7 @@ pub(crate) struct DeviceFingerprintInput {
 pub struct ClassifierHandle {
     client: Arc<ClassifierClient>,
     availability: Arc<Mutex<AvailabilityState>>,
+    demo_metadata: bool,
     #[cfg(test)]
     test_mode: bool,
     #[cfg(test)]
@@ -164,6 +166,7 @@ impl ClassifierHandle {
         Ok(Self {
             client: Arc::new(client),
             availability: Arc::new(Mutex::new(AvailabilityState::default())),
+            demo_metadata: false,
             #[cfg(test)]
             test_mode: false,
             #[cfg(test)]
@@ -171,25 +174,16 @@ impl ClassifierHandle {
         })
     }
 
-    pub fn disabled() -> Self {
-        Self {
-            client: Arc::new(
-                ClassifierClient::new(ClassifierClientConfig {
-                    socket_path: PathBuf::from("/disabled/classifierd.sock"),
-                    connect_timeout: Duration::from_millis(1),
-                    ..Default::default()
-                })
-                .expect("disabled classifier client config"),
-            ),
-            availability: Arc::new(Mutex::new(AvailabilityState {
-                state: Availability::Ready,
-                ..AvailabilityState::default()
-            })),
-            #[cfg(test)]
-            test_mode: false,
-            #[cfg(test)]
-            test_entitlement: Arc::new(Mutex::new(None)),
-        }
+    pub(crate) fn for_demo() -> Self {
+        let mut handle = Self::connect(PathBuf::from("/disabled/classifierd.sock"))
+            .expect("demo classifier config");
+        handle
+            .availability
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .state = Availability::Ready;
+        handle.demo_metadata = true;
+        handle
     }
 
     #[cfg(test)]
@@ -207,6 +201,7 @@ impl ClassifierHandle {
                 state: Availability::Ready,
                 ..AvailabilityState::default()
             })),
+            demo_metadata: false,
             test_mode: true,
             test_entitlement: Arc::new(Mutex::new(None)),
         }
@@ -244,6 +239,35 @@ impl ClassifierHandle {
                 .collect(),
             }),
             device_evidence: Vec::new(),
+        })
+    }
+
+    /// Resolve a domain identity without letting ASN, address or DPI matches
+    /// masquerade as a domain rule.
+    pub fn classify_domain(&self, domain: &str) -> Result<ClassificationResult, String> {
+        #[cfg(test)]
+        if self.test_mode {
+            return Ok(fixture_classification(&ClassificationInput {
+                domain: Some(domain),
+                remote_ip: "0.0.0.0".parse().unwrap(),
+                remote_asn: None,
+                remote_port: 0,
+                protocol: 0,
+                dpi: None,
+                signatures: Vec::new(),
+            }));
+        }
+        self.classify_request(ClassificationRequest {
+            entry_id: "collector-domain".to_owned(),
+            domain: Some(domain.to_owned()),
+            remote_ip: None,
+            remote_asn: None,
+            remote_port: None,
+            protocol: None,
+            favicon_sha256: None,
+            dpi_evidence: None,
+            device_evidence: Vec::new(),
+            signature_evidence: Vec::new(),
         })
     }
 
@@ -497,24 +521,18 @@ impl ClassifierHandle {
     pub fn organization_metadata(&self, id: &str) -> Option<EntityMetadata> {
         self.metadata(EntityKind::Organization, id)
     }
-    #[allow(clippy::unused_self)]
-    pub fn application_organization_id(&self, id: &str) -> Option<String> {
-        fallback_application_org_id(id)
-    }
     fn metadata(&self, kind: EntityKind, id: &str) -> Option<EntityMetadata> {
+        if self.demo_metadata {
+            return crate::demo::metadata(kind, id);
+        }
         #[cfg(test)]
         if self.test_mode {
             return fixture_metadata(kind, id);
         }
-        if let Some(metadata) = self
-            .request(|client| client.metadata(kind, id))
+        self.request(|client| client.metadata(kind, id))
             .ok()
             .flatten()
             .map(map_metadata)
-        {
-            return Some(metadata);
-        }
-        fallback_metadata(kind, id)
     }
     /// Matches bounded flow samples through classifierd's payload-signature
     /// engine. A missing or older classifierd yields no matches and never
@@ -531,10 +549,7 @@ impl ClassifierHandle {
         Ok(result
             .matches
             .into_iter()
-            .map(|matched| SignatureApplicationMatch {
-                application_id: matched.application_id,
-                confidence: matched.confidence,
-            })
+            .map(map_signature_match)
             .collect())
     }
 
@@ -745,7 +760,7 @@ fn fixture_classification(input: &ClassificationInput<'_>) -> ClassificationResu
             || domain.contains("openai.com"))
     {
         evidence.push(ClassificationEvidence {
-            evidence_type: "domain_application".to_owned(),
+            evidence_type: "domain_suffix".to_owned(),
             value: domain,
             source: "test-fixture".to_owned(),
             weight: 1.0,
@@ -762,7 +777,7 @@ fn fixture_classification(input: &ClassificationInput<'_>) -> ClassificationResu
         });
     } else if !domain.is_empty() && (domain.contains("tracker") || domain.contains("hdtime.org")) {
         evidence.push(ClassificationEvidence {
-            evidence_type: "domain_application".to_owned(),
+            evidence_type: "domain_suffix".to_owned(),
             value: domain,
             source: "test-fixture".to_owned(),
             weight: 1.0,
@@ -796,264 +811,13 @@ fn fixture_classification(input: &ClassificationInput<'_>) -> ClassificationResu
     }
 }
 
-fn fallback_metadata(kind: EntityKind, id: &str) -> Option<EntityMetadata> {
-    let (name, icon_domain, fallback_domains, local_fallback) = match (kind, id) {
-        // Applications
-        (EntityKind::Application, "youtube") => (
-            "YouTube",
-            Some("youtube.com"),
-            vec!["googlevideo.com"],
-            Some("youtube"),
-        ),
-        (EntityKind::Application, "netflix") => (
-            "Netflix",
-            Some("netflix.com"),
-            vec!["nflxvideo.net"],
-            Some("netflix"),
-        ),
-        (EntityKind::Application, "bilibili") => (
-            "Bilibili",
-            Some("bilibili.com"),
-            vec!["bilivideo.com"],
-            Some("bilibili"),
-        ),
-        (EntityKind::Application, "github") => (
-            "GitHub",
-            Some("github.com"),
-            vec!["githubassets.com"],
-            Some("github"),
-        ),
-        (EntityKind::Application, "openai") => (
-            "OpenAI",
-            Some("openai.com"),
-            vec!["chatgpt.com"],
-            Some("openai"),
-        ),
-        (EntityKind::Application, "steam") => (
-            "Steam",
-            Some("steampowered.com"),
-            vec!["steamcommunity.com"],
-            Some("steam"),
-        ),
-        (EntityKind::Application, "playstation-network" | "playstation") => (
-            "PlayStation Network",
-            Some("playstation.com"),
-            vec!["playstation.net"],
-            Some("playstation"),
-        ),
-        (EntityKind::Application, "nintendo-eshop" | "nintendo") => (
-            "Nintendo eShop",
-            Some("nintendo.com"),
-            vec!["nintendo.net"],
-            None,
-        ),
-        (EntityKind::Application, "spotify") => {
-            ("Spotify", Some("spotify.com"), vec![], Some("spotify"))
-        }
-        (EntityKind::Application, "apple-music") => (
-            "Apple Music",
-            Some("music.apple.com"),
-            vec!["apple.com"],
-            Some("applemusic"),
-        ),
-        (EntityKind::Application, "icloud") => (
-            "Apple iCloud",
-            Some("icloud.com"),
-            vec!["apple.com"],
-            Some("icloud"),
-        ),
-        (EntityKind::Application, "slack") => ("Slack", Some("slack.com"), vec![], Some("slack")),
-        (EntityKind::Application, "discord") => (
-            "Discord",
-            Some("discord.com"),
-            vec!["discord.gg"],
-            Some("discord"),
-        ),
-        (EntityKind::Application, "wechat") => (
-            "WeChat",
-            Some("weixin.qq.com"),
-            vec!["qq.com"],
-            Some("wechat"),
-        ),
-        (EntityKind::Application, "telegram") => {
-            ("Telegram", Some("telegram.org"), vec![], Some("telegram"))
-        }
-        (EntityKind::Application, "reddit") => (
-            "Reddit",
-            Some("reddit.com"),
-            vec!["redd.it"],
-            Some("reddit"),
-        ),
-        (EntityKind::Application, "microsoft-365" | "microsoft") => (
-            "Microsoft 365",
-            Some("office.com"),
-            vec!["microsoft.com"],
-            Some("microsoft"),
-        ),
-        (EntityKind::Application, "notion") => {
-            ("Notion", Some("notion.so"), vec![], Some("notion"))
-        }
-        (EntityKind::Application, "amazon-prime-video" | "primevideo") => (
-            "Prime Video",
-            Some("primevideo.com"),
-            vec!["amazon.com"],
-            Some("primevideo"),
-        ),
-        (EntityKind::Application, "docker-hub" | "docker") => (
-            "Docker Hub",
-            Some("docker.com"),
-            vec!["docker.io"],
-            Some("docker"),
-        ),
-        (EntityKind::Application, "wikipedia") => (
-            "Wikipedia",
-            Some("wikipedia.org"),
-            vec![],
-            Some("wikipedia"),
-        ),
-        (EntityKind::Application, "cloudflare-dns" | "cloudflare") => (
-            "Cloudflare",
-            Some("cloudflare.com"),
-            vec!["1.1.1.1"],
-            Some("cloudflare"),
-        ),
-        (EntityKind::Application, "google-dns" | "google") => (
-            "Google",
-            Some("google.com"),
-            vec!["dns.google"],
-            Some("google"),
-        ),
-        (EntityKind::Application, "ntp") => (
-            "NTP Service",
-            Some("cloudflare.com"),
-            vec!["pool.ntp.org"],
-            None,
-        ),
-        (EntityKind::Application, "twitch") => {
-            ("Twitch", Some("twitch.tv"), vec![], Some("twitch"))
-        }
-        (EntityKind::Application, "aqara-cloud" | "aqara") => {
-            ("Aqara IoT", Some("aqara.com"), vec![], None)
-        }
-        (EntityKind::Application, "cloudflare-backup") => (
-            "Cloudflare R2",
-            Some("cloudflare.com"),
-            vec![],
-            Some("cloudflare"),
-        ),
-        (EntityKind::Application, "nas-smb") => ("LAN File Sharing", None, vec![], None),
-        (EntityKind::Application, "plex") => {
-            ("Plex Media Server", Some("plex.tv"), vec![], Some("plex"))
-        }
-        (EntityKind::Application, "synology-dsm" | "synology") => (
-            "Synology DSM",
-            Some("synology.com"),
-            vec![],
-            Some("synology"),
-        ),
-        (EntityKind::Application, "speedtest") => (
-            "Speedtest",
-            Some("speedtest.net"),
-            vec![],
-            Some("speedtest"),
-        ),
+#[cfg(test)]
+fn fixture_metadata(kind: EntityKind, id: &str) -> Option<EntityMetadata> {
+    let (name, icon_domain, local_fallback, organization_id) = match (kind, id) {
         (EntityKind::Application, "xiaohongshu") => {
-            ("Xiaohongshu", None, vec![], Some("xiaohongshu"))
+            ("Xiaohongshu", None, Some("xiaohongshu"), Some("xingyin"))
         }
-        (EntityKind::Application, "tiktok") => {
-            ("TikTok", Some("tiktok.com"), vec![], Some("tiktok"))
-        }
-        (EntityKind::Application, "twitter" | "x") => {
-            ("X", Some("x.com"), vec!["twitter.com"], Some("x"))
-        }
-        (EntityKind::Application, "facebook") => {
-            ("Facebook", Some("facebook.com"), vec![], Some("facebook"))
-        }
-        (EntityKind::Application, "instagram") => (
-            "Instagram",
-            Some("instagram.com"),
-            vec![],
-            Some("instagram"),
-        ),
-        (EntityKind::Application, "zoom") => ("Zoom", Some("zoom.us"), vec![], Some("zoom")),
-        (EntityKind::Application, "whatsapp") => {
-            ("WhatsApp", Some("whatsapp.com"), vec![], Some("whatsapp"))
-        }
-
-        // Organizations
-        (EntityKind::Organization, "google") => {
-            ("Google", Some("google.com"), vec![], Some("google"))
-        }
-        (EntityKind::Organization, "apple") => ("Apple", Some("apple.com"), vec![], Some("apple")),
-        (EntityKind::Organization, "microsoft") => (
-            "Microsoft",
-            Some("microsoft.com"),
-            vec![],
-            Some("microsoft"),
-        ),
-        (EntityKind::Organization, "amazon") => {
-            ("Amazon", Some("amazon.com"), vec![], Some("amazon"))
-        }
-        (EntityKind::Organization, "meta") => ("Meta", Some("meta.com"), vec![], Some("meta")),
-        (EntityKind::Organization, "netflix") => {
-            ("Netflix", Some("netflix.com"), vec![], Some("netflix"))
-        }
-        (EntityKind::Organization, "bilibili") => {
-            ("Bilibili", Some("bilibili.com"), vec![], Some("bilibili"))
-        }
-        (EntityKind::Organization, "github") => {
-            ("GitHub", Some("github.com"), vec![], Some("github"))
-        }
-        (EntityKind::Organization, "openai") => {
-            ("OpenAI", Some("openai.com"), vec![], Some("openai"))
-        }
-        (EntityKind::Organization, "valve") => {
-            ("Valve", Some("valvesoftware.com"), vec![], Some("valve"))
-        }
-        (EntityKind::Organization, "sony") => ("Sony", Some("sony.com"), vec![], Some("sony")),
-        (EntityKind::Organization, "nintendo") => ("Nintendo", Some("nintendo.com"), vec![], None),
-        (EntityKind::Organization, "spotify") => {
-            ("Spotify", Some("spotify.com"), vec![], Some("spotify"))
-        }
-        (EntityKind::Organization, "salesforce") => (
-            "Salesforce",
-            Some("salesforce.com"),
-            vec![],
-            Some("salesforce"),
-        ),
-        (EntityKind::Organization, "discord") => {
-            ("Discord", Some("discord.com"), vec![], Some("discord"))
-        }
-        (EntityKind::Organization, "tencent") => ("Tencent", Some("tencent.com"), vec![], None),
-        (EntityKind::Organization, "telegram") => {
-            ("Telegram", Some("telegram.org"), vec![], Some("telegram"))
-        }
-        (EntityKind::Organization, "reddit") => {
-            ("Reddit", Some("reddit.com"), vec![], Some("reddit"))
-        }
-        (EntityKind::Organization, "notion") => {
-            ("Notion Labs", Some("notion.so"), vec![], Some("notion"))
-        }
-        (EntityKind::Organization, "docker") => {
-            ("Docker", Some("docker.com"), vec![], Some("docker"))
-        }
-        (EntityKind::Organization, "wikimedia") => (
-            "Wikimedia",
-            Some("wikimedia.org"),
-            vec![],
-            Some("wikipedia"),
-        ),
-        (EntityKind::Organization, "cloudflare") => (
-            "Cloudflare",
-            Some("cloudflare.com"),
-            vec![],
-            Some("cloudflare"),
-        ),
-        (EntityKind::Organization, "synology") => {
-            ("Synology", Some("synology.com"), vec![], Some("synology"))
-        }
-        (EntityKind::Organization, "lumi") => ("Lumi / Aqara", Some("aqara.com"), vec![], None),
-        (EntityKind::Organization, "xingyin") => ("Xingyin", Some("xiaohongshu.com"), vec![], None),
+        (EntityKind::Organization, "xingyin") => ("Xingyin", Some("xiaohongshu.com"), None, None),
         _ => return None,
     };
     Some(EntityMetadata {
@@ -1061,46 +825,11 @@ fn fallback_metadata(kind: EntityKind, id: &str) -> Option<EntityMetadata> {
         name: name.to_owned(),
         icon: IconMetadata {
             domain: icon_domain.map(str::to_owned),
-            fallback_domains: fallback_domains.into_iter().map(str::to_owned).collect(),
+            fallback_domains: Vec::new(),
             local_fallback: local_fallback.map(str::to_owned),
         },
+        organization_id: organization_id.map(str::to_owned),
     })
-}
-
-fn fallback_application_org_id(id: &str) -> Option<String> {
-    let org = match id {
-        "youtube" | "google-dns" => "google",
-        "netflix" => "netflix",
-        "bilibili" => "bilibili",
-        "github" => "github",
-        "openai" => "openai",
-        "steam" => "valve",
-        "playstation-network" => "sony",
-        "nintendo-eshop" => "nintendo",
-        "spotify" => "spotify",
-        "apple-music" | "icloud" => "apple",
-        "slack" => "salesforce",
-        "discord" => "discord",
-        "wechat" => "tencent",
-        "telegram" => "telegram",
-        "reddit" => "reddit",
-        "microsoft-365" => "microsoft",
-        "notion" => "notion",
-        "amazon-prime-video" | "twitch" => "amazon",
-        "docker-hub" => "docker",
-        "wikipedia" => "wikimedia",
-        "cloudflare-dns" | "cloudflare-backup" => "cloudflare",
-        "synology-dsm" => "synology",
-        "aqara-cloud" => "lumi",
-        "xiaohongshu" => "xingyin",
-        _ => return None,
-    };
-    Some(org.to_owned())
-}
-
-#[cfg(test)]
-fn fixture_metadata(kind: EntityKind, id: &str) -> Option<EntityMetadata> {
-    fallback_metadata(kind, id)
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -1183,6 +912,14 @@ fn ip_text(bytes: &[u8]) -> String {
     }
 }
 
+fn map_signature_match(matched: WireFlowSampleApplicationMatch) -> SignatureApplicationMatch {
+    SignatureApplicationMatch {
+        application_id: matched.application_id,
+        confidence: matched.confidence,
+        signature_hits: matched.signature_hits,
+    }
+}
+
 fn signature_evidence(
     signatures: &[SignatureApplicationMatch],
 ) -> Vec<ApplicationSignatureEvidence> {
@@ -1192,6 +929,7 @@ fn signature_evidence(
             application_id: matched.application_id.clone(),
             source: "payload_signature".to_owned(),
             confidence: matched.confidence,
+            signature_hits: matched.signature_hits,
         })
         .collect()
 }
@@ -1207,6 +945,7 @@ fn fixture_signature_matches(request: &FlowSampleMatchRequest) -> Vec<SignatureA
         vec![SignatureApplicationMatch {
             application_id: "honor_of_kings".to_owned(),
             confidence: 0.95,
+            signature_hits: 1,
         }]
     } else {
         Vec::new()
@@ -1250,5 +989,34 @@ fn map_metadata(value: WireMetadata) -> EntityMetadata {
             fallback_domains: value.fallback_domains,
             local_fallback: value.local_fallback,
         },
+        organization_id: value.organization_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signature_evidence_forwards_independent_hit_counts() {
+        let evidence = signature_evidence(&[SignatureApplicationMatch {
+            application_id: "sig_beta".to_owned(),
+            confidence: 0.9,
+            signature_hits: 3,
+        }]);
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].application_id, "sig_beta");
+        assert_eq!(evidence[0].signature_hits, 3);
+    }
+
+    #[test]
+    fn wire_signature_matches_preserve_hit_counts() {
+        let mapped = map_signature_match(WireFlowSampleApplicationMatch {
+            application_id: "sig_beta".to_owned(),
+            confidence: 0.9,
+            signature_hits: 3,
+        });
+        assert_eq!(mapped.application_id, "sig_beta");
+        assert_eq!(mapped.signature_hits, 3);
     }
 }

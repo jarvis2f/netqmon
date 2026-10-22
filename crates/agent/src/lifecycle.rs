@@ -23,5 +23,6 @@ impl fmt::Display for FlowState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlowLifecycleEvent {
     pub key: FlowKey,
+    pub policy_flow_id: Option<String>,
     pub state: FlowState,
 }

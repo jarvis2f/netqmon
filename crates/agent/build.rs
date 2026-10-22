@@ -33,17 +33,27 @@ mod linux {
             _ => "-D__TARGET_ARCH_unknown",
         };
 
+        let mut clang_args = vec![
+            OsString::from("-I"),
+            include_dir.into_os_string(),
+            OsString::from("-Wall"),
+            OsString::from("-mcpu=v3"),
+            OsString::from("-Werror"),
+            OsString::from("-Wno-error=unused-command-line-argument"),
+            OsString::from(target_arch_define),
+        ];
+        if env::var_os("CARGO_FEATURE_QOS_COMPATIBILITY_POC").is_some() {
+            clang_args.push(OsString::from("-DNETQMON_QOS_POC=1"));
+        }
+        if env::var_os("CARGO_FEATURE_QOS_CLIENT_PATH_PROBE").is_some() {
+            clang_args.push(OsString::from("-DNETQMON_QOS_PATH_PROBE=1"));
+        }
+        if env::var_os("CARGO_FEATURE_QOS_CLIENT_PRIORITY").is_some() {
+            clang_args.push(OsString::from("-DNETQMON_QOS_PRIORITY=1"));
+        }
         SkeletonBuilder::new()
             .source(&source)
-            .clang_args([
-                OsString::from("-I"),
-                include_dir.into_os_string(),
-                OsString::from("-Wall"),
-                OsString::from("-mcpu=v3"),
-                OsString::from("-Werror"),
-                OsString::from("-Wno-error=unused-command-line-argument"),
-                OsString::from(target_arch_define),
-            ])
+            .clang_args(clang_args)
             .reference_obj(true)
             .build_and_generate(&output)
             .expect("failed to compile flow.bpf.c and generate its Rust skeleton");
@@ -57,6 +67,7 @@ mod linux {
 }
 
 fn main() {
+    generate_classids();
     #[cfg(target_os = "linux")]
     {
         println!("cargo:rustc-link-lib=zstd");
@@ -67,4 +78,27 @@ fn main() {
 
     #[cfg(not(target_os = "linux"))]
     println!("cargo:warning=eBPF compilation is skipped on non-Linux build hosts");
+}
+
+fn generate_classids() {
+    use std::{env, fs, path::PathBuf};
+    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let header = manifest.join("../../bpf/include/netqmon_classid.h");
+    let source = fs::read_to_string(&header).expect("read canonical QoS class IDs");
+    let mut rust = String::from("// Generated from netqmon_classid.h. Do not edit.\n");
+    for line in source.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() == 3 && fields[0] == "#define" {
+            if let Some(name) = fields[1].strip_prefix("NETQMON_QOS_") {
+                let value = fields[2]
+                    .strip_prefix("0x")
+                    .expect("classid literal must be hex");
+                let value = u32::from_str_radix(value, 16).expect("valid classid literal");
+                rust.push_str(&format!("pub(crate) const {name}: u32 = 0x{value:08x};\n"));
+            }
+        }
+    }
+    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("qos_classid.rs");
+    fs::write(output, rust).expect("write generated QoS class IDs");
+    println!("cargo:rerun-if-changed={}", header.display());
 }

@@ -53,6 +53,15 @@ jobs:
           test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/api/overview)" = "200"
           test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/api/settings/diagnostics)" = "404"
           test "$(curl -sS -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:3000/api/overview)" = "403"
+          curl -fsS 'http://127.0.0.1:3000/api/policies?gateway_id=demo-gateway' > /tmp/netqmon-demo-policies.json
+          python3 -c 'import json; d=json.load(open("/tmp/netqmon-demo-policies.json"))["data"]; assert d["total"] == 4; assert d["capabilities"]["status"] == "demo"'
+          python3 -c 'import json,time; p=next(p for p in json.load(open("/tmp/netqmon-demo-policies.json"))["data"]["items"] if p["spec"]["selectors"]["applications"] == ["youtube"]); print(json.dumps(dict(gateway_id="demo-gateway",client_mac=p["spec"]["selectors"]["clients"][0],application_id="youtube",category_id="streaming",application_confidence=0.99,scope="internet",at_ms=int(time.time()*1000))))' > /tmp/netqmon-demo-preview.json
+          curl -fsS -H 'Origin: http://127.0.0.1:3000' -H 'Content-Type: application/json' --data-binary @/tmp/netqmon-demo-preview.json http://127.0.0.1:3000/api/policies/preview > /tmp/netqmon-demo-preview-result.json
+          python3 -c 'import json; assert json.load(open("/tmp/netqmon-demo-preview-result.json"))["data"]["selected_block_verdict"] == "block"'
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -X POST 'http://127.0.0.1:3000/api/policies/republish?gateway_id=demo-gateway')" = "403"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -X PATCH 'http://127.0.0.1:3000/api/policies/example/enabled')" = "403"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE 'http://127.0.0.1:3000/api/policies/example')" = "403"
+
 
       - name: Stop smoke test container
         if: always()

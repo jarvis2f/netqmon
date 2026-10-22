@@ -50,6 +50,7 @@ pub(super) fn flow_delta(
         destination_segment: flow
             .destination_segment
             .map_or_else(String::new, |value| value.to_string()),
+        policy_flow_id: delta.policy_flow_id.clone().unwrap_or_default(),
     }
 }
 
@@ -59,6 +60,7 @@ pub(super) fn lifecycle_delta(
     protocol: u8,
     lifecycle: FlowLifecycle,
     observed_at_ms: u64,
+    policy_flow_id: Option<&str>,
 ) -> WireFlowDelta {
     WireFlowDelta {
         ip_version: if flow.client_addr.is_ipv4() { 4 } else { 6 },
@@ -81,6 +83,7 @@ pub(super) fn lifecycle_delta(
         destination_segment: flow
             .destination_segment
             .map_or_else(String::new, |value| value.to_string()),
+        policy_flow_id: policy_flow_id.unwrap_or_default().to_owned(),
         ..WireFlowDelta::default()
     }
 }
@@ -183,12 +186,14 @@ mod tests {
                 ip_version: 4,
                 protocol: 6,
                 direction: 0,
+                hook: 1,
                 ifindex: 1,
                 source_address: [0; 16],
                 destination_address: [0; 16],
                 source_port: 443,
                 destination_port: 50_000,
             },
+            policy_flow_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
             packets: 3,
             bytes: 512,
             counters: FlowCounters {

@@ -5,6 +5,7 @@
     <option name="workingDirectory" value="file://$PROJECT_DIR$" />
     <envs>
       <env name="NETQMON_COLLECTOR_DATABASE_PATH" value="$PROJECT_DIR$/target/netqmon-local.db" />
+      <env name="NETQMON_COLLECTOR_POLICY_DB_PATH" value="$PROJECT_DIR$/target/netqmon-policies-local.db" />
       <env name="NETQMON_COLLECTOR_ENROLLMENT_TOKEN" value="netqmon-local-enrollment-token" />
       <env name="NETQMON_COLLECTOR_GEO_DIR" value="$PROJECT_DIR$/target/geo" />
       <env name="NETQMON_CLASSIFIER_SOCKET" value="/tmp/netqmon/classifierd.sock" />

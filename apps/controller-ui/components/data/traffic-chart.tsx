@@ -26,6 +26,51 @@ interface TrafficChartProps {
   showUpload?: boolean;
 }
 
+function calculateNiceBitrateScale(
+  rawPeak: number,
+  targetIntervals = 3,
+): { niceMax: number; ticks: number[] } {
+  const effectiveMax = Math.max(rawPeak * 1.05, 1000);
+  const rawStep = effectiveMax / targetIntervals;
+  const exp = Math.floor(Math.log10(rawStep));
+  const frac = rawStep / Math.pow(10, exp);
+
+  let niceFrac: number;
+  if (frac < 1.4) {
+    niceFrac = 1;
+  } else if (frac < 2.2) {
+    niceFrac = 2;
+  } else if (frac < 3.5) {
+    niceFrac = 2.5;
+  } else if (frac < 7.5) {
+    niceFrac = 5;
+  } else {
+    niceFrac = 10;
+  }
+
+  const step = niceFrac * Math.pow(10, exp);
+  const niceMax = Math.ceil(effectiveMax / step) * step;
+
+  const ticks: number[] = [];
+  for (let val = 0; val <= niceMax + step * 0.001; val += step) {
+    ticks.push(val);
+  }
+  return { niceMax, ticks };
+}
+
+function formatTickBitrate(bps: number): string {
+  if (bps === 0) return "0 bps";
+  const k = 1000;
+  const sizes = ["bps", "Kbps", "Mbps", "Gbps", "Tbps"];
+  const i = Math.min(
+    Math.floor(Math.log10(Math.abs(bps)) / 3),
+    sizes.length - 1,
+  );
+  const scaled = bps / Math.pow(k, i);
+  const formatted = scaled % 1 === 0 ? scaled.toFixed(0) : scaled.toFixed(1);
+  return `${formatted} ${sizes[i]}`;
+}
+
 export function TrafficChart({
   data,
   title,
@@ -68,15 +113,27 @@ export function TrafficChart({
     const chartHeight = Math.max(height - 42, 60);
 
     // Max value calculation
-    let maxVal = 1000; // minimum scale 1 Kbps
+    let rawPeak = 1000; // minimum scale 1 Kbps
     for (const d of boundedData) {
-      if (seriesVisible.download) maxVal = Math.max(maxVal, d.downloadBps);
-      if (seriesVisible.upload) maxVal = Math.max(maxVal, d.uploadBps);
-      if (seriesVisible.total)
-        maxVal = Math.max(maxVal, d.totalBps ?? d.downloadBps + d.uploadBps);
+      if (seriesVisible.download && Number.isFinite(d.downloadBps)) {
+        rawPeak = Math.max(rawPeak, d.downloadBps);
+      }
+      if (seriesVisible.upload && Number.isFinite(d.uploadBps)) {
+        rawPeak = Math.max(rawPeak, d.uploadBps);
+      }
+      if (seriesVisible.total) {
+        const total = d.totalBps ?? d.downloadBps + d.uploadBps;
+        if (Number.isFinite(total)) {
+          rawPeak = Math.max(rawPeak, total);
+        }
+      }
     }
-    // Add 10% headroom
-    maxVal = maxVal * 1.15;
+
+    const { niceMax, ticks: yTickValues } = calculateNiceBitrateScale(
+      rawPeak,
+      3,
+    );
+    const maxVal = niceMax;
 
     const numPoints = boundedData.length;
     const getX = (index: number) =>
@@ -116,11 +173,11 @@ export function TrafficChart({
       return `${linePath} L ${lastX.toFixed(1)} ${baseLineY} L ${firstX.toFixed(1)} ${baseLineY} Z`;
     };
 
-    // Generate 4 Y-axis ticks
-    const yTicks = [0, maxVal * 0.33, maxVal * 0.66, maxVal].map((val) => ({
+    // Generate Y-axis ticks with nice scale
+    const yTicks = yTickValues.map((val) => ({
       val,
       y: getY(val),
-      label: formatBitrate(val),
+      label: formatTickBitrate(val),
     }));
 
     // Generate 4-6 X-axis ticks
@@ -318,10 +375,10 @@ export function TrafficChart({
 
       {/* SVG Interactive Chart Canvas */}
       <div
-        className="relative w-full min-w-0 overflow-hidden pl-16 pr-2"
+        className="relative w-full min-w-0 overflow-hidden pl-[5.25rem] pr-2"
         style={{ height }}
       >
-        <div className="absolute inset-y-0 left-0 w-14">
+        <div className="absolute inset-y-0 left-0 w-20">
           {chartLayout.yTicks.map((tick, index) => (
             <span
               key={index}
@@ -498,7 +555,7 @@ export function TrafficChart({
             className="pointer-events-none absolute z-30 flex flex-col gap-1 rounded-md border border-border bg-surface/95 p-2 shadow-md backdrop-blur-xs text-xs animate-in fade-in-50 duration-75"
             style={{
               top: 8,
-              left: `clamp(64px, calc(64px + ${(chartLayout.getX(hoverIndex) / chartLayout.plotWidth) * 100}% - 75px), calc(100% - 165px))`,
+              left: `clamp(84px, calc(84px + ${(chartLayout.getX(hoverIndex) / chartLayout.plotWidth) * 100}% - 75px), calc(100% - 165px))`,
             }}
           >
             <div className="font-mono text-[10px] text-foreground-muted border-b border-border pb-1">

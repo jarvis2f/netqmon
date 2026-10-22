@@ -64,6 +64,19 @@ pub struct ApplicationSignatureEvidence {
     pub source: String,
     /// Confidence assigned to this match.
     pub confidence: f64,
+    /// Independent signatures that matched this application. Defaults to one
+    /// for older classifiers that emit one entry per signature.
+    #[serde(default = "default_signature_hits", skip_serializing_if = "is_one")]
+    pub signature_hits: u32,
+}
+
+const fn default_signature_hits() -> u32 {
+    1
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_one(value: &u32) -> bool {
+    *value == 1
 }
 
 /// One normalized device observation.
@@ -172,6 +185,9 @@ pub struct EntityMetadata {
     pub fallback_domains: Vec<String>,
     /// Local fallback icon identifier, when one is packaged with the client.
     pub local_fallback: Option<String>,
+    /// Organization that owns the application, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_id: Option<String>,
 }
 
 /// A batch result whose entries align by `entry_id`, not positional order.
@@ -337,6 +353,10 @@ pub struct FlowSampleApplicationMatch {
     pub application_id: String,
     /// Confidence assigned to the match.
     pub confidence: f64,
+    /// Independent signatures that matched this application. Defaults to one
+    /// for older classifiers that emit one match per signature.
+    #[serde(default = "default_signature_hits", skip_serializing_if = "is_one")]
+    pub signature_hits: u32,
 }
 
 /// Signature-matching result for one flow.
@@ -1407,6 +1427,7 @@ mod tests {
                     icon_domain: None,
                     fallback_domains: vec![],
                     local_fallback: None,
+                    organization_id: None,
                 }),
             },
             ClientRequest::ApplyEntitlement {
@@ -1482,6 +1503,7 @@ mod tests {
                 matches: vec![FlowSampleApplicationMatch {
                     application_id: "honor_of_kings".into(),
                     confidence: 0.95,
+                    signature_hits: 1,
                 }],
             },
         };
@@ -1513,6 +1535,7 @@ mod tests {
                         application_id: "honor_of_kings".into(),
                         source: "payload_signature".into(),
                         confidence: 0.95,
+                        signature_hits: 1,
                     }],
                 }],
             },
@@ -1545,6 +1568,56 @@ mod tests {
             !empty.contains("signature_evidence"),
             "absent evidence must stay out of the wire shape"
         );
+    }
+
+    #[test]
+    fn signature_hit_counts_round_trip_and_default_to_one() {
+        let evidence = ApplicationSignatureEvidence {
+            application_id: "honor_of_kings".into(),
+            source: "payload_signature".into(),
+            confidence: 0.95,
+            signature_hits: 3,
+        };
+        let json = serde_json::to_string(&evidence).unwrap();
+        assert!(json.contains("\"signature_hits\":3"));
+        assert_eq!(
+            serde_json::from_str::<ApplicationSignatureEvidence>(&json).unwrap(),
+            evidence
+        );
+
+        // Older classifiers omit the field; the collector must keep the
+        // historical one-per-entry meaning.
+        let legacy: ApplicationSignatureEvidence = serde_json::from_str(
+            r#"{"application_id":"honor_of_kings","source":"payload_signature","confidence":0.95}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.signature_hits, 1);
+
+        let one = ApplicationSignatureEvidence {
+            signature_hits: 1,
+            ..evidence
+        };
+        assert!(
+            !serde_json::to_string(&one)
+                .unwrap()
+                .contains("signature_hits"),
+            "a default hit count must stay out of the legacy wire shape"
+        );
+
+        let result = FlowSampleMatchResult {
+            matches: vec![FlowSampleApplicationMatch {
+                application_id: "honor_of_kings".into(),
+                confidence: 0.95,
+                signature_hits: 3,
+            }],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"signature_hits\":3"));
+        let legacy: FlowSampleMatchResult = serde_json::from_str(
+            r#"{"matches":[{"application_id":"honor_of_kings","confidence":0.95}]}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.matches[0].signature_hits, 1);
     }
 
     #[test]

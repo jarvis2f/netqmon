@@ -625,6 +625,20 @@ function handleInternal(request, response, pathname, params, state) {
   const scenario = state.scenario;
   const path = pathname.replace(/^\/internal\/?/, "");
 
+  if (path.startsWith("policies")) {
+    if (request.headers.authorization !== `Bearer ${token}`) {
+      json(response, 401, {
+        schema_version: 1,
+        error: {
+          code: "unauthorized",
+          message: "a valid admin session is required",
+        },
+      });
+      return true;
+    }
+    return handlePolicies(request, response, path, params, state);
+  }
+
   if (path === "settings/diagnostics" && request.method === "GET") {
     json(
       response,
@@ -1028,8 +1042,432 @@ function handleInternal(request, response, pathname, params, state) {
   return false;
 }
 
+function handlePolicies(request, response, path, params, state) {
+  const revision = () => state.policyRevision ?? 0;
+  const getPolicy = (id) => state.policies.find((policy) => policy.id === id);
+  const expectedRevision = request.headers["if-match"];
+  const rejectRevision = () => {
+    if (expectedRevision === `"rev:${revision()}"`) return false;
+    json(response, 409, {
+      schema_version: 1,
+      error: {
+        code: "revision_conflict",
+        message: "gateway policy revision has changed",
+        details: { current_revision: revision() },
+      },
+    });
+    return true;
+  };
+
+  if (path === "policies/options" && request.method === "GET") {
+    const kind = params.get("kind") ?? "gateways";
+    const q = (params.get("q") ?? "").toLowerCase();
+    const options = {
+      gateways: [{ id: gatewayId, name: "OpenWrt development gateway" }],
+      clients: [
+        {
+          id: "AA:BB:CC:DD:EE:01",
+          mac: "AA:BB:CC:DD:EE:01",
+          name: "Office Laptop",
+          gateway_id: gatewayId,
+        },
+        {
+          id: "AA:BB:CC:DD:EE:02",
+          mac: "AA:BB:CC:DD:EE:02",
+          name: "Living Room TV",
+          gateway_id: gatewayId,
+        },
+      ],
+      applications: [
+        { id: "youtube", name: "YouTube" },
+        { id: "openai", name: "OpenAI" },
+      ],
+      categories: [
+        { id: "streaming", name: "Streaming" },
+        { id: "ai", name: "AI" },
+      ],
+    };
+    const items = (options[kind] ?? []).filter((item) =>
+      `${item.id} ${item.name} ${item.mac ?? ""}`.toLowerCase().includes(q),
+    );
+    json(
+      response,
+      200,
+      envelope({
+        items,
+        total: items.length,
+        page: Number(params.get("page") ?? 1),
+        page_size: Number(params.get("page_size") ?? 20),
+      }),
+    );
+    return true;
+  }
+  if (path === "policies/republish" && request.method === "POST") {
+    state.policyRevision = revision() + 1;
+    json(response, 200, envelope({ desired_revision: revision() }));
+    return true;
+  }
+  if (path === "policies/deployment" && request.method === "GET") {
+    json(
+      response,
+      200,
+      envelope({
+        gateway_id: gatewayId,
+        desired_revision: revision(),
+        delivered_revision: 0,
+        delivery_status: state.policies.some((policy) => policy.spec.enabled)
+          ? "pending"
+          : "not_deployed",
+        delivered_at_ms: null,
+        acknowledged_revision: 0,
+        acknowledged_status: null,
+        applied_revision: 0,
+        status: state.policies.some((policy) => policy.spec.enabled)
+          ? "unsupported"
+          : "not_deployed",
+        last_error_code: null,
+        last_error_message: null,
+        last_reported_at_ms: null,
+        capabilities: {
+          enforcement_supported: false,
+          status: "unsupported",
+          reason: "policy_execution_not_implemented",
+          client_block: "unsupported",
+          client_limit: "unsupported",
+          application_block: "unsupported",
+          application_limit: "unsupported",
+        },
+        policies: state.policies.map((policy) => ({
+          policy_id: policy.id,
+          status: policy.spec.enabled ? "unsupported" : "not_deployed",
+        })),
+      }),
+    );
+    return true;
+  }
+  if (path === "policies/preview" && request.method === "POST") {
+    textBody(request).then((raw) => {
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        json(response, 400, {
+          schema_version: 1,
+          error: { code: "invalid_preview", message: "invalid JSON" },
+        });
+        return;
+      }
+      if (body.gateway_id !== gatewayId) {
+        json(response, 404, {
+          schema_version: 1,
+          error: { code: "not_found", message: "gateway was not found" },
+        });
+        return;
+      }
+      json(
+        response,
+        200,
+        envelope({
+          matched_policies: [],
+          selected_block_verdict: "none",
+          active_limits: [],
+          explanation:
+            "No enabled application policy matches this client, application, confidence, and time window.",
+          unsupported_reasons: [],
+        }),
+      );
+    });
+    return true;
+  }
+  if (path === "policies/validate" && request.method === "POST") {
+    textBody(request).then((raw) => {
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        json(response, 400, {
+          schema_version: 1,
+          error: { code: "invalid_spec", message: "invalid JSON" },
+        });
+        return;
+      }
+      const spec = body.spec;
+      const errors = [];
+      if (!spec || !spec.name?.trim())
+        errors.push({
+          path: "name",
+          code: "invalid_spec",
+          message: "name is required",
+        });
+      if (spec?.gateway_id !== gatewayId)
+        errors.push({
+          path: "gateway_id",
+          code: "not_found",
+          message: "gateway was not found",
+        });
+      if (
+        !spec?.selectors?.clients?.length &&
+        !spec?.selectors?.applications?.length &&
+        !spec?.selectors?.categories?.length
+      )
+        errors.push({
+          path: "selectors",
+          code: "invalid_spec",
+          message: "at least one selector is required",
+        });
+      json(
+        response,
+        200,
+        envelope({
+          normalized_spec: errors.length ? null : spec,
+          errors,
+          warnings: [],
+          valid: errors.length === 0,
+        }),
+      );
+    });
+    return true;
+  }
+  if (path === "policies" && request.method === "GET") {
+    if (params.get("gateway_id") !== gatewayId) {
+      json(response, 404, {
+        schema_version: 1,
+        error: { code: "not_found", message: "gateway was not found" },
+      });
+      return true;
+    }
+    const pageSize = Number(params.get("page_size") ?? 20);
+    const page = Number(params.get("page") ?? 1);
+    json(
+      response,
+      200,
+      envelope({
+        items: state.policies.slice((page - 1) * pageSize, page * pageSize),
+        total: state.policies.length,
+        desired_revision: revision(),
+        applied_revision: 0,
+        capabilities: {
+          enforcement_supported: false,
+          status: "unsupported",
+          reason: "policy_execution_not_implemented",
+          client_block: "unsupported",
+          client_limit: "unsupported",
+          application_block: "unsupported",
+          application_limit: "unsupported",
+        },
+      }),
+    );
+    return true;
+  }
+  const enabledMatch = path.match(/^policies\/([^/]+)\/enabled$/);
+  const detailMatch = path.match(/^policies\/([^/]+)$/);
+  if (path === "policies" && request.method === "POST") {
+    if (rejectRevision()) return true;
+    textBody(request).then((raw) => {
+      const spec = JSON.parse(raw);
+      const now = Date.now();
+      const policy = {
+        id: `policy-${now}`,
+        created_at_ms: now,
+        updated_at_ms: now,
+        version: 1,
+        spec,
+        execution_status: spec.enabled ? "unsupported" : "not_deployed",
+      };
+      state.policies.push(policy);
+      state.policyRevision = revision() + 1;
+      state.policyEvents.push({
+        event_id: state.policyEvents.length + 1,
+        policy_id: policy.id,
+        action: "create",
+        actor_user_id: "admin",
+        before: null,
+        after: spec,
+        revision: revision(),
+        created_at_ms: now,
+      });
+      json(
+        response,
+        201,
+        envelope({
+          policy,
+          desired_revision: revision(),
+          changed: true,
+          warnings: [],
+        }),
+      );
+    });
+    return true;
+  }
+  if (enabledMatch && request.method === "PATCH") {
+    if (rejectRevision()) return true;
+    const policy = getPolicy(decodeURIComponent(enabledMatch[1]));
+    if (!policy) {
+      json(response, 404, {
+        schema_version: 1,
+        error: { code: "not_found", message: "policy was not found" },
+      });
+      return true;
+    }
+    if (
+      Number(request.headers["x-expected-policy-version"]) !== policy.version
+    ) {
+      json(response, 409, {
+        schema_version: 1,
+        error: {
+          code: "revision_conflict",
+          message: "policy was changed by another editor",
+          details: {
+            current_revision: revision(),
+            current_policy_version: policy.version,
+          },
+        },
+      });
+      return true;
+    }
+    textBody(request).then((raw) => {
+      const body = JSON.parse(raw);
+      policy.spec = { ...policy.spec, enabled: body.enabled };
+      policy.version += 1;
+      policy.updated_at_ms = Date.now();
+      policy.execution_status = body.enabled ? "unsupported" : "not_deployed";
+      state.policyRevision = revision() + 1;
+      json(
+        response,
+        200,
+        envelope({
+          policy,
+          desired_revision: revision(),
+          changed: true,
+          warnings: [],
+        }),
+      );
+    });
+    return true;
+  }
+  if (detailMatch && request.method === "GET") {
+    const policy = getPolicy(decodeURIComponent(detailMatch[1]));
+    if (!policy) {
+      json(response, 404, {
+        schema_version: 1,
+        error: { code: "not_found", message: "policy was not found" },
+      });
+      return true;
+    }
+    json(
+      response,
+      200,
+      envelope({
+        policy,
+        events: state.policyEvents.filter(
+          (event) => event.policy_id === policy.id,
+        ),
+        desired_revision: revision(),
+        applied_revision: 0,
+      }),
+    );
+    return true;
+  }
+  if (detailMatch && request.method === "PUT") {
+    if (rejectRevision()) return true;
+    const policy = getPolicy(decodeURIComponent(detailMatch[1]));
+    if (!policy) {
+      json(response, 404, {
+        schema_version: 1,
+        error: { code: "not_found", message: "policy was not found" },
+      });
+      return true;
+    }
+    if (
+      Number(request.headers["x-expected-policy-version"]) !== policy.version
+    ) {
+      json(response, 409, {
+        schema_version: 1,
+        error: {
+          code: "revision_conflict",
+          message: "policy was changed by another editor",
+          details: {
+            current_revision: revision(),
+            current_policy_version: policy.version,
+          },
+        },
+      });
+      return true;
+    }
+    textBody(request).then((raw) => {
+      const before = policy.spec;
+      policy.spec = JSON.parse(raw);
+      policy.version += 1;
+      policy.updated_at_ms = Date.now();
+      policy.execution_status = policy.spec.enabled
+        ? "unsupported"
+        : "not_deployed";
+      state.policyRevision = revision() + 1;
+      state.policyEvents.push({
+        event_id: state.policyEvents.length + 1,
+        policy_id: policy.id,
+        action: "update",
+        actor_user_id: "admin",
+        before,
+        after: policy.spec,
+        revision: revision(),
+        created_at_ms: policy.updated_at_ms,
+      });
+      json(
+        response,
+        200,
+        envelope({
+          policy,
+          desired_revision: revision(),
+          changed: true,
+          warnings: [],
+        }),
+      );
+    });
+    return true;
+  }
+  if (detailMatch && request.method === "DELETE") {
+    if (rejectRevision()) return true;
+    const index = state.policies.findIndex(
+      (policy) => policy.id === decodeURIComponent(detailMatch[1]),
+    );
+    if (index < 0) {
+      json(response, 404, {
+        schema_version: 1,
+        error: { code: "not_found", message: "policy was not found" },
+      });
+      return true;
+    }
+    const [policy] = state.policies.splice(index, 1);
+    state.policyRevision = revision() + 1;
+    state.policyEvents.push({
+      event_id: state.policyEvents.length + 1,
+      policy_id: policy.id,
+      action: "delete",
+      actor_user_id: "admin",
+      before: policy.spec,
+      after: null,
+      revision: revision(),
+      created_at_ms: Date.now(),
+    });
+    response.writeHead(204);
+    response.end();
+    return true;
+  }
+  json(response, 404, {
+    schema_version: 1,
+    error: { code: "not_found", message: "policy route not found" },
+  });
+  return true;
+}
+
 export function createMockCollectorServer() {
-  const state = { scenario: "live" };
+  const state = {
+    scenario: "live",
+    policies: [],
+    policyEvents: [],
+    policyRevision: 0,
+  };
   return http.createServer((request, response) => {
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
     if (url.pathname.startsWith("/__scenario/") && request.method === "POST") {
@@ -1037,6 +1475,9 @@ export function createMockCollectorServer() {
       state.scenario = ["live", "offline", "hfo"].includes(scenario)
         ? scenario
         : "live";
+      state.policies = [];
+      state.policyEvents = [];
+      state.policyRevision = 0;
       state.license = {
         installation_id: "00000000-0000-0000-0000-000000000001",
         activated: false,

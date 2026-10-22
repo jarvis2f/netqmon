@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
 
 # 2. Download and unpack reliable, musl-patched target static C libraries from Alpine Linux (armv7)
 # Note: Alpine armv7 is ARMv7-A with VFPv3-D16 / hard-float (armhf ABI)
-RUN mkdir -p /tmp/target-pkgs && cd /tmp/target-pkgs && \
+RUN mkdir -p /tmp/target-pkgs /usr/local/arm-linux-musleabihf && cd /tmp/target-pkgs && \
     curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/armv7/elfutils-dev-0.191-r0.apk -o elfutils-dev.apk && \
     curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/armv7/zlib-dev-1.3.2-r1.apk -o zlib-dev.apk && \
     curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/armv7/zlib-static-1.3.2-r1.apk -o zlib-static.apk && \
@@ -25,23 +25,29 @@ RUN mkdir -p /tmp/target-pkgs && cd /tmp/target-pkgs && \
     curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/armv7/zstd-static-1.5.6-r2.apk -o zstd-static.apk && \
     curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/main/armv7/libbpf-dev-1.5.0-r0.apk -o libbpf-dev.apk && \
     for f in *.apk; do \
-        tar -xzf "$f" -C /usr/local/arm-linux-musleabihf 2>/dev/null || true; \
+        tar -xzf "$f" -C /usr/local/arm-linux-musleabihf || exit 1; \
     done && \
     rm -rf /tmp/target-pkgs
 
 # 3. Create target gcc wrapper to ensure -lzstd -lz are linked with -lelf
-RUN mv /usr/local/bin/arm-linux-musleabihf-gcc /usr/local/bin/arm-linux-musleabihf-gcc.real && \
-    printf '#!/bin/sh\nfor arg in "$@"; do\n  if [ "$arg" = "-c" ] || [ "$arg" = "-E" ] || [ "$arg" = "-S" ]; then\n    exec /usr/local/bin/arm-linux-musleabihf-gcc.real "$@"\n  fi\ndone\nexec /usr/local/bin/arm-linux-musleabihf-gcc.real "$@" -lzstd -lz\n' > /usr/local/bin/arm-linux-musleabihf-gcc && \
-    chmod +x /usr/local/bin/arm-linux-musleabihf-gcc
+RUN target_cc="$(command -v "${CC_armv7_unknown_linux_musleabihf}")" && \
+    printf '#!/bin/sh\nfor arg in "$@"; do\n  if [ "$arg" = "-c" ] || [ "$arg" = "-E" ] || [ "$arg" = "-S" ]; then\n    exec "%s" "$@"\n  fi\ndone\nexec "%s" "$@" -lzstd -lz\n' "$target_cc" "$target_cc" > /usr/local/bin/netqmon-armv7hf-gcc && \
+    chmod +x /usr/local/bin/netqmon-armv7hf-gcc
+
+ENV CC_armv7_unknown_linux_musleabihf="/usr/local/bin/netqmon-armv7hf-gcc"
+ENV CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER="/usr/local/bin/netqmon-armv7hf-gcc"
 
 # 4. Smoke check target static libraries
-RUN file /usr/local/arm-linux-musleabihf/usr/lib/libelf.a && \
+RUN test -f /usr/local/arm-linux-musleabihf/usr/lib/libelf.a && \
+    test -f /usr/local/arm-linux-musleabihf/usr/lib/libz.a && \
+    test -f /usr/local/arm-linux-musleabihf/usr/lib/libbpf.a && \
+    file /usr/local/arm-linux-musleabihf/usr/lib/libelf.a && \
     file /usr/local/arm-linux-musleabihf/usr/lib/libz.a && \
     file /usr/local/arm-linux-musleabihf/usr/lib/libbpf.a
 
 # 5. Compile and link minimal probe test using target cross compiler
 RUN printf '#include <libelf.h>\n#include <zlib.h>\nint main(void) { return elf_version(EV_CURRENT) == EV_NONE; }\n' > /tmp/test_target.c && \
-    /usr/local/bin/arm-linux-musleabihf-gcc -I/usr/local/arm-linux-musleabihf/usr/include /tmp/test_target.c -L/usr/local/arm-linux-musleabihf/usr/lib -lelf -lz -o /tmp/test_target && \
+    /usr/local/bin/netqmon-armv7hf-gcc -I/usr/local/arm-linux-musleabihf/usr/include /tmp/test_target.c -L/usr/local/arm-linux-musleabihf/usr/lib -lelf -lz -o /tmp/test_target && \
     file /tmp/test_target && \
     rm -f /tmp/test_target.c /tmp/test_target
 

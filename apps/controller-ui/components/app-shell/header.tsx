@@ -32,15 +32,18 @@ interface HeaderProps {
 export function Header({
   title = "Overview",
   subtitle,
-  gatewayName = "OpenWrt Gateway",
-  gatewayStatus = "online",
-  isLive = true,
+  gatewayName,
+  gatewayStatus = "loading",
+  isLive = "loading",
   username = "admin",
   onMobileMenuToggle,
   actions,
 }: HeaderProps) {
   const t = useTranslations("common");
   const tA11y = useTranslations("accessibility.sidebar");
+  const displayGatewayName =
+    gatewayName ??
+    (gatewayStatus === "loading" ? t("status.loading") : t("header.noGateway"));
   const { theme, setTheme } = useTheme();
   const { isDemo } = useRuntimeMode();
   const router = useRouter();
@@ -98,15 +101,14 @@ export function Header({
         {/* Gateway Status Badge */}
         <div
           className="hidden md:flex items-center gap-1.5 px-2 py-1 rounded-md border border-border bg-surface-subtle text-xs text-foreground-secondary"
-          title={
-            gatewayStatus === "loading"
-              ? t("status.loading")
-              : `Connected to ${gatewayName}`
-          }
+          title={t("header.gatewayStatus", {
+            name: displayGatewayName,
+            status: t(`status.${gatewayStatus}`),
+          })}
         >
           <Server className="size-3.5 text-foreground-muted" />
           <span className="font-medium truncate max-w-[120px]">
-            {gatewayName}
+            {displayGatewayName}
           </span>
           <StatusBadge
             status={gatewayStatus}
@@ -119,7 +121,7 @@ export function Header({
           {isLive === "loading" ? (
             <span
               className="inline-flex h-[22px] items-center gap-1.5 rounded-[5px] border border-border bg-surface-subtle px-2 text-[11px] font-medium text-foreground-muted"
-              title="Connecting to Realtime Stream..."
+              title={t("header.streamConnecting")}
             >
               <Loader2 className="size-2.5 animate-spin text-foreground-muted" />
               <span>{t("status.connecting")}</span>
@@ -127,7 +129,7 @@ export function Header({
           ) : isLive ? (
             <span
               className="inline-flex h-[22px] items-center gap-1.5 rounded-[5px] border border-success/30 bg-success-soft px-2 text-[11px] font-medium text-success"
-              title="Realtime SSE Stream Active"
+              title={t("header.streamLive")}
             >
               <span className="size-1.5 rounded-full bg-success animate-pulse" />
               <span>{t("status.live")}</span>
@@ -135,7 +137,7 @@ export function Header({
           ) : (
             <span
               className="inline-flex h-[22px] items-center gap-1.5 rounded-[5px] border border-warning/30 bg-warning-soft px-2 text-[11px] font-medium text-warning"
-              title="Realtime Stream Delayed or Offline"
+              title={t("header.streamDelayed")}
             >
               <span className="size-1.5 rounded-full bg-warning" />
               <span>{t("status.delayed")}</span>

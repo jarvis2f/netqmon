@@ -1,3 +1,5 @@
+pub(crate) mod policies;
+
 use std::collections::HashMap;
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,11 +12,13 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use tokio::sync::broadcast;
 
+use crate::classifier::{EntityMetadata, IconMetadata};
 use crate::realtime::{
     ActiveFlowSnapshot, GatewayHealthSnapshot, RealtimeEvent, RealtimeSnapshot, ScopedThroughput,
     Throughput, ThroughputPoint, format_ip, format_mac,
 };
 use crate::{CollectorState, unix_time_ms};
+use netqmon_classifier_client::EntityKind;
 
 const DEMO_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_HISTORY_POINTS: usize = 900;
@@ -1157,4 +1161,311 @@ mod tests {
         let nas_tp = frame1.clients.get("02:00:00:00:00:03").unwrap();
         assert!(nas_tp.upload_bytes_per_second > tv_tp.upload_bytes_per_second);
     }
+}
+
+pub(crate) fn metadata(kind: EntityKind, id: &str) -> Option<EntityMetadata> {
+    let (name, icon_domain, fallback_domains, local_fallback) = match (kind, id) {
+        // Applications
+        (EntityKind::Application, "youtube") => (
+            "YouTube",
+            Some("youtube.com"),
+            vec!["googlevideo.com"],
+            Some("youtube"),
+        ),
+        (EntityKind::Application, "netflix") => (
+            "Netflix",
+            Some("netflix.com"),
+            vec!["nflxvideo.net"],
+            Some("netflix"),
+        ),
+        (EntityKind::Application, "bilibili") => (
+            "Bilibili",
+            Some("bilibili.com"),
+            vec!["bilivideo.com"],
+            Some("bilibili"),
+        ),
+        (EntityKind::Application, "github") => (
+            "GitHub",
+            Some("github.com"),
+            vec!["githubassets.com"],
+            Some("github"),
+        ),
+        (EntityKind::Application, "openai") => (
+            "OpenAI",
+            Some("openai.com"),
+            vec!["chatgpt.com"],
+            Some("openai"),
+        ),
+        (EntityKind::Application, "steam") => (
+            "Steam",
+            Some("steampowered.com"),
+            vec!["steamcommunity.com"],
+            Some("steam"),
+        ),
+        (EntityKind::Application, "playstation-network" | "playstation") => (
+            "PlayStation Network",
+            Some("playstation.com"),
+            vec!["playstation.net"],
+            Some("playstation"),
+        ),
+        (EntityKind::Application, "nintendo-eshop" | "nintendo") => (
+            "Nintendo eShop",
+            Some("nintendo.com"),
+            vec!["nintendo.net"],
+            None,
+        ),
+        (EntityKind::Application, "spotify") => {
+            ("Spotify", Some("spotify.com"), vec![], Some("spotify"))
+        }
+        (EntityKind::Application, "apple-music") => (
+            "Apple Music",
+            Some("music.apple.com"),
+            vec!["apple.com"],
+            Some("applemusic"),
+        ),
+        (EntityKind::Application, "icloud") => (
+            "Apple iCloud",
+            Some("icloud.com"),
+            vec!["apple.com"],
+            Some("icloud"),
+        ),
+        (EntityKind::Application, "slack") => ("Slack", Some("slack.com"), vec![], Some("slack")),
+        (EntityKind::Application, "discord") => (
+            "Discord",
+            Some("discord.com"),
+            vec!["discord.gg"],
+            Some("discord"),
+        ),
+        (EntityKind::Application, "wechat") => (
+            "WeChat",
+            Some("weixin.qq.com"),
+            vec!["qq.com"],
+            Some("wechat"),
+        ),
+        (EntityKind::Application, "telegram") => {
+            ("Telegram", Some("telegram.org"), vec![], Some("telegram"))
+        }
+        (EntityKind::Application, "reddit") => (
+            "Reddit",
+            Some("reddit.com"),
+            vec!["redd.it"],
+            Some("reddit"),
+        ),
+        (EntityKind::Application, "microsoft-365" | "microsoft") => (
+            "Microsoft 365",
+            Some("office.com"),
+            vec!["microsoft.com"],
+            Some("microsoft"),
+        ),
+        (EntityKind::Application, "notion") => {
+            ("Notion", Some("notion.so"), vec![], Some("notion"))
+        }
+        (EntityKind::Application, "amazon-prime-video" | "primevideo") => (
+            "Prime Video",
+            Some("primevideo.com"),
+            vec!["amazon.com"],
+            Some("primevideo"),
+        ),
+        (EntityKind::Application, "docker-hub" | "docker") => (
+            "Docker Hub",
+            Some("docker.com"),
+            vec!["docker.io"],
+            Some("docker"),
+        ),
+        (EntityKind::Application, "wikipedia") => (
+            "Wikipedia",
+            Some("wikipedia.org"),
+            vec![],
+            Some("wikipedia"),
+        ),
+        (EntityKind::Application, "cloudflare-dns" | "cloudflare") => (
+            "Cloudflare",
+            Some("cloudflare.com"),
+            vec!["1.1.1.1"],
+            Some("cloudflare"),
+        ),
+        (EntityKind::Application, "google-dns" | "google") => (
+            "Google",
+            Some("google.com"),
+            vec!["dns.google"],
+            Some("google"),
+        ),
+        (EntityKind::Application, "ntp") => (
+            "NTP Service",
+            Some("cloudflare.com"),
+            vec!["pool.ntp.org"],
+            None,
+        ),
+        (EntityKind::Application, "twitch") => {
+            ("Twitch", Some("twitch.tv"), vec![], Some("twitch"))
+        }
+        (EntityKind::Application, "aqara-cloud" | "aqara") => {
+            ("Aqara IoT", Some("aqara.com"), vec![], None)
+        }
+        (EntityKind::Application, "cloudflare-backup") => (
+            "Cloudflare R2",
+            Some("cloudflare.com"),
+            vec![],
+            Some("cloudflare"),
+        ),
+        (EntityKind::Application, "nas-smb") => ("LAN File Sharing", None, vec![], None),
+        (EntityKind::Application, "plex") => {
+            ("Plex Media Server", Some("plex.tv"), vec![], Some("plex"))
+        }
+        (EntityKind::Application, "synology-dsm" | "synology") => (
+            "Synology DSM",
+            Some("synology.com"),
+            vec![],
+            Some("synology"),
+        ),
+        (EntityKind::Application, "speedtest") => (
+            "Speedtest",
+            Some("speedtest.net"),
+            vec![],
+            Some("speedtest"),
+        ),
+        (EntityKind::Application, "xiaohongshu") => {
+            ("Xiaohongshu", None, vec![], Some("xiaohongshu"))
+        }
+        (EntityKind::Application, "tiktok") => {
+            ("TikTok", Some("tiktok.com"), vec![], Some("tiktok"))
+        }
+        (EntityKind::Application, "twitter" | "x") => {
+            ("X", Some("x.com"), vec!["twitter.com"], Some("x"))
+        }
+        (EntityKind::Application, "facebook") => {
+            ("Facebook", Some("facebook.com"), vec![], Some("facebook"))
+        }
+        (EntityKind::Application, "instagram") => (
+            "Instagram",
+            Some("instagram.com"),
+            vec![],
+            Some("instagram"),
+        ),
+        (EntityKind::Application, "zoom") => ("Zoom", Some("zoom.us"), vec![], Some("zoom")),
+        (EntityKind::Application, "whatsapp") => {
+            ("WhatsApp", Some("whatsapp.com"), vec![], Some("whatsapp"))
+        }
+
+        // Organizations
+        (EntityKind::Organization, "google") => {
+            ("Google", Some("google.com"), vec![], Some("google"))
+        }
+        (EntityKind::Organization, "apple") => ("Apple", Some("apple.com"), vec![], Some("apple")),
+        (EntityKind::Organization, "microsoft") => (
+            "Microsoft",
+            Some("microsoft.com"),
+            vec![],
+            Some("microsoft"),
+        ),
+        (EntityKind::Organization, "amazon") => {
+            ("Amazon", Some("amazon.com"), vec![], Some("amazon"))
+        }
+        (EntityKind::Organization, "meta") => ("Meta", Some("meta.com"), vec![], Some("meta")),
+        (EntityKind::Organization, "netflix") => {
+            ("Netflix", Some("netflix.com"), vec![], Some("netflix"))
+        }
+        (EntityKind::Organization, "bilibili") => {
+            ("Bilibili", Some("bilibili.com"), vec![], Some("bilibili"))
+        }
+        (EntityKind::Organization, "github") => {
+            ("GitHub", Some("github.com"), vec![], Some("github"))
+        }
+        (EntityKind::Organization, "openai") => {
+            ("OpenAI", Some("openai.com"), vec![], Some("openai"))
+        }
+        (EntityKind::Organization, "valve") => {
+            ("Valve", Some("valvesoftware.com"), vec![], Some("valve"))
+        }
+        (EntityKind::Organization, "sony") => ("Sony", Some("sony.com"), vec![], Some("sony")),
+        (EntityKind::Organization, "nintendo") => ("Nintendo", Some("nintendo.com"), vec![], None),
+        (EntityKind::Organization, "spotify") => {
+            ("Spotify", Some("spotify.com"), vec![], Some("spotify"))
+        }
+        (EntityKind::Organization, "salesforce") => (
+            "Salesforce",
+            Some("salesforce.com"),
+            vec![],
+            Some("salesforce"),
+        ),
+        (EntityKind::Organization, "discord") => {
+            ("Discord", Some("discord.com"), vec![], Some("discord"))
+        }
+        (EntityKind::Organization, "tencent") => ("Tencent", Some("tencent.com"), vec![], None),
+        (EntityKind::Organization, "telegram") => {
+            ("Telegram", Some("telegram.org"), vec![], Some("telegram"))
+        }
+        (EntityKind::Organization, "reddit") => {
+            ("Reddit", Some("reddit.com"), vec![], Some("reddit"))
+        }
+        (EntityKind::Organization, "notion") => {
+            ("Notion Labs", Some("notion.so"), vec![], Some("notion"))
+        }
+        (EntityKind::Organization, "docker") => {
+            ("Docker", Some("docker.com"), vec![], Some("docker"))
+        }
+        (EntityKind::Organization, "wikimedia") => (
+            "Wikimedia",
+            Some("wikimedia.org"),
+            vec![],
+            Some("wikipedia"),
+        ),
+        (EntityKind::Organization, "cloudflare") => (
+            "Cloudflare",
+            Some("cloudflare.com"),
+            vec![],
+            Some("cloudflare"),
+        ),
+        (EntityKind::Organization, "synology") => {
+            ("Synology", Some("synology.com"), vec![], Some("synology"))
+        }
+        (EntityKind::Organization, "lumi") => ("Lumi / Aqara", Some("aqara.com"), vec![], None),
+        (EntityKind::Organization, "xingyin") => ("Xingyin", Some("xiaohongshu.com"), vec![], None),
+        _ => return None,
+    };
+    Some(EntityMetadata {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        icon: IconMetadata {
+            domain: icon_domain.map(str::to_owned),
+            fallback_domains: fallback_domains.into_iter().map(str::to_owned).collect(),
+            local_fallback: local_fallback.map(str::to_owned),
+        },
+        organization_id: if matches!(kind, EntityKind::Application) {
+            fallback_application_org_id(id)
+        } else {
+            None
+        },
+    })
+}
+
+fn fallback_application_org_id(id: &str) -> Option<String> {
+    let org = match id {
+        "youtube" | "google-dns" => "google",
+        "netflix" => "netflix",
+        "bilibili" => "bilibili",
+        "github" => "github",
+        "openai" => "openai",
+        "steam" => "valve",
+        "playstation-network" => "sony",
+        "nintendo-eshop" => "nintendo",
+        "spotify" => "spotify",
+        "apple-music" | "icloud" => "apple",
+        "slack" => "salesforce",
+        "discord" => "discord",
+        "wechat" => "tencent",
+        "telegram" => "telegram",
+        "reddit" => "reddit",
+        "microsoft-365" => "microsoft",
+        "notion" => "notion",
+        "amazon-prime-video" | "twitch" => "amazon",
+        "docker-hub" => "docker",
+        "wikipedia" => "wikimedia",
+        "cloudflare-dns" | "cloudflare-backup" => "cloudflare",
+        "synology-dsm" => "synology",
+        "aqara-cloud" => "lumi",
+        "xiaohongshu" => "xingyin",
+        _ => return None,
+    };
+    Some(org.to_owned())
 }

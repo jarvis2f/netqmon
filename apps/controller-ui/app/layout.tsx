@@ -7,6 +7,7 @@ import { ThemeProvider } from "@/components/theme-provider";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { RuntimeModeProvider } from "@/components/runtime-mode-provider";
 import { isDemoMode } from "@/lib/runtime-mode";
+import { GatewayStatusProvider } from "@/components/app-shell/gateway-status-provider";
 import "flag-icons/css/flag-icons.min.css";
 import "./globals.css";
 
@@ -47,7 +48,7 @@ export default async function RootLayout({
           <ThemeProvider defaultTheme="system">
             <TooltipProvider delay={200}>
               <RuntimeModeProvider isDemo={isDemo}>
-                {children}
+                <GatewayStatusProvider>{children}</GatewayStatusProvider>
               </RuntimeModeProvider>
             </TooltipProvider>
           </ThemeProvider>

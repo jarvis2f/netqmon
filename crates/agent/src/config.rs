@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -10,6 +11,8 @@ use serde::Deserialize;
 
 pub const DEFAULT_INTERFACE: &str = "br-lan";
 pub const DEFAULT_CONTROLLER_URL: &str = "http://127.0.0.1:8090";
+pub const DEFAULT_POLICY_STATE_PATH: &str = "/etc/netqmon/policy-state.json";
+pub const DEFAULT_POLICY_DISABLED_PATH: &str = "/etc/netqmon/policies-disabled";
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 1_000;
 pub const DEFAULT_BATCH_INTERVAL_MS: u64 = 1_000;
 pub const DEFAULT_MAX_FLOWS: u32 = 65_536;
@@ -29,6 +32,10 @@ pub const DEFAULT_DIAGNOSTICS_ENABLED: bool = false;
 pub const DEFAULT_TC_PRIORITY: u32 = 49_152;
 pub const DEFAULT_TC_HANDLE: u32 = 0x4e51_4d01;
 pub const MAX_INTERFACES: usize = 32;
+pub(crate) const MIN_POLICY_CAPACITY_BPS: u64 = 64_000;
+// Keep capacities exactly representable in JSON diagnostics and bounded for
+// aggregate class arithmetic, independently of explicit policy rate limits.
+pub(crate) const MAX_POLICY_CAPACITY_BPS: u64 = netqmon_protocol::policy::MAX_SAFE_JSON_INTEGER;
 
 #[derive(Debug, Parser)]
 #[command(name = "netqmon-agent", version, about = "netqmon telemetry agent")]
@@ -52,6 +59,8 @@ pub enum Command {
     Run,
     /// Probe kernel and network capabilities, print a report, and exit.
     Doctor,
+    /// Inspect or manage locally enforced policies.
+    Policies(PoliciesArgs),
     /// Inspect or manage agent runtime diagnostics.
     Diagnostics(DiagnosticsArgs),
 }
@@ -77,12 +86,38 @@ pub enum DiagnosticsAction {
     Reset,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::Args)]
+pub struct PoliciesArgs {
+    #[command(subcommand)]
+    pub action: PoliciesAction,
+    /// Output policy status in JSON format.
+    #[arg(long, global = true)]
+    pub json: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Subcommand)]
+pub enum PoliciesAction {
+    /// Show the last persisted policy revision and local capability state.
+    Status,
+    /// Disable and remove only NetQmon policy enforcement.
+    Unlock,
+    /// Reapply the last valid local policy snapshot.
+    Resume,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentConfig {
     pub interface: String,
     pub interfaces: Vec<String>,
     pub controller_url: String,
     pub token: String,
+    pub policy_ws_url: Option<String>,
+    pub policy_state_path: PathBuf,
+    pub policy_disabled_path: PathBuf,
+    /// Permit plain policy WebSockets only for loopback or RFC 1918/ULA IP addresses.
+    pub allow_insecure_policy_ws: bool,
+    pub policy_interface_capacity_bps: BTreeMap<String, u64>,
+    pub policy_one_arm_return_path_verified: bool,
     pub poll_interval_ms: u64,
     pub batch_interval_ms: u64,
     pub max_flows: u32,
@@ -190,6 +225,12 @@ impl Default for AgentConfig {
             interfaces: vec![DEFAULT_INTERFACE.into()],
             controller_url: DEFAULT_CONTROLLER_URL.into(),
             token: String::new(),
+            policy_ws_url: None,
+            policy_state_path: PathBuf::from(DEFAULT_POLICY_STATE_PATH),
+            policy_disabled_path: PathBuf::from(DEFAULT_POLICY_DISABLED_PATH),
+            allow_insecure_policy_ws: true,
+            policy_interface_capacity_bps: BTreeMap::new(),
+            policy_one_arm_return_path_verified: true,
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             batch_interval_ms: DEFAULT_BATCH_INTERVAL_MS,
             max_flows: DEFAULT_MAX_FLOWS,
@@ -228,6 +269,12 @@ struct PartialConfig {
     interfaces: Option<Vec<String>>,
     controller_url: Option<String>,
     token: Option<String>,
+    policy_ws_url: Option<String>,
+    policy_state_path: Option<PathBuf>,
+    policy_disabled_path: Option<PathBuf>,
+    allow_insecure_policy_ws: Option<bool>,
+    policy_interface_capacity_bps: Option<BTreeMap<String, u64>>,
+    policy_one_arm_return_path_verified: Option<bool>,
     poll_interval_ms: Option<u64>,
     batch_interval_ms: Option<u64>,
     max_flows: Option<u32>,
@@ -302,6 +349,16 @@ impl AgentConfig {
             interfaces: env_interfaces,
             controller_url: env_string(&get_env, "NETQMON_CONTROLLER_URL")?,
             token: env_string(&get_env, "NETQMON_TOKEN")?,
+            policy_ws_url: env_string(&get_env, "NETQMON_POLICY_WS_URL")?,
+            policy_state_path: env_string(&get_env, "NETQMON_POLICY_STATE_PATH")?
+                .map(PathBuf::from),
+            policy_disabled_path: env_string(&get_env, "NETQMON_POLICY_DISABLED_PATH")?
+                .map(PathBuf::from),
+            allow_insecure_policy_ws: env_bool(&get_env, "NETQMON_ALLOW_INSECURE_POLICY_WS")?,
+            policy_interface_capacity_bps: env_string(&get_env, "NETQMON_POLICY_INTERFACE_CAPACITY_BPS")?
+                .map(|value| serde_json::from_str(&value).context("NETQMON_POLICY_INTERFACE_CAPACITY_BPS must be a JSON object of interface capacities"))
+                .transpose()?,
+            policy_one_arm_return_path_verified: None,
             poll_interval_ms: env_number(&get_env, "NETQMON_POLL_INTERVAL_MS")?,
             batch_interval_ms: env_number(&get_env, "NETQMON_BATCH_INTERVAL_MS")?,
             max_flows: env_number(&get_env, "NETQMON_MAX_FLOWS")?,
@@ -391,6 +448,24 @@ impl AgentConfig {
         if let Some(value) = partial.token {
             self.token = value;
         }
+        if let Some(value) = partial.policy_ws_url {
+            self.policy_ws_url = Some(value);
+        }
+        if let Some(value) = partial.policy_state_path {
+            self.policy_state_path = value;
+        }
+        if let Some(value) = partial.policy_disabled_path {
+            self.policy_disabled_path = value;
+        }
+        if let Some(value) = partial.allow_insecure_policy_ws {
+            self.allow_insecure_policy_ws = value;
+        }
+        if let Some(value) = partial.policy_interface_capacity_bps {
+            self.policy_interface_capacity_bps = value;
+        }
+        if let Some(value) = partial.policy_one_arm_return_path_verified {
+            self.policy_one_arm_return_path_verified = value;
+        }
         if let Some(value) = partial.poll_interval_ms {
             self.poll_interval_ms = value;
         }
@@ -442,6 +517,17 @@ impl AgentConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        for (interface, capacity) in &self.policy_interface_capacity_bps {
+            if interface.is_empty()
+                || interface.len() > 15
+                || interface.bytes().any(|byte| byte == 0 || byte == b'/')
+                || !(MIN_POLICY_CAPACITY_BPS..=MAX_POLICY_CAPACITY_BPS).contains(capacity)
+            {
+                bail!(
+                    "policy_interface_capacity_bps requires valid interface names and capacities between {MIN_POLICY_CAPACITY_BPS} and {MAX_POLICY_CAPACITY_BPS} bps"
+                );
+            }
+        }
         if self.interfaces.is_empty() || self.interfaces.len() > MAX_INTERFACES {
             bail!("interfaces must contain between 1 and {MAX_INTERFACES} entries");
         }
@@ -467,6 +553,26 @@ impl AgentConfig {
             .context("controller_url is not a valid URI")?;
         if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.authority().is_none() {
             bail!("controller_url must be an absolute HTTP or HTTPS URL");
+        }
+        if let Some(policy_url) = &self.policy_ws_url {
+            let policy_uri = policy_url
+                .parse::<Uri>()
+                .context("policy_ws_url is not a valid URI")?;
+            if !matches!(policy_uri.scheme_str(), Some("ws" | "wss"))
+                || policy_uri.authority().is_none()
+            {
+                bail!("policy_ws_url must be an absolute ws or wss URL");
+            }
+            if policy_uri.scheme_str() == Some("ws")
+                && (!self.allow_insecure_policy_ws
+                    || !policy_uri
+                        .authority()
+                        .is_some_and(|authority| is_intranet_host(authority.host())))
+            {
+                bail!(
+                    "ws:// policy transport requires NETQMON_ALLOW_INSECURE_POLICY_WS=1 and a loopback, RFC 1918 IPv4, or ULA IPv6 host"
+                );
+            }
         }
         if self.token.chars().any(char::is_control) {
             bail!("token must not contain control characters");
@@ -528,12 +634,58 @@ impl AgentConfig {
         Ok(())
     }
 
+    pub fn effective_policy_ws_url(&self) -> Result<Option<String>> {
+        if let Some(url) = &self.policy_ws_url {
+            return Ok(Some(url.clone()));
+        }
+        let controller = self.controller_url.parse::<Uri>()?;
+        let scheme = match controller.scheme_str() {
+            Some("http") => "ws",
+            Some("https") => "wss",
+            _ => bail!("controller_url must use http or https"),
+        };
+        let authority = controller
+            .authority()
+            .context("controller_url has no authority")?;
+        if scheme == "ws" && (!self.allow_insecure_policy_ws || !is_intranet_host(authority.host()))
+        {
+            return Ok(None);
+        }
+        Ok(Some(format!(
+            "{scheme}://{authority}/v1/agent/policies/stream"
+        )))
+    }
+
     fn set_interfaces(&mut self, interfaces: Vec<String>) {
         if let Some(primary) = interfaces.first() {
             self.interface.clone_from(primary);
         }
         self.interfaces = interfaces;
     }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || parse_host_ip(host).is_some_and(|address| address.is_loopback())
+}
+
+fn is_intranet_host(host: &str) -> bool {
+    if is_loopback_host(host) {
+        return true;
+    }
+    match parse_host_ip(host) {
+        Some(std::net::IpAddr::V4(address)) => address.is_private(),
+        Some(std::net::IpAddr::V6(address)) => (address.segments()[0] & 0xfe00) == 0xfc00,
+        None => false,
+    }
+}
+
+fn parse_host_ip(host: &str) -> Option<std::net::IpAddr> {
+    let address = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    address.parse().ok()
 }
 
 fn split_interfaces(value: &str) -> Result<Vec<String>> {
@@ -669,6 +821,8 @@ interface = "tun0"
     fn provides_documented_defaults() {
         let config = AgentConfig::load_with_env(&cli(&[]), |_| None).unwrap();
         assert_eq!(config.interface, DEFAULT_INTERFACE);
+        assert!(config.policy_interface_capacity_bps.is_empty());
+        assert!(config.policy_one_arm_return_path_verified);
         assert_eq!(config.interfaces, [DEFAULT_INTERFACE]);
         assert_eq!(config.controller_url, DEFAULT_CONTROLLER_URL);
         assert_eq!(config.poll_interval_ms, DEFAULT_POLL_INTERVAL_MS);
@@ -693,7 +847,59 @@ interface = "tun0"
             DEFAULT_INTERFACE_COUNTER_MAX_UNACCOUNTED_RATIO
         );
         assert_eq!(config.log_level, DEFAULT_LOG_LEVEL);
+        assert!(config.allow_insecure_policy_ws);
         assert!(config.token.is_empty());
+    }
+
+    #[test]
+    fn policy_capacity_merges_and_validates_with_explicit_return_path_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        fs::write(&path, "policy_one_arm_return_path_verified = false\n[policy_interface_capacity_bps]\neth1 = 100000000\n").unwrap();
+        let config = AgentConfig::load_with_env(
+            &cli(&["--config", path.to_str().unwrap()]),
+            |key| match key {
+                "NETQMON_POLICY_INTERFACE_CAPACITY_BPS" => Some(r#"{"eth1":50000000}"#.into()),
+                _ => None,
+            },
+        )
+        .unwrap();
+        assert!(!config.policy_one_arm_return_path_verified);
+        assert_eq!(config.policy_interface_capacity_bps["eth1"], 50_000_000);
+        for value in [
+            r#"{"eth1":0}"#,
+            r#"{"eth1":9007199254740992}"#,
+            r#"{"../bad":100000}"#,
+            "[]",
+            "bad",
+        ] {
+            assert!(
+                AgentConfig::load_with_env(&cli(&[]), |key| (key
+                    == "NETQMON_POLICY_INTERFACE_CAPACITY_BPS")
+                    .then(|| value.into()))
+                .is_err()
+            );
+        }
+        for rate in [2_500_000_000_u64, 10_000_000_000] {
+            let value = format!(r#"{{"eth1":{rate}}}"#);
+            let config = AgentConfig::load_with_env(&cli(&[]), |key| {
+                (key == "NETQMON_POLICY_INTERFACE_CAPACITY_BPS").then(|| value.clone().into())
+            })
+            .unwrap();
+            assert_eq!(config.policy_interface_capacity_bps["eth1"], rate);
+        }
+    }
+
+    #[test]
+    fn ignores_removed_one_arm_return_path_environment_variable() {
+        let expected = AgentConfig::load_with_env(&cli(&[]), |_| None).unwrap();
+        for value in ["false", "true", "invalid"] {
+            let config = AgentConfig::load_with_env(&cli(&[]), |key| {
+                (key == "NETQMON_POLICY_ONE_ARM_RETURN_PATH_VERIFIED").then(|| value.into())
+            })
+            .unwrap();
+            assert_eq!(config, expected);
+        }
     }
 
     #[test]

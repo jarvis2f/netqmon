@@ -1,5 +1,5 @@
 <p align="center">
-  Network visibility for OpenWrt — from clients and applications to flows and destinations.
+  Network visibility and traffic policy engine for OpenWrt — from clients and applications to flows, destinations, and traffic control.
 </p>
 
 <p align="center">
@@ -18,13 +18,11 @@
   <img src="apps/controller-ui/public/netqmon-cloud-banner-1920*400.png" width="100%" alt="NetQmon Cloud">
 </p>
 
-NetQmon is a self-hosted network observability platform built for OpenWrt. It shows what is using your network, where traffic is going, and how that activity
-changes over time — without turning the router itself into a heavy analytics box.
+NetQmon is a self-hosted network observability and traffic policy platform built for OpenWrt. It gives you complete visibility into what is using your network, where traffic is going, and how that activity changes over time — while providing granular, application-aware traffic control and bandwidth shaping directly on the gateway.
 
-A lightweight Agent runs on the gateway and collects flow telemetry with TC eBPF. The Controller handles storage, classification, realtime views, historical
-queries, and the web interface.
+A lightweight Agent runs on the gateway, leveraging TC eBPF for zero-overhead flow telemetry and wire-speed policy enforcement. The Controller handles high-performance storage, classification, real-time analytics, visual policy management, and simulation.
 
-> NetQmon focuses on **observability**. It is not intended to replace your firewall, QoS, or network policy system.
+> NetQmon combines **deep network observability** with **application-aware traffic policies** (rate limiting, blocking, and scheduling via eBPF & TC). It brings actionable traffic governance to home and edge networks alongside your existing firewall without turning your router into a heavy analytics appliance.
 
 ## Screenshots
 
@@ -39,10 +37,12 @@ queries, and the web interface.
 |----------------------------|----------------------------------------------------------------------------------------------------------------------|
 | **Clients**                | Realtime upload/download, traffic history, IP/MAC/hostname correlation, and device identity signals.                 |
 | **Applications**           | Classify traffic by organization, application, category, domain, protocol, IP/ASN metadata, and bounded DPI signals. |
+| **Traffic Policies**       | Application- and client-aware policy engine: blocking, upload/download bandwidth shaping (TC/eBPF), and schedules.   |
 | **Flows**                  | Explore IPv4/IPv6 flows with source, destination, protocol, ports, bytes, and classification context.                |
 | **Destinations**           | Understand where traffic goes with domain, country/region, ASN/ISP, and geographic views.                            |
 | **Realtime + history**     | Follow current activity and query historical ranges from the same interface.                                         |
-| **OpenWrt-native**         | TC eBPF data plane, native `procd` service, UCI configuration, diagnostics, and optional LuCI integration.           |
+| **Simulation & Tracking**  | Dry-run policy evaluation against sample traffic before deployment, with real-time 4-stage synchronization tracking. |
+| **OpenWrt-native**         | TC eBPF data plane, native `procd` service, UCI configuration, emergency CLI controls, and optional LuCI app.        |
 | **Self-hosted Controller** | Docker deployment with SQLite by default and optional ClickHouse for larger datasets.                                |
 
 ## How it works
@@ -50,20 +50,50 @@ queries, and the web interface.
 ```mermaid
 flowchart LR
   subgraph Gateway["OpenWrt Gateway"]
-    BPF["TC eBPF"]
+    direction TB
+    BPF["TC eBPF (Flow Telemetry & Fast Drop)"]
+    TC["Linux TC / Qdisc (Bandwidth Shaping)"]
     Agent["NetQmon Agent"]
-    BPF --> Agent
+    BPF <--> Agent
+    Agent --> TC
   end
 
-  Agent -->|" Flow / DNS / device telemetry "| Collector["Collector"]
+  Agent -->|" Flow / DNS / Device Telemetry "| Collector["Collector & Policy Engine"]
+  Collector -->|" Policy Push (WebSocket) "| Agent
   Collector --> Classifier["Classifier"]
   Collector --> Storage[("SQLite / ClickHouse")]
-  Collector --> UI["Next.js Web UI"]
-  Cloud["NetQmon Cloud\nRule & update services"] -. " optional " .-> Classifier
+  Collector <--> UI["Next.js Web UI (Dashboard & Policies)"]
+  Cloud["NetQmon Cloud (Rule & update services)"] -. " optional " .-> Classifier
 ```
 
-The Agent stays focused on capture and lightweight enrichment. Expensive work — classification, aggregation, historical queries, and visualization — belongs on
-the Controller.
+The Agent stays focused on capture, lightweight enrichment, and kernel-level policy enforcement. Heavy computational work — application classification, policy compilation and evaluation, aggregation, historical queries, and visualization — belongs on the Controller.
+
+## Traffic Policies & QoS
+
+NetQmon includes a declarative traffic policy engine that bridges high-level application classification with kernel-level traffic control:
+
+- **Targeted Selection**:
+  - **Clients**: Apply rules to specific devices by MAC address, IP, or hostname, or apply global gateway-wide limits.
+  - **Applications & Categories**: Target identified services (e.g., video streaming, gaming, P2P/downloads, social media) or entire application categories.
+  - **Confidence Threshold**: Set a minimum application identification confidence (`min_application_confidence`) to prevent false positives on early or ambiguous flows.
+
+- **Granular Actions**:
+  - **Block**: Fast-path packet dropping via TC eBPF maps (`flow_verdict_map` and dynamic `endpoint_blocks` with DNS lease correlation). Drops unwanted traffic at wire speed with minimal gateway CPU usage.
+  - **Limit (Traffic Shaping)**: Independent upload and download bandwidth caps (in bps/Mbps) implemented through Linux Traffic Control (`tc` / HTB / CAKE / FQ-CoDel / IFB). Supports both per-client total bandwidth limits and fine-grained per-application shaping.
+  - **Allow / Priority**: Whitelist mission-critical traffic or assign policy priorities (0–1000) to override broader restrictions.
+
+- **Time Windows & Scheduling**:
+  - Define timezone-aware schedules with recurring active windows (e.g., limit streaming bandwidth during work hours 09:00–18:00, block gaming on school nights).
+
+- **Visual Management & Simulation**:
+  - **Dual Editor**: Seamlessly switch between the intuitive visual form editor and the declarative YAML specification editor with real-time validation.
+  - **Policy Verdict Preview**: Interactive dry-run simulator to test and verify how policies evaluate a sample client MAC, application, and category before applying changes to the network.
+  - **4-Stage Deployment Tracking**: Full visibility into the sync lifecycle: `Desired` (Controller) → `Delivered` (WebSocket) → `Acknowledged` (Agent received) → `Applied` (Active on kernel/interfaces), with transparent reporting of degraded or unsupported states.
+
+- **Reliability & Fail-Safe Protection**:
+  - **Hardware & Link Probing**: Automatically negotiates physical interface speeds (including multi-gigabit links) or accepts explicit interface capacity overrides.
+  - **Zero-Disruption Fallback**: Non-disruptive rollbacks and capability checks ensure your router never hangs.
+  - **Local Emergency Unlock**: If a misconfiguration occurs, run `netqmon-agent policies unlock` directly on the router CLI to instantly tear down active policy rules and qdiscs without needing Controller connectivity.
 
 ## Quick start
 
@@ -100,11 +130,19 @@ Then install the NetQmon Agent package and, if wanted, the LuCI app from a relea
 netqmon-agent doctor
 ```
 
-See [Agent CLI Reference](docs/agent-cli-reference.md) for command-line options, diagnostics, UCI configuration, and environment variables.
+Check policy synchronization status or manage emergency unlock directly on the router:
+
+```sh
+netqmon-agent policies status
+netqmon-agent policies unlock   # Instantly remove all NetQmon policy rules and qdiscs
+netqmon-agent policies resume   # Restore policy enforcement
+```
+
+See [Agent CLI Reference](docs/agent-cli-reference.md) for command-line options, policy management, diagnostics, UCI configuration, and environment variables.
 
 ## Community and Pro
 
-NetQmon Community and Pro use the same monitoring engine and interface. The difference is the classification data available to them.
+NetQmon Community and Pro use the same monitoring engine, policy framework, and web interface. The difference is the classification data available to them.
 
 | Edition       | Classification data                                                                                                          |
 |---------------|------------------------------------------------------------------------------------------------------------------------------|
@@ -127,16 +165,16 @@ See [Privacy](docs/PRIVACY.md) for the implementation details and probe limits.
 ## Project layout
 
 ```text
-bpf/                         TC eBPF data plane
-crates/agent/                OpenWrt userspace Agent
-crates/collector/            Ingestion, DPI, realtime and query pipeline
+bpf/                         TC eBPF data plane & fast-path policy enforcement maps
+crates/agent/                OpenWrt userspace Agent (telemetry & policy executor)
+crates/collector/            Ingestion, DPI, policy engine, realtime and query pipeline
 crates/classifier-client/    Classification client
 crates/classifier-manager/   Rule lifecycle and updates
 crates/storage/              SQLite / ClickHouse storage
-apps/controller-ui/          Next.js Controller UI
+apps/controller-ui/          Next.js Controller UI & Policy dashboard
 packaging/openwrt/           OpenWrt packages and LuCI app
 deploy/docker/               Controller container build
-docs/                        Architecture, deployment and protocol docs
+docs/                        Architecture, deployment, CLI and protocol docs
 ```
 
 ## Development

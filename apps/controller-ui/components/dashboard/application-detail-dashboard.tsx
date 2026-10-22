@@ -301,11 +301,11 @@ export function ApplicationDetailDashboard({
         downloadBps:
           point.download_bytes *
           8 *
-          (60_000 / (data?.traffic.bucket_ms ?? 60_000)),
+          (1_000 / (data?.traffic.bucket_ms ?? 60_000)),
         uploadBps:
           point.upload_bytes *
           8 *
-          (60_000 / (data?.traffic.bucket_ms ?? 60_000)),
+          (1_000 / (data?.traffic.bucket_ms ?? 60_000)),
       })),
     [data],
   );
@@ -670,7 +670,6 @@ export function ApplicationDetailDashboard({
             : t("detail.fallbackSubtitle")
       }
       username={username}
-      isLive={false}
       headerActions={
         <Link
           href={applicationsHref}
@@ -696,6 +695,7 @@ export function ApplicationDetailDashboard({
               value={initialTab}
               onValueChange={(val) => setTab(val as Tab)}
               variant="pill"
+              className="w-auto"
             >
               <TabsList className="h-8 p-0.5 bg-surface-subtle/80">
                 {tabs.map((tab) => (

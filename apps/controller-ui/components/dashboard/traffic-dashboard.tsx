@@ -196,9 +196,9 @@ export function TrafficDashboard({
       (data?.points ?? []).map((point) => ({
         timestamp: point.timestamp,
         downloadBps:
-          point.download_bytes * 8 * (60_000 / (data?.bucket_ms ?? 60_000)),
+          point.download_bytes * 8 * (1_000 / (data?.bucket_ms ?? 60_000)),
         uploadBps:
-          point.upload_bytes * 8 * (60_000 / (data?.bucket_ms ?? 60_000)),
+          point.upload_bytes * 8 * (1_000 / (data?.bucket_ms ?? 60_000)),
       })),
     [data],
   );
@@ -402,7 +402,6 @@ export function TrafficDashboard({
       title={tNav("traffic")}
       subtitle={t("subtitle")}
       username={username}
-      isLive={false}
       toolbar={toolbar}
     >
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">

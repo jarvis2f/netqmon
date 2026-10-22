@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDown,
   ArrowLeft,
@@ -87,15 +87,19 @@ const COLORS = {
     down: "#38bdf8",
     up: "#34d399",
     wan: "#a78bfa",
-    route: "#64748b",
+    route: "#38bdf8",
     tunnel: "#22d3ee",
+    track: "rgba(148, 163, 184, 0.14)",
+    trackCenter: "rgba(148, 163, 184, 0.22)",
   },
   light: {
     down: "#0284c7",
     up: "#059669",
     wan: "#7c3aed",
-    route: "#64748b",
+    route: "#0284c7",
     tunnel: "#0891b2",
+    track: "rgba(100, 116, 139, 0.16)",
+    trackCenter: "rgba(100, 116, 139, 0.24)",
   },
 };
 
@@ -261,22 +265,119 @@ function rgba(hex: string, alpha: number) {
   return `rgba(${(value >> 16) & 255},${(value >> 8) & 255},${value & 255},${alpha})`;
 }
 
-class Particle {
-  t = Math.random();
-  seed = Math.random();
-  constructor(
-    public edge: Edge,
-    public direction: "down" | "up",
-  ) {}
-  update(dt: number) {
-    const traffic = this.direction === "down" ? this.edge.down : this.edge.up;
-    this.t =
-      (this.t +
-        dt *
-          (0.00028 + Math.min(traffic / 100_000_000, 1) * 0.0008) *
-          (0.8 + this.seed * 0.4)) %
-      1;
+class SwarmParticle {
+  t: number;
+  lateralRatio: number;
+  radius: number;
+  colorType: "aqua" | "purple" | "white";
+  alpha: number;
+  speedMult: number;
+  direction: "down" | "up";
+  edge: Edge;
+
+  constructor(edge: Edge, direction: "down" | "up", initialT?: number) {
+    this.edge = edge;
+    this.direction = direction;
+    this.t = initialT ?? Math.random();
+    // Triangular distribution centered around 0 to naturally cluster near the middle of the river
+    this.lateralRatio = (Math.random() + Math.random() - 1) * 0.95;
+    this.radius = 0.75 + Math.random() * 0.55; // 0.75px to 1.3px
+    this.speedMult = 0.85 + Math.random() * 0.3; // natural speed variation
+    this.alpha = 0.5 + Math.random() * 0.45; // twinkling opacity
+
+    const rand = Math.random();
+    if (direction === "down") {
+      this.colorType = rand < 0.62 ? "aqua" : rand < 0.92 ? "purple" : "white";
+    } else {
+      this.colorType = rand < 0.62 ? "purple" : rand < 0.92 ? "aqua" : "white";
+    }
   }
+
+  update(dt: number, baseSpeed: number) {
+    this.t = (this.t + dt * baseSpeed * this.speedMult) % 1;
+  }
+}
+
+function computeStreamWidth(trafficBps: number, isWan: boolean): number {
+  if (trafficBps <= 50) return 0;
+  if (trafficBps < 5_000) return 9; // like 864 bps in UniFi console
+  if (trafficBps < 50_000) return 12;
+  if (trafficBps < 500_000) return 15;
+  if (trafficBps < 10_000_000) return 18;
+  return isWan ? 24 : 21;
+}
+
+function computeSwarmCount(trafficBps: number, isWan: boolean): number {
+  if (trafficBps <= 50) return 0;
+  if (trafficBps < 5_000) return 22;
+  if (trafficBps < 50_000) return 34;
+  if (trafficBps < 500_000) return 46;
+  if (trafficBps < 10_000_000) return 64;
+  return isWan ? 90 : 76;
+}
+
+interface EdgeGeometry {
+  p0x: number;
+  p0y: number;
+  p1x: number;
+  p1y: number;
+  p2x: number;
+  p2y: number;
+  p3x: number;
+  p3y: number;
+  spanY: number;
+  dx: number;
+}
+
+function getEdgeGeometry(
+  edge: Edge,
+  width: number,
+  height: number,
+  portOffsetX = 0,
+): EdgeGeometry {
+  const deltaY = Math.max(10, (edge.to.y - edge.from.y) * height);
+  const cardHalfHeight = Math.min(38, deltaY * 0.35);
+
+  const p0x = edge.from.x * width + portOffsetX;
+  const p0y = edge.from.y * height + cardHalfHeight;
+  const p3x = edge.to.x * width;
+  const p3y = edge.to.y * height - cardHalfHeight;
+
+  const spanY = Math.max(1, p3y - p0y);
+  const p1x = p0x;
+  const p1y = p0y + spanY * 0.5;
+  const p2x = p3x;
+  const p2y = p3y - spanY * 0.5;
+
+  return {
+    p0x,
+    p0y,
+    p1x,
+    p1y,
+    p2x,
+    p2y,
+    p3x,
+    p3y,
+    spanY,
+    dx: p3x - p0x,
+  };
+}
+
+function evalCurve(g: EdgeGeometry, s: number) {
+  const t = Math.max(0, Math.min(1, s));
+  const x = g.p0x + g.dx * (3 * t * t - 2 * t * t * t);
+  const y = g.p0y + g.spanY * t;
+
+  const dxdt = g.dx * 6 * t * (1 - t);
+  const dydt = g.spanY;
+  const len = Math.hypot(dxdt, dydt) || 1;
+
+  const tx = dxdt / len;
+  const ty = dydt / len;
+  const nx = -ty;
+  const ny = tx;
+
+  return { x, y, tx, ty, nx, ny };
 }
 
 export function ClientTrafficFlowMap({
@@ -298,7 +399,14 @@ export function ClientTrafficFlowMap({
   const dark = resolvedTheme === "dark";
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLElement>(null);
-  const particlePool = useRef<Map<string, Particle[]>>(new Map());
+  const particlePool = useRef<Map<string, SwarmParticle[]>>(new Map());
+  const [smoothRates, setSmoothRates] = useState<
+    Record<string, { down: number; up: number }>
+  >({});
+  const smoothRatesRef = useRef<Record<string, { down: number; up: number }>>(
+    {},
+  );
+  const lastUiUpdateRef = useRef<number>(0);
   const [size, setSize] = useState({ width: 900, height: 620 });
   const [hovered, setHovered] = useState<string | null>(null);
   const [paused, setPaused] = useState(false);
@@ -470,28 +578,54 @@ export function ClientTrafficFlowMap({
     return result;
   }, [nodes]);
 
+  const outgoingMap = useMemo(() => {
+    const map = new Map<string, Edge[]>();
+    edges.forEach((edge) => {
+      const list = map.get(edge.from.id) ?? [];
+      list.push(edge);
+      map.set(edge.from.id, list);
+    });
+    map.forEach((list) => {
+      list.sort((a, b) => a.to.x - b.to.x);
+    });
+    return map;
+  }, [edges]);
+
+  const getPortOffset = useCallback(
+    (edge: Edge) => {
+      const siblings = outgoingMap.get(edge.from.id);
+      if (!siblings || siblings.length <= 1) return 0;
+      const idx = siblings.indexOf(edge);
+      if (idx === -1) return 0;
+      const count = siblings.length;
+      const maxSpan = Math.min(110, (count - 1) * 22);
+      return -maxSpan / 2 + (idx / (count - 1)) * maxSpan;
+    },
+    [outgoingMap],
+  );
+
   useEffect(() => {
-    const next = new Map<string, Particle[]>();
+    const next = new Map<string, SwarmParticle[]>();
     edges.forEach((edge) => {
       const key = `${edge.from.id}->${edge.to.id}`;
       const old = particlePool.current.get(key) ?? [];
-      old.forEach((particle) => {
-        particle.edge = edge;
+      old.forEach((p) => {
+        p.edge = edge;
       });
-      const downCount = edge.down
-        ? Math.min(12, Math.max(3, Math.round(Math.sqrt(edge.down / 150_000))))
-        : 2;
-      const upCount = edge.up
-        ? Math.min(9, Math.max(2, Math.round(Math.sqrt(edge.up / 180_000))))
-        : 1;
+      const isWan = edge.kind === "wan";
+      const downCount = computeSwarmCount(edge.down, isWan);
+      const upCount = computeSwarmCount(edge.up, isWan);
       const down = old
-        .filter((particle) => particle.direction === "down")
+        .filter((p) => p.direction === "down")
         .slice(0, downCount);
-      const up = old
-        .filter((particle) => particle.direction === "up")
-        .slice(0, upCount);
-      while (down.length < downCount) down.push(new Particle(edge, "down"));
-      while (up.length < upCount) up.push(new Particle(edge, "up"));
+      const up = old.filter((p) => p.direction === "up").slice(0, upCount);
+
+      while (down.length < downCount) {
+        down.push(new SwarmParticle(edge, "down"));
+      }
+      while (up.length < upCount) {
+        up.push(new SwarmParticle(edge, "up"));
+      }
       next.set(key, [...down, ...up]);
     });
     particlePool.current = next;
@@ -532,77 +666,242 @@ export function ClientTrafficFlowMap({
         context.setTransform(dpr, 0, 0, dpr, 0, 0);
         context.clearRect(0, 0, size.width, size.height);
         const palette = dark ? COLORS.dark : COLORS.light;
-        const geometry = (edge: Edge) => {
-          const x0 = edge.from.x * size.width,
-            y0 = edge.from.y * size.height,
-            x1 = edge.to.x * size.width,
-            y1 = edge.to.y * size.height;
-          const dx = x1 - x0,
-            dy = y1 - y0,
-            length = Math.hypot(dx, dy) || 1,
-            bend = length * (edge.kind === "wan" ? 0.025 : 0.06);
-          return {
-            x0,
-            y0,
-            x1,
-            y1,
-            cx: (x0 + x1) / 2 - (dy / length) * bend,
-            cy: (y0 + y1) / 2 + (dx / length) * bend,
+
+        // Smoothly interpolate rates for nodes
+        nodes.forEach((node) => {
+          const targetDown = node.down;
+          const targetUp = node.up;
+          const current = smoothRatesRef.current[node.id] ?? {
+            down: targetDown,
+            up: targetUp,
           };
-        };
-        const laneWidth = (edge: Edge) =>
-          3 + Math.min(1, Math.sqrt((edge.down + edge.up) / 100_000_000)) * 23;
-        edges.forEach((edge) => {
-          const g = geometry(edge),
-            related =
-              !hovered || edge.from.id === hovered || edge.to.id === hovered;
-          const color =
-            edge.kind === "wan"
-              ? palette.wan
-              : edge.kind === "tunnel"
-                ? palette.tunnel
-                : edge.kind === "route"
-                  ? palette.route
-                  : edge.down >= edge.up
-                    ? palette.down
-                    : palette.up;
-          context.beginPath();
-          context.moveTo(g.x0, g.y0);
-          context.quadraticCurveTo(g.cx, g.cy, g.x1, g.y1);
-          context.lineCap = "round";
-          context.strokeStyle = rgba(color, related ? 0.16 : 0.04);
-          context.lineWidth = laneWidth(edge) * 2;
-          context.shadowBlur = related ? 18 : 0;
-          context.shadowColor = rgba(color, 0.28);
-          context.stroke();
-          context.shadowBlur = 0;
-          context.strokeStyle = rgba(color, related ? 0.5 : 0.12);
-          context.lineWidth = 1.3;
-          context.stroke();
+          const factor = 1 - Math.exp(-dt * 0.007);
+          const newDown =
+            Math.abs(targetDown - current.down) < 50
+              ? targetDown
+              : current.down + (targetDown - current.down) * factor;
+          const newUp =
+            Math.abs(targetUp - current.up) < 50
+              ? targetUp
+              : current.up + (targetUp - current.up) * factor;
+          smoothRatesRef.current[node.id] = { down: newDown, up: newUp };
         });
-        particlePool.current.forEach((particles) =>
-          particles.forEach((particle) => {
-            if (!paused) particle.update(dt);
-            const edge = particle.edge,
-              g = geometry(edge),
-              s = particle.direction === "down" ? particle.t : 1 - particle.t,
-              u = 1 - s;
-            const x = u * u * g.x0 + 2 * u * s * g.cx + s * s * g.x1,
-              y = u * u * g.y0 + 2 * u * s * g.cy + s * s * g.y1;
-            const color =
-              edge.kind === "wan"
-                ? palette.wan
-                : particle.direction === "down"
-                  ? palette.down
-                  : palette.up;
+
+        if (now - lastUiUpdateRef.current > 50) {
+          lastUiUpdateRef.current = now;
+          setSmoothRates({ ...smoothRatesRef.current });
+        }
+
+        const geometries = new Map<Edge, EdgeGeometry>();
+        edges.forEach((edge) => {
+          geometries.set(
+            edge,
+            getEdgeGeometry(edge, size.width, size.height, getPortOffset(edge)),
+          );
+        });
+
+        // 1. Sleek Cable Tracks & UniFi Translucent River Conduits
+        edges.forEach((edge) => {
+          const g = geometries.get(edge)!;
+          const related =
+            !hovered || edge.from.id === hovered || edge.to.id === hovered;
+          const smoothedNodeRates = smoothRatesRef.current[edge.to.id];
+          const totalTraffic =
+            (smoothedNodeRates?.down ?? edge.down) +
+            (smoothedNodeRates?.up ?? edge.up);
+          const isWan = edge.kind === "wan";
+          const streamWidth = computeStreamWidth(totalTraffic, isWan);
+          const hasTraffic = streamWidth > 0;
+
+          // 1a. Base center guide wire (crisp 1.5px, subtle slate)
+          context.beginPath();
+          context.moveTo(g.p0x, g.p0y);
+          context.bezierCurveTo(g.p1x, g.p1y, g.p2x, g.p2y, g.p3x, g.p3y);
+          context.lineCap = "round";
+          context.strokeStyle = dark
+            ? related
+              ? hasTraffic
+                ? "rgba(148, 163, 184, 0.22)"
+                : "rgba(148, 163, 184, 0.12)"
+              : "rgba(148, 163, 184, 0.05)"
+            : related
+              ? hasTraffic
+                ? "rgba(100, 116, 139, 0.24)"
+                : "rgba(100, 116, 139, 0.15)"
+              : "rgba(100, 116, 139, 0.06)";
+          context.lineWidth = 1.5;
+          context.stroke();
+
+          // 1b. Translucent river corridor (UniFi fluid bed) when active
+          if (hasTraffic && related) {
+            // Outer soft river conduit
+            context.beginPath();
+            context.moveTo(g.p0x, g.p0y);
+            context.bezierCurveTo(g.p1x, g.p1y, g.p2x, g.p2y, g.p3x, g.p3y);
+            context.lineCap = "round";
+            context.strokeStyle = dark
+              ? "rgba(56, 189, 248, 0.11)"
+              : "rgba(2, 132, 199, 0.08)";
+            context.lineWidth = streamWidth + 4;
+            context.stroke();
+
+            // Inner river corridor
+            context.beginPath();
+            context.moveTo(g.p0x, g.p0y);
+            context.bezierCurveTo(g.p1x, g.p1y, g.p2x, g.p2y, g.p3x, g.p3y);
+            context.lineCap = "round";
+            context.strokeStyle = dark
+              ? "rgba(56, 189, 248, 0.08)"
+              : "rgba(2, 132, 199, 0.05)";
+            context.lineWidth = streamWidth * 0.6;
+            context.stroke();
+          }
+        });
+
+        // 2. Hardware Connection Ports (Crisp terminal pins)
+        edges.forEach((edge) => {
+          const g = geometries.get(edge)!;
+          const related =
+            !hovered || edge.from.id === hovered || edge.to.id === hovered;
+          const smoothedNodeRates = smoothRatesRef.current[edge.to.id];
+          const totalTraffic =
+            (smoothedNodeRates?.down ?? edge.down) +
+            (smoothedNodeRates?.up ?? edge.up);
+          const hasTraffic = totalTraffic > 50;
+          const isWan = edge.kind === "wan";
+          const activeColor = isWan ? palette.wan : palette.route;
+
+          const pinAlpha = related ? (hasTraffic ? 0.9 : 0.35) : 0.12;
+          const pinColor = hasTraffic
+            ? activeColor
+            : dark
+              ? "#64748b"
+              : "#94a3b8";
+
+          // Top pin
+          context.beginPath();
+          context.arc(g.p0x, g.p0y, 2.5, 0, Math.PI * 2);
+          context.fillStyle = rgba(pinColor, pinAlpha);
+          context.fill();
+
+          // Bottom pin
+          context.beginPath();
+          context.arc(g.p3x, g.p3y, 2.5, 0, Math.PI * 2);
+          context.fillStyle = rgba(pinColor, pinAlpha);
+          context.fill();
+
+          if (hasTraffic && related) {
+            context.beginPath();
+            context.arc(g.p0x, g.p0y, 5, 0, Math.PI * 2);
+            context.fillStyle = rgba(pinColor, 0.18);
+            context.fill();
+
+            context.beginPath();
+            context.arc(g.p3x, g.p3y, 5, 0, Math.PI * 2);
+            context.fillStyle = rgba(pinColor, 0.18);
+            context.fill();
+          }
+        });
+
+        // 3. UniFi Stardust Particle Swarm (Dense Micro-Particles)
+        const aquaDots: { x: number; y: number; r: number; a: number }[] = [];
+        const purpleDots: { x: number; y: number; r: number; a: number }[] = [];
+        const whiteDots: { x: number; y: number; r: number; a: number }[] = [];
+
+        particlePool.current.forEach((particles) => {
+          particles.forEach((p) => {
+            const edge = p.edge;
+            const g = geometries.get(edge);
+            if (!g) return;
+
             const related =
               !hovered || edge.from.id === hovered || edge.to.id === hovered;
+            const smoothedNodeRates = smoothRatesRef.current[edge.to.id];
+            const traffic =
+              p.direction === "down"
+                ? (smoothedNodeRates?.down ?? edge.down)
+                : (smoothedNodeRates?.up ?? edge.up);
+
+            if (traffic <= 50) return;
+
+            const isWan = edge.kind === "wan";
+            const streamWidth = computeStreamWidth(traffic, isWan);
+            if (streamWidth <= 0) return;
+
+            // Speed formula: steady, smooth, natural drift
+            const baseSpeed =
+              0.00012 +
+              Math.min(1, Math.log10(Math.max(1, traffic / 3000)) / 6) *
+                0.00016;
+
+            if (!paused) p.update(dt, baseSpeed);
+
+            // Compute curve parameter s along the path
+            const s = p.direction === "down" ? p.t : 1 - p.t;
+
+            // Smooth fade in near source port, fade out near destination port
+            const edgeFade = Math.min(
+              1,
+              Math.min(p.t / 0.08, (1 - p.t) / 0.08),
+            );
+            const totalAlpha = p.alpha * edgeFade * (related ? 1.0 : 0.15);
+            if (totalAlpha <= 0.02) return;
+
+            // Point along the curve + lateral stardust offset
+            const evalPt = evalCurve(g, s);
+            const offset = p.lateralRatio * (streamWidth / 2);
+            const px = evalPt.x + offset * evalPt.nx;
+            const py = evalPt.y + offset * evalPt.ny;
+
+            if (p.colorType === "aqua") {
+              aquaDots.push({ x: px, y: py, r: p.radius, a: totalAlpha });
+            } else if (p.colorType === "purple") {
+              purpleDots.push({ x: px, y: py, r: p.radius, a: totalAlpha });
+            } else {
+              whiteDots.push({
+                x: px,
+                y: py,
+                r: p.radius * 0.9,
+                a: totalAlpha,
+              });
+            }
+          });
+        });
+
+        // Batch render all aqua stardust
+        if (aquaDots.length > 0) {
+          context.fillStyle = dark ? "#38bdf8" : "#0284c7";
+          aquaDots.forEach((pt) => {
+            context.globalAlpha = pt.a;
             context.beginPath();
-            context.arc(x, y, 1.1 + particle.seed, 0, Math.PI * 2);
-            context.fillStyle = rgba(color, related ? 0.9 : 0.14);
+            context.arc(pt.x, pt.y, pt.r, 0, Math.PI * 2);
             context.fill();
-          }),
-        );
+          });
+        }
+
+        // Batch render all purple stardust
+        if (purpleDots.length > 0) {
+          context.fillStyle = dark ? "#c084fc" : "#7c3aed";
+          purpleDots.forEach((pt) => {
+            context.globalAlpha = pt.a;
+            context.beginPath();
+            context.arc(pt.x, pt.y, pt.r, 0, Math.PI * 2);
+            context.fill();
+          });
+        }
+
+        // Batch render all white sparkle stardust
+        if (whiteDots.length > 0) {
+          context.fillStyle = "#ffffff";
+          whiteDots.forEach((pt) => {
+            context.globalAlpha = pt.a;
+            context.beginPath();
+            context.arc(pt.x, pt.y, pt.r, 0, Math.PI * 2);
+            context.fill();
+          });
+        }
+
+        context.globalAlpha = 1.0;
       }
       frame = requestAnimationFrame(render);
     };
@@ -611,7 +910,7 @@ export function ClientTrafficFlowMap({
       alive = false;
       cancelAnimationFrame(frame);
     };
-  }, [dark, edges, hovered, paused, size]);
+  }, [dark, edges, getPortOffset, hovered, nodes, paused, size]);
 
   const back = () => setCategory(null);
   return (
@@ -620,20 +919,6 @@ export function ClientTrafficFlowMap({
       style={{ height }}
       className="relative w-full overflow-hidden rounded-xl border border-border bg-surface-subtle/80 text-foreground shadow-sm dark:bg-[#07101d]"
     >
-      <div
-        className="pointer-events-none absolute inset-0 dark:hidden"
-        style={{
-          background:
-            "radial-gradient(circle at 50% 40%,rgba(2,132,199,.08),rgba(241,245,249,.5) 46%,transparent 76%),linear-gradient(180deg,#fff,#f8fafc)",
-        }}
-      />
-      <div
-        className="pointer-events-none absolute inset-0 hidden dark:block"
-        style={{
-          background:
-            "radial-gradient(circle at 50% 40%,rgba(56,189,248,.12),rgba(15,23,42,.45) 52%,transparent 82%),linear-gradient(180deg,#090e17,#060a12)",
-        }}
-      />
       <canvas
         ref={canvasRef}
         className="pointer-events-none absolute inset-0"
@@ -708,6 +993,16 @@ export function ClientTrafficFlowMap({
           wan = node.type === "internet" || node.type === "upstream",
           agent = node.type === "agent",
           selected = node.client?.id === selectedClientId;
+        const isHovered = node.id === hovered;
+        const isConnectedToHovered =
+          hovered !== null &&
+          edges.some(
+            (e) =>
+              (e.from.id === hovered && e.to.id === node.id) ||
+              (e.to.id === hovered && e.from.id === node.id),
+          );
+        const isDimmed =
+          hovered !== null && !isHovered && !isConnectedToHovered;
         const icon =
           node.type === "internet" ? (
             <Cloud className="size-4" />
@@ -722,6 +1017,13 @@ export function ClientTrafficFlowMap({
           ) : (
             <Network className="size-4" />
           );
+        const displayRates = smoothRates[node.id] ?? {
+          down: node.down,
+          up: node.up,
+        };
+        const displayDown = Math.round(displayRates.down);
+        const displayUp = Math.round(displayRates.up);
+
         return (
           <button
             key={node.id}
@@ -734,7 +1036,7 @@ export function ClientTrafficFlowMap({
               else if (node.client) onSelectClient(node.client.id);
             }}
             style={{ left: `${node.x * 100}%`, top: `${node.y * 100}%` }}
-            className={`absolute z-10 -translate-x-1/2 -translate-y-1/2 rounded-xl bg-surface/95 px-3 py-2 text-left shadow-sm backdrop-blur transition hover:shadow-md ${interactive ? "cursor-pointer" : "cursor-default"} disabled:cursor-default dark:bg-slate-900/90 ${agent ? "w-[190px] max-w-[190px] border-2 border-sky-500/40" : wan ? "min-w-[155px] border border-purple-500/40" : selected ? "min-w-[135px] scale-105 border-2 border-sky-500" : "min-w-[130px] max-w-[190px] border border-border/80 hover:border-sky-500/60"}`}
+            className={`absolute z-10 -translate-x-1/2 -translate-y-1/2 w-[176px] h-[76px] rounded-xl bg-surface/95 px-3 py-2 text-left shadow-sm backdrop-blur transition-all duration-200 hover:shadow-md ${isDimmed ? "opacity-40 scale-[0.98]" : "opacity-100"} ${isHovered ? "ring-2 ring-sky-500 shadow-md shadow-sky-500/25 scale-[1.02]" : ""} ${interactive ? "cursor-pointer" : "cursor-default"} disabled:cursor-default dark:bg-slate-900/90 ${agent ? "border-2 border-sky-500/50" : wan ? "border border-purple-500/40" : selected ? "scale-105 border-2 border-sky-500" : "border border-border/80 hover:border-sky-500/60"}`}
           >
             <div className="flex items-center gap-2.5">
               <span
@@ -743,23 +1045,25 @@ export function ClientTrafficFlowMap({
                 {icon}
               </span>
               <span className="min-w-0 flex-1">
-                <b className="block truncate text-xs">{node.name}</b>
+                <b className="block truncate text-xs font-semibold leading-tight">
+                  {node.name}
+                </b>
                 <span
-                  className="block truncate text-[10px] text-foreground-muted"
+                  className="block truncate text-[10px] text-foreground-muted leading-tight mt-0.5"
                   title={node.meta}
                 >
                   {node.meta}
                 </span>
               </span>
             </div>
-            <div className="mt-2 flex justify-between border-t border-border/70 pt-1.5 font-mono text-[10px]">
-              <span className="flex items-center gap-1 text-sky-600">
-                <ArrowDown className="size-3" />
-                <b>{formatBitrate(node.down)}</b>
+            <div className="mt-2 flex items-center justify-between border-t border-border/70 pt-1.5 font-mono text-[10px] tabular-nums">
+              <span className="flex items-center gap-1 text-sky-600 dark:text-sky-400 min-w-0 flex-1">
+                <ArrowDown className="size-3 shrink-0" />
+                <span className="truncate">{formatBitrate(displayDown)}</span>
               </span>
-              <span className="flex items-center gap-1 text-emerald-600">
-                <ArrowUp className="size-3" />
-                <b>{formatBitrate(node.up)}</b>
+              <span className="flex items-center justify-end gap-1 text-emerald-600 dark:text-emerald-400 min-w-0 flex-1">
+                <ArrowUp className="size-3 shrink-0" />
+                <span className="truncate">{formatBitrate(displayUp)}</span>
               </span>
             </div>
           </button>
@@ -772,8 +1076,18 @@ export function ClientTrafficFlowMap({
       ) : null}
       <footer className="absolute bottom-3.5 left-4 right-4 z-20 flex flex-wrap gap-2 text-xs">
         {[
-          [t("totalDown"), formatBitrate(totals.down), "text-sky-600"],
-          [t("totalUp"), formatBitrate(totals.up), "text-emerald-600"],
+          [
+            t("totalDown"),
+            formatBitrate(
+              Math.round(smoothRates["internet"]?.down ?? totals.down),
+            ),
+            "text-sky-600 dark:text-sky-400",
+          ],
+          [
+            t("totalUp"),
+            formatBitrate(Math.round(smoothRates["internet"]?.up ?? totals.up)),
+            "text-emerald-600 dark:text-emerald-400",
+          ],
           [t("activeFlows"), activeInternetFlows.toLocaleString(), ""],
           [t("onlineDevices"), onlineClientCount.toLocaleString(), ""],
         ].map(([label, value, color]) => (

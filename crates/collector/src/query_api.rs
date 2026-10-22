@@ -1323,9 +1323,19 @@ async fn applications(
                 for item in &mut items {
                     let application_id = item["application_id"].as_str().unwrap_or("unknown");
                     let application = inner.classifier.application_metadata(application_id);
-                    let organization_id = item["organization_id"].as_str().unwrap_or("unknown");
+                    let current_organization_id = item["organization_id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty() && *id != "unknown")
+                        .map(str::to_owned);
+                    let organization_id = current_organization_id
+                        .or_else(|| {
+                            application
+                                .as_ref()
+                                .and_then(|metadata| metadata.organization_id.clone())
+                        })
+                        .unwrap_or_else(|| "unknown".to_owned());
                     let organization = (organization_id != "unknown")
-                        .then(|| inner.classifier.organization_metadata(organization_id))
+                        .then(|| inner.classifier.organization_metadata(&organization_id))
                         .flatten();
                     if let Some(object) = item.as_object_mut() {
                         object.insert(
@@ -1333,6 +1343,7 @@ async fn applications(
                             json!(application.as_ref().map(|value| value.name.clone())),
                         );
                         object.insert("icon".to_owned(), icon_json(application));
+                        object.insert("organization_id".to_owned(), json!(organization_id));
                         object.insert(
                             "organization_name".to_owned(),
                             json!(organization.as_ref().map(|value| value.name.clone())),
@@ -1449,6 +1460,12 @@ fn map_application_row(row: &Row<'_>, inner: &crate::CollectorInner) -> rusqlite
         None
     } else {
         row.get::<_, Option<String>>(8)?
+    };
+    let organization_id = match organization_id {
+        Some(id) if !id.is_empty() && id != "unknown" => Some(id),
+        _ => application_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.organization_id.clone()),
     };
     let organization_metadata = organization_id
         .as_deref()
@@ -3893,7 +3910,7 @@ where
     connection.query_row(sql, parameters, |row| row.get(0))
 }
 
-fn format_mac(bytes: &[u8]) -> String {
+pub(crate) fn format_mac(bytes: &[u8]) -> String {
     if bytes.len() != 6 {
         return "unknown".to_owned();
     }

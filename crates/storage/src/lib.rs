@@ -1,6 +1,5 @@
 //! SQLite-backed persistence and aggregation for netqmon.
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
@@ -11,6 +10,8 @@ use netqmon_protocol::v1::{FlowDelta, FlowLifecycle, TelemetryBatch};
 use rusqlite::types::{Type, Value};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
+mod attribution;
+
 const INITIAL_MIGRATION: &str = include_str!("../../../migrations/sqlite/0001_initial.sql");
 const PROTOCOL_MIGRATION: &str =
     include_str!("../../../migrations/sqlite/0002_traffic_scope_protocol.sql");
@@ -20,13 +21,38 @@ const PROTOCOL_ONLY_APPLICATION_MIGRATION: &str =
     include_str!("../../../migrations/sqlite/0004_protocol_only_app_rollup.sql");
 const PROTOCOL_APPLICATION_ROLLUP_MIGRATION: &str =
     include_str!("../../../migrations/sqlite/0005_protocol_application_rollup.sql");
-const MIGRATIONS: [(i64, &str); 5] = [
+const MIGRATIONS: [(i64, &str); 7] = [
     (1, INITIAL_MIGRATION),
     (2, PROTOCOL_MIGRATION),
     (3, SCOPE_TIMESTAMP_MIGRATION),
     (4, PROTOCOL_ONLY_APPLICATION_MIGRATION),
     (5, PROTOCOL_APPLICATION_ROLLUP_MIGRATION),
+    (
+        6,
+        include_str!("../../../migrations/sqlite/0006_flow_rollup_contributions.sql"),
+    ),
+    (
+        7,
+        include_str!("../../../migrations/sqlite/0007_dns_answer_lookup.sql"),
+    ),
 ];
+const SAME_DEVICE_DNS_QUERY: &str =
+    "SELECT dns.domain FROM device_addresses client
+     JOIN devices d ON d.id=client.device_id
+     JOIN device_addresses source ON source.device_id=d.id
+     JOIN dns_observations dns ON dns.gateway_id=d.gateway_id AND dns.client_ip=source.ip
+     WHERE d.gateway_id=?1 AND client.ip=?2 AND dns.answer_ip = ?3
+       AND dns.observed_at <= ?4 AND dns.expires_at > ?4
+       AND client.first_seen<=?4 AND client.last_seen>=?4-300000
+           AND source.first_seen<=dns.observed_at AND source.last_seen>=dns.observed_at-300000
+           AND NOT EXISTS (
+             SELECT 1 FROM device_addresses other JOIN devices od ON od.id=other.device_id
+             WHERE od.gateway_id=?1 AND other.device_id!=d.id AND (
+               (other.ip=?2 AND other.first_seen<=?4 AND other.last_seen>=?4-300000) OR
+               (other.ip=dns.client_ip AND other.first_seen<=dns.observed_at AND other.last_seen>=dns.observed_at-300000)
+             )
+           )
+     ORDER BY dns.observed_at DESC, dns.id DESC LIMIT 1";
 pub(crate) const PROTOCOL_APPLICATION_PREFIX: &str = "protocol:";
 const MINUTE_MS: i64 = 60 * 1_000;
 const HOUR_MS: i64 = 60 * MINUTE_MS;
@@ -67,7 +93,7 @@ pub struct TrafficTotal {
     pub flow_count: i64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FlowAttribution {
     pub domain: Option<String>,
     pub organization_id: String,
@@ -776,7 +802,6 @@ impl SqliteStorage {
         persist_devices(&transaction, batch, device_identities)?;
         persist_self_host_endpoint_evidence(&transaction, batch, attributions)?;
         persist_dns(&transaction, batch)?;
-        persist_minute_rollups(&transaction, batch, attributions)?;
         let mut staged_active_flows = self.active_flows.clone();
         update_active_flows(
             &transaction,
@@ -838,12 +863,17 @@ impl SqliteStorage {
         answer_ip: &[u8],
         at_ms: u64,
     ) -> rusqlite::Result<Option<String>> {
+        let exact = self.connection.query_row(
+            "SELECT domain FROM dns_observations WHERE gateway_id=?1 AND client_ip=?2 AND answer_ip=?3
+             AND observed_at<=?4 AND expires_at>?4 ORDER BY observed_at DESC,id DESC LIMIT 1",
+            params![gateway_id, client_ip, answer_ip, to_i64(at_ms)], |row| row.get(0),
+        ).optional()?;
+        if exact.is_some() {
+            return Ok(exact);
+        }
         self.connection
             .query_row(
-                "SELECT domain FROM dns_observations
-                 WHERE gateway_id = ?1 AND client_ip = ?2 AND answer_ip = ?3
-                   AND observed_at <= ?4 AND expires_at > ?4
-                 ORDER BY observed_at DESC, id DESC LIMIT 1",
+                SAME_DEVICE_DNS_QUERY,
                 params![gateway_id, client_ip, answer_ip, to_i64(at_ms)],
                 |row| row.get(0),
             )
@@ -862,7 +892,18 @@ impl SqliteStorage {
             aggregate(&transaction, dimension, "minute", "hour", HOUR_MS, now)?;
             aggregate(&transaction, dimension, "hour", "day", DAY_MS, now)?;
         }
+        attribution::mark_aggregated(&transaction, now)?;
         transaction.commit()
+    }
+
+    /// Removes expired correction work after checkpointing recovery state.
+    ///
+    /// # Errors
+    /// Returns an error if the cleanup transaction cannot be committed.
+    pub fn prune_reclassification(&mut self, now_ms: u64) -> rusqlite::Result<()> {
+        let tx = self.connection.transaction()?;
+        attribution::prune(&tx, to_i64(now_ms))?;
+        tx.commit()
     }
 
     /// Deletes data older than its retention window and expired DNS answers.
@@ -873,6 +914,7 @@ impl SqliteStorage {
     pub fn run_retention(&mut self, now_ms: u64, policy: RetentionPolicy) -> rusqlite::Result<()> {
         let now = to_i64(now_ms);
         let transaction = self.connection.transaction()?;
+        attribution::prune(&transaction, now)?;
         delete_older_than(
             &transaction,
             "flow_sessions",
@@ -1223,30 +1265,44 @@ impl Storage {
         flow: &FlowDelta,
         attribution: &FlowAttribution,
     ) -> StorageResult<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+            });
+        self.reclassify_flow_at(gateway, flow, attribution, now)
+    }
+
+    /// Applies late classification using collector receipt time for the bounded
+    /// correction window, independently of device packet timestamps.
+    pub fn reclassify_flow_at(
+        &mut self,
+        gateway: &str,
+        flow: &FlowDelta,
+        attribution: &FlowAttribution,
+        received_at_ms: u64,
+    ) -> StorageResult<()> {
         match self {
             Self::ClickHouse(storage) => storage.reclassify_flow(gateway, flow, attribution),
             Self::Sqlite(storage) => {
-                for (key, current) in &mut storage.active_flows {
-                    if sample_matches(key, current, gateway, flow)
-                        && attribution.protocol_confidence
-                            >= current.attribution.protocol_confidence
-                    {
-                        apply_late_protocol(&mut current.attribution, attribution);
-                    }
-                }
-                storage.connection.execute(
-                    "UPDATE flow_sessions SET protocol_id=?1,protocol_confidence=?2,category_id=CASE WHEN ?3='unknown' THEN category_id ELSE ?3 END,traffic_role=CASE WHEN ?4='unknown' THEN traffic_role ELSE ?4 END,
-                        classification_confidence=MAX(classification_confidence,?5),classification_reason=?6,classification_evidence_json=?7
-                     WHERE gateway_id=?8 AND ip_version=?9 AND protocol=?10 AND client_ip=?11 AND client_port=?12
-                        AND remote_ip=?13 AND remote_port=?14 AND started_at<=?15 AND last_seen_at>=?16
-                        AND protocol_confidence<=?2",
-                    params![attribution.protocol_id,attribution.protocol_confidence,attribution.category_id,attribution.traffic_role,
-                        attribution.confidence,attribution.reason,attribution.evidence_json,gateway,flow.ip_version,flow.protocol,
-                        flow.client_ip,flow.client_port,flow.remote_ip,flow.remote_port,to_i64(flow.last_seen_unix_ms.saturating_add(1)),to_i64(flow.first_seen_unix_ms.saturating_sub(1))],
+                attribution::reclassify_sqlite(
+                    storage,
+                    gateway,
+                    flow,
+                    attribution,
+                    to_i64(received_at_ms),
                 )?;
                 Ok(())
             }
         }
+    }
+
+    /// Reclaims expired SQLite correction work; historical rollups are retained.
+    pub fn prune_reclassification(&mut self, now_ms: u64) -> StorageResult<()> {
+        if let Self::Sqlite(storage) = self {
+            storage.prune_reclassification(now_ms)?;
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -1771,7 +1827,7 @@ fn load_active_flows(connection: &Connection) -> rusqlite::Result<HashMap<FlowKe
                 source_segment, destination_segment, device_id, id
          FROM flow_sessions WHERE ended_at IS NULL",
     )?;
-    statement
+    let mut active: HashMap<FlowKey, ActiveFlow> = statement
         .query_map([], |row| {
             Ok((
                 FlowKey {
@@ -1830,7 +1886,9 @@ fn load_active_flows(connection: &Connection) -> rusqlite::Result<HashMap<FlowKe
                 },
             ))
         })?
-        .collect()
+        .collect::<rusqlite::Result<_>>()?;
+    attribution::restore_active(connection, &mut active)?;
+    Ok(active)
 }
 
 fn update_gateway(tx: &Transaction<'_>, batch: &TelemetryBatch, now: i64) -> rusqlite::Result<()> {
@@ -2259,6 +2317,20 @@ fn upsert_rollup(
     download: i64,
     packets: i64,
 ) -> rusqlite::Result<()> {
+    adjust_rollup(tx, table, dimension, keys, upload, download, packets, 1)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn adjust_rollup(
+    tx: &Transaction<'_>,
+    table: &str,
+    dimension: Option<&str>,
+    keys: &[Value],
+    upload: i64,
+    download: i64,
+    packets: i64,
+    flow_count: i64,
+) -> rusqlite::Result<()> {
     let columns = dimension.map_or_else(
         || "timestamp, gateway_id".to_owned(),
         |dimension| format!("timestamp, gateway_id, {dimension}"),
@@ -2270,17 +2342,23 @@ fn upsert_rollup(
     let metric_offset = keys.len() + 1;
     let sql = format!(
         "INSERT INTO {table}({columns}, upload_bytes, download_bytes, packets, flow_count)
-         VALUES ({placeholders}, ?{metric_offset}, ?{}, ?{}, 1)
+         VALUES ({placeholders}, ?{metric_offset}, ?{}, ?{}, ?{})
          ON CONFLICT({columns}) DO UPDATE SET
            upload_bytes = upload_bytes + excluded.upload_bytes,
            download_bytes = download_bytes + excluded.download_bytes,
            packets = packets + excluded.packets,
-           flow_count = flow_count + 1",
+           flow_count = flow_count + excluded.flow_count",
         metric_offset + 1,
         metric_offset + 2,
+        metric_offset + 3,
     );
     let mut values = keys.to_vec();
-    values.extend([upload.into(), download.into(), packets.into()]);
+    values.extend([
+        upload.into(),
+        download.into(),
+        packets.into(),
+        flow_count.into(),
+    ]);
     tx.execute(&sql, rusqlite::params_from_iter(values))?;
     Ok(())
 }
@@ -2298,13 +2376,33 @@ fn update_active_flows(
         let key = FlowKey::from_batch(&batch.gateway_id, flow);
         let ended = flow.lifecycle == FlowLifecycle::Ended as i32;
         {
-            let current = active
-                .entry(key.clone())
-                .or_insert_with(|| ActiveFlow::new(&key, flow, attribution.clone(), received_at));
+            let current = match active.entry(key.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let mut restored =
+                        ActiveFlow::new(&key, flow, FlowAttribution::default(), received_at);
+                    attribution::restore(tx, &mut restored)?;
+                    entry.insert(restored)
+                }
+            };
+            let previous = current.attribution.clone();
             current.add(flow, attribution);
+            if current.attribution != previous {
+                attribution::reassign(tx, &current.session_id, &current.attribution, received_at)?;
+            }
+            // Rollups and the contribution ledger must use the merged identity,
+            // including for batches with weaker or missing classifier evidence.
+            let classified = TelemetryBatch {
+                gateway_id: batch.gateway_id.clone(),
+                sent_at: batch.sent_at,
+                flows: vec![flow.clone()],
+                ..TelemetryBatch::default()
+            };
+            persist_minute_rollups(tx, &classified, std::slice::from_ref(&current.attribution))?;
             if let Some(device_id) = device_id_for_mac(tx, &key.gateway_id, &current.client_mac)? {
                 current.device_id = Some(device_id);
             }
+            attribution::record(tx, &key, current, batch, flow, received_at)?;
             let checkpoint =
                 received_at.saturating_sub(current.checkpointed_at) >= FLOW_CHECKPOINT_MS;
             let ended_at = ended.then(|| flow_lifecycle_end_at(flow, received_at));
@@ -2488,7 +2586,7 @@ fn to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 struct FlowKey {
     gateway_id: String,
     ip_version: i64,
@@ -2608,16 +2706,7 @@ impl ActiveFlow {
         self.source_segment.clone_from(&flow.source_segment);
         self.destination_segment
             .clone_from(&flow.destination_segment);
-        let confidence_order = attribution
-            .confidence
-            .total_cmp(&self.attribution.confidence);
-        if confidence_order == Ordering::Greater
-            || (confidence_order == Ordering::Equal
-                && self.attribution.domain.is_none()
-                && attribution.domain.is_some())
-        {
-            self.attribution.clone_from(attribution);
-        }
+        attribution::merge(&mut self.attribution, attribution);
     }
 }
 
@@ -2651,13 +2740,28 @@ fn sample_matches(key: &FlowKey, current: &ActiveFlow, gateway: &str, flow: &Flo
 
 // Late DPI must not erase the independently established DNS/application identity.
 fn apply_late_protocol(current: &mut FlowAttribution, incoming: &FlowAttribution) {
+    // Legacy ClickHouse protocol rewrite. SQLite uses the transactional,
+    // dimension-aware path in attribution::reclassify_sqlite instead.
     current.protocol_id.clone_from(&incoming.protocol_id);
     current.protocol_confidence = incoming.protocol_confidence;
+    if incoming.application_id != "unknown"
+        && incoming.application_confidence >= current.application_confidence
+    {
+        current
+            .organization_id
+            .clone_from(&incoming.organization_id);
+        current.organization_confidence = incoming.organization_confidence;
+        current.application_id.clone_from(&incoming.application_id);
+        current.application_confidence = incoming.application_confidence;
+    }
     if incoming.category_id != "unknown" {
         current.category_id.clone_from(&incoming.category_id);
     }
     if incoming.traffic_role != "unknown" {
         current.traffic_role.clone_from(&incoming.traffic_role);
+    }
+    if incoming.domain.is_some() {
+        current.domain.clone_from(&incoming.domain);
     }
     current.confidence = current.confidence.max(incoming.confidence);
     current.reason.clone_from(&incoming.reason);

@@ -17,6 +17,8 @@ message FlowSampleBatch {
 message FlowSample {
   // Agent-assigned ID, unique for a flow lifetime within this gateway boot.
   string flow_id = 1;
+  // Present only when the sample was linked to the exact BPF flow lifetime.
+  string policy_flow_id = 6;
   // Explicit tuple allows sample processing even when flow telemetry is lost.
   FlowSampleKey key = 2;
   repeated SamplePacket packets = 3;
@@ -124,6 +126,9 @@ message FlowDelta {
   NatType nat = 19;
   string source_segment = 20;
   string destination_segment = 21;
+  // Agent-scoped stable, opaque Flow ID; unique within gateway_id + boot_id.
+  // Empty for older Agents or when application-policy tracking is disabled.
+  string policy_flow_id = 22;
 }
 
 message DnsObservation {
@@ -198,6 +203,10 @@ message AgentHealth {
   TopologySummary topology = 25;
   // Ordered observation interfaces; the first entry is capture_interface.
   repeated string capture_interfaces = 26;
+  // Cumulative count of policy flow identities rejected because the exact
+  // alias cache reached its fixed capacity.
+  uint64 policy_flow_cache_full = 27;
+  uint64 policy_flow_partial_coverage = 28;
 }
 
 message TopologySummary {

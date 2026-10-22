@@ -201,6 +201,7 @@ export function ApplicationsDashboard({
           icon={row.icon}
           showProtocolDescription={false}
           hideUnknownCategory
+          unknownUsesCategory
         />
       ),
     },
@@ -299,7 +300,6 @@ export function ApplicationsDashboard({
       title={tNav("applications")}
       subtitle={t("subtitle")}
       username={username}
-      isLive={false}
       toolbar={toolbar}
     >
       {error ? (

@@ -2,18 +2,37 @@
 #ifndef NETQMON_BPF_H
 #define NETQMON_BPF_H
 
+#include "netqmon_classid.h"
+
 #define __uint(name, value) int (*name)[value]
 #define __type(name, value) value *name
+#define __array(name, value) typeof(value) *name[]
 #define SEC(name) __attribute__((section(name), used))
 #define __always_inline inline __attribute__((always_inline))
 
 #define BPF_MAP_TYPE_LRU_HASH 9
 #define BPF_MAP_TYPE_ARRAY 2
+#define BPF_MAP_TYPE_ARRAY_OF_MAPS 12
+#define BPF_MAP_TYPE_LPM_TRIE 11
 #define BPF_MAP_TYPE_PERCPU_ARRAY 6
 #define BPF_MAP_TYPE_RINGBUF 27
 #define BPF_NOEXIST 1
+#define BPF_F_RDONLY_PROG 128
+#define BPF_F_NO_PREALLOC 1
+#define MAX_FLOW_VERDICT_ENTRIES 16384
 
 #define TC_ACT_OK 0
+#define TC_ACT_SHOT 2
+
+#define NETQMON_HOOK_INGRESS 1
+#define NETQMON_HOOK_EGRESS 2
+/* Read-only observation immediately before the QoS egress class rewrite. */
+#define NETQMON_HOOK_QOS_EGRESS_PRE 3
+#define NETQMON_VERDICT_BLOCK 1
+#define NETQMON_VERDICT_SHAPE 2
+#define NETQMON_APPLICATION_MARK_SHIFT 25
+#define NETQMON_APPLICATION_MARK_MASK 0xfe000000
+#define NETQMON_APPLICATION_MARK_MAX_TAG 0x7f
 
 #define ETH_P_IP 0x0800
 #define ETH_P_IPV6 0x86DD
@@ -157,12 +176,53 @@ struct flow_key {
     __u8 ip_version;
     __u8 protocol;
     __u8 direction;
-    __u8 pad;
+    __u8 hook;
     __u32 ifindex;
     __u8 source_address[16];
     __u8 destination_address[16];
     __be16 source_port;
     __be16 destination_port;
+};
+
+struct flow_verdict {
+    __u64 expires_monotonic_ns;
+    __u64 policy_generation;
+    __u8 flow_identity_hash[16];
+    __u8 policy_identity_hash[16];
+    __u8 policy_client_mac[6];
+    __u8 policy_identity_reserved[2];
+    __u32 policy_tag;
+    __u8 verdict;
+    __u8 reserved[3];
+};
+
+/* Original client -> remote endpoint, independent of the ephemeral port,
+ * interface and flow lifetime. MAC binding prevents address-reuse spillover. */
+struct endpoint_block_key {
+    __u8 ip_version;
+    __u8 protocol;
+    __be16 remote_port;
+    __u8 client_address[16];
+    __u8 remote_address[16];
+    __u8 client_mac[6];
+    __u8 reserved[2];
+};
+
+struct policy_drop_value {
+    __u64 packets;
+    __u64 bytes;
+};
+
+struct policy_drop_key {
+    __u8 policy_identity_hash[16];
+    __u8 client_mac[6];
+    __u8 reserved[2];
+};
+
+struct flow_policy_state {
+    __u8 enabled;
+    __u8 reserved[7];
+    __u64 generation;
 };
 
 struct flow_value {
@@ -223,6 +283,7 @@ struct sample_event {
     __u32 original_length;
     __u64 timestamp_ns;
     __u64 first_seen_ns;
+    __u64 flow_first_seen_ns;
     __u32 captured_length;
     __u32 reserved;
     __u8 payload[SAMPLE_MAX_PAYLOAD_LENGTH];
@@ -244,11 +305,17 @@ _Static_assert(__builtin_offsetof(struct discovery_event, original_payload_lengt
 _Static_assert(__builtin_offsetof(struct discovery_event, payload) == 48,
                "discovery payload offset changed");
 _Static_assert(sizeof(struct sample_budget) == 32, "sample_budget ABI changed");
-_Static_assert(sizeof(struct sample_event) == 4168, "sample_event ABI changed");
+_Static_assert(sizeof(struct sample_event) == 4176, "sample_event ABI changed");
+_Static_assert(sizeof(struct flow_policy_state) == 16, "flow_policy_state ABI changed");
+_Static_assert(sizeof(struct flow_verdict) == 64, "flow_verdict ABI changed");
+_Static_assert(sizeof(struct endpoint_block_key) == 44, "endpoint_block_key ABI changed");
+_Static_assert(sizeof(struct policy_drop_value) == 16, "policy_drop_value ABI changed");
+_Static_assert(sizeof(struct policy_drop_key) == 24, "policy_drop_key ABI changed");
 
 static long (*bpf_map_update_elem)(void *map, const void *key,
                                    const void *value, __u64 flags) = (void *)2;
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
+static long (*bpf_map_delete_elem)(void *map, const void *key) = (void *)3;
 static __u64 (*bpf_ktime_get_ns)(void) = (void *)5;
 static long (*bpf_skb_load_bytes)(const struct __sk_buff *skb, __u32 offset,
                                   void *to, __u32 length) = (void *)26;
