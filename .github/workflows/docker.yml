@@ -175,7 +175,9 @@ jobs:
           tags=()
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             tags+=("-t" "ghcr.io/${{ github.repository }}:${GITHUB_REF_NAME}")
-            tags+=("-t" "ghcr.io/${{ github.repository }}:latest")
+            if [[ "${GITHUB_REF_NAME}" != *-* ]]; then
+              tags+=("-t" "ghcr.io/${{ github.repository }}:latest")
+            fi
           else
             tags+=("-t" "ghcr.io/${{ github.repository }}:dev-${GITHUB_SHA}")
             tags+=("-t" "ghcr.io/${{ github.repository }}:dev-latest")
@@ -185,8 +187,9 @@ jobs:
 
       - name: Inspect image
         run: |
-          target="ghcr.io/${{ github.repository }}:latest"
-          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            target="ghcr.io/${{ github.repository }}:${GITHUB_REF_NAME}"
+          else
             target="ghcr.io/${{ github.repository }}:dev-latest"
           fi
           docker buildx imagetools inspect "$target"
