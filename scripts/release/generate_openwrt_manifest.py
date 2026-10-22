@@ -16,6 +16,13 @@ MANIFEST_NAME = "openwrt-agent-manifest.json"
 PACKAGE_NAMES = {"netqmon-agent", "luci-app-netqmon"}
 
 
+def release_asset_url(repository: str, tag: str, filename: str) -> str:
+    # GitHub replaces '~' in uploaded asset names with '.'. Package versions
+    # still retain '~' so APK prereleases sort before the corresponding stable.
+    filename = filename.replace("~", ".")
+    return f"https://github.com/{repository}/releases/download/{tag}/{filename}"
+
+
 def read_control(path: Path) -> dict[str, str]:
     with tarfile.open(path, mode="r:*") as package:
         control_archive = next(
@@ -66,7 +73,7 @@ def ipk_package_record(path: Path, repository: str, tag: str) -> dict[str, str] 
         "openwrt_arch": architecture,
         "package_format": "ipk",
         "version": version,
-        "url": f"https://github.com/{repository}/releases/download/{tag}/{path.name}",
+        "url": release_asset_url(repository, tag, path.name),
         "sha256": digest,
     }
 
@@ -102,7 +109,7 @@ def apk_package_record(path: Path, repository: str, tag: str) -> dict[str, str] 
         "openwrt_arch": architecture,
         "package_format": "apk",
         "version": version,
-        "url": f"https://github.com/{repository}/releases/download/{tag}/{path.name}",
+        "url": release_asset_url(repository, tag, path.name),
         "sha256": digest,
     }
 

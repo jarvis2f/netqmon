@@ -142,6 +142,35 @@ class OpenWrtManifestTests(unittest.TestCase):
             self.assertEqual(agent_records[1]["sha256"], hashlib.sha256(apk.read_bytes()).hexdigest())
             self.assertTrue(agent_records[1]["url"].endswith("netqmon-agent-1.0.0-r1_x86_64.apk"))
 
+    def test_beta_apk_urls_match_github_normalized_asset_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_ipk(root / "luci.ipk", "luci-app-netqmon", "all", "1.1.0-beta.1-r1")
+            version = "1.1.0~03d585d-r1"
+            paths = [
+                make_apk_artifact(root, name, "x86_64", version)
+                for name in ("netqmon-agent", "luci-app-netqmon")
+            ]
+
+            manifest = create_manifest("jarvis2f/netqmon", [f"beta:v1.1.0-beta.1:{root}"])
+
+            records = {
+                record["name"]: record
+                for record in manifest["channels"]["beta"]["packages"]
+                if record["package_format"] == "apk"
+            }
+            self.assertEqual(len(records), 2)
+            for path in paths:
+                name = path.name.split("-1.1.0~", 1)[0]
+                record = records[name]
+                self.assertEqual(record["version"], version)
+                self.assertEqual(
+                    record["url"],
+                    "https://github.com/jarvis2f/netqmon/releases/download/v1.1.0-beta.1/"
+                    f"{name}-1.1.0.03d585d-r1_x86_64.apk",
+                )
+                self.assertEqual(record["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+
     def test_manifest_rejects_apk_without_artifact_architecture(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
