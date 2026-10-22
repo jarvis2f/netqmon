@@ -228,3 +228,54 @@ fn wal_reader_is_consistent_while_the_writer_commits() {
         (200, 100, 6, 2)
     );
 }
+
+#[test]
+fn late_dpi_waits_for_a_maintenance_writer_before_reading() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("writers.db");
+    let mut storage = open_at(&path, NOW).unwrap();
+    storage
+        .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
+        .unwrap();
+    let input = batch(1, FlowLifecycle::Ended);
+    storage
+        .persist_classified_batch(&input, &[transport_attribution()], &[], NOW)
+        .unwrap();
+    let maintenance = storage.independent_connection(false).unwrap().unwrap();
+    maintenance
+        .connection
+        .execute_batch("BEGIN IMMEDIATE; UPDATE gateways SET name='maintenance';")
+        .unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let result = attribution::reclassify_sqlite(
+            &mut storage,
+            "gateway-1",
+            &input.flows[0],
+            &service_attribution(),
+            to_i64(NOW + 2_000),
+        );
+        done_tx.send((result, storage)).unwrap();
+    });
+    started_rx.recv().unwrap();
+    let early = done_rx.recv_timeout(Duration::from_millis(200));
+    let waited = matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+    maintenance.connection.execute_batch("COMMIT").unwrap();
+    let (result, storage) = early.unwrap_or_else(|_| done_rx.recv().unwrap());
+    worker.join().unwrap();
+    assert!(
+        waited,
+        "DPI must wait for the writer instead of upgrading a stale read snapshot"
+    );
+    result.unwrap();
+    assert_eq!(
+        metrics(
+            storage.connection(),
+            "traffic_application_minute",
+            "application_id='video-app'"
+        ),
+        (100, 50, 3, 1)
+    );
+}

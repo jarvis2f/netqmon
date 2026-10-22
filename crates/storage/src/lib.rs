@@ -432,7 +432,7 @@ pub trait StorageBackend {
     fn backend_name(&self) -> &'static str;
 }
 
-/// The single SQLite writer owned by the Collector.
+/// A SQLite connection and its optional live-flow cache.
 #[derive(Debug)]
 pub struct SqliteStorage {
     connection: Connection,
@@ -453,7 +453,7 @@ impl SqliteStorage {
         } else {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
         };
-        let connection =
+        let mut connection =
             Connection::open_with_flags(path, flags | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
@@ -463,6 +463,7 @@ impl SqliteStorage {
         }
         if !read_only {
             connection.pragma_update(None, "synchronous", "NORMAL")?;
+            connection.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
         }
         connection.set_prepared_statement_cache_capacity(64);
         Ok(Some(Self {
@@ -493,8 +494,12 @@ impl SqliteStorage {
         Self::from_connection_at(connection, unix_time_ms())
     }
 
-    fn from_connection_at(connection: Connection, now_ms: u64) -> rusqlite::Result<Self> {
+    fn from_connection_at(mut connection: Connection, now_ms: u64) -> rusqlite::Result<Self> {
         connection.busy_timeout(Duration::from_secs(5))?;
+        // Reserve the writer before reading. With independent maintenance writers,
+        // upgrading a deferred read snapshot can fail immediately with BUSY_SNAPSHOT
+        // instead of honoring busy_timeout and waiting for the other writer.
+        connection.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
