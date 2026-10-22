@@ -29,6 +29,9 @@ A lightweight Agent runs on the gateway, leveraging TC eBPF for zero-overhead fl
 <p align="center">
   <img src="docs/netqmon-controller-screenshot-01.png" width="49%" alt="NetQmon Controller Overview">
   <img src="docs/netqmon-controller-screenshot-02.png" width="49%" alt="NetQmon Controller Clients">
+  <img src="docs/netqmon-controller-screenshot-03.png" width="49%" alt="NetQmon Controller Applications">
+  <img src="docs/netqmon-controller-screenshot-04.png" width="49%" alt="NetQmon Controller Destinations">
+  <img src="docs/netqmon-controller-screenshot-05.png" width="49%" alt="NetQmon Controller Traffic Policies">
 </p>
 
 ## Highlights
