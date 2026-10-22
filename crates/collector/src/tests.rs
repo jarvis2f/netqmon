@@ -17,6 +17,7 @@ use tower::ServiceExt;
 use super::*;
 
 const ENROLLMENT_TOKEN: &str = "test-enrollment-token";
+mod concurrency;
 
 #[test]
 fn dns_history_is_scoped_by_client_and_answer_ip() {

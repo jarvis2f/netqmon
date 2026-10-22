@@ -335,7 +335,7 @@ async fn overview(
         return *response;
     }
     let snapshot = state.realtime_snapshot();
-    let inner = state.lock();
+    let inner = state.query();
     if let Some(clickhouse) = inner.storage.clickhouse_storage() {
         let now = now_ms();
         let offline_after_ms = gateway_offline_after_ms();
@@ -586,7 +586,7 @@ fn traffic_breakdown(
     scope: Option<i64>,
     direction: Option<i64>,
 ) -> Response {
-    let inner = state.lock();
+    let inner = state.query();
     if let Some(clickhouse) = inner.storage.clickhouse_storage() {
         let duration = to.saturating_sub(from);
         let bucket_ms = duration.div_ceil(180).max(60_000).div_ceil(60_000) * 60_000;
@@ -844,7 +844,7 @@ async fn clients(
         Ok(window) => window,
         Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_time_range", message),
     };
-    let inner = state.lock();
+    let inner = state.query();
     if let Some(clickhouse) = inner.storage.clickhouse_storage() {
         let query = match window {
             Some((from, to)) => {
@@ -880,7 +880,7 @@ async fn client_detail(
             "client id must be positive",
         );
     }
-    let inner = state.lock();
+    let inner = state.query();
     if let Some(clickhouse) = inner.storage.clickhouse_storage() {
         return match clickhouse.query_client_detail(id) {
             Ok(Some(value)) => api_ok(value),
@@ -992,7 +992,7 @@ async fn client_related(
         Ok(value) => value,
         Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_scope", message),
     };
-    let inner = state.lock();
+    let inner = state.query();
     if let Some(clickhouse) = inner.storage.clickhouse_storage() {
         if !matches!(
             relation.as_str(),
@@ -1281,7 +1281,7 @@ async fn applications(
         Ok(window) => window,
         Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_time_range", message),
     };
-    let inner = state.lock();
+    let inner = state.query();
     if let Some(clickhouse) = inner.storage.clickhouse_storage() {
         return clickhouse
             .query_applications_for_window(page.limit, page.offset, window)
@@ -1417,7 +1417,7 @@ async fn applications(
     result.map_or_else(storage_error, |(items, total)| page_ok(items, page, total))
 }
 
-fn map_application_row(row: &Row<'_>, inner: &crate::CollectorInner) -> rusqlite::Result<Value> {
+fn map_application_row(row: &Row<'_>, inner: &crate::QueryContext<'_>) -> rusqlite::Result<Value> {
     let application_id = row.get::<_, String>(0)?;
     let application_metadata = inner.classifier.application_metadata(&application_id);
     let organization_id = if matches!(application_id.as_str(), "unknown" | "protocol-only") {
@@ -1473,7 +1473,7 @@ async fn organizations(
         Ok(page) => page,
         Err(response) => return *response,
     };
-    let inner = state.lock();
+    let inner = state.query();
     if let Some(clickhouse) = inner.storage.clickhouse_storage() {
         return clickhouse
             .query_flow_groups("organization_id", page.limit, page.offset)
@@ -1534,7 +1534,7 @@ async fn protocols(
         Ok(page) => page,
         Err(response) => return *response,
     };
-    let inner = state.lock();
+    let inner = state.query();
     if let Some(clickhouse) = inner.storage.clickhouse_storage() {
         return clickhouse
             .query_flow_groups("protocol_id", page.limit, page.offset)
@@ -1611,7 +1611,7 @@ async fn application_detail(
         );
     }
     let category = query.category.as_deref();
-    let inner = state.lock();
+    let inner = state.query();
     if let Some(clickhouse) = inner.storage.clickhouse_storage() {
         return match clickhouse.query_application_detail(&id, category, window) {
             Ok(Some(mut value)) => {
@@ -1855,7 +1855,7 @@ async fn application_related(
             "from must be less than to",
         );
     }
-    let inner = state.lock();
+    let inner = state.query();
     let category = query.category.as_deref();
     let include_all =
         query.all.unwrap_or(false) && matches!(relation.as_str(), "domains" | "destinations");
@@ -2200,7 +2200,7 @@ async fn destinations(
             );
         }
     }
-    let inner = state.lock();
+    let inner = state.query();
     if let Some(clickhouse) = inner.storage.clickhouse_storage() {
         let window = match (query.from, query.to) {
             (Some(from), Some(to)) => Some((to_i64(from), to_i64(to))),
@@ -2353,7 +2353,7 @@ async fn destinations(
 
 fn map_destination_row(
     row: &Row<'_>,
-    inner: &crate::CollectorInner,
+    inner: &crate::QueryContext<'_>,
     lang: Option<&str>,
 ) -> rusqlite::Result<Value> {
     let address: Vec<u8> = row.get(0)?;
@@ -2417,7 +2417,7 @@ async fn geo_summary(
             );
         }
     }
-    let inner = state.lock();
+    let inner = state.query();
     if !inner.geo_provider.is_enabled() {
         return api_ok(json!({
             "enabled": false,
@@ -2445,7 +2445,7 @@ async fn insights(
         Err(response) => return *response,
     };
     let snapshot = state.realtime_snapshot();
-    let inner = state.lock();
+    let inner = state.query();
     if let Some(clickhouse) = inner.storage.clickhouse_storage() {
         return crate::insights::detect_clickhouse(
             clickhouse.client(),
@@ -2472,7 +2472,7 @@ async fn insights(
 }
 
 fn aggregate_geo_traffic(
-    inner: &crate::CollectorInner,
+    inner: &crate::QueryContext<'_>,
     from: Option<u64>,
     to: Option<u64>,
     lang: Option<&str>,
@@ -2507,7 +2507,7 @@ fn aggregate_geo_traffic(
 }
 
 fn aggregate_geo_values(
-    inner: &crate::CollectorInner,
+    inner: &crate::QueryContext<'_>,
     rows: impl IntoIterator<Item = (Vec<u8>, i64)>,
     lang: Option<&str>,
 ) -> Value {
@@ -2636,7 +2636,7 @@ async fn flows(
         Ok(options) => options,
         Err(response) => return *response,
     };
-    let inner = state.lock();
+    let inner = state.query();
     if let Some(clickhouse) = inner.storage.clickhouse_storage() {
         if let Err(rusqlite::Error::InvalidParameterName(name)) = flow_filters(&query) {
             return flow_query_error(&name);
@@ -3375,7 +3375,7 @@ fn summary_page(
         Ok(page) => page,
         Err(response) => return *response,
     };
-    let inner = state.lock();
+    let inner = state.query();
     if table == "traffic_domain_minute" {
         if let Some(clickhouse) = inner.storage.clickhouse_storage() {
             return clickhouse
@@ -3604,7 +3604,7 @@ fn query_client_detail(connection: &Connection, id: i64) -> rusqlite::Result<Opt
 }
 
 async fn get_retention(State(state): State<CollectorState>) -> Response {
-    let inner = state.lock();
+    let inner = state.query();
     let result = inner.storage.load_retention_policy();
     match result {
         Ok(policy) => api_ok(json!({
@@ -3681,14 +3681,7 @@ async fn put_retention(State(state): State<CollectorState>, body: Bytes) -> Resp
 }
 
 async fn run_retention(State(state): State<CollectorState>) -> Response {
-    let result = {
-        let mut inner = state.lock();
-        let policy = match inner.storage.load_retention_policy() {
-            Ok(policy) => policy,
-            Err(error) => return storage_error(error),
-        };
-        inner.storage.run_retention(now_ms(), policy)
-    };
+    let result = state.run_maintenance(true);
     match result {
         Ok(()) => api_ok(json!({ "status": "completed" })),
         Err(error) => storage_error(error),
@@ -3696,8 +3689,8 @@ async fn run_retention(State(state): State<CollectorState>) -> Response {
 }
 
 async fn reload_rules(State(state): State<CollectorState>) -> Response {
-    let inner = state.lock();
-    match inner.classifier.reload_rules() {
+    let classifier = state.lock().classifier.clone();
+    match classifier.reload_rules() {
         Ok(stats) => {
             let mut payload =
                 serde_json::to_value(&stats).expect("rule statistics serialize as JSON object");
@@ -3716,18 +3709,22 @@ async fn diagnostics(State(state): State<CollectorState>) -> Response {
     let topology = state
         .realtime_snapshot()
         .gateway_health
-        .and_then(|health| health.topology);
-    let inner = state.lock();
+        .as_ref()
+        .and_then(|health| health.topology.clone());
+    let inner = state.query();
     let result = (|| -> Result<Value, String> {
         let now = now_ms();
         let db_size = inner
             .storage
             .database_size_bytes()
             .map_err(|e| e.to_string())?;
-        let active_flows = inner
-            .storage
-            .active_flow_count()
-            .map_err(|e| e.to_string())?;
+        let active_flows = match inner.active_flows {
+            Some(count) => count,
+            None => inner
+                .storage
+                .active_flow_count()
+                .map_err(|e| e.to_string())?,
+        };
         let unknown_ratio = inner
             .storage
             .unknown_ratio(now.saturating_sub(DAY_MS))
@@ -3788,7 +3785,7 @@ async fn diagnostics(State(state): State<CollectorState>) -> Response {
             "classification": inner.classifier.diagnostics(),
             "classifier_manager": classifier_manager_status(),
             "sampling": state.sampling.diagnostics(),
-            "recognition": crate::recognition_diagnostics::diagnostics(&inner, now.saturating_sub(DAY_MS))?,
+            "recognition": crate::recognition_diagnostics::diagnostics(&inner.storage, now.saturating_sub(DAY_MS))?,
             "topology": topology,
         }))
     })();
@@ -4013,6 +4010,10 @@ async fn post_geo_update(
         }
         let enabled = load.provider.is_enabled();
         inner.geo_provider = Arc::new(load.provider);
+        *state
+            .query_geo
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&inner.geo_provider);
         tracing::info!(
             enabled,
             directory = %inner.geo_directory.display(),

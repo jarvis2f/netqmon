@@ -2,6 +2,72 @@ use netqmon_protocol::v1::{AgentHealth, DeviceObservation, FlowDelta};
 
 use super::*;
 
+#[test]
+fn published_snapshots_remain_immutable_when_a_flow_changes() {
+    let mut engine = RealtimeEngine::default();
+    engine.update(
+        &batch(1, FlowLifecycle::Active),
+        &[attribution()],
+        2_000,
+        2_000,
+    );
+    let original = engine.snapshot();
+    let mut receiver = engine.subscribe();
+    engine.update(
+        &batch(2, FlowLifecycle::Active),
+        &[attribution()],
+        3_000,
+        3_000,
+    );
+    assert_eq!(original.active_flows[0].upload_bytes, 100);
+    assert_eq!(engine.snapshot().active_flows[0].upload_bytes, 200);
+    assert_eq!(engine.flow_order.len(), engine.active_flows.len());
+    let mut snapshots = 0;
+    while let Ok(event) = receiver.try_recv() {
+        if let RealtimeEvent::Snapshot(snapshot) = event {
+            assert_eq!(snapshot.active_flows[0].upload_bytes, 200);
+            let wire = serde_json::to_value(snapshot).unwrap();
+            assert!(wire["active_flows"].is_array());
+            snapshots += 1;
+        }
+    }
+    assert_eq!(snapshots, 1);
+    engine.update(&batch(3, FlowLifecycle::Ended), &[], 4_000, 4_000);
+    assert!(engine.flow_order.is_empty());
+}
+
+#[test]
+#[ignore = "manual realtime snapshot benchmark"]
+fn large_realtime_snapshot_benchmark() {
+    let mut engine = RealtimeEngine::default();
+    let mut initial = batch(1, FlowLifecycle::Active);
+    let prototype = initial.flows[0].clone();
+    initial.flows = (0..10_000)
+        .map(|index| {
+            let mut flow = prototype.clone();
+            flow.remote_port = 1_000 + index;
+            flow
+        })
+        .collect();
+    engine.update(&initial, &[], 2_000, 2_000);
+    let start = std::time::Instant::now();
+    for sequence in 2..102 {
+        let mut input = batch(sequence, FlowLifecycle::Active);
+        input.flows[0].remote_port = 1_000;
+        engine.update(&input, &[], input.sent_at, input.sent_at);
+    }
+    let updates = start.elapsed();
+    let start = std::time::Instant::now();
+    for _ in 0..100 {
+        std::hint::black_box(engine.snapshot());
+    }
+    eprintln!(
+        "realtime_10000_flows update_100={updates:?} snapshot_read_100={:?}",
+        start.elapsed()
+    );
+    assert_eq!(engine.snapshot().active_flows.len(), 10_000);
+}
+
 fn batch(sequence: u64, lifecycle: FlowLifecycle) -> TelemetryBatch {
     TelemetryBatch {
         gateway_id: "gateway-1".to_owned(),

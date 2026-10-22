@@ -1,14 +1,14 @@
 //! Counts unique stored clients and flow sessions, never sample packets or payloads.
-use crate::CollectorInner;
+use netqmon_storage::Storage;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) fn diagnostics(inner: &CollectorInner, since: u64) -> Result<Value, String> {
+pub(crate) fn diagnostics(storage: &Storage, since: u64) -> Result<Value, String> {
     let device_sql = "SELECT device_type, vendor, private_mac, identity_evidence_json FROM devices";
     let flow_sql = format!(
         "SELECT application_id, protocol_id, domain, classification_evidence_json, count(*) AS count FROM flow_sessions {{final}} WHERE last_seen_at >= {since} GROUP BY application_id, protocol_id, domain, classification_evidence_json"
     );
-    let (devices, flows) = if let Some(ch) = inner.storage.clickhouse_storage() {
+    let (devices, flows) = if let Some(ch) = storage.clickhouse_storage() {
         let devices = ch
             .client()
             .query_json(&format!("{device_sql} FINAL FORMAT JSON"))
@@ -25,7 +25,7 @@ pub(crate) fn diagnostics(inner: &CollectorInner, since: u64) -> Result<Value, S
             flows["data"].as_array().cloned().unwrap_or_default(),
         )
     } else {
-        let connection = inner.storage.connection();
+        let connection = storage.connection();
         let mut statement = connection.prepare(device_sql).map_err(|e| e.to_string())?;
         let devices = statement.query_map([], |r| Ok(json!({"device_type":r.get::<_,Option<String>>(0)?, "vendor":r.get::<_,Option<String>>(1)?, "private_mac":r.get::<_,i64>(2)?, "identity_evidence_json":r.get::<_,String>(3)?})))
             .map_err(|e| e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?;

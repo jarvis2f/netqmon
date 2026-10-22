@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use netqmon_classifier_client::{DeviceEvidenceInput, DeviceEvidenceResult};
@@ -22,12 +23,12 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DeviceIdentifier {
-    mac_dataset: MacPrefixDataset,
+    mac_dataset: Arc<MacPrefixDataset>,
 }
 
 impl DeviceIdentifier {
     pub(crate) fn replace_mac_dataset(&mut self, dataset: MacPrefixDataset) {
-        self.mac_dataset = dataset;
+        self.mac_dataset = Arc::new(dataset);
     }
 
     #[allow(dead_code)]
@@ -64,7 +65,9 @@ impl DeviceIdentifier {
                 }
             }
         };
-        Self { mac_dataset }
+        Self {
+            mac_dataset: Arc::new(mac_dataset),
+        }
     }
 
     pub(crate) fn identify_batch(
@@ -1091,7 +1094,7 @@ mod tests {
         )
         .unwrap();
         let identifier = DeviceIdentifier {
-            mac_dataset: dataset,
+            mac_dataset: Arc::new(dataset),
         };
         let observation = DeviceObservation {
             mac: vec![0x02, 0, 0, 0, 0, 1],
@@ -1120,7 +1123,7 @@ mod tests {
         )
         .unwrap();
         let identifier = DeviceIdentifier {
-            mac_dataset: dataset,
+            mac_dataset: Arc::new(dataset),
         };
         let observation = DeviceObservation {
             mac: vec![0x24, 0x0a, 0xc4, 0x01, 0x02, 0x03],

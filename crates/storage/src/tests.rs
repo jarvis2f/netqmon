@@ -8,6 +8,10 @@ use super::*;
 
 const NOW: u64 = 1_700_000_000_000;
 
+fn open_at(path: &Path, now: u64) -> rusqlite::Result<SqliteStorage> {
+    SqliteStorage::from_connection_at(Connection::open(path)?, now)
+}
+
 fn setup() -> SqliteStorage {
     let mut storage = SqliteStorage::open_in_memory().unwrap();
     assert!(
@@ -101,14 +105,14 @@ fn migration_and_gateway_survive_reopen() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("netqmon.db");
     {
-        let mut storage = SqliteStorage::open(&path).unwrap();
+        let mut storage = open_at(&path, NOW).unwrap();
         assert!(
             storage
                 .save_gateway("gateway-1", "router", "0.1.0", &[9; 32], NOW)
                 .unwrap()
         );
     }
-    let storage = SqliteStorage::open(&path).unwrap();
+    let storage = open_at(&path, NOW).unwrap();
     assert_eq!(storage.gateway().unwrap().unwrap().id, "gateway-1");
     let journal_mode: String = storage
         .connection()
@@ -354,7 +358,7 @@ fn initial_database_persists_and_queries_application_rollups() {
             .unwrap();
     }
 
-    let storage = SqliteStorage::open(&path).unwrap();
+    let storage = open_at(&path, NOW).unwrap();
     let row: (String, String, i64) = storage
         .connection()
         .query_row(
@@ -520,7 +524,7 @@ fn device_evidence_accumulates_and_survives_reopen() {
         (1, NOW + 10, 0.7, r#"{"rule":"iphone-hostname"}"#),
         (2, NOW + 20, 0.8, r#"{"rule":"iphone-hostname-v2"}"#),
     ] {
-        let mut storage = SqliteStorage::open(&path).unwrap();
+        let mut storage = open_at(&path, NOW).unwrap();
         if storage.gateway().unwrap().is_none() {
             storage
                 .save_gateway("gateway-1", "router", "0.1.0", &[7; 32], NOW)
@@ -567,7 +571,7 @@ fn device_evidence_accumulates_and_survives_reopen() {
         }
     }
 
-    let storage = SqliteStorage::open(&path).unwrap();
+    let storage = open_at(&path, NOW).unwrap();
     let evidence = storage.device_evidence("gateway-1", &mac).unwrap();
     assert_eq!(evidence.len(), 1);
     assert_eq!(evidence[0].first_seen, NOW + 10);
@@ -713,7 +717,7 @@ fn long_flow_checkpoints_and_resumes_after_restart() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("netqmon.db");
     {
-        let mut storage = SqliteStorage::open(&path).unwrap();
+        let mut storage = open_at(&path, NOW).unwrap();
         assert!(
             storage
                 .save_gateway("gateway-1", "router", "0.1.0", &[7; 32], NOW)
@@ -744,7 +748,7 @@ fn long_flow_checkpoints_and_resumes_after_restart() {
         assert_eq!(active, 1);
     }
 
-    let mut restarted = SqliteStorage::open(&path).unwrap();
+    let mut restarted = open_at(&path, NOW).unwrap();
     restarted
         .persist_batch(
             &batch(3, FlowLifecycle::Ended),
@@ -1045,7 +1049,7 @@ fn late_application_after_reopen_reassigns_all_resolutions_exactly_once() {
     let path = dir.path().join("late.db");
     let input = batch(1, FlowLifecycle::Ended);
     {
-        let mut storage = SqliteStorage::open(&path).unwrap();
+        let mut storage = open_at(&path, NOW).unwrap();
         storage
             .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
             .unwrap();
@@ -1056,7 +1060,7 @@ fn late_application_after_reopen_reassigns_all_resolutions_exactly_once() {
             .roll_up_hour_and_day(NOW + 2 * DAY_MS as u64)
             .unwrap();
     }
-    let mut storage = Storage::sqlite(SqliteStorage::open(&path).unwrap());
+    let mut storage = Storage::sqlite(open_at(&path, NOW).unwrap());
     let late = FlowAttribution {
         protocol_id: "other-transport".into(),
         protocol_confidence: 0.8,
@@ -1378,7 +1382,7 @@ fn restart_before_session_checkpoint_recovers_classification_and_bytes() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("early-restart.db");
     {
-        let mut storage = SqliteStorage::open(&path).unwrap();
+        let mut storage = open_at(&path, NOW).unwrap();
         storage
             .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
             .unwrap();
@@ -1399,7 +1403,7 @@ fn restart_before_session_checkpoint_recovers_classification_and_bytes() {
             0
         );
     }
-    let mut storage = SqliteStorage::open(&path).unwrap();
+    let mut storage = open_at(&path, NOW).unwrap();
     storage
         .persist_classified_batch(
             &batch(2, FlowLifecycle::Ended),
@@ -1491,4 +1495,7 @@ fn late_dpi_is_time_scoped_and_reclassifies_both_directions() {
     );
 }
 
+mod active_cache;
 mod bounded;
+mod incremental;
+mod performance;

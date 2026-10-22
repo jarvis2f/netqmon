@@ -42,7 +42,7 @@ fn session_json_is_stored_once_across_minutes() {
 fn only_recent_contributions_move_even_before_gc_and_restart_preserves_full_counts() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("window.db");
-    let mut storage = SqliteStorage::open(&path).unwrap();
+    let mut storage = open_at(&path, NOW).unwrap();
     storage
         .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
         .unwrap();
@@ -92,7 +92,7 @@ fn only_recent_contributions_move_even_before_gc_and_restart_preserves_full_coun
     storage.prune_reclassification(later + 2_000).unwrap();
     assert_eq!(count(&storage, "flow_rollup_contributions"), 1);
     drop(storage);
-    let mut storage = SqliteStorage::open(&path).unwrap();
+    let mut storage = open_at(&path, NOW).unwrap();
     let mut third = batch(3, FlowLifecycle::Ended);
     third.sent_at = later + 3_000;
     third.flows[0].last_seen_unix_ms = later + 3_000;
@@ -176,7 +176,7 @@ fn gc_checkpoints_unwritten_recovery_state_and_does_not_restore_stale_classifica
     let path = dir.path().join("orphan.db");
     let input = batch(1, FlowLifecycle::Active);
     {
-        let mut storage = SqliteStorage::open(&path).unwrap();
+        let mut storage = open_at(&path, NOW).unwrap();
         storage
             .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
             .unwrap();
@@ -185,7 +185,7 @@ fn gc_checkpoints_unwritten_recovery_state_and_does_not_restore_stale_classifica
             .unwrap();
         assert_eq!(count(&storage, "flow_sessions"), 0);
     }
-    let mut unified = Storage::sqlite(SqliteStorage::open(&path).unwrap());
+    let mut unified = Storage::sqlite(open_at(&path, NOW).unwrap());
     // Reopen before any new telemetry: the pending state must restore the tuple
     // and counters, so late DPI can still find this not-yet-checkpointed flow.
     let expired = NOW + CORRECTION_WINDOW_MS as u64;
@@ -221,7 +221,7 @@ fn gc_checkpoints_unwritten_recovery_state_and_does_not_restore_stale_classifica
         .unwrap();
     assert_eq!(identity, ("video-app".into(), 100, 50));
     drop(storage);
-    let mut storage = SqliteStorage::open(&path).unwrap();
+    let mut storage = open_at(&path, NOW).unwrap();
     let mut next = batch(2, FlowLifecycle::Ended);
     next.sent_at = expired + 1_000;
     next.flows[0].last_seen_unix_ms = expired + 1_000;
@@ -372,6 +372,7 @@ fn gc_failure_rolls_back_checkpoint_and_deletion() {
     assert_eq!(count(&storage, "flow_sessions"), 0);
     assert_eq!(count(&storage, "flow_rollup_sessions"), 1);
     assert_eq!(count(&storage, "flow_rollup_contributions"), 1);
+    assert_eq!(storage.active_flow_count().unwrap(), 1);
     assert_eq!(
         metrics(storage.connection(), "traffic_total_minute", "1=1"),
         (100, 50, 3, 1)
@@ -393,16 +394,30 @@ fn v5_upgrade_preserves_history_and_enables_correction_for_new_traffic() {
         .roll_up_hour_and_day(NOW + 2 * DAY_MS as u64)
         .unwrap();
     // Schema 5 has durable sessions and rollups, but no correction work tables.
+    for dimension in DIMENSIONS {
+        for (source, target) in [("minute", "hour"), ("hour", "day")] {
+            storage
+                .connection()
+                .execute_batch(&format!(
+                    "DROP TRIGGER traffic_{dimension}_{source}_pending_insert;
+                 DROP TRIGGER traffic_{dimension}_{source}_pending_update;
+                 DROP TABLE traffic_{dimension}_{target}_pending;"
+                ))
+                .unwrap();
+        }
+    }
     storage
         .connection()
         .execute_batch(
             "DROP TABLE flow_rollup_contributions;
          DROP TABLE flow_rollup_sessions;
          DROP INDEX dns_observations_answer_lookup;
+         DROP INDEX flow_sessions_sample_lookup;
+         DROP INDEX flow_sessions_open_checkpoint;
          DELETE FROM schema_migrations WHERE version>=6;",
         )
         .unwrap();
-    let storage = SqliteStorage::from_connection(storage.connection).unwrap();
+    let storage = SqliteStorage::from_connection_at(storage.connection, NOW).unwrap();
     assert_eq!(
         count(&storage, "schema_migrations"),
         i64::try_from(MIGRATIONS.len()).unwrap()

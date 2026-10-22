@@ -1,10 +1,10 @@
 //! Independent classification dimensions and exact SQLite rollup reassignment.
 use super::{
-    DAY_MS, FlowAttribution, FlowDelta, HOUR_MS, MINUTE_MS, PROTOCOL_APPLICATION_PREFIX,
+    DAY_MS, FlowAttribution, FlowDelta, FlowKey, HOUR_MS, MINUTE_MS, PROTOCOL_APPLICATION_PREFIX,
     SqliteStorage, Transaction, Value, adjust_rollup, sample_matches, to_i64,
 };
-use rusqlite::OptionalExtension;
 use rusqlite::params;
+use rusqlite::{OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -304,6 +304,32 @@ fn transfer(
         metrics[2],
         metrics[3],
     )?;
+    if table.ends_with("_hour") || table.ends_with("_day") {
+        // The correction ledger updates already-materialized tiers immediately.
+        // Cancel that portion of the queued lower-tier delta to avoid applying
+        // the same reclassification again during the next maintenance pass.
+        let pending = format!("{table}_pending");
+        adjust_rollup(
+            tx,
+            &pending,
+            Some(dimensions),
+            &old_keys,
+            metrics[0],
+            metrics[1],
+            metrics[2],
+            metrics[3],
+        )?;
+        adjust_rollup(
+            tx,
+            &pending,
+            Some(dimensions),
+            &[base, new].concat(),
+            -metrics[0],
+            -metrics[1],
+            -metrics[2],
+            -metrics[3],
+        )?;
+    }
     tx.execute(&format!("DELETE FROM {table} WHERE {predicate} AND upload_bytes=0 AND download_bytes=0 AND packets=0 AND flow_count=0"),rusqlite::params_from_iter(&old_keys))?;
     Ok(())
 }
@@ -316,8 +342,14 @@ pub(super) fn reclassify_sqlite(
     now: i64,
 ) -> rusqlite::Result<()> {
     let tx = storage.connection.transaction()?;
-    let mut staged = storage.active_flows.clone();
-    let mut sessions: HashMap<String,FlowAttribution> = tx.prepare("SELECT id,domain,organization_id,
+    let mut staged = FlowKey::sample_keys(gateway, flow)
+        .into_iter()
+        .filter_map(|key| {
+            let current = storage.active_flows.get(&key)?;
+            sample_matches(&key, current, gateway, flow).then(|| (key, current.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut sessions: HashMap<String,FlowAttribution> = tx.prepare_cached("SELECT id,domain,organization_id,
         application_id,category_id,traffic_role,protocol_id,organization_confidence,application_confidence,
         protocol_confidence,classification_confidence,classification_reason,classification_evidence_json
         FROM flow_sessions WHERE gateway_id=?1 AND ip_version=?2 AND protocol=?3 AND client_ip=?4
@@ -325,36 +357,49 @@ pub(super) fn reclassify_sqlite(
         .query_map(params![gateway,flow.ip_version,flow.protocol,flow.client_ip,flow.client_port,
             flow.remote_ip,flow.remote_port,to_i64(flow.last_seen_unix_ms.saturating_add(1)),
             to_i64(flow.first_seen_unix_ms.saturating_sub(1))],|row| {
-            Ok((row.get(0)?,FlowAttribution {
-                domain: row.get(1)?, organization_id: row.get::<_,Option<String>>(2)?.unwrap_or_else(||"unknown".into()),
-                application_id: row.get::<_,Option<String>>(3)?.unwrap_or_else(||"unknown".into()),
-                category_id: row.get::<_,Option<String>>(4)?.unwrap_or_else(||"unknown".into()),
-                traffic_role: row.get::<_,Option<String>>(5)?.unwrap_or_else(||"unknown".into()),
-                protocol_id: row.get::<_,Option<String>>(6)?.unwrap_or_else(||"unknown".into()),
-                organization_confidence:row.get::<_,Option<f64>>(7)?.unwrap_or(0.0),
-                application_confidence:row.get::<_,Option<f64>>(8)?.unwrap_or(0.0),
-                protocol_confidence:row.get::<_,Option<f64>>(9)?.unwrap_or(0.0),
-                confidence:row.get::<_,Option<f64>>(10)?.unwrap_or(0.0),
-                reason:row.get::<_,Option<String>>(11)?.unwrap_or_default(),evidence_json:row.get(12)?,
-            }))
+            Ok((row.get(0)?, read_attribution(row, 1)?))
         })?.collect::<rusqlite::Result<_>>()?;
-    for (key, current) in &mut staged {
-        if sample_matches(key, current, gateway, flow) {
-            merge(&mut current.attribution, incoming);
-            sessions.insert(current.session_id.clone(), current.attribution.clone());
-        }
+    for current in staged.values_mut() {
+        merge(&mut current.attribution, incoming);
+        sessions.insert(current.session_id.clone(), current.attribution.clone());
     }
     for (id, mut attr) in sessions {
         merge(&mut attr, incoming);
         reassign(&tx, &id, &attr, now)?;
-        tx.execute("UPDATE flow_sessions SET domain=?1,organization_id=?2,application_id=?3,
+        tx.prepare_cached("UPDATE flow_sessions SET domain=?1,organization_id=?2,application_id=?3,
             category_id=?4,traffic_role=?5,protocol_id=?6,organization_confidence=?7,application_confidence=?8,
-            protocol_confidence=?9,classification_confidence=?10,classification_reason=?11,classification_evidence_json=?12 WHERE id=?13",
-            params![attr.domain,attr.organization_id,attr.application_id,attr.category_id,attr.traffic_role,
+            protocol_confidence=?9,classification_confidence=?10,classification_reason=?11,classification_evidence_json=?12 WHERE id=?13")?
+            .execute(params![attr.domain,attr.organization_id,attr.application_id,attr.category_id,attr.traffic_role,
                 attr.protocol_id,attr.organization_confidence,attr.application_confidence,attr.protocol_confidence,
                 attr.confidence,attr.reason,attr.evidence_json,id])?;
     }
     tx.commit()?;
-    storage.active_flows = staged;
+    storage.active_flows.extend(staged);
     Ok(())
+}
+
+pub(super) fn read_attribution(row: &Row<'_>, offset: usize) -> rusqlite::Result<FlowAttribution> {
+    let identity = |column| -> rusqlite::Result<String> {
+        Ok(row
+            .get::<_, Option<String>>(column)?
+            .unwrap_or_else(|| "unknown".into()))
+    };
+    let score =
+        |column| -> rusqlite::Result<f64> { Ok(row.get::<_, Option<f64>>(column)?.unwrap_or(0.0)) };
+    Ok(FlowAttribution {
+        domain: row.get(offset)?,
+        organization_id: identity(offset + 1)?,
+        application_id: identity(offset + 2)?,
+        category_id: identity(offset + 3)?,
+        traffic_role: identity(offset + 4)?,
+        protocol_id: identity(offset + 5)?,
+        organization_confidence: score(offset + 6)?,
+        application_confidence: score(offset + 7)?,
+        protocol_confidence: score(offset + 8)?,
+        confidence: score(offset + 9)?,
+        reason: row
+            .get::<_, Option<String>>(offset + 10)?
+            .unwrap_or_default(),
+        evidence_json: row.get(offset + 11)?,
+    })
 }

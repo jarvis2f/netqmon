@@ -20,7 +20,8 @@ use std::fmt;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
@@ -309,6 +310,11 @@ async fn bind_listeners(
 struct CollectorState {
     enrollment_token_hash: [u8; 32],
     inner: Arc<Mutex<CollectorInner>>,
+    processing: Arc<Mutex<()>>,
+    query_storage: Option<Arc<Mutex<Storage>>>,
+    query_classifier: ClassifierHandle,
+    query_geo: Arc<RwLock<Arc<dyn GeoProvider>>>,
+    active_flow_count: Arc<AtomicI64>,
     icon_service: Arc<IconService>,
     sampling: Arc<dpi::SamplingService>,
     license: Arc<license::LicenseCoordinator>,
@@ -382,6 +388,17 @@ impl CollectorState {
             gateway_id: record.id,
             agent_token_hash: record.agent_token_hash,
         });
+        let query_storage = storage
+            .query_reader()?
+            .map(|reader| Arc::new(Mutex::new(reader)));
+        let query_classifier = classifier.clone();
+        let query_geo = Arc::new(RwLock::new(Arc::clone(&geo_provider)));
+        let active_flow_count =
+            Arc::new(AtomicI64::new(if matches!(storage, Storage::Sqlite(_)) {
+                storage.active_flow_count()?
+            } else {
+                0
+            }));
         let inner = Arc::new(Mutex::new(CollectorInner {
             gateway,
             storage,
@@ -401,6 +418,8 @@ impl CollectorState {
             traffic_bytes: 0,
         }));
         let policy_hub = PolicyHub::new();
+        let processing = Arc::new(Mutex::new(()));
+        let callback_processing = Arc::clone(&processing);
         let weak = Arc::downgrade(&inner);
         let callback_policy_hub = policy_hub.clone();
         let sampling = Arc::new(dpi::SamplingService::new(
@@ -409,16 +428,17 @@ impl CollectorState {
             signature_matcher,
             move |cached| {
                 if let Some(inner) = weak.upgrade() {
-                    let mut inner = inner
+                    let processing_guard = callback_processing
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let result = apply_sample_result(&mut inner, &cached);
-                    if result.as_ref().is_ok_and(|decisions| decisions.is_empty()) {
+                    let result = process_sample(&inner, &cached, &processing_guard);
+                    if result.as_ref().is_ok_and(Vec::is_empty) {
                         inner
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .pending_flow_samples
                             .defer(cached, std::time::Instant::now());
                     }
-                    drop(inner);
                     match result {
                         Ok(decisions) => {
                             for (batch, attribution) in decisions {
@@ -437,6 +457,11 @@ impl CollectorState {
         Ok(Self {
             enrollment_token_hash: hash_token(enrollment_token),
             inner,
+            processing,
+            query_storage,
+            query_classifier,
+            query_geo,
+            active_flow_count,
             icon_service: Arc::new(IconService::new(icon_cache_config)),
             sampling,
             license,
@@ -449,6 +474,52 @@ impl CollectorState {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn query(&self) -> QueryContext<'_> {
+        if let Some(source) = &self.query_storage {
+            let reader = source
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .query_reader();
+            if let Ok(Some(storage)) = reader {
+                let active_flows = matches!(storage, Storage::Sqlite(_))
+                    .then(|| self.active_flow_count.load(Ordering::Relaxed));
+                return QueryContext {
+                    storage: QueryStorage::Independent(storage),
+                    classifier: self.query_classifier.clone(),
+                    geo_provider: Arc::clone(
+                        &self
+                            .query_geo
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    ),
+                    active_flows,
+                };
+            }
+        }
+        let inner = self.lock();
+        let classifier = inner.classifier.clone();
+        let geo_provider = Arc::clone(&inner.geo_provider);
+        let active_flows = if matches!(inner.storage, Storage::Sqlite(_)) {
+            inner.storage.active_flow_count().ok()
+        } else {
+            None
+        };
+        let storage = match inner.storage.query_reader() {
+            Ok(Some(storage)) => QueryStorage::Independent(storage),
+            Ok(None) => QueryStorage::Locked(inner),
+            Err(error) => {
+                tracing::warn!(%error, "independent query connection unavailable");
+                QueryStorage::Locked(inner)
+            }
+        };
+        QueryContext {
+            storage,
+            classifier,
+            geo_provider,
+            active_flows,
+        }
     }
 
     fn enrollment_token_matches(&self, token: &str) -> bool {
@@ -549,97 +620,111 @@ impl CollectorState {
         &self,
         batch: &TelemetryBatch,
     ) -> Result<BatchDisposition, TelemetryIngestError> {
-        let mut inner = self.lock();
-        let mut favicon_endpoints = std::mem::take(&mut inner.favicon_endpoints);
-        favicon_endpoints.observe_results(&inner.classifier, batch);
-        inner.dns_domains.observe(batch);
-        let dpi_results = self.sampling.lookup_batch(batch);
-        let mut service_bindings = std::mem::take(&mut inner.service_bindings);
-        let classified = classify_batch(
-            &inner.storage,
-            &inner.classifier,
-            inner.geo_provider.as_ref(),
-            &mut service_bindings,
-            &inner.dns_domains,
-            &favicon_endpoints,
-            batch,
-            &dpi_results,
-            false,
-        );
-        inner.service_bindings = service_bindings;
-        // Restore probe state before any fallible storage work below. A rejected
-        // telemetry batch must not discard previously learned endpoint identities
-        // or outstanding request correlation.
-        inner.favicon_endpoints = favicon_endpoints;
-        let attributions = classified?;
-        let mut supplemental_evidence =
-            DeviceIdentifier::destination_evidence(&inner.classifier, batch, &attributions);
-        for (mac, evidence) in DeviceIdentifier::discovery_evidence(
-            &inner.classifier,
-            &batch.device_discovery_observations,
-        ) {
-            supplemental_evidence
-                .entry(mac)
-                .or_default()
-                .extend(evidence);
-        }
-        let mut effective_batch = batch.clone();
-        for flow in &batch.flows {
-            if supplemental_evidence.contains_key(&flow.client_mac)
-                && matches!(flow.client_ip.len(), 4 | 16)
-                && !effective_batch
+        // Serialize writer-side caches without holding the query/state mutex
+        // while classifier IPC is in flight.
+        let processing_guard = self
+            .processing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut work, domains) = {
+            let mut inner = self.lock();
+            inner.dns_domains.observe(batch);
+            let domains = resolve_batch_domains(&inner.storage, batch)?;
+            (ClassificationWork::take(&mut inner), domains)
+        };
+        let analyses = self.sampling.lookup_batch(batch);
+        let prepared = (|| -> Result<_, TelemetryIngestError> {
+            work.favicon_endpoints
+                .observe_results(&work.classifier, batch);
+            let attributions = classify_resolved_batch(
+                &work.classifier,
+                work.geo_provider.as_ref(),
+                &mut work.service_bindings,
+                &work.dns_domains,
+                &work.favicon_endpoints,
+                batch,
+                &analyses,
+                false,
+                &domains,
+            )?;
+            let mut supplemental_evidence =
+                DeviceIdentifier::destination_evidence(&work.classifier, batch, &attributions);
+            for (mac, evidence) in DeviceIdentifier::discovery_evidence(
+                &work.classifier,
+                &batch.device_discovery_observations,
+            ) {
+                supplemental_evidence
+                    .entry(mac)
+                    .or_default()
+                    .extend(evidence);
+            }
+            let mut effective_batch = batch.clone();
+            for flow in &batch.flows {
+                if supplemental_evidence.contains_key(&flow.client_mac)
+                    && matches!(flow.client_ip.len(), 4 | 16)
+                    && !effective_batch
+                        .device_observations
+                        .iter()
+                        .any(|item| item.mac == flow.client_mac)
+                {
+                    effective_batch.device_observations.push(
+                        netqmon_protocol::v1::DeviceObservation {
+                            mac: flow.client_mac.clone(),
+                            ip: flow.client_ip.clone(),
+                            last_seen_unix_ms: flow.last_seen_unix_ms,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            for discovery in &batch.device_discovery_observations {
+                if discovery.mac.len() != 6 || !matches!(discovery.ip.len(), 4 | 16) {
+                    continue;
+                }
+                if effective_batch
                     .device_observations
                     .iter()
-                    .any(|item| item.mac == flow.client_mac)
-            {
+                    .any(|item| item.mac == discovery.mac && item.ip == discovery.ip)
+                {
+                    continue;
+                }
                 effective_batch
                     .device_observations
                     .push(netqmon_protocol::v1::DeviceObservation {
-                        mac: flow.client_mac.clone(),
-                        ip: flow.client_ip.clone(),
-                        last_seen_unix_ms: flow.last_seen_unix_ms,
-                        ..Default::default()
+                        mac: discovery.mac.clone(),
+                        ip: discovery.ip.clone(),
+                        hostname: discovery.hostname.clone(),
+                        last_seen_unix_ms: discovery.observed_at_unix_ms,
+                        dhcp: None,
                     });
             }
-        }
-        for discovery in &batch.device_discovery_observations {
-            if discovery.mac.len() != 6 || !matches!(discovery.ip.len(), 4 | 16) {
-                continue;
-            }
-            if effective_batch
-                .device_observations
-                .iter()
-                .any(|item| item.mac == discovery.mac && item.ip == discovery.ip)
-            {
-                continue;
-            }
-            effective_batch
-                .device_observations
-                .push(netqmon_protocol::v1::DeviceObservation {
-                    mac: discovery.mac.clone(),
-                    ip: discovery.ip.clone(),
-                    hostname: discovery.hostname.clone(),
-                    last_seen_unix_ms: discovery.observed_at_unix_ms,
-                    dhcp: None,
-                });
-        }
-        let mut historical_evidence = std::collections::HashMap::new();
-        for observation in &effective_batch.device_observations {
-            if !historical_evidence.contains_key(&observation.mac) {
-                historical_evidence.insert(
-                    observation.mac.clone(),
-                    inner
-                        .storage
-                        .device_evidence(&batch.gateway_id, &observation.mac)?,
-                );
-            }
-        }
-        let device_identities = inner.device_identifier.identify_batch(
-            &inner.classifier,
-            &effective_batch.device_observations,
-            &historical_evidence,
-            &supplemental_evidence,
-        );
+            let historical_evidence = {
+                let inner = self.lock();
+                let mut historical_evidence = std::collections::HashMap::new();
+                for observation in &effective_batch.device_observations {
+                    if !historical_evidence.contains_key(&observation.mac) {
+                        historical_evidence.insert(
+                            observation.mac.clone(),
+                            inner
+                                .storage
+                                .device_evidence(&batch.gateway_id, &observation.mac)?,
+                        );
+                    }
+                }
+                historical_evidence
+            };
+            let device_identities = work.device_identifier.identify_batch(
+                &work.classifier,
+                &effective_batch.device_observations,
+                &historical_evidence,
+                &supplemental_evidence,
+            );
+            Ok((effective_batch, attributions, device_identities))
+        })();
+        let mut inner = self.lock();
+        work.restore(&mut inner);
+        let (effective_batch, attributions, device_identities) = prepared?;
+        let mut ready_samples = Vec::new();
         let mut late_sample_decisions = Vec::new();
         let result = match inner.storage.persist_classified_batch(
             &effective_batch,
@@ -655,7 +740,7 @@ impl CollectorState {
                 inner
                     .policy_flow_contexts
                     .observe(batch, std::time::Instant::now());
-                let ready_samples = {
+                ready_samples = {
                     let CollectorInner {
                         policy_flow_contexts,
                         pending_flow_samples,
@@ -663,17 +748,6 @@ impl CollectorState {
                     } = &mut *inner;
                     pending_flow_samples.take_ready(policy_flow_contexts, std::time::Instant::now())
                 };
-                for sample in ready_samples {
-                    match apply_sample_result(&mut inner, &sample) {
-                        Ok(mut decisions) => late_sample_decisions.append(&mut decisions),
-                        Err(error) => {
-                            tracing::warn!(%error, "deferred sample classification update failed");
-                            inner
-                                .pending_flow_samples
-                                .defer(sample, std::time::Instant::now());
-                        }
-                    }
-                }
                 self.sampling.observe_telemetry(batch);
                 let observed_at = if batch.sent_at == 0 {
                     unix_time_ms()
@@ -698,8 +772,20 @@ impl CollectorState {
                 Ok(BatchDisposition::Accepted)
             }
         };
+        self.refresh_active_flow_count(&inner.storage);
         if matches!(&result, Ok(BatchDisposition::Accepted)) {
             drop(inner);
+            for sample in ready_samples {
+                match process_sample(&self.inner, &sample, &processing_guard) {
+                    Ok(mut decisions) => late_sample_decisions.append(&mut decisions),
+                    Err(error) => {
+                        tracing::warn!(%error, "deferred sample classification update failed");
+                        self.lock()
+                            .pending_flow_samples
+                            .defer(sample, std::time::Instant::now());
+                    }
+                }
+            }
             queue_policy_flow_decisions(&self.policy_hub, batch, &attributions);
             for (late_batch, attribution) in late_sample_decisions {
                 queue_policy_flow_decisions(
@@ -718,13 +804,32 @@ impl CollectorState {
 
     fn run_maintenance(&self, retention: bool) -> Result<(), StorageError> {
         let mut inner = self.lock();
+        let now = unix_time_ms();
+        inner.storage.prune_reclassification(now)?;
+        self.refresh_active_flow_count(&inner.storage);
+        if let Some(mut writer) = inner.storage.maintenance_writer()? {
+            drop(inner);
+            return if retention {
+                let policy = writer.load_retention_policy()?;
+                writer.run_retention(now, policy)
+            } else {
+                writer.roll_up_hour_and_day(now)
+            };
+        }
         if retention {
             let policy = inner.storage.load_retention_policy()?;
             inner.storage.run_retention(unix_time_ms(), policy)
         } else {
             let now = unix_time_ms();
-            inner.storage.roll_up_hour_and_day(now)?;
-            inner.storage.prune_reclassification(now)
+            inner.storage.prune_reclassification(now)?;
+            inner.storage.roll_up_hour_and_day(now)
+        }
+    }
+
+    fn refresh_active_flow_count(&self, storage: &Storage) {
+        if matches!(storage, Storage::Sqlite(_)) {
+            self.active_flow_count
+                .store(storage.active_flow_count().unwrap_or(0), Ordering::Relaxed);
         }
     }
 
@@ -738,14 +843,14 @@ impl CollectorState {
         }
     }
 
-    fn realtime_snapshot(&self) -> RealtimeSnapshot {
+    fn realtime_snapshot(&self) -> Arc<RealtimeSnapshot> {
         self.lock().realtime.snapshot()
     }
 
     fn realtime_subscription(
         &self,
     ) -> (
-        RealtimeSnapshot,
+        Arc<RealtimeSnapshot>,
         tokio::sync::broadcast::Receiver<RealtimeEvent>,
     ) {
         let inner = self.lock();
@@ -763,19 +868,70 @@ impl CollectorState {
         Option<classifier::EntityMetadata>,
         Option<classifier::EntityMetadata>,
     ) {
-        let inner = self.lock();
-        let application = inner.classifier.application_metadata(id);
+        let classifier = self.lock().classifier.clone();
+        let application = classifier.application_metadata(id);
         let organization = application.as_ref().and_then(|metadata| {
             metadata
                 .organization_id
                 .as_ref()
-                .and_then(|organization_id| inner.classifier.organization_metadata(organization_id))
+                .and_then(|organization_id| classifier.organization_metadata(organization_id))
         });
         (application, organization)
     }
 
     fn icon_organization_context(&self, id: &str) -> Option<classifier::EntityMetadata> {
-        self.lock().classifier.organization_metadata(id)
+        let classifier = self.lock().classifier.clone();
+        classifier.organization_metadata(id)
+    }
+}
+
+struct QueryContext<'a> {
+    storage: QueryStorage<'a>,
+    classifier: ClassifierHandle,
+    geo_provider: Arc<dyn GeoProvider>,
+    active_flows: Option<i64>,
+}
+
+enum QueryStorage<'a> {
+    Independent(Storage),
+    Locked(MutexGuard<'a, CollectorInner>),
+}
+
+impl std::ops::Deref for QueryStorage<'_> {
+    type Target = Storage;
+    fn deref(&self) -> &Storage {
+        match self {
+            Self::Independent(storage) => storage,
+            Self::Locked(inner) => &inner.storage,
+        }
+    }
+}
+
+struct ClassificationWork {
+    classifier: ClassifierHandle,
+    geo_provider: Arc<dyn GeoProvider>,
+    device_identifier: DeviceIdentifier,
+    service_bindings: ServiceBindingCache,
+    dns_domains: DnsDomainCache,
+    favicon_endpoints: FaviconEndpointCache,
+}
+
+impl ClassificationWork {
+    fn take(inner: &mut CollectorInner) -> Self {
+        Self {
+            classifier: inner.classifier.clone(),
+            geo_provider: Arc::clone(&inner.geo_provider),
+            device_identifier: inner.device_identifier.clone(),
+            service_bindings: std::mem::take(&mut inner.service_bindings),
+            dns_domains: std::mem::take(&mut inner.dns_domains),
+            favicon_endpoints: std::mem::take(&mut inner.favicon_endpoints),
+        }
+    }
+
+    fn restore(self, inner: &mut CollectorInner) {
+        inner.service_bindings = self.service_bindings;
+        inner.dns_domains = self.dns_domains;
+        inner.favicon_endpoints = self.favicon_endpoints;
     }
 }
 
@@ -1256,6 +1412,7 @@ struct IngestStats {
 }
 
 #[allow(clippy::too_many_lines)]
+#[cfg(test)]
 fn classify_batch(
     storage: &Storage,
     classifier: &ClassifierHandle,
@@ -1266,6 +1423,62 @@ fn classify_batch(
     batch: &TelemetryBatch,
     analyses: &[Option<dpi::SampleAnalysis>],
     fail_open_on_classifier_error: bool,
+) -> Result<Vec<FlowAttribution>, TelemetryIngestError> {
+    let domains = resolve_batch_domains(storage, batch)?;
+    classify_resolved_batch(
+        classifier,
+        geo_provider,
+        service_bindings,
+        dns_domains,
+        favicon_endpoints,
+        batch,
+        analyses,
+        fail_open_on_classifier_error,
+        &domains,
+    )
+}
+
+fn resolve_batch_domains(
+    storage: &Storage,
+    batch: &TelemetryBatch,
+) -> Result<Vec<Option<String>>, StorageError> {
+    let mut cached: HashMap<_, Option<String>> = HashMap::new();
+    batch
+        .flows
+        .iter()
+        .map(|flow| {
+            let at = if flow.last_seen_unix_ms == 0 {
+                batch.sent_at
+            } else {
+                flow.last_seen_unix_ms
+            };
+            if let Some(domain) = resolve_batch_domain(batch, &flow.client_ip, &flow.remote_ip, at)
+            {
+                return Ok(Some(domain.to_owned()));
+            }
+            let key = (&flow.client_ip, &flow.remote_ip, at);
+            if let Some(domain) = cached.get(&key) {
+                return Ok(domain.clone());
+            }
+            let domain =
+                storage.resolve_domain(&batch.gateway_id, &flow.client_ip, &flow.remote_ip, at)?;
+            cached.insert(key, domain.clone());
+            Ok(domain)
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn classify_resolved_batch(
+    classifier: &ClassifierHandle,
+    geo_provider: &dyn GeoProvider,
+    service_bindings: &mut ServiceBindingCache,
+    dns_domains: &DnsDomainCache,
+    favicon_endpoints: &FaviconEndpointCache,
+    batch: &TelemetryBatch,
+    analyses: &[Option<dpi::SampleAnalysis>],
+    fail_open_on_classifier_error: bool,
+    domains: &[Option<String>],
 ) -> Result<Vec<FlowAttribution>, TelemetryIngestError> {
     let remote_asns = lookup_batch_remote_asns(geo_provider, batch);
     batch
@@ -1290,17 +1503,7 @@ fn classify_batch(
             let ambiguous_signature_ids =
                 ambiguous_signature_application_ids(&signature_matches);
             let ambiguous_signatures = !ambiguous_signature_ids.is_empty();
-            let mut domain =
-                resolve_batch_domain(batch, &flow.client_ip, &flow.remote_ip, observed_at)
-                    .map(str::to_owned);
-            if domain.is_none() {
-                domain = storage.resolve_domain(
-                    &batch.gateway_id,
-                    &flow.client_ip,
-                    &flow.remote_ip,
-                    observed_at,
-                )?;
-            }
+            let mut domain = domains.get(index).cloned().flatten();
             if domain.is_none() {
                 domain = dpi_result
                     .and_then(|r| r.metadata.get("hostname"))
@@ -2004,6 +2207,7 @@ fn unix_time_ms() -> u64 {
 fn spawn_maintenance(state: CollectorState, interval: Duration, retention: bool) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
             let state = state.clone();
@@ -2358,30 +2562,12 @@ fn canonical_mac(value: &[u8]) -> Option<String> {
     })
 }
 
+#[cfg(test)]
 fn apply_sample_result(
     inner: &mut CollectorInner,
     cached: &dpi::CachedResult,
 ) -> Result<Vec<(TelemetryBatch, FlowAttribution)>, StorageError> {
-    let key = &cached.key;
-    let flow = netqmon_protocol::v1::FlowDelta {
-        ip_version: key.ip_version,
-        protocol: key.protocol,
-        client_ip: key.client_ip.clone(),
-        client_port: key.client_port,
-        remote_ip: key.remote_ip.clone(),
-        remote_port: key.remote_port,
-        first_seen_unix_ms: key.first_seen_unix_ms,
-        last_seen_unix_ms: cached.last_packet_ms,
-        policy_flow_id: cached.policy_flow_ids.first().cloned().unwrap_or_default(),
-        ..Default::default()
-    };
-    let batch = TelemetryBatch {
-        gateway_id: cached.gateway.clone(),
-        boot_id: cached.boot.clone(),
-        sent_at: cached.last_packet_ms,
-        flows: vec![flow],
-        ..Default::default()
-    };
+    let batch = sample_batch(cached);
     let mut service_bindings = std::mem::take(&mut inner.service_bindings);
     let classified = classify_batch(
         &inner.storage,
@@ -2406,6 +2592,79 @@ fn apply_sample_result(
         }
         Err(TelemetryIngestError::Storage(error)) => return Err(error),
     };
+    commit_sample_result(inner, cached, &batch, &attributions)
+}
+
+fn sample_batch(cached: &dpi::CachedResult) -> TelemetryBatch {
+    let key = &cached.key;
+    let flow = netqmon_protocol::v1::FlowDelta {
+        ip_version: key.ip_version,
+        protocol: key.protocol,
+        client_ip: key.client_ip.clone(),
+        client_port: key.client_port,
+        remote_ip: key.remote_ip.clone(),
+        remote_port: key.remote_port,
+        first_seen_unix_ms: key.first_seen_unix_ms,
+        last_seen_unix_ms: cached.last_packet_ms,
+        policy_flow_id: cached.policy_flow_ids.first().cloned().unwrap_or_default(),
+        ..Default::default()
+    };
+    TelemetryBatch {
+        gateway_id: cached.gateway.clone(),
+        boot_id: cached.boot.clone(),
+        sent_at: cached.last_packet_ms,
+        flows: vec![flow],
+        ..Default::default()
+    }
+}
+
+fn process_sample(
+    shared: &Arc<Mutex<CollectorInner>>,
+    cached: &dpi::CachedResult,
+    _processing_guard: &MutexGuard<'_, ()>,
+) -> Result<Vec<(TelemetryBatch, FlowAttribution)>, StorageError> {
+    let batch = sample_batch(cached);
+    let (mut work, domains) = {
+        let mut inner = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let domains = resolve_batch_domains(&inner.storage, &batch)?;
+        (ClassificationWork::take(&mut inner), domains)
+    };
+    let classified = classify_resolved_batch(
+        &work.classifier,
+        work.geo_provider.as_ref(),
+        &mut work.service_bindings,
+        &work.dns_domains,
+        &work.favicon_endpoints,
+        &batch,
+        &[Some(dpi::SampleAnalysis {
+            dpi: cached.result.clone(),
+            signatures: cached.signatures.clone(),
+        })],
+        false,
+        &domains,
+    );
+    let mut inner = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    work.restore(&mut inner);
+    match classified {
+        Ok(attributions) => commit_sample_result(&mut inner, cached, &batch, &attributions),
+        Err(TelemetryIngestError::ClassifierUnavailable(error)) => {
+            tracing::debug!(%error, "skipping late DPI update while classifier is unavailable");
+            Ok(Vec::new())
+        }
+        Err(TelemetryIngestError::Storage(error)) => Err(error),
+    }
+}
+
+fn commit_sample_result(
+    inner: &mut CollectorInner,
+    cached: &dpi::CachedResult,
+    batch: &TelemetryBatch,
+    attributions: &[FlowAttribution],
+) -> Result<Vec<(TelemetryBatch, FlowAttribution)>, StorageError> {
     inner
         .storage
         .reclassify_flow(&cached.gateway, &batch.flows[0], &attributions[0])?;

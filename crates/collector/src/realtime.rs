@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 
 use netqmon_protocol::v1::{
     CounterSanityStatus, FlowLifecycle, FlowScope as WireFlowScope, NatType, OffloadStatus,
@@ -128,7 +129,7 @@ pub(crate) struct RealtimeSnapshot {
     pub(crate) clients: HashMap<String, Throughput>,
     pub(crate) client_scopes: HashMap<String, ScopedThroughput>,
     pub(crate) applications: HashMap<String, Throughput>,
-    pub(crate) active_flows: Vec<ActiveFlowSnapshot>,
+    pub(crate) active_flows: Vec<Arc<ActiveFlowSnapshot>>,
     pub(crate) history: Vec<ThroughputPoint>,
     pub(crate) gateway_health: Option<GatewayHealthSnapshot>,
 }
@@ -159,7 +160,7 @@ pub(crate) struct WarningEvent {
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum RealtimeEvent {
-    Snapshot(RealtimeSnapshot),
+    Snapshot(Arc<RealtimeSnapshot>),
     GatewayStatus(GatewayStatusEvent),
     DeviceSeen(DeviceSeenEvent),
     Warning(WarningEvent),
@@ -186,8 +187,9 @@ impl RealtimeEvent {
 }
 
 pub(crate) struct RealtimeEngine {
-    snapshot: RealtimeSnapshot,
-    active_flows: HashMap<String, ActiveFlowSnapshot>,
+    snapshot: Arc<RealtimeSnapshot>,
+    active_flows: HashMap<String, Arc<ActiveFlowSnapshot>>,
+    flow_order: BTreeSet<(std::cmp::Reverse<u64>, String)>,
     recent_clients: HashMap<String, (Throughput, u64)>,
     last_update_at: Option<u64>,
     sender: broadcast::Sender<RealtimeEvent>,
@@ -197,8 +199,9 @@ impl Default for RealtimeEngine {
     fn default() -> Self {
         let (sender, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
-            snapshot: RealtimeSnapshot::default(),
+            snapshot: Arc::new(RealtimeSnapshot::default()),
             active_flows: HashMap::new(),
+            flow_order: BTreeSet::new(),
             recent_clients: HashMap::new(),
             last_update_at: None,
             sender,
@@ -207,7 +210,7 @@ impl Default for RealtimeEngine {
 }
 
 impl RealtimeEngine {
-    pub(crate) fn snapshot(&self) -> RealtimeSnapshot {
+    pub(crate) fn snapshot(&self) -> Arc<RealtimeSnapshot> {
         self.snapshot.clone()
     }
 
@@ -262,7 +265,7 @@ impl RealtimeEngine {
             })
             .collect();
 
-        let mut history = VecDeque::from(std::mem::take(&mut self.snapshot.history));
+        let mut history = VecDeque::from(self.snapshot.history.clone());
         history.push_back(ThroughputPoint {
             timestamp: received_at,
             upload_bytes_per_second: internet.upload_bytes_per_second,
@@ -271,13 +274,11 @@ impl RealtimeEngine {
         while history.len() > MAX_HISTORY_POINTS {
             history.pop_front();
         }
-        let mut active_flows = self.active_flows.values().cloned().collect::<Vec<_>>();
-        active_flows.sort_by(|left, right| {
-            right
-                .last_seen
-                .cmp(&left.last_seen)
-                .then_with(|| left.id.cmp(&right.id))
-        });
+        let active_flows = self
+            .flow_order
+            .iter()
+            .filter_map(|(_, id)| self.active_flows.get(id).cloned())
+            .collect();
         let gateway_health = batch.health.as_ref().map_or_else(
             || self.snapshot.gateway_health.clone(),
             |health| {
@@ -349,7 +350,7 @@ impl RealtimeEngine {
                 })
             },
         );
-        self.snapshot = RealtimeSnapshot {
+        self.snapshot = Arc::new(RealtimeSnapshot {
             generated_at: received_at,
             agent_batch_time: observed_at,
             total,
@@ -363,7 +364,7 @@ impl RealtimeEngine {
             active_flows,
             history: history.into(),
             gateway_health,
-        };
+        });
 
         self.publish_batch_events(batch, attributions, received_at);
     }
@@ -463,19 +464,27 @@ impl RealtimeEngine {
         client_ip: String,
     ) {
         let id = flow_id(flow);
+        if let Some(previous) = self.active_flows.get(&id) {
+            self.flow_order
+                .remove(&(std::cmp::Reverse(previous.last_seen), id.clone()));
+        }
         match FlowLifecycle::try_from(flow.lifecycle) {
             Ok(FlowLifecycle::Ended) => {
                 self.active_flows.remove(&id);
                 return;
             }
             Ok(FlowLifecycle::Active | FlowLifecycle::Idle) => {}
-            _ => return,
+            _ => {
+                if let Some(previous) = self.active_flows.get(&id) {
+                    self.flow_order
+                        .insert((std::cmp::Reverse(previous.last_seen), id));
+                }
+                return;
+            }
         }
-        let current = self
-            .active_flows
-            .entry(id.clone())
-            .or_insert_with(|| ActiveFlowSnapshot {
-                id,
+        let current = self.active_flows.entry(id.clone()).or_insert_with(|| {
+            Arc::new(ActiveFlowSnapshot {
+                id: id.clone(),
                 client_ip,
                 client_port: flow.client_port,
                 remote_ip: format_ip(&flow.remote_ip),
@@ -495,7 +504,9 @@ impl RealtimeEngine {
                 nat: nat_name(flow.nat).to_owned(),
                 source_segment: flow.source_segment.clone(),
                 destination_segment: flow.destination_segment.clone(),
-            });
+            })
+        });
+        let current = Arc::make_mut(current);
         lifecycle_name(flow.lifecycle).clone_into(&mut current.lifecycle);
         current.upload_bytes = current.upload_bytes.saturating_add(flow.upload_bytes);
         current.download_bytes = current.download_bytes.saturating_add(flow.download_bytes);
@@ -514,6 +525,8 @@ impl RealtimeEngine {
             current.domain.clone_from(&attribution.domain);
             current.confidence = attribution.confidence;
         }
+        self.flow_order
+            .insert((std::cmp::Reverse(current.last_seen), id));
     }
 
     fn publish_batch_events(
@@ -549,17 +562,10 @@ impl RealtimeEngine {
     }
 
     fn evict_oldest_flows(&mut self) {
-        let excess = self.active_flows.len().saturating_sub(MAX_ACTIVE_FLOWS);
-        if excess == 0 {
-            return;
-        }
-        let mut oldest = self
-            .active_flows
-            .iter()
-            .map(|(id, flow)| (flow.last_seen, id.clone()))
-            .collect::<Vec<_>>();
-        oldest.sort_unstable();
-        for (_, id) in oldest.into_iter().take(excess) {
+        while self.active_flows.len() > MAX_ACTIVE_FLOWS {
+            let Some((_, id)) = self.flow_order.pop_last() else {
+                break;
+            };
             self.active_flows.remove(&id);
         }
     }

@@ -50,6 +50,7 @@ impl RecoveryMetadata {
             started_at: self.started_at,
             last_seen_at: counters[3],
             checkpointed_at: self.checkpointed_at,
+            last_received_at: 0, // Filled from the collector's updated_at column.
             attribution: attr,
             scope: self.scope,
             path_type: self.path_type,
@@ -119,14 +120,19 @@ fn read_recovery(row: &Row<'_>) -> rusqlite::Result<(FlowKey, ActiveFlow)> {
     let metadata: RecoveryMetadata =
         serde_json::from_str(&row.get::<_, String>(0)?).map_err(json_error)?;
     let attr = serde_json::from_str(&row.get::<_, String>(1)?).map_err(json_error)?;
-    Ok(metadata.into_flow(attr, [row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?]))
+    let (key, mut flow) =
+        metadata.into_flow(attr, [row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?]);
+    flow.last_received_at = row.get(6)?;
+    Ok((key, flow))
 }
 
 pub(crate) fn restore(connection: &Connection, current: &mut ActiveFlow) -> rusqlite::Result<()> {
     let state = connection
-        .query_row(
-            "SELECT metadata_json,attribution_json,upload_bytes,download_bytes,packets,last_seen_at
+        .prepare_cached(
+            "SELECT metadata_json,attribution_json,upload_bytes,download_bytes,packets,last_seen_at,updated_at
         FROM flow_rollup_sessions WHERE session_id=?1",
+        )?
+        .query_row(
             [&current.session_id],
             read_recovery,
         )
@@ -137,6 +143,31 @@ pub(crate) fn restore(connection: &Connection, current: &mut ActiveFlow) -> rusq
         current.download_bytes = current.download_bytes.max(restored.download_bytes);
         current.packets = current.packets.max(restored.packets);
         current.last_seen_at = current.last_seen_at.max(restored.last_seen_at);
+    } else {
+        // A late delta/End can arrive after cache GC. Recover the full counters
+        // for this exact lifetime instead of overwriting its historical totals.
+        let historical = connection
+            .prepare_cached(
+                "SELECT upload_bytes,download_bytes,packets,last_seen_at,domain,organization_id,
+                application_id,category_id,traffic_role,protocol_id,organization_confidence,
+                application_confidence,protocol_confidence,classification_confidence,
+                classification_reason,classification_evidence_json
+             FROM flow_sessions WHERE id=?1",
+            )?
+            .query_row([&current.session_id], |row| {
+                Ok((
+                    [row.get::<_, i64>(0)?, row.get(1)?, row.get(2)?, row.get(3)?],
+                    super::read_attribution(row, 4)?,
+                ))
+            })
+            .optional()?;
+        if let Some((counters, attribution)) = historical {
+            current.upload_bytes = counters[0];
+            current.download_bytes = counters[1];
+            current.packets = counters[2];
+            current.last_seen_at = current.last_seen_at.max(counters[3]);
+            merge(&mut current.attribution, &attribution);
+        }
     }
     Ok(())
 }
@@ -146,7 +177,7 @@ pub(crate) fn restore_active(
     active: &mut HashMap<FlowKey, ActiveFlow>,
 ) -> rusqlite::Result<()> {
     let mut statement = connection.prepare(
-        "SELECT metadata_json,attribution_json,upload_bytes,download_bytes,packets,last_seen_at
+        "SELECT metadata_json,attribution_json,upload_bytes,download_bytes,packets,last_seen_at,updated_at
         FROM flow_rollup_sessions WHERE ended_at IS NULL",
     )?;
     for state in statement.query_map([], read_recovery)? {
@@ -172,13 +203,13 @@ pub(crate) fn prune(tx: &Transaction<'_>, now: i64) -> rusqlite::Result<()> {
     // Checkpoint orphaned/open recovery state before GC; otherwise a restart
     // before the ordinary five-minute checkpoint could lose session counters.
     let mut statement = tx.prepare(
-        "SELECT metadata_json,attribution_json,upload_bytes,download_bytes,packets,last_seen_at
+        "SELECT metadata_json,attribution_json,upload_bytes,download_bytes,packets,last_seen_at,updated_at
         FROM flow_rollup_sessions WHERE ended_at IS NULL AND updated_at<=?1",
     )?;
     for state in statement.query_map([now.saturating_sub(CORRECTION_WINDOW_MS)], read_recovery)? {
         let (key, flow) = state?;
         if flow.last_seen_at > 0 {
-            write_flow_session(tx, &key, &flow, None, now)?;
+            write_flow_session(tx, &key, &flow, Some(flow.last_seen_at), now)?;
         }
     }
     drop(statement);

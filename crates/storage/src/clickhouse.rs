@@ -348,6 +348,14 @@ pub struct ClickHouseStorage {
 }
 
 impl ClickHouseStorage {
+    pub(crate) fn query_reader(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            active_flows: HashMap::new(),
+            dns_cache: Arc::clone(&self.dns_cache),
+        }
+    }
+
     pub(crate) fn reclassify_flow(
         &mut self,
         gateway: &str,
@@ -463,6 +471,7 @@ impl ClickHouseStorage {
                         started_at: json_i64(&row["started_at"]),
                         last_seen_at: json_i64(&row["last_seen_at"]),
                         checkpointed_at: json_i64(&row["checkpointed_at"]),
+                        last_received_at: json_i64(&row["checkpointed_at"]),
                         attribution: FlowAttribution {
                             domain: optional_string("domain"),
                             organization_id: optional_string("organization_id")
@@ -3576,7 +3585,7 @@ impl StorageBackend for ClickHouseStorage {
 
         // 6. BATCH insert flow_sessions (Task 18.3: No single-row synchronous insert!)
         let mut session_rows = Vec::new();
-        let mut staged_active_flows = self.active_flows.clone();
+        let mut staged_active_flows = crate::stage_active_flows(&self.active_flows, batch);
         for (index, flow) in batch.flows.iter().enumerate() {
             let attr = attributions.get(index).unwrap_or(&unknown);
             let key = FlowKey::from_batch(&batch.gateway_id, flow);
@@ -3585,7 +3594,7 @@ impl StorageBackend for ClickHouseStorage {
             let current = staged_active_flows
                 .entry(key.clone())
                 .or_insert_with(|| ActiveFlow::new(&key, flow, attr.clone(), received_at));
-            current.add(flow, attr);
+            current.add(flow, attr, received_at);
             current.device_id = current
                 .client_mac
                 .get(..6)
@@ -3698,7 +3707,7 @@ impl StorageBackend for ClickHouseStorage {
         // insert tokens make those replays idempotent while their dedup windows
         // retain the token.
         self.insert_batch_rows(batch, "ingest_batches", &[ingest_record])?;
-        self.active_flows = staged_active_flows;
+        crate::commit_active_flows(&mut self.active_flows, batch, staged_active_flows);
 
         Ok(PersistDisposition::Accepted)
     }

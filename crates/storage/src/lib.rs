@@ -1,12 +1,12 @@
 //! SQLite-backed persistence and aggregation for netqmon.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use netqmon_protocol::v1::{FlowDelta, FlowLifecycle, TelemetryBatch};
+use netqmon_protocol::v1::{Direction, FlowDelta, FlowLifecycle, TelemetryBatch};
 use rusqlite::types::{Type, Value};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -21,7 +21,7 @@ const PROTOCOL_ONLY_APPLICATION_MIGRATION: &str =
     include_str!("../../../migrations/sqlite/0004_protocol_only_app_rollup.sql");
 const PROTOCOL_APPLICATION_ROLLUP_MIGRATION: &str =
     include_str!("../../../migrations/sqlite/0005_protocol_application_rollup.sql");
-const MIGRATIONS: [(i64, &str); 7] = [
+const MIGRATIONS: [(i64, &str); 9] = [
     (1, INITIAL_MIGRATION),
     (2, PROTOCOL_MIGRATION),
     (3, SCOPE_TIMESTAMP_MIGRATION),
@@ -34,6 +34,14 @@ const MIGRATIONS: [(i64, &str); 7] = [
     (
         7,
         include_str!("../../../migrations/sqlite/0007_dns_answer_lookup.sql"),
+    ),
+    (
+        8,
+        include_str!("../../../migrations/sqlite/0008_flow_lookup.sql"),
+    ),
+    (
+        9,
+        include_str!("../../../migrations/sqlite/0009_incremental_rollups.sql"),
     ),
 ];
 const SAME_DEVICE_DNS_QUERY: &str =
@@ -58,6 +66,9 @@ const MINUTE_MS: i64 = 60 * 1_000;
 const HOUR_MS: i64 = 60 * MINUTE_MS;
 const DAY_MS: i64 = 24 * HOUR_MS;
 const FLOW_CHECKPOINT_MS: i64 = 5 * MINUTE_MS;
+// A safety net for missing End events, well beyond the Agent's default idle
+// timeouts. Use collector receipt time, including zero-traffic lifecycle events.
+const ACTIVE_FLOW_TTL_MS: i64 = 30 * MINUTE_MS;
 const DIMENSIONS: [&str; 5] = ["total", "device", "application", "domain", "destination"];
 
 /// Default database location for the single-container deployment.
@@ -429,6 +440,37 @@ pub struct SqliteStorage {
 }
 
 impl SqliteStorage {
+    fn independent_connection(&self, read_only: bool) -> StorageResult<Option<Self>> {
+        let Some(path) = self
+            .connection
+            .path()
+            .filter(|path| !path.is_empty() && *path != ":memory:")
+        else {
+            return Ok(None);
+        };
+        let flags = if read_only {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+        } else {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        };
+        let connection =
+            Connection::open_with_flags(path, flags | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.pragma_update(None, "query_only", read_only)?;
+        if read_only {
+            connection.execute_batch("BEGIN DEFERRED")?;
+        }
+        if !read_only {
+            connection.pragma_update(None, "synchronous", "NORMAL")?;
+        }
+        connection.set_prepared_statement_cache_capacity(64);
+        Ok(Some(Self {
+            connection,
+            active_flows: HashMap::new(),
+        }))
+    }
+
     /// Opens or creates a database, configures it, and applies migrations.
     ///
     /// # Errors
@@ -448,16 +490,24 @@ impl SqliteStorage {
     }
 
     fn from_connection(connection: Connection) -> rusqlite::Result<Self> {
+        Self::from_connection_at(connection, unix_time_ms())
+    }
+
+    fn from_connection_at(connection: Connection, now_ms: u64) -> rusqlite::Result<Self> {
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
+        connection.set_prepared_statement_cache_capacity(64);
         migrate(&connection)?;
-        let active_flows = load_active_flows(&connection)?;
-        Ok(Self {
+        let mut storage = Self {
             connection,
-            active_flows,
-        })
+            active_flows: HashMap::new(),
+        };
+        // Close stale persisted state before loading it into memory again.
+        storage.prune_reclassification(now_ms)?;
+        storage.active_flows = load_active_flows(&storage.connection)?;
+        Ok(storage)
     }
 
     /// Loads the single enrolled Gateway.
@@ -802,7 +852,7 @@ impl SqliteStorage {
         persist_devices(&transaction, batch, device_identities)?;
         persist_self_host_endpoint_evidence(&transaction, batch, attributions)?;
         persist_dns(&transaction, batch)?;
-        let mut staged_active_flows = self.active_flows.clone();
+        let mut staged_active_flows = stage_active_flows(&self.active_flows, batch);
         update_active_flows(
             &transaction,
             &mut staged_active_flows,
@@ -811,7 +861,7 @@ impl SqliteStorage {
             received_at,
         )?;
         transaction.commit()?;
-        self.active_flows = staged_active_flows;
+        commit_active_flows(&mut self.active_flows, batch, staged_active_flows);
         Ok(PersistDisposition::Accepted)
     }
 
@@ -888,9 +938,10 @@ impl SqliteStorage {
     pub fn roll_up_hour_and_day(&mut self, now_ms: u64) -> rusqlite::Result<()> {
         let now = to_i64(now_ms);
         let transaction = self.connection.transaction()?;
-        for dimension in DIMENSIONS {
-            aggregate(&transaction, dimension, "minute", "hour", HOUR_MS, now)?;
-            aggregate(&transaction, dimension, "hour", "day", DAY_MS, now)?;
+        for (target, size) in [("hour", HOUR_MS), ("day", DAY_MS)] {
+            for dimension in DIMENSIONS {
+                aggregate(&transaction, dimension, target, now / size * size)?;
+            }
         }
         attribution::mark_aggregated(&transaction, now)?;
         transaction.commit()
@@ -902,8 +953,12 @@ impl SqliteStorage {
     /// Returns an error if the cleanup transaction cannot be committed.
     pub fn prune_reclassification(&mut self, now_ms: u64) -> rusqlite::Result<()> {
         let tx = self.connection.transaction()?;
-        attribution::prune(&tx, to_i64(now_ms))?;
-        tx.commit()
+        prune_flow_state(&tx, &self.active_flows, to_i64(now_ms))?;
+        tx.commit()?;
+        self.active_flows.retain(|_, flow| {
+            flow.last_received_at > to_i64(now_ms).saturating_sub(ACTIVE_FLOW_TTL_MS)
+        });
+        Ok(())
     }
 
     /// Deletes data older than its retention window and expired DNS answers.
@@ -914,7 +969,7 @@ impl SqliteStorage {
     pub fn run_retention(&mut self, now_ms: u64, policy: RetentionPolicy) -> rusqlite::Result<()> {
         let now = to_i64(now_ms);
         let transaction = self.connection.transaction()?;
-        attribution::prune(&transaction, now)?;
+        prune_flow_state(&transaction, &self.active_flows, now)?;
         delete_older_than(
             &transaction,
             "flow_sessions",
@@ -960,8 +1015,20 @@ impl SqliteStorage {
                 now,
                 policy.day_days,
             )?;
+            for (tier, days) in [("hour", policy.hour_days), ("day", policy.day_days)] {
+                delete_older_than(
+                    &transaction,
+                    &format!("traffic_{dimension}_{tier}_pending"),
+                    "timestamp",
+                    now,
+                    days,
+                )?;
+            }
         }
-        transaction.commit()
+        transaction.commit()?;
+        self.active_flows
+            .retain(|_, flow| flow.last_received_at > now.saturating_sub(ACTIVE_FLOW_TTL_MS));
+        Ok(())
     }
 
     pub fn connection(&self) -> &Connection {
@@ -1006,17 +1073,13 @@ impl SqliteStorage {
         Ok(())
     }
 
-    /// Returns the number of currently active (non-ended) flow sessions.
+    /// Counts cached active flows, including those not checkpointed to disk yet.
     ///
     /// # Errors
     ///
-    /// Returns an error when SQLite cannot execute the query.
+    /// This cached count does not execute a database query.
     pub fn active_flow_count(&self) -> rusqlite::Result<i64> {
-        self.connection.query_row(
-            "SELECT COUNT(*) FROM flow_sessions WHERE ended_at IS NULL",
-            [],
-            |row| row.get(0),
-        )
+        Ok(i64::try_from(self.active_flows.len()).unwrap_or(i64::MAX))
     }
 
     /// Returns the ratio of unknown-classified flows to total recent flows.
@@ -1255,6 +1318,27 @@ pub enum Storage {
 
 #[allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 impl Storage {
+    /// Opens an independent WAL reader without migrations or active-flow recovery.
+    /// In-memory databases keep using the owning connection.
+    pub fn query_reader(&self) -> StorageResult<Option<Self>> {
+        match self {
+            Self::Sqlite(storage) => storage
+                .independent_connection(true)
+                .map(|reader| reader.map(Self::Sqlite)),
+            Self::ClickHouse(storage) => Ok(Some(Self::ClickHouse(storage.query_reader()))),
+        }
+    }
+
+    /// Opens a separate file-backed SQLite writer for bounded maintenance work.
+    pub fn maintenance_writer(&self) -> StorageResult<Option<Self>> {
+        match self {
+            Self::Sqlite(storage) => storage
+                .independent_connection(false)
+                .map(|writer| writer.map(Self::Sqlite)),
+            Self::ClickHouse(storage) => Ok(Some(Self::ClickHouse(storage.query_reader()))),
+        }
+    }
+
     /// Applies late DPI metadata without inserting telemetry or changing counters.
     ///
     /// # Errors
@@ -1850,6 +1934,7 @@ fn load_active_flows(connection: &Connection) -> rusqlite::Result<HashMap<FlowKe
                     started_at: row.get(11)?,
                     last_seen_at: row.get(12)?,
                     checkpointed_at: row.get(13)?,
+                    last_received_at: row.get(13)?,
                     scope: row.get(26)?,
                     path_type: row.get(27)?,
                     nat: row.get(28)?,
@@ -1889,6 +1974,58 @@ fn load_active_flows(connection: &Connection) -> rusqlite::Result<HashMap<FlowKe
         .collect::<rusqlite::Result<_>>()?;
     attribution::restore_active(connection, &mut active)?;
     Ok(active)
+}
+
+fn stage_active_flows(
+    active: &HashMap<FlowKey, ActiveFlow>,
+    batch: &TelemetryBatch,
+) -> HashMap<FlowKey, ActiveFlow> {
+    let mut staged = HashMap::new();
+    for flow in &batch.flows {
+        let key = FlowKey::from_batch(&batch.gateway_id, flow);
+        if let std::collections::hash_map::Entry::Vacant(entry) = staged.entry(key)
+            && let Some(current) = active.get(entry.key())
+        {
+            entry.insert(current.clone());
+        }
+    }
+    staged
+}
+
+fn commit_active_flows(
+    active: &mut HashMap<FlowKey, ActiveFlow>,
+    batch: &TelemetryBatch,
+    staged: HashMap<FlowKey, ActiveFlow>,
+) {
+    // An End can remove a staged entry, so publish deletions as well as updates.
+    for flow in &batch.flows {
+        active.remove(&FlowKey::from_batch(&batch.gateway_id, flow));
+    }
+    active.extend(staged);
+}
+
+fn prune_flow_state(
+    tx: &Transaction<'_>,
+    active: &HashMap<FlowKey, ActiveFlow>,
+    now: i64,
+) -> rusqlite::Result<()> {
+    let cutoff = now.saturating_sub(ACTIVE_FLOW_TTL_MS);
+    for (key, flow) in active {
+        if flow.last_received_at <= cutoff && flow.last_seen_at > 0 {
+            write_flow_session(tx, key, flow, Some(flow.last_seen_at), now)?;
+        }
+    }
+    attribution::prune(tx, now)?;
+    // Legacy checkpoints can outlive their short-lived recovery records. A
+    // recent recovery record protects a flow updated since its last checkpoint.
+    tx.prepare_cached(
+        "UPDATE flow_sessions SET ended_at=last_seen_at
+         WHERE ended_at IS NULL AND checkpointed_at<=?1
+           AND NOT EXISTS (SELECT 1 FROM flow_rollup_sessions r
+             WHERE r.session_id=flow_sessions.id AND r.ended_at IS NULL AND r.updated_at>?1)",
+    )?
+    .execute([cutoff])?;
+    Ok(())
 }
 
 fn update_gateway(tx: &Transaction<'_>, batch: &TelemetryBatch, now: i64) -> rusqlite::Result<()> {
@@ -2005,7 +2142,7 @@ fn persist_self_host_endpoint_evidence(
              WHERE e.gateway_id=?1 AND e.ip=device_addresses.ip AND e.expires_at>?2)",
         params![batch.gateway_id, newest],
     )?;
-    let mut affected = Vec::<Vec<u8>>::new();
+    let mut affected = HashSet::<Vec<u8>>::new();
     for (index, flow) in batch.flows.iter().enumerate() {
         let Some(attribution) = attributions.get(index) else {
             continue;
@@ -2015,9 +2152,7 @@ fn persist_self_host_endpoint_evidence(
                 "DELETE FROM self_host_endpoint_evidence WHERE gateway_id=?1 AND ip=?2",
                 params![batch.gateway_id, flow.remote_ip],
             )?;
-            if !affected.contains(&flow.remote_ip) {
-                affected.push(flow.remote_ip.clone());
-            }
+            affected.insert(flow.remote_ip.clone());
             continue;
         }
         if attribution.application_id == "unknown"
@@ -2055,9 +2190,7 @@ fn persist_self_host_endpoint_evidence(
                 observed_at.saturating_add(EVIDENCE_TTL_MS),
             ],
         )?;
-        if !affected.contains(&flow.remote_ip) {
-            affected.push(flow.remote_ip.clone());
-        }
+        affected.insert(flow.remote_ip.clone());
     }
     refresh_self_host_addresses(tx, &batch.gateway_id, newest, affected)
 }
@@ -2066,7 +2199,7 @@ fn refresh_self_host_addresses(
     tx: &Transaction<'_>,
     gateway_id: &str,
     newest: i64,
-    affected: Vec<Vec<u8>>,
+    affected: HashSet<Vec<u8>>,
 ) -> rusqlite::Result<()> {
     for ip in affected {
         let application_count: i64 = tx.query_row(
@@ -2159,25 +2292,25 @@ fn persist_device_evidence(
 }
 
 fn persist_dns(tx: &Transaction<'_>, batch: &TelemetryBatch) -> rusqlite::Result<()> {
+    let mut insert = tx.prepare_cached(
+        "INSERT INTO dns_observations(
+            gateway_id, client_ip, domain, answer_ip, record_type, ttl,
+            observed_at, expires_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?;
     for observation in &batch.dns_observations {
         let observed_at = to_i64(observation.observed_at_unix_ms);
         let ttl_ms = i64::from(observation.ttl_seconds).saturating_mul(1_000);
-        tx.execute(
-            "INSERT INTO dns_observations(
-                gateway_id, client_ip, domain, answer_ip, record_type, ttl,
-                observed_at, expires_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                batch.gateway_id,
-                observation.client_ip,
-                observation.domain,
-                observation.answer_ip,
-                observation.record_type,
-                observation.ttl_seconds,
-                observed_at,
-                observed_at.saturating_add(ttl_ms),
-            ],
-        )?;
+        insert.execute(params![
+            batch.gateway_id,
+            observation.client_ip,
+            observation.domain,
+            observation.answer_ip,
+            observation.record_type,
+            observation.ttl_seconds,
+            observed_at,
+            observed_at.saturating_add(ttl_ms),
+        ])?;
     }
     Ok(())
 }
@@ -2186,125 +2319,123 @@ fn persist_dns(tx: &Transaction<'_>, batch: &TelemetryBatch) -> rusqlite::Result
 fn persist_minute_rollups(
     tx: &Transaction<'_>,
     batch: &TelemetryBatch,
-    attributions: &[FlowAttribution],
+    flow: &FlowDelta,
+    attribution: &FlowAttribution,
+    device_id: Option<i64>,
 ) -> rusqlite::Result<()> {
     let timestamp = to_i64(batch.sent_at) / MINUTE_MS * MINUTE_MS;
-    let unknown = FlowAttribution::default();
-    for (index, flow) in batch.flows.iter().enumerate() {
-        let attribution = attributions.get(index).unwrap_or(&unknown);
-        let upload = to_i64(flow.upload_bytes);
-        let download = to_i64(flow.download_bytes);
-        let packets = to_i64(flow.packets);
-        let protocol_application_id = (attribution.application_id == "unknown"
-            && !attribution.protocol_id.is_empty()
-            && attribution.protocol_id != "unknown")
-            .then(|| format!("{PROTOCOL_APPLICATION_PREFIX}{}", attribution.protocol_id));
-        let (application_id, category_id) = protocol_application_id.as_deref().map_or_else(
-            || {
-                (
-                    attribution.application_id.as_str(),
-                    attribution.category_id.as_str(),
-                )
-            },
-            |id| (id, "unknown"),
-        );
+    let upload = to_i64(flow.upload_bytes);
+    let download = to_i64(flow.download_bytes);
+    let packets = to_i64(flow.packets);
+    let protocol_application_id = (attribution.application_id == "unknown"
+        && !attribution.protocol_id.is_empty()
+        && attribution.protocol_id != "unknown")
+        .then(|| format!("{PROTOCOL_APPLICATION_PREFIX}{}", attribution.protocol_id));
+    let (application_id, category_id) = protocol_application_id.as_deref().map_or_else(
+        || {
+            (
+                attribution.application_id.as_str(),
+                attribution.category_id.as_str(),
+            )
+        },
+        |id| (id, "unknown"),
+    );
+    upsert_rollup(
+        tx,
+        "traffic_total_minute",
+        None,
+        &[timestamp.into(), batch.gateway_id.clone().into()],
+        upload,
+        download,
+        packets,
+    )?;
+    if let Some(device_id) = device_id {
         upsert_rollup(
             tx,
-            "traffic_total_minute",
-            None,
-            &[timestamp.into(), batch.gateway_id.clone().into()],
-            upload,
-            download,
-            packets,
-        )?;
-        if let Some(device_id) = device_id_for_flow(tx, &batch.gateway_id, flow)? {
-            upsert_rollup(
-                tx,
-                "traffic_device_minute",
-                Some("device_id"),
-                &[
-                    timestamp.into(),
-                    batch.gateway_id.clone().into(),
-                    device_id.into(),
-                ],
-                upload,
-                download,
-                packets,
-            )?;
-        }
-        upsert_rollup(
-            tx,
-            "traffic_application_minute",
-            Some("application_id, category_id"),
+            "traffic_device_minute",
+            Some("device_id"),
             &[
                 timestamp.into(),
                 batch.gateway_id.clone().into(),
-                application_id.to_owned().into(),
-                category_id.to_owned().into(),
-            ],
-            upload,
-            download,
-            packets,
-        )?;
-        upsert_rollup(
-            tx,
-            "traffic_domain_minute",
-            Some("domain"),
-            &[
-                timestamp.into(),
-                batch.gateway_id.clone().into(),
-                attribution
-                    .domain
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_owned())
-                    .into(),
-            ],
-            upload,
-            download,
-            packets,
-        )?;
-        upsert_rollup(
-            tx,
-            "traffic_destination_minute",
-            Some("remote_ip"),
-            &[
-                timestamp.into(),
-                batch.gateway_id.clone().into(),
-                flow.remote_ip.clone().into(),
-            ],
-            upload,
-            download,
-            packets,
-        )?;
-        let device_id = device_id_for_flow(tx, &batch.gateway_id, flow)?.unwrap_or(0);
-        upsert_rollup(
-            tx,
-            "traffic_scope_minute",
-            Some(
-                "scope, direction, device_id, application_id, category_id, domain, remote_ip, protocol, protocol_id",
-            ),
-            &[
-                timestamp.into(),
-                batch.gateway_id.clone().into(),
-                i64::from(flow.scope).into(),
-                i64::from(flow.direction).into(),
                 device_id.into(),
-                attribution.application_id.clone().into(),
-                attribution.category_id.clone().into(),
-                attribution
-                    .domain
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_owned())
-                    .into(),
-                flow.remote_ip.clone().into(),
-                i64::from(flow.protocol).into(),
-                attribution.protocol_id.clone().into(),
             ],
             upload,
             download,
             packets,
         )?;
     }
+    upsert_rollup(
+        tx,
+        "traffic_application_minute",
+        Some("application_id, category_id"),
+        &[
+            timestamp.into(),
+            batch.gateway_id.clone().into(),
+            application_id.to_owned().into(),
+            category_id.to_owned().into(),
+        ],
+        upload,
+        download,
+        packets,
+    )?;
+    upsert_rollup(
+        tx,
+        "traffic_domain_minute",
+        Some("domain"),
+        &[
+            timestamp.into(),
+            batch.gateway_id.clone().into(),
+            attribution
+                .domain
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned())
+                .into(),
+        ],
+        upload,
+        download,
+        packets,
+    )?;
+    upsert_rollup(
+        tx,
+        "traffic_destination_minute",
+        Some("remote_ip"),
+        &[
+            timestamp.into(),
+            batch.gateway_id.clone().into(),
+            flow.remote_ip.clone().into(),
+        ],
+        upload,
+        download,
+        packets,
+    )?;
+    let device_id = device_id.unwrap_or(0);
+    upsert_rollup(
+        tx,
+        "traffic_scope_minute",
+        Some(
+            "scope, direction, device_id, application_id, category_id, domain, remote_ip, protocol, protocol_id",
+        ),
+        &[
+            timestamp.into(),
+            batch.gateway_id.clone().into(),
+            i64::from(flow.scope).into(),
+            i64::from(flow.direction).into(),
+            device_id.into(),
+            attribution.application_id.clone().into(),
+            attribution.category_id.clone().into(),
+            attribution
+                .domain
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned())
+                .into(),
+            flow.remote_ip.clone().into(),
+            i64::from(flow.protocol).into(),
+            attribution.protocol_id.clone().into(),
+        ],
+        upload,
+        download,
+        packets,
+    )?;
     Ok(())
 }
 
@@ -2359,7 +2490,8 @@ fn adjust_rollup(
         packets.into(),
         flow_count.into(),
     ]);
-    tx.execute(&sql, rusqlite::params_from_iter(values))?;
+    tx.prepare_cached(&sql)?
+        .execute(rusqlite::params_from_iter(values))?;
     Ok(())
 }
 
@@ -2371,6 +2503,7 @@ fn update_active_flows(
     received_at: i64,
 ) -> rusqlite::Result<()> {
     let unknown = FlowAttribution::default();
+    let mut device_ids = HashMap::new();
     for (index, flow) in batch.flows.iter().enumerate() {
         let attribution = attributions.get(index).unwrap_or(&unknown);
         let key = FlowKey::from_batch(&batch.gateway_id, flow);
@@ -2386,22 +2519,20 @@ fn update_active_flows(
                 }
             };
             let previous = current.attribution.clone();
-            current.add(flow, attribution);
+            current.add(flow, attribution, received_at);
             if current.attribution != previous {
                 attribution::reassign(tx, &current.session_id, &current.attribution, received_at)?;
             }
             // Rollups and the contribution ledger must use the merged identity,
             // including for batches with weaker or missing classifier evidence.
-            let classified = TelemetryBatch {
-                gateway_id: batch.gateway_id.clone(),
-                sent_at: batch.sent_at,
-                flows: vec![flow.clone()],
-                ..TelemetryBatch::default()
+            let device_id = match device_ids.entry(current.client_mac.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    *entry.insert(device_id_for_mac(tx, &key.gateway_id, &current.client_mac)?)
+                }
             };
-            persist_minute_rollups(tx, &classified, std::slice::from_ref(&current.attribution))?;
-            if let Some(device_id) = device_id_for_mac(tx, &key.gateway_id, &current.client_mac)? {
-                current.device_id = Some(device_id);
-            }
+            current.device_id = device_id.or(current.device_id);
+            persist_minute_rollups(tx, batch, flow, &current.attribution, current.device_id)?;
             attribution::record(tx, &key, current, batch, flow, received_at)?;
             let checkpoint =
                 received_at.saturating_sub(current.checkpointed_at) >= FLOW_CHECKPOINT_MS;
@@ -2427,8 +2558,11 @@ fn write_flow_session(
     ended_at: Option<i64>,
     checkpointed_at: i64,
 ) -> rusqlite::Result<()> {
-    let device_id = device_id_for_mac(tx, &key.gateway_id, &flow.client_mac)?.or(flow.device_id);
-    tx.execute(
+    let device_id = match flow.device_id {
+        Some(id) => Some(id),
+        None => device_id_for_mac(tx, &key.gateway_id, &flow.client_mac)?,
+    };
+    tx.prepare_cached(
         "INSERT INTO flow_sessions(
             id, gateway_id, device_id, ip_version, protocol, client_ip, client_port,
             remote_ip, remote_port, direction, upload_bytes, download_bytes, packets,
@@ -2444,7 +2578,8 @@ fn write_flow_session(
             device_id = COALESCE(excluded.device_id, flow_sessions.device_id),
             upload_bytes = excluded.upload_bytes, download_bytes = excluded.download_bytes,
             packets = excluded.packets, last_seen_at = excluded.last_seen_at,
-            ended_at = COALESCE(excluded.ended_at, flow_sessions.ended_at),
+            ended_at = CASE WHEN excluded.last_seen_at > flow_sessions.ended_at
+                THEN excluded.ended_at ELSE COALESCE(excluded.ended_at, flow_sessions.ended_at) END,
             checkpointed_at = excluded.checkpointed_at,
             domain = excluded.domain, organization_id = excluded.organization_id,
             application_id = excluded.application_id, category_id = excluded.category_id,
@@ -2458,52 +2593,44 @@ fn write_flow_session(
             scope = excluded.scope, path_type = excluded.path_type, nat = excluded.nat,
             source_segment = excluded.source_segment,
             destination_segment = excluded.destination_segment",
-        params![
-            flow.session_id,
-            key.gateway_id,
-            device_id,
-            key.ip_version,
-            key.protocol,
-            key.client_ip,
-            key.client_port,
-            key.remote_ip,
-            key.remote_port,
-            key.direction,
-            flow.upload_bytes,
-            flow.download_bytes,
-            flow.packets,
-            flow.started_at,
-            flow.last_seen_at,
-            ended_at,
-            checkpointed_at,
-            flow.attribution.domain,
-            flow.attribution.organization_id,
-            flow.attribution.application_id,
-            flow.attribution.category_id,
-            flow.attribution.traffic_role,
-            flow.attribution.protocol_id,
-            flow.attribution.organization_confidence,
-            flow.attribution.application_confidence,
-            flow.attribution.protocol_confidence,
-            flow.attribution.confidence,
-            flow.attribution.reason,
-            flow.attribution.evidence_json,
-            flow.scope,
-            flow.path_type,
-            flow.nat,
-            flow.source_segment,
-            flow.destination_segment,
-        ],
-    )?;
+    )?
+    .execute(params![
+        flow.session_id,
+        key.gateway_id,
+        device_id,
+        key.ip_version,
+        key.protocol,
+        key.client_ip,
+        key.client_port,
+        key.remote_ip,
+        key.remote_port,
+        key.direction,
+        flow.upload_bytes,
+        flow.download_bytes,
+        flow.packets,
+        flow.started_at,
+        flow.last_seen_at,
+        ended_at,
+        checkpointed_at,
+        flow.attribution.domain,
+        flow.attribution.organization_id,
+        flow.attribution.application_id,
+        flow.attribution.category_id,
+        flow.attribution.traffic_role,
+        flow.attribution.protocol_id,
+        flow.attribution.organization_confidence,
+        flow.attribution.application_confidence,
+        flow.attribution.protocol_confidence,
+        flow.attribution.confidence,
+        flow.attribution.reason,
+        flow.attribution.evidence_json,
+        flow.scope,
+        flow.path_type,
+        flow.nat,
+        flow.source_segment,
+        flow.destination_segment,
+    ])?;
     Ok(())
-}
-
-fn device_id_for_flow(
-    tx: &Transaction<'_>,
-    gateway_id: &str,
-    flow: &FlowDelta,
-) -> rusqlite::Result<Option<i64>> {
-    device_id_for_mac(tx, gateway_id, &flow.client_mac)
 }
 
 fn device_id_for_mac(
@@ -2514,12 +2641,9 @@ fn device_id_for_mac(
     if mac.len() != 6 {
         return Ok(None);
     }
-    tx.query_row(
-        "SELECT id FROM devices WHERE gateway_id = ?1 AND mac = ?2",
-        params![gateway_id, mac],
-        |row| row.get(0),
-    )
-    .optional()
+    tx.prepare_cached("SELECT id FROM devices WHERE gateway_id = ?1 AND mac = ?2")?
+        .query_row(params![gateway_id, mac], |row| row.get(0))
+        .optional()
 }
 
 fn dimension_columns(dimension: &str) -> &'static str {
@@ -2536,23 +2660,25 @@ fn dimension_columns(dimension: &str) -> &'static str {
 fn aggregate(
     tx: &Transaction<'_>,
     dimension: &str,
-    source: &str,
     target: &str,
-    bucket_ms: i64,
-    now: i64,
+    cutoff: i64,
 ) -> rusqlite::Result<()> {
-    let columns = dimension_columns(dimension);
-    let source_table = format!("traffic_{dimension}_{source}");
+    let keys = format!("timestamp, {}", dimension_columns(dimension));
     let target_table = format!("traffic_{dimension}_{target}");
-    let sql = format!(
-        "INSERT OR REPLACE INTO {target_table}(
-            timestamp, {columns}, upload_bytes, download_bytes, packets, flow_count
-         ) SELECT (timestamp / ?1) * ?1, {columns}, SUM(upload_bytes),
-                  SUM(download_bytes), SUM(packets), SUM(flow_count)
-           FROM {source_table} WHERE timestamp < ?2
-           GROUP BY (timestamp / ?1), {columns}"
-    );
-    tx.execute(&sql, params![bucket_ms, now / bucket_ms * bucket_ms])?;
+    let pending = format!("{target_table}_pending");
+    tx.prepare_cached(&format!(
+        "INSERT INTO {target_table}({keys},upload_bytes,download_bytes,packets,flow_count)
+         SELECT {keys},upload_bytes,download_bytes,packets,flow_count FROM {pending} WHERE timestamp<?1
+         ON CONFLICT({keys}) DO UPDATE SET
+         upload_bytes=upload_bytes+excluded.upload_bytes,download_bytes=download_bytes+excluded.download_bytes,
+         packets=packets+excluded.packets,flow_count=flow_count+excluded.flow_count"
+    ))?.execute([cutoff])?;
+    tx.prepare_cached(&format!(
+        "DELETE FROM {target_table} WHERE timestamp IN (SELECT timestamp FROM {pending} WHERE timestamp<?1)
+         AND upload_bytes=0 AND download_bytes=0 AND packets=0 AND flow_count=0"
+    ))?.execute([cutoff])?;
+    tx.prepare_cached(&format!("DELETE FROM {pending} WHERE timestamp<?1"))?
+        .execute([cutoff])?;
     Ok(())
 }
 
@@ -2586,6 +2712,14 @@ fn to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 struct FlowKey {
     gateway_id: String,
@@ -2599,6 +2733,19 @@ struct FlowKey {
 }
 
 impl FlowKey {
+    fn sample_keys(gateway: &str, flow: &FlowDelta) -> [Self; 3] {
+        // Samples have no direction; telemetry validates the three wire values.
+        [
+            Direction::Unspecified,
+            Direction::Upload,
+            Direction::Download,
+        ]
+        .map(|direction| Self {
+            direction: i64::from(direction as i32),
+            ..Self::from_batch(gateway, flow)
+        })
+    }
+
     fn from_batch(gateway_id: &str, flow: &FlowDelta) -> Self {
         Self {
             gateway_id: gateway_id.to_owned(),
@@ -2642,6 +2789,7 @@ struct ActiveFlow {
     started_at: i64,
     last_seen_at: i64,
     checkpointed_at: i64,
+    last_received_at: i64,
     attribution: FlowAttribution,
     scope: i64,
     path_type: i64,
@@ -2679,6 +2827,7 @@ impl ActiveFlow {
             started_at,
             last_seen_at,
             checkpointed_at: started_at,
+            last_received_at: received_at,
             attribution,
             scope: i64::from(flow.scope),
             path_type: i64::from(flow.path_type),
@@ -2688,7 +2837,8 @@ impl ActiveFlow {
         }
     }
 
-    fn add(&mut self, flow: &FlowDelta, attribution: &FlowAttribution) {
+    fn add(&mut self, flow: &FlowDelta, attribution: &FlowAttribution, received_at: i64) {
+        self.last_received_at = self.last_received_at.max(received_at);
         if self.client_mac.is_empty() && !flow.client_mac.is_empty() {
             self.client_mac.clone_from(&flow.client_mac);
         }
