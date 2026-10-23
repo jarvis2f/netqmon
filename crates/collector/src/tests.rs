@@ -1171,7 +1171,54 @@ async fn realtime_sse_sends_initial_snapshot_after_every_reconnect() {
         let text = String::from_utf8_lossy(&first);
         assert!(text.contains("event: snapshot"));
         assert!(text.contains("\"generated_at\""));
+        assert!(text.contains("\"active_flows\""));
+        assert!(text.contains("\"history\""));
     }
+}
+
+#[tokio::test]
+async fn realtime_sse_status_only_omits_traffic_and_preserves_gateway_events() {
+    let state = query_state();
+    let router = internal_router(state.clone());
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/internal/realtime/stream?status_only=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let first = stream.next().await.unwrap().unwrap();
+    let text = String::from_utf8_lossy(&first);
+    assert!(text.contains("event: snapshot"));
+    let data = text
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .unwrap();
+    let snapshot: serde_json::Value = serde_json::from_str(data).unwrap();
+    assert_eq!(snapshot.as_object().unwrap().len(), 2);
+    assert!(snapshot.get("generated_at").is_some());
+    assert!(snapshot.get("gateway_health").is_some());
+    assert!(snapshot.get("active_flows").is_none());
+    assert!(snapshot.get("history").is_none());
+    assert!(snapshot.get("clients").is_none());
+
+    state
+        .lock()
+        .realtime
+        .gateway_status("test-gateway", "offline", 1234);
+    let next = tokio::time::timeout(Duration::from_secs(1), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let text = String::from_utf8_lossy(&next);
+    assert!(text.contains("event: gateway_status"));
+    assert!(text.contains("\"status\":\"offline\""));
+    assert!(text.contains("\"observed_at\":1234"));
 }
 
 #[tokio::test]
@@ -2971,6 +3018,74 @@ async fn flows_use_a_stable_cursor_without_counting_all_records() {
     let second_value: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(second_value["data"][0]["id"], "zz-cursor-second");
     assert!(second_value["pagination"]["next_cursor"].is_null());
+}
+
+#[tokio::test]
+async fn overview_status_is_small_and_matches_overview() {
+    for online in [false, true] {
+        let state = query_state();
+        let last_seen = if online {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64
+        } else {
+            1_700_000_000_000
+        };
+        state
+            .lock()
+            .storage
+            .connection()
+            .execute("UPDATE gateways SET last_seen = ?1", [last_seen])
+            .unwrap();
+        let router = internal_router(state);
+        let mut responses = Vec::new();
+        for path in ["/internal/overview/status", "/internal/overview"] {
+            let response = router
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            if path.ends_with("/status") {
+                assert!(body.len() < 1024);
+            }
+            responses.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
+        }
+        let status = &responses[0]["data"];
+        let full = &responses[1]["data"];
+        assert_eq!(status.as_object().unwrap().len(), 2);
+        assert_eq!(
+            status["gateway_status"],
+            if online { "online" } else { "offline" }
+        );
+        assert_eq!(status["gateway_status"], full["gateway_status"]);
+        assert_eq!(status["gateway"].as_object().unwrap().len(), 4);
+        for field in ["id", "name", "last_seen", "offline_after_ms"] {
+            assert_eq!(status["gateway"][field], full["gateway"][field]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn overview_status_handles_unenrolled_gateway() {
+    let response = internal_router(test_state_with_repository_rules())
+        .oneshot(
+            Request::builder()
+                .uri("/internal/overview/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024).await.unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        value["data"],
+        serde_json::json!({ "gateway_status": "unenrolled", "gateway": null })
+    );
 }
 
 #[tokio::test]

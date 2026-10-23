@@ -36,7 +36,7 @@ const STATUS_CONFIG: Record<
     bg: "bg-success-soft text-success",
     text: "text-success",
     border: "border-success/30",
-    dot: "bg-success animate-pulse",
+    dot: "bg-success",
   },
   active: {
     bg: "bg-accent-soft text-accent",
@@ -84,7 +84,7 @@ const STATUS_CONFIG: Record<
     bg: "bg-surface-subtle text-foreground-muted",
     text: "text-foreground-muted",
     border: "border-border",
-    dot: "bg-foreground-muted animate-pulse",
+    dot: "bg-foreground-muted",
   },
 };
 

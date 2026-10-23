@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
+import { subscribeVisibleEventSource } from "@/lib/visible-event-source";
 import {
   Activity,
   ArrowDown,
@@ -177,8 +178,15 @@ export function ClientDetailDashboard({
   ];
 
   useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
-    return () => window.clearInterval(timer);
+    // Online state uses a 30s threshold; a coarse tick avoids an extra full
+    // re-render every second on top of the realtime snapshots.
+    const tick = () => setNow(Date.now());
+    const first = window.setTimeout(tick, 0);
+    const timer = window.setInterval(tick, 5_000);
+    return () => {
+      window.clearTimeout(first);
+      window.clearInterval(timer);
+    };
   }, []);
 
   useEffect(() => {
@@ -287,17 +295,17 @@ export function ClientDetailDashboard({
 
   useEffect(() => {
     if (!data) return;
-    const events = new EventSource("/api/realtime");
-    events.onopen = () => setStreamConnected(true);
-    events.addEventListener("snapshot", (event) => {
-      try {
-        applySnapshot(JSON.parse(event.data) as RealtimeSnapshot);
-      } catch {
-        setStreamConnected(false);
-      }
+    return subscribeVisibleEventSource("/api/realtime", (events) => {
+      events.onopen = () => setStreamConnected(true);
+      events.addEventListener("snapshot", (event) => {
+        try {
+          applySnapshot(JSON.parse(event.data) as RealtimeSnapshot);
+        } catch {
+          setStreamConnected(false);
+        }
+      });
+      events.onerror = () => setStreamConnected(false);
     });
-    events.onerror = () => setStreamConnected(false);
-    return () => events.close();
   }, [applySnapshot, data]);
 
   const client = data?.detail.client;

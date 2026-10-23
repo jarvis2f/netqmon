@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { cpSync, existsSync, mkdirSync } from "node:fs";
+import { cpSync, mkdirSync } from "node:fs";
 import { createMockCollectorServer } from "./mock-collector.mjs";
 
 const host = process.env.PLAYWRIGHT_HOST ?? "127.0.0.1";
@@ -9,12 +9,10 @@ const appRoot = new URL("../../..", import.meta.url);
 const standaloneRoot = new URL(".next/standalone/apps/controller-ui/", appRoot);
 const standaloneStatic = new URL(".next/static/", standaloneRoot);
 
-if (!existsSync(standaloneStatic)) {
-  mkdirSync(new URL(".next/", standaloneRoot), { recursive: true });
-  cpSync(new URL(".next/static/", appRoot), standaloneStatic, {
-    recursive: true,
-  });
-}
+mkdirSync(new URL(".next/", standaloneRoot), { recursive: true });
+cpSync(new URL(".next/static/", appRoot), standaloneStatic, {
+  recursive: true,
+});
 
 const collector = createMockCollectorServer();
 const next = spawn(

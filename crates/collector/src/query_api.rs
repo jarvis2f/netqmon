@@ -34,6 +34,7 @@ const PROTOCOL_APPLICATION_PREFIX: &str = "protocol:";
 pub(crate) fn router() -> Router<CollectorState> {
     Router::new()
         .route("/internal/overview", get(overview))
+        .route("/internal/overview/status", get(overview_status))
         .route("/internal/traffic", get(traffic))
         .route("/internal/clients", get(clients))
         .route(
@@ -324,6 +325,57 @@ struct FlowPageOptions {
     sort_name: &'static str,
     descending: bool,
     cursor: Option<FlowCursor>,
+}
+
+// The persistent page header needs no traffic history, flows, or aggregate scans.
+async fn overview_status(State(state): State<CollectorState>) -> Response {
+    let inner = state.query();
+    let gateway = if let Some(clickhouse) = inner.storage.clickhouse_storage() {
+        match clickhouse.client().query_json(
+            "SELECT id, name, last_seen FROM gateways FINAL ORDER BY created_at LIMIT 1 FORMAT JSON",
+        ) {
+            Ok(value) => value["data"].as_array().and_then(|rows| rows.first()).map(|row| {
+                let last_seen = row["last_seen"].as_u64()
+                    .or_else(|| row["last_seen"].as_str().and_then(|value| value.parse().ok()))
+                    .unwrap_or(0);
+                json!({ "id": row["id"], "name": row["name"], "last_seen": last_seen })
+            }),
+            Err(error) => return storage_error(error),
+        }
+    } else {
+        match inner
+            .storage
+            .connection()
+            .query_row(
+                "SELECT id, name, last_seen FROM gateways ORDER BY created_at LIMIT 1",
+                [],
+                |row| {
+                    Ok(json!({
+                        "id": row.get::<_, String>(0)?,
+                        "name": row.get::<_, String>(1)?,
+                        "last_seen": to_u64(row.get::<_, i64>(2)?),
+                    }))
+                },
+            )
+            .optional()
+        {
+            Ok(gateway) => gateway,
+            Err(error) => return storage_error(error),
+        }
+    };
+    let offline_after_ms = gateway_offline_after_ms();
+    let gateway_status = gateway.as_ref().map_or("unenrolled", |gateway| {
+        if now_ms().saturating_sub(gateway["last_seen"].as_u64().unwrap_or(0)) <= offline_after_ms {
+            "online"
+        } else {
+            "offline"
+        }
+    });
+    let gateway = gateway.map(|mut gateway| {
+        gateway["offline_after_ms"] = json!(offline_after_ms);
+        gateway
+    });
+    api_ok(json!({ "gateway_status": gateway_status, "gateway": gateway }))
 }
 
 #[allow(clippy::too_many_lines)]

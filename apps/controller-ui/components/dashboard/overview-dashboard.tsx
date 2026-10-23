@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { subscribeVisibleEventSource } from "@/lib/visible-event-source";
 import { Activity, ArrowDown, ArrowUp, CircleAlert, Users } from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
 import { AppLayout } from "@/components/app-shell/app-layout";
@@ -413,42 +414,47 @@ export function OverviewDashboard({ username }: { username: string }) {
     }
 
     void loadOverview();
-    const events = new EventSource("/api/realtime");
-    events.onopen = () => {
-      if (!mounted.current) return;
-      setError(null);
-    };
-    events.addEventListener("snapshot", (event) => {
-      if (!mounted.current) return;
-      try {
-        applySnapshot(JSON.parse(event.data) as RealtimeSnapshot);
-      } catch {
-        setError(t("decodeError"));
-      }
-    });
-    events.addEventListener("gateway_status", (event) => {
-      if (!mounted.current) return;
-      try {
-        const status = (JSON.parse(event.data) as { status?: string }).status;
-        const nextStatus =
-          status === "online" || status === "offline" ? status : "degraded";
-        setGatewayStatus(nextStatus);
-        setGateway((current) =>
-          current
-            ? {
-                ...current,
-                status: nextStatus,
-              }
-            : current,
-        );
-      } catch {
-        setGatewayStatus("degraded");
-      }
-    });
+    const stopRealtime = subscribeVisibleEventSource(
+      "/api/realtime",
+      (events) => {
+        events.onopen = () => {
+          if (!mounted.current) return;
+          setError(null);
+        };
+        events.addEventListener("snapshot", (event) => {
+          if (!mounted.current) return;
+          try {
+            applySnapshot(JSON.parse(event.data) as RealtimeSnapshot);
+          } catch {
+            setError(t("decodeError"));
+          }
+        });
+        events.addEventListener("gateway_status", (event) => {
+          if (!mounted.current) return;
+          try {
+            const status = (JSON.parse(event.data) as { status?: string })
+              .status;
+            const nextStatus =
+              status === "online" || status === "offline" ? status : "degraded";
+            setGatewayStatus(nextStatus);
+            setGateway((current) =>
+              current
+                ? {
+                    ...current,
+                    status: nextStatus,
+                  }
+                : current,
+            );
+          } catch {
+            setGatewayStatus("degraded");
+          }
+        });
+      },
+    );
     return () => {
       mounted.current = false;
       controller.abort();
-      events.close();
+      stopRealtime();
     };
   }, [applySnapshot, categoryItems, locale, rankItems, t]);
 

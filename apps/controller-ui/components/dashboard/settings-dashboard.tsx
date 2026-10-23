@@ -791,7 +791,7 @@ export function SettingsDashboard({ username }: { username: string }) {
                   label="Session Status"
                   value={
                     <span className="inline-flex items-center gap-1.5 text-xs text-success">
-                      <span className="size-2 rounded-full bg-success animate-pulse" />
+                      <span className="size-2 rounded-full bg-success" />
                       Authenticated
                     </span>
                   }

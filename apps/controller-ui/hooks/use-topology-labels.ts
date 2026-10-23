@@ -1,6 +1,7 @@
 "use client";
 
 import { useTranslations } from "next-intl";
+import { useMemo } from "react";
 
 type ValueGroup =
   | "mode"
@@ -37,23 +38,26 @@ function valueKey(value: string) {
 export function useTopologyLabels() {
   const t = useTranslations("topologyValues");
 
-  return {
-    value(group: ValueGroup, value: string | null | undefined) {
-      if (!value) return value;
-      if (group === "order") {
-        const netlinkOrder = /^priority (\d+) \/ handle (.+)$/i.exec(value);
-        if (netlinkOrder)
-          return t("order.netlink", {
-            priority: netlinkOrder[1],
-            handle: netlinkOrder[2],
-          });
-      }
-      const key = `${group}.${valueKey(value)}` as Parameters<typeof t>[0];
-      return t.has(key) ? t(key) : value;
-    },
-    warning(value: string) {
-      const key = WARNING_KEYS[value];
-      return key ? t(key) : value;
-    },
-  };
+  return useMemo(
+    () => ({
+      value(group: ValueGroup, value: string | null | undefined) {
+        if (!value) return value;
+        if (group === "order") {
+          const netlinkOrder = /^priority (\d+) \/ handle (.+)$/i.exec(value);
+          if (netlinkOrder)
+            return t("order.netlink", {
+              priority: netlinkOrder[1],
+              handle: netlinkOrder[2],
+            });
+        }
+        const key = `${group}.${valueKey(value)}` as Parameters<typeof t>[0];
+        return t.has(key) ? t(key) : value;
+      },
+      warning(value: string) {
+        const key = WARNING_KEYS[value];
+        return key ? t(key) : value;
+      },
+    }),
+    [t],
+  );
 }

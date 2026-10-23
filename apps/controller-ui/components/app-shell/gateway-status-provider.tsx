@@ -3,6 +3,7 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
+import { subscribeVisibleEventSource } from "@/lib/visible-event-source";
 
 type GatewayStatus = "online" | "offline" | "degraded" | "loading";
 interface GatewayState {
@@ -28,14 +29,14 @@ function GatewayStatusConnection({ children }: { children: ReactNode }) {
   const [state, setState] = useState(INITIAL_STATE);
 
   useEffect(() => {
-    const controller = new AbortController();
+    let refreshController: AbortController | null = null;
+    let timeout: number | undefined;
     let active = true;
-    let refreshing = false;
     let gatewayId: string | null = null;
     let lastSeen = 0;
     let offlineAfterMs = 30_000;
     const update = (patch: Partial<GatewayState>) => {
-      if (!active) return;
+      if (!active || document.hidden) return;
       setState((current) => {
         const next = { ...current, ...patch };
         return current.gatewayName === next.gatewayName &&
@@ -46,10 +47,11 @@ function GatewayStatusConnection({ children }: { children: ReactNode }) {
       });
     };
     const refresh = async () => {
-      if (refreshing) return;
-      refreshing = true;
+      if (!active || document.hidden || refreshController) return;
+      const controller = new AbortController();
+      refreshController = controller;
       try {
-        const response = await fetch("/api/overview", {
+        const response = await fetch("/api/overview/status", {
           cache: "no-store",
           signal: controller.signal,
         });
@@ -65,7 +67,7 @@ function GatewayStatusConnection({ children }: { children: ReactNode }) {
             } | null;
           };
         };
-        if (!active) return;
+        if (!active || controller.signal.aborted || document.hidden) return;
         const gateway = data.gateway;
         gatewayId = gateway?.id ?? null;
         if (gateway?.offline_after_ms && gateway.offline_after_ms > 0)
@@ -81,56 +83,72 @@ function GatewayStatusConnection({ children }: { children: ReactNode }) {
           });
         }
       } catch {
-        if (!lastSeen) update({ gatewayStatus: "degraded" });
+        if (!controller.signal.aborted && !lastSeen)
+          update({ gatewayStatus: "degraded" });
       } finally {
-        refreshing = false;
+        if (refreshController === controller) refreshController = null;
       }
     };
 
     void refresh();
-    const events = new EventSource("/api/realtime");
-    const timeout = window.setTimeout(
-      () => update({ streamStatus: "delayed" }),
-      8_000,
+    const stopRealtime = subscribeVisibleEventSource(
+      "/api/realtime?status_only=true",
+      (events) => {
+        update({ streamStatus: "loading" });
+        timeout = window.setTimeout(
+          () => update({ streamStatus: "delayed" }),
+          8_000,
+        );
+        events.onopen = () => {
+          window.clearTimeout(timeout);
+          update({ streamStatus: "live" });
+        };
+        events.onerror = () => update({ streamStatus: "delayed" });
+        events.addEventListener("gateway_status", (event) => {
+          try {
+            const data = JSON.parse(event.data) as {
+              gateway_id?: string;
+              status?: string;
+              observed_at?: number;
+            };
+            if (gatewayId && data.gateway_id !== gatewayId) return;
+            if (!data.status || data.status === "enrolled") return;
+            if (data.status === "online" && data.observed_at)
+              lastSeen = Math.max(lastSeen, data.observed_at);
+            update({ gatewayStatus: observedStatus(data.status) });
+          } catch {
+            update({ streamStatus: "delayed" });
+          }
+        });
+        events.addEventListener("snapshot", (event) => {
+          try {
+            const data = JSON.parse(event.data) as {
+              gateway_health?: { observed_at?: number } | null;
+            };
+            const observed = data.gateway_health?.observed_at;
+            if (observed && observed > lastSeen) {
+              lastSeen = observed;
+              update({
+                gatewayStatus:
+                  Date.now() - observed > offlineAfterMs ? "offline" : "online",
+              });
+            }
+          } catch {
+            update({ streamStatus: "delayed" });
+          }
+        });
+      },
     );
-    events.onopen = () => {
-      window.clearTimeout(timeout);
-      update({ streamStatus: "live" });
+    const onVisibilityChange = () => {
+      if (document.hidden) {
+        refreshController?.abort();
+        refreshController = null;
+        window.clearTimeout(timeout);
+      } else {
+        void refresh();
+      }
     };
-    events.onerror = () => update({ streamStatus: "delayed" });
-    events.addEventListener("gateway_status", (event) => {
-      try {
-        const data = JSON.parse(event.data) as {
-          gateway_id?: string;
-          status?: string;
-          observed_at?: number;
-        };
-        if (gatewayId && data.gateway_id !== gatewayId) return;
-        if (!data.status || data.status === "enrolled") return;
-        if (data.status === "online" && data.observed_at)
-          lastSeen = Math.max(lastSeen, data.observed_at);
-        update({ gatewayStatus: observedStatus(data.status) });
-      } catch {
-        update({ streamStatus: "delayed" });
-      }
-    });
-    events.addEventListener("snapshot", (event) => {
-      try {
-        const data = JSON.parse(event.data) as {
-          gateway_health?: { observed_at?: number } | null;
-        };
-        const observed = data.gateway_health?.observed_at;
-        if (observed && observed > lastSeen) {
-          lastSeen = observed;
-          update({
-            gatewayStatus:
-              Date.now() - observed > offlineAfterMs ? "offline" : "online",
-          });
-        }
-      } catch {
-        update({ streamStatus: "delayed" });
-      }
-    });
+    document.addEventListener("visibilitychange", onVisibilityChange);
     const refreshTimer = window.setInterval(() => void refresh(), 15_000);
     const staleTimer = window.setInterval(() => {
       if (lastSeen && Date.now() - lastSeen > offlineAfterMs)
@@ -138,8 +156,9 @@ function GatewayStatusConnection({ children }: { children: ReactNode }) {
     }, 1_000);
     return () => {
       active = false;
-      controller.abort();
-      events.close();
+      refreshController?.abort();
+      stopRealtime();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       window.clearTimeout(timeout);
       window.clearInterval(refreshTimer);
       window.clearInterval(staleTimer);

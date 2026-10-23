@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { subscribeVisibleEventSource } from "@/lib/visible-event-source";
 import { Network, Search, Pencil } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { AppLayout } from "@/components/app-shell/app-layout";
@@ -12,6 +13,7 @@ import {
   type ThroughputRate,
 } from "@/components/dashboard/client-traffic-flow-map";
 import { EditClientDialog } from "@/components/dashboard/edit-client-dialog";
+import { BulkClientNamesDialog } from "@/components/dashboard/bulk-client-names-dialog";
 import {
   AnimatedToastStack,
   useAnimatedToastStack,
@@ -111,6 +113,7 @@ export function ClientsDashboard({
   const [reloadKey, setReloadKey] = useState(0);
   const [now, setNow] = useState(0);
   const [showTopology, setShowTopology] = useState(true);
+  const [bulkNamesOpen, setBulkNamesOpen] = useState(false);
   const [streamConnected, setStreamConnected] = useState(false);
   const [totalThroughput, setTotalThroughput] = useState<ThroughputRate>({
     upload_bytes_per_second: 0,
@@ -217,43 +220,50 @@ export function ClientsDashboard({
   }, []);
 
   useEffect(() => {
-    const events = new EventSource("/api/realtime");
-    events.onopen = () => setStreamConnected(true);
-    events.addEventListener("snapshot", (event) => {
-      try {
-        applySnapshot(JSON.parse(event.data) as RealtimeSnapshot);
-      } catch {
-        // Ignore decode issues
-      }
+    return subscribeVisibleEventSource("/api/realtime", (events) => {
+      events.onopen = () => setStreamConnected(true);
+      events.addEventListener("snapshot", (event) => {
+        try {
+          applySnapshot(JSON.parse(event.data) as RealtimeSnapshot);
+        } catch {
+          // Ignore decode issues
+        }
+      });
+      events.addEventListener("device_seen", (event) => {
+        try {
+          const seen = JSON.parse(event.data) as DeviceSeenEvent;
+          const observedAt = seen.observed_at;
+          if (!seen.mac || typeof observedAt !== "number") return;
+          const mac = seen.mac.toLowerCase();
+          setItems((current) =>
+            current.map((client) =>
+              client.mac.toLowerCase() === mac && observedAt > client.last_seen
+                ? {
+                    ...client,
+                    ip: client.ip || seen.ip || null,
+                    last_seen: observedAt,
+                  }
+                : client,
+            ),
+          );
+        } catch {
+          // Ignore decode issues
+        }
+      });
+      events.onerror = () => setStreamConnected(false);
     });
-    events.addEventListener("device_seen", (event) => {
-      try {
-        const seen = JSON.parse(event.data) as DeviceSeenEvent;
-        const observedAt = seen.observed_at;
-        if (!seen.mac || typeof observedAt !== "number") return;
-        const mac = seen.mac.toLowerCase();
-        setItems((current) =>
-          current.map((client) =>
-            client.mac.toLowerCase() === mac && observedAt > client.last_seen
-              ? {
-                  ...client,
-                  ip: client.ip || seen.ip || null,
-                  last_seen: observedAt,
-                }
-              : client,
-          ),
-        );
-      } catch {
-        // Ignore decode issues
-      }
-    });
-    events.onerror = () => setStreamConnected(false);
-    return () => events.close();
   }, [applySnapshot]);
 
   useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
-    return () => window.clearInterval(timer);
+    // Online state uses a 30s threshold; a coarse tick avoids an extra full
+    // re-render every second on top of the realtime snapshots.
+    const tick = () => setNow(Date.now());
+    const first = window.setTimeout(tick, 0);
+    const timer = window.setInterval(tick, 5_000);
+    return () => {
+      window.clearTimeout(first);
+      window.clearInterval(timer);
+    };
   }, []);
 
   useEffect(() => {
@@ -390,8 +400,8 @@ export function ClientsDashboard({
   ];
 
   const toolbar = (
-    <div className="flex items-center justify-between gap-3">
-      <label className="relative block w-full max-w-sm">
+    <div className="flex min-w-max items-center justify-between gap-3">
+      <label className="relative block w-64 shrink-0 sm:w-80 lg:w-96">
         <Search className="pointer-events-none absolute left-2.5 top-2 size-3.5 text-foreground-muted z-10" />
         <Input
           ref={searchRef}
@@ -410,7 +420,16 @@ export function ClientsDashboard({
           /
         </kbd>
       </label>
-      <div className="flex items-center gap-3">
+      <div className="flex shrink-0 items-center gap-3">
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => setBulkNamesOpen(true)}
+          className="gap-1.5"
+        >
+          <Pencil data-icon="inline-start" />
+          {t("bulkNames.open")}
+        </Button>
         <Button
           variant="outline"
           size="sm"
@@ -604,6 +623,29 @@ export function ClientsDashboard({
           </>
         )}
       </SidePanel>
+
+      <BulkClientNamesDialog
+        open={bulkNamesOpen}
+        onOpenChange={setBulkNamesOpen}
+        onUpdated={(updates) => {
+          const names = new Map(
+            updates.map((update) => [update.id, update.name]),
+          );
+          setItems((current) =>
+            current.map((item) =>
+              names.has(item.id)
+                ? { ...item, name: names.get(item.id)! }
+                : item,
+            ),
+          );
+        }}
+        onSuccess={(count) =>
+          showToast({
+            title: t("bulkNames.success", { count }),
+            status: "success",
+          })
+        }
+      />
 
       <EditClientDialog
         client={editingClient}

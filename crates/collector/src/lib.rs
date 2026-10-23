@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{DefaultBodyLimit, FromRef, FromRequestParts, State};
+use axum::extract::{DefaultBodyLimit, FromRef, FromRequestParts, Query, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -1955,32 +1955,48 @@ fn internal_router(state: CollectorState) -> Router {
         .with_state(state)
 }
 
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RealtimeStreamQuery {
+    #[serde(default)]
+    status_only: bool,
+}
+
 async fn realtime_stream(
     State(state): State<CollectorState>,
+    Query(query): Query<RealtimeStreamQuery>,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
     let (snapshot, receiver) = state.realtime_subscription();
     let initial = RealtimeEvent::Snapshot(snapshot);
     let events = stream::unfold(
         (Some(initial), receiver),
-        |(initial, mut receiver)| async move {
-            let event = if let Some(initial) = initial {
-                initial
-            } else {
-                loop {
-                    match receiver.recv().await {
-                        Ok(event) => break event,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+        move |(mut initial, mut receiver)| async move {
+            loop {
+                let event = if let Some(initial) = initial.take() {
+                    initial
+                } else {
+                    loop {
+                        match receiver.recv().await {
+                            Ok(event) => break event,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                        }
                     }
+                };
+                let payload = if query.status_only {
+                    let Some(payload) = event.status_json() else {
+                        continue;
+                    };
+                    payload
+                } else {
+                    event.json()
                 }
-            };
-            let payload = event
-                .json()
                 .unwrap_or_else(|_| "{\"code\":\"serialization_failed\"}".to_owned());
-            Some((
-                Ok(Event::default().event(event.name()).data(payload)),
-                (None, receiver),
-            ))
+                return Some((
+                    Ok(Event::default().event(event.name()).data(payload)),
+                    (None, receiver),
+                ));
+            }
         },
     );
     Sse::new(events).keep_alive(

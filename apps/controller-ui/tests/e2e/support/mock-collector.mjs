@@ -791,26 +791,49 @@ function handleInternal(request, response, pathname, params, state) {
     return true;
   }
   if (path === "realtime/stream" && request.method === "GET") {
+    const statusOnly = params.get("status_only") === "true";
+    const writeSnapshot = () => {
+      const snapshot = realtimeSnapshot(Date.now(), state.scenario);
+      writeSse(
+        response,
+        "snapshot",
+        statusOnly
+          ? {
+              generated_at: snapshot.generated_at,
+              gateway_health: {
+                observed_at: snapshot.gateway_health.observed_at,
+              },
+            }
+          : snapshot,
+      );
+    };
     response.writeHead(200, {
       "content-type": "text/event-stream",
       "cache-control": "no-cache",
       connection: "keep-alive",
     });
-    writeSse(response, "snapshot", realtimeSnapshot(now, scenario));
+    writeSnapshot();
     writeSse(response, "gateway_status", {
       status: scenario === "offline" ? "offline" : "online",
       gateway_id: gatewayId,
     });
-    const timer = setInterval(
-      () =>
-        writeSse(
-          response,
-          "snapshot",
-          realtimeSnapshot(Date.now(), state.scenario),
-        ),
-      1_000,
-    );
+    const timer = setInterval(writeSnapshot, 1_000);
     request.on("close", () => clearInterval(timer));
+    return true;
+  }
+  if (path === "overview/status" && request.method === "GET") {
+    const { id, name, last_seen, offline_after_ms, status } = gateway(
+      now,
+      scenario,
+    );
+    json(
+      response,
+      200,
+      envelope({
+        gateway_status: status,
+        gateway: { id, name, last_seen, offline_after_ms },
+      }),
+    );
     return true;
   }
   if (path === "overview" && request.method === "GET") {

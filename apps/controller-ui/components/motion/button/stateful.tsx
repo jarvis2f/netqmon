@@ -38,6 +38,8 @@ const CASCADE_LETTER_VARIANTS: Variants = {
     opacity: 1,
     y: "0%",
     filter: "blur(0px)",
+    // Drop the settled filter so idle buttons do not keep a filter layer.
+    transitionEnd: { filter: "none" },
     transition: { ...SPRING_SWAP, delay },
   }),
   exit: (delay: number = 0) => ({
@@ -57,6 +59,7 @@ const ICON_VARIANTS: Variants = {
     width: "1.5rem",
     scale: 1,
     filter: "blur(0px)",
+    transitionEnd: { filter: "none" },
     transition: SPRING_SWAP,
   },
   exit: {
@@ -144,7 +147,7 @@ function TextSlot({ value, children }: { value: string; children: ReactNode }) {
                   key={index}
                   custom={index * CASCADE_STAGGER}
                   variants={CASCADE_LETTER_VARIANTS}
-                  className="inline-block whitespace-pre will-change-[opacity,filter,transform]"
+                  className="inline-block whitespace-pre"
                 >
                   {char}
                 </motion.span>
@@ -162,7 +165,12 @@ function TextSlot({ value, children }: { value: string; children: ReactNode }) {
             animate={
               reduce
                 ? { opacity: 1 }
-                : { opacity: 1, y: 0, filter: "blur(0px)" }
+                : {
+                    opacity: 1,
+                    y: 0,
+                    filter: "blur(0px)",
+                    transitionEnd: { filter: "none" },
+                  }
             }
             exit={
               reduce
@@ -170,7 +178,7 @@ function TextSlot({ value, children }: { value: string; children: ReactNode }) {
                 : { opacity: 0, y: -14, filter: ROLL_BLUR }
             }
             transition={reduce ? { duration: 0.15 } : SPRING_SWAP}
-            className="absolute left-0 top-0 inline-block will-change-[opacity,filter,transform]"
+            className="absolute left-0 top-0 inline-block"
           >
             {children}
           </motion.span>

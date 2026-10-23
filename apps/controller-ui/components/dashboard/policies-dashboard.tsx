@@ -646,8 +646,8 @@ export function PoliciesDashboard({ username }: { username: string }) {
       subtitle={t("subtitle")}
       username={username}
       toolbar={
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+        <div className="flex min-w-max items-center justify-between gap-2">
+          <div className="flex flex-1 items-center gap-2">
             <label className="min-w-[200px] flex-1 sm:max-w-xs">
               <span className="sr-only">{t("search")}</span>
               <Input
@@ -721,7 +721,7 @@ export function PoliciesDashboard({ username }: { username: string }) {
               {common("actions.refresh")}
             </Button>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-2">
             <Button
               variant="outline"
               onClick={() => {

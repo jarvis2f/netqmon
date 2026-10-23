@@ -23,6 +23,7 @@ import { ClientDeviceIcon } from "@/components/icons/client-device-icon";
 import { useTheme } from "@/components/theme-provider";
 import { formatBitrate } from "@/lib/formatters";
 import { useTopologyLabels } from "@/hooks/use-topology-labels";
+import { useAnimationActivity } from "@/hooks/use-animation-activity";
 import {
   resolveDeviceIconType,
   type DeviceIconType,
@@ -54,6 +55,10 @@ interface Props {
 type Category = "computer" | "mobile" | "tv" | "server" | "iot" | "other";
 type NodeType = "internet" | "upstream" | "agent" | "category" | "client";
 type EdgeKind = "wan" | "route" | "tunnel" | "client";
+
+const NODE_WIDTH = 176;
+const NODE_GAP = 24;
+const GRAPH_PADDING = 24;
 
 interface Segment extends TopologySegment {
   id: string;
@@ -398,7 +403,9 @@ export function ClientTrafficFlowMap({
   const { resolvedTheme } = useTheme();
   const dark = resolvedTheme === "dark";
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const containerRef = useRef<HTMLElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const animation = useAnimationActivity(scrollRef);
   const particlePool = useRef<Map<string, SwarmParticle[]>>(new Map());
   const [smoothRates, setSmoothRates] = useState<
     Record<string, { down: number; up: number }>
@@ -408,9 +415,23 @@ export function ClientTrafficFlowMap({
   );
   const lastUiUpdateRef = useRef<number>(0);
   const [size, setSize] = useState({ width: 900, height: 620 });
+  const [viewportWidth, setViewportWidth] = useState(900);
   const [hovered, setHovered] = useState<string | null>(null);
   const [paused, setPaused] = useState(false);
   const [category, setCategory] = useState<Category | null>(null);
+  const columnCount = useMemo(() => {
+    const categories = clients.map((client) =>
+      categoryOf(resolveDeviceIconType(client)),
+    );
+    return category
+      ? Math.min(
+          6,
+          Math.max(1, categories.filter((key) => key === category).length),
+        )
+      : Math.max(1, new Set(categories).size);
+  }, [category, clients]);
+  const minWidth =
+    columnCount * NODE_WIDTH + (columnCount - 1) * NODE_GAP + GRAPH_PADDING * 2;
   const segments = useMemo(
     () => arrangeSegments(topology, clients),
     [topology, clients],
@@ -432,6 +453,7 @@ export function ClientTrafficFlowMap({
 
   const nodes = useMemo<Node[]>(() => {
     const expanded = Boolean(category);
+    const inset = (NODE_WIDTH / 2 + GRAPH_PADDING) / size.width;
     const result: Node[] = [
       {
         id: "internet",
@@ -499,7 +521,7 @@ export function ClientTrafficFlowMap({
           meta: `${t("devicesCount", { count: group.length })} · ${lt("networksCount", { count: routeCount })}`,
           ...ratesFor(group, realtimeRates),
           category: key,
-          x: spread(index, entries.length, 0.12, 0.88),
+          x: spread(index, entries.length, inset, 1 - inset),
           y: 0.74,
         });
       });
@@ -536,7 +558,7 @@ export function ClientTrafficFlowMap({
         ...ratesFor([client], realtimeRates),
         client,
         category,
-        x: spread(index % columns, rowCount, 0.09, 0.91),
+        x: spread(index % columns, rowCount, inset, 1 - inset),
         y: (485 + row * 95) / height,
       });
     });
@@ -549,6 +571,7 @@ export function ClientTrafficFlowMap({
     lt,
     realtimeRates,
     segments,
+    size.width,
     t,
     topology,
     topologyLabels,
@@ -613,8 +636,11 @@ export function ClientTrafficFlowMap({
         p.edge = edge;
       });
       const isWan = edge.kind === "wan";
-      const downCount = computeSwarmCount(edge.down, isWan);
-      const upCount = computeSwarmCount(edge.up, isWan);
+      const density = animation.compact ? 0.4 : 1;
+      const downCount = Math.ceil(
+        computeSwarmCount(edge.down, isWan) * density,
+      );
+      const upCount = Math.ceil(computeSwarmCount(edge.up, isWan) * density);
       const down = old
         .filter((p) => p.direction === "down")
         .slice(0, downCount);
@@ -629,40 +655,73 @@ export function ClientTrafficFlowMap({
       next.set(key, [...down, ...up]);
     });
     particlePool.current = next;
-  }, [edges]);
+  }, [edges, animation.compact]);
 
   useEffect(() => {
     const resize = () => {
       if (!containerRef.current || !canvasRef.current) return;
       const width = Math.max(
-        320,
+        1,
         Math.round(containerRef.current.getBoundingClientRect().width),
       );
-      const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+      const dpr = Math.max(
+        1,
+        Math.min(animation.compact ? 1 : 2, window.devicePixelRatio || 1),
+      );
       canvasRef.current.width = width * dpr;
       canvasRef.current.height = height * dpr;
       canvasRef.current.style.width = `${width}px`;
       canvasRef.current.style.height = `${height}px`;
       setSize({ width, height });
+      setViewportWidth(scrollRef.current?.clientWidth ?? width);
     };
     resize();
     const observer = new ResizeObserver(resize);
     const container = containerRef.current;
     if (container) observer.observe(container);
+    if (scrollRef.current) observer.observe(scrollRef.current);
     return () => observer.disconnect();
-  }, [height]);
+  }, [height, animation.compact]);
 
   useEffect(() => {
+    const viewport = scrollRef.current;
+    if (viewport)
+      viewport.scrollLeft = (viewport.scrollWidth - viewport.clientWidth) / 2;
+  }, [category, minWidth, size.width, viewportWidth]);
+
+  useEffect(() => {
+    if (!animation.visible) return;
     let alive = true;
     let previous = performance.now();
+    let lastFrame = 0;
     let frame = 0;
+    const animate =
+      !paused &&
+      !animation.reducedMotion &&
+      edges.some((edge) => edge.down > 50 || edge.up > 50);
+    const frameInterval = 1_000 / (animation.compact ? 24 : 60);
+    const uiInterval = animation.compact ? 500 : 250;
+    const geometries = new Map(
+      edges.map((edge) => [
+        edge,
+        getEdgeGeometry(edge, size.width, size.height, getPortOffset(edge)),
+      ]),
+    );
     const render = (now: number) => {
       if (!alive) return;
-      const dt = Math.min(34, Math.max(1, now - previous));
+      if (lastFrame && now - lastFrame < frameInterval) {
+        frame = requestAnimationFrame(render);
+        return;
+      }
+      lastFrame = now;
+      const dt = Math.min(100, Math.max(1, now - previous));
       previous = now;
       const context = canvasRef.current?.getContext("2d");
       if (context) {
-        const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+        const dpr = Math.max(
+          1,
+          Math.min(animation.compact ? 1 : 2, window.devicePixelRatio || 1),
+        );
         context.setTransform(dpr, 0, 0, dpr, 0, 0);
         context.clearRect(0, 0, size.width, size.height);
         const palette = dark ? COLORS.dark : COLORS.light;
@@ -675,7 +734,7 @@ export function ClientTrafficFlowMap({
             down: targetDown,
             up: targetUp,
           };
-          const factor = 1 - Math.exp(-dt * 0.007);
+          const factor = animate ? 1 - Math.exp(-dt * 0.007) : 1;
           const newDown =
             Math.abs(targetDown - current.down) < 50
               ? targetDown
@@ -687,18 +746,21 @@ export function ClientTrafficFlowMap({
           smoothRatesRef.current[node.id] = { down: newDown, up: newUp };
         });
 
-        if (now - lastUiUpdateRef.current > 50) {
+        if (!animate || now - lastUiUpdateRef.current >= uiInterval) {
           lastUiUpdateRef.current = now;
-          setSmoothRates({ ...smoothRatesRef.current });
-        }
-
-        const geometries = new Map<Edge, EdgeGeometry>();
-        edges.forEach((edge) => {
-          geometries.set(
-            edge,
-            getEdgeGeometry(edge, size.width, size.height, getPortOffset(edge)),
+          const next = { ...smoothRatesRef.current };
+          setSmoothRates((current) =>
+            nodes.every(
+              (node) =>
+                Math.round(current[node.id]?.down ?? -1) ===
+                  Math.round(next[node.id].down) &&
+                Math.round(current[node.id]?.up ?? -1) ===
+                  Math.round(next[node.id].up),
+            )
+              ? current
+              : next,
           );
-        });
+        }
 
         // 1. Sleek Cable Tracks & UniFi Translucent River Conduits
         edges.forEach((edge) => {
@@ -834,7 +896,7 @@ export function ClientTrafficFlowMap({
               Math.min(1, Math.log10(Math.max(1, traffic / 3000)) / 6) *
                 0.00016;
 
-            if (!paused) p.update(dt, baseSpeed);
+            if (animate) p.update(dt, baseSpeed);
 
             // Compute curve parameter s along the path
             const s = p.direction === "down" ? p.t : 1 - p.t;
@@ -903,33 +965,36 @@ export function ClientTrafficFlowMap({
 
         context.globalAlpha = 1.0;
       }
-      frame = requestAnimationFrame(render);
+      if (animate) frame = requestAnimationFrame(render);
     };
     frame = requestAnimationFrame(render);
     return () => {
       alive = false;
       cancelAnimationFrame(frame);
     };
-  }, [dark, edges, getPortOffset, hovered, nodes, paused, size]);
+  }, [
+    dark,
+    edges,
+    getPortOffset,
+    hovered,
+    nodes,
+    paused,
+    size,
+    animation.visible,
+    animation.compact,
+    animation.reducedMotion,
+  ]);
 
   const back = () => setCategory(null);
   return (
-    <section
-      ref={containerRef}
-      style={{ height }}
-      className="relative w-full overflow-hidden rounded-xl border border-border bg-surface-subtle/80 text-foreground shadow-sm dark:bg-[#07101d]"
-    >
-      <canvas
-        ref={canvasRef}
-        className="pointer-events-none absolute inset-0"
-      />
-      <header className="absolute left-4 right-4 top-3.5 z-20 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-3">
+    <section className="min-w-0 w-full overflow-hidden rounded-xl border border-border bg-surface-subtle/80 text-foreground shadow-sm dark:bg-[#07101d]">
+      <header className="flex flex-wrap items-start justify-between gap-3 px-4 pt-3.5">
+        <div className="flex min-w-0 flex-1 basis-52 items-start gap-3">
           <span
-            className={`size-2.5 rounded-full ${isLive && !paused ? "bg-emerald-500 shadow-[0_0_12px_#10b981]" : "bg-slate-400"}`}
+            className={`mt-1.5 size-2.5 shrink-0 rounded-full ${isLive && !paused ? "bg-emerald-500 shadow-[0_0_12px_#10b981]" : "bg-slate-400"}`}
           />
-          <div>
-            <div className="flex items-center gap-2 text-sm font-bold">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2 text-sm font-bold">
               {lt("title")}
               <span className="rounded-full border border-border bg-surface/80 px-2 py-0.5 font-mono text-[10px] font-normal text-foreground-secondary">
                 {topologyLabels.value(
@@ -949,7 +1014,7 @@ export function ClientTrafficFlowMap({
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 flex-wrap items-center gap-2">
           {category && (
             <button
               type="button"
@@ -988,93 +1053,119 @@ export function ClientTrafficFlowMap({
           </button>
         </div>
       </header>
-      {nodes.map((node) => {
-        const interactive = node.type === "category" || node.type === "client",
-          wan = node.type === "internet" || node.type === "upstream",
-          agent = node.type === "agent",
-          selected = node.client?.id === selectedClientId;
-        const isHovered = node.id === hovered;
-        const isConnectedToHovered =
-          hovered !== null &&
-          edges.some(
-            (e) =>
-              (e.from.id === hovered && e.to.id === node.id) ||
-              (e.to.id === hovered && e.from.id === node.id),
-          );
-        const isDimmed =
-          hovered !== null && !isHovered && !isConnectedToHovered;
-        const icon =
-          node.type === "internet" ? (
-            <Cloud className="size-4" />
-          ) : node.type === "upstream" ? (
-            <Router className="size-4" />
-          ) : agent ? (
-            <Server className="size-4" />
-          ) : node.type === "client" && node.client ? (
-            <ClientDeviceIcon client={node.client} size="sm" />
-          ) : node.type === "category" ? (
-            categoryIcon(node.category)
-          ) : (
-            <Network className="size-4" />
-          );
-        const displayRates = smoothRates[node.id] ?? {
-          down: node.down,
-          up: node.up,
-        };
-        const displayDown = Math.round(displayRates.down);
-        const displayUp = Math.round(displayRates.up);
+      {minWidth > viewportWidth && (
+        <p className="px-4 pt-2 text-[11px] text-foreground-muted">
+          {lt("scrollHint")}
+        </p>
+      )}
+      <div
+        ref={scrollRef}
+        role="region"
+        aria-label={lt("title")}
+        tabIndex={0}
+        className="w-full overflow-x-auto overscroll-x-contain"
+      >
+        <div
+          ref={containerRef}
+          style={{ height, minWidth }}
+          className="relative w-full"
+        >
+          <canvas
+            ref={canvasRef}
+            className="pointer-events-none absolute inset-0"
+          />
+          {nodes.map((node) => {
+            const interactive =
+                node.type === "category" || node.type === "client",
+              wan = node.type === "internet" || node.type === "upstream",
+              agent = node.type === "agent",
+              selected = node.client?.id === selectedClientId;
+            const isHovered = node.id === hovered;
+            const isConnectedToHovered =
+              hovered !== null &&
+              edges.some(
+                (e) =>
+                  (e.from.id === hovered && e.to.id === node.id) ||
+                  (e.to.id === hovered && e.from.id === node.id),
+              );
+            const isDimmed =
+              hovered !== null && !isHovered && !isConnectedToHovered;
+            const icon =
+              node.type === "internet" ? (
+                <Cloud className="size-4" />
+              ) : node.type === "upstream" ? (
+                <Router className="size-4" />
+              ) : agent ? (
+                <Server className="size-4" />
+              ) : node.type === "client" && node.client ? (
+                <ClientDeviceIcon client={node.client} size="sm" />
+              ) : node.type === "category" ? (
+                categoryIcon(node.category)
+              ) : (
+                <Network className="size-4" />
+              );
+            const displayRates = smoothRates[node.id] ?? {
+              down: node.down,
+              up: node.up,
+            };
+            const displayDown = Math.round(displayRates.down);
+            const displayUp = Math.round(displayRates.up);
 
-        return (
-          <button
-            key={node.id}
-            type="button"
-            disabled={!interactive}
-            onMouseEnter={() => setHovered(node.id)}
-            onMouseLeave={() => setHovered(null)}
-            onClick={() => {
-              if (node.type === "category") setCategory(node.category!);
-              else if (node.client) onSelectClient(node.client.id);
-            }}
-            style={{ left: `${node.x * 100}%`, top: `${node.y * 100}%` }}
-            className={`absolute z-10 -translate-x-1/2 -translate-y-1/2 w-[176px] h-[76px] rounded-xl bg-surface/95 px-3 py-2 text-left shadow-sm backdrop-blur transition-all duration-200 hover:shadow-md ${isDimmed ? "opacity-40 scale-[0.98]" : "opacity-100"} ${isHovered ? "ring-2 ring-sky-500 shadow-md shadow-sky-500/25 scale-[1.02]" : ""} ${interactive ? "cursor-pointer" : "cursor-default"} disabled:cursor-default dark:bg-slate-900/90 ${agent ? "border-2 border-sky-500/50" : wan ? "border border-purple-500/40" : selected ? "scale-105 border-2 border-sky-500" : "border border-border/80 hover:border-sky-500/60"}`}
-          >
-            <div className="flex items-center gap-2.5">
-              <span
-                className={`flex size-8 shrink-0 items-center justify-center rounded-lg border ${wan ? "border-purple-200 bg-purple-100 text-purple-700 dark:bg-purple-950/80 dark:text-purple-300" : agent ? "border-sky-200 bg-sky-100 text-sky-700 dark:bg-sky-950/80 dark:text-sky-300" : "border-cyan-200 bg-cyan-100 text-cyan-700 dark:bg-cyan-950/80 dark:text-cyan-300"}`}
+            return (
+              <button
+                key={node.id}
+                type="button"
+                disabled={!interactive}
+                onMouseEnter={() => setHovered(node.id)}
+                onMouseLeave={() => setHovered(null)}
+                onClick={() => {
+                  if (node.type === "category") setCategory(node.category!);
+                  else if (node.client) onSelectClient(node.client.id);
+                }}
+                style={{ left: `${node.x * 100}%`, top: `${node.y * 100}%` }}
+                className={`absolute z-10 -translate-x-1/2 -translate-y-1/2 w-[176px] h-[76px] rounded-xl bg-surface/95 px-3 py-2 text-left shadow-sm md:backdrop-blur transition-all duration-200 hover:shadow-md ${isDimmed ? "opacity-40 scale-[0.98]" : "opacity-100"} ${isHovered ? "ring-2 ring-sky-500 shadow-md shadow-sky-500/25 scale-[1.02]" : ""} ${interactive ? "cursor-pointer" : "cursor-default"} disabled:cursor-default dark:bg-slate-900/90 ${agent ? "border-2 border-sky-500/50" : wan ? "border border-purple-500/40" : selected ? "scale-105 border-2 border-sky-500" : "border border-border/80 hover:border-sky-500/60"}`}
               >
-                {icon}
-              </span>
-              <span className="min-w-0 flex-1">
-                <b className="block truncate text-xs font-semibold leading-tight">
-                  {node.name}
-                </b>
-                <span
-                  className="block truncate text-[10px] text-foreground-muted leading-tight mt-0.5"
-                  title={node.meta}
-                >
-                  {node.meta}
-                </span>
-              </span>
-            </div>
-            <div className="mt-2 flex items-center justify-between border-t border-border/70 pt-1.5 font-mono text-[10px] tabular-nums">
-              <span className="flex items-center gap-1 text-sky-600 dark:text-sky-400 min-w-0 flex-1">
-                <ArrowDown className="size-3 shrink-0" />
-                <span className="truncate">{formatBitrate(displayDown)}</span>
-              </span>
-              <span className="flex items-center justify-end gap-1 text-emerald-600 dark:text-emerald-400 min-w-0 flex-1">
-                <ArrowUp className="size-3 shrink-0" />
-                <span className="truncate">{formatBitrate(displayUp)}</span>
-              </span>
-            </div>
-          </button>
-        );
-      })}
+                <div className="flex items-center gap-2.5">
+                  <span
+                    className={`flex size-8 shrink-0 items-center justify-center rounded-lg border ${wan ? "border-purple-200 bg-purple-100 text-purple-700 dark:bg-purple-950/80 dark:text-purple-300" : agent ? "border-sky-200 bg-sky-100 text-sky-700 dark:bg-sky-950/80 dark:text-sky-300" : "border-cyan-200 bg-cyan-100 text-cyan-700 dark:bg-cyan-950/80 dark:text-cyan-300"}`}
+                  >
+                    {icon}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <b className="block truncate text-xs font-semibold leading-tight">
+                      {node.name}
+                    </b>
+                    <span
+                      className="block truncate text-[10px] text-foreground-muted leading-tight mt-0.5"
+                      title={node.meta}
+                    >
+                      {node.meta}
+                    </span>
+                  </span>
+                </div>
+                <div className="mt-2 flex items-center justify-between border-t border-border/70 pt-1.5 font-mono text-[10px] tabular-nums">
+                  <span className="flex items-center gap-1 text-sky-600 dark:text-sky-400 min-w-0 flex-1">
+                    <ArrowDown className="size-3 shrink-0" />
+                    <span className="truncate">
+                      {formatBitrate(displayDown)}
+                    </span>
+                  </span>
+                  <span className="flex items-center justify-end gap-1 text-emerald-600 dark:text-emerald-400 min-w-0 flex-1">
+                    <ArrowUp className="size-3 shrink-0" />
+                    <span className="truncate">{formatBitrate(displayUp)}</span>
+                  </span>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
       {topology?.topology_warnings.length ? (
-        <div className="absolute bottom-14 left-4 right-4 z-20 rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-[10px] text-amber-700 backdrop-blur dark:text-amber-300">
+        <div className="mx-4 mt-3 rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-[10px] text-amber-700 backdrop-blur dark:text-amber-300">
           {topology.topology_warnings.map(topologyLabels.warning).join(" · ")}
         </div>
       ) : null}
-      <footer className="absolute bottom-3.5 left-4 right-4 z-20 flex flex-wrap gap-2 text-xs">
+      <footer className="flex flex-wrap gap-2 px-4 py-3.5 text-xs">
         {[
           [
             t("totalDown"),

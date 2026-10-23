@@ -40,7 +40,11 @@ export default async function RootLayout({
       className={`${GeistSans.variable} ${GeistMono.variable}`}
       suppressHydrationWarning
     >
-      <body className="min-h-screen bg-background text-foreground antialiased selection:bg-accent/20 selection:text-accent">
+      {/* Browser extensions can add body classes before React hydrates. */}
+      <body
+        className="min-h-screen bg-background text-foreground antialiased selection:bg-accent/20 selection:text-accent"
+        suppressHydrationWarning
+      >
         <NextIntlClientProvider locale={locale} messages={messages}>
           <ThemeProvider defaultTheme="system">
             <TooltipProvider delay={200}>

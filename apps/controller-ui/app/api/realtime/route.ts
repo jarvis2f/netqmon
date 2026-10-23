@@ -7,9 +7,14 @@ export async function GET(request: Request) {
   if (!(await verifySession()))
     return Response.json({ error: "unauthorized" }, { status: 401 });
   try {
-    const response = await collectorFetch("internal/realtime/stream", {
-      signal: request.signal,
-    });
+    const statusOnly =
+      new URL(request.url).searchParams.get("status_only") === "true";
+    const response = await collectorFetch(
+      `internal/realtime/stream${statusOnly ? "?status_only=true" : ""}`,
+      {
+        signal: request.signal,
+      },
+    );
     return new Response(response.body, {
       status: response.status,
       headers: {

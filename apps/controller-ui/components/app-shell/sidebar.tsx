@@ -213,7 +213,7 @@ export function Sidebar({
 
   const statusColor =
     gatewayStatus === "loading"
-      ? "bg-foreground-muted animate-pulse shadow-[0_0_8px_rgba(150,150,150,0.4)]"
+      ? "bg-foreground-muted"
       : gatewayStatus === "online"
         ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]"
         : gatewayStatus === "degraded"

@@ -68,6 +68,41 @@ fn large_realtime_snapshot_benchmark() {
     assert_eq!(engine.snapshot().active_flows.len(), 10_000);
 }
 
+#[test]
+fn status_snapshots_stay_small_with_10000_active_flows() {
+    let mut engine = RealtimeEngine::default();
+    let mut input = batch(1, FlowLifecycle::Active);
+    let prototype = input.flows[0].clone();
+    input.flows = (0..10_000)
+        .map(|index| {
+            let mut flow = prototype.clone();
+            flow.remote_port = 1_000 + index;
+            flow
+        })
+        .collect();
+    engine.update(&input, &[], 2_000, 2_000);
+    let event = RealtimeEvent::Snapshot(engine.snapshot());
+    let full = event.json().unwrap();
+    let status = event.status_json().unwrap().unwrap();
+    eprintln!(
+        "realtime payload: full={} bytes, status={} bytes",
+        full.len(),
+        status.len()
+    );
+    assert!(status.len() < 256);
+    assert!(full.len() > status.len() * 1_000);
+    let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+    assert!(value.get("active_flows").is_none());
+    assert!(value.get("history").is_none());
+    assert_eq!(value["gateway_health"]["observed_at"], 2_000);
+    let warning = RealtimeEvent::Warning(WarningEvent {
+        code: "test".to_owned(),
+        message: "not a status event".to_owned(),
+        observed_at: 2_000,
+    });
+    assert!(warning.status_json().is_none());
+}
+
 fn batch(sequence: u64, lifecycle: FlowLifecycle) -> TelemetryBatch {
     TelemetryBatch {
         gateway_id: "gateway-1".to_owned(),

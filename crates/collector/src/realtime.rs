@@ -184,6 +184,19 @@ impl RealtimeEvent {
             Self::Warning(value) => serde_json::to_string(value),
         }
     }
+
+    pub(crate) fn status_json(&self) -> Option<serde_json::Result<String>> {
+        match self {
+            Self::Snapshot(value) => Some(serde_json::to_string(&serde_json::json!({
+                "generated_at": value.generated_at,
+                "gateway_health": value.gateway_health.as_ref().map(|health| {
+                    serde_json::json!({ "observed_at": health.observed_at })
+                }),
+            }))),
+            Self::GatewayStatus(_) => Some(self.json()),
+            Self::DeviceSeen(_) | Self::Warning(_) => None,
+        }
+    }
 }
 
 pub(crate) struct RealtimeEngine {

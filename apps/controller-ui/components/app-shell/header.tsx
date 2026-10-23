@@ -66,7 +66,7 @@ export function Header({
   };
 
   return (
-    <header className="sticky top-0 z-10 flex h-[52px] w-full shrink-0 items-center justify-between border-b border-border bg-surface/95 px-4 lg:px-6 backdrop-blur-xs select-none">
+    <header className="sticky top-0 z-10 flex h-[52px] w-full shrink-0 items-center justify-between border-b border-border bg-surface px-4 lg:px-6 select-none">
       {/* Left: Mobile Menu Toggle & Title */}
       <div className="flex items-center gap-3 min-w-0">
         <button
@@ -124,7 +124,7 @@ export function Header({
               className="inline-flex h-[22px] items-center gap-1.5 rounded-[5px] border border-success/30 bg-success-soft px-2 text-[11px] font-medium text-success"
               title={t("header.streamLive")}
             >
-              <span className="size-1.5 rounded-full bg-success animate-pulse" />
+              <span className="size-1.5 rounded-full bg-success" />
               <span>{t("status.live")}</span>
             </span>
           ) : (
