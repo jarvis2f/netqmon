@@ -174,7 +174,20 @@
     "statusDegraded": "Degraded",
     "statusDegradedDesc": "Some services degraded",
     "statusOffline": "Offline",
-    "statusOfflineDesc": "Unable to reach gateway"
+    "statusOfflineDesc": "Unable to reach gateway",
+    "versions": {
+      "loading": "Loading",
+      "checking": "Checking",
+      "unknown": "Unknown",
+      "notConnected": "Disconnected",
+      "lastConnected": "Last connected version",
+      "unavailable": "Unavailable",
+      "checkFailed": "Check failed",
+      "updateAvailable": "Update",
+      "updateAction": "Update",
+      "upToDate": "Up to date",
+      "viewRelease": "View {name} v{version} release notes"
+    }
   },
   "auth": {
     "controlPlane": "netqmon · Network Observability",

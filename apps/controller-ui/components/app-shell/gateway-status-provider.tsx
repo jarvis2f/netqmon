@@ -4,18 +4,27 @@ import { createContext, useContext, useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
 import { subscribeVisibleEventSource } from "@/lib/visible-event-source";
+import type { Release } from "@/lib/releases";
 
 type GatewayStatus = "online" | "offline" | "degraded" | "loading";
 interface GatewayState {
   gatewayName: string | null;
   gatewayStatus: GatewayStatus;
   streamStatus: "live" | "delayed" | "loading";
+  controllerVersion: string | null;
+  agentVersion: string | null;
+  releases: Release[] | null;
+  releaseCheckStatus: "loading" | "ready" | "error";
 }
 
 const INITIAL_STATE: GatewayState = {
   gatewayName: null,
   gatewayStatus: "loading",
   streamStatus: "loading",
+  controllerVersion: null,
+  agentVersion: null,
+  releases: null,
+  releaseCheckStatus: "loading",
 };
 const GatewayStatusContext = createContext(INITIAL_STATE);
 
@@ -27,6 +36,65 @@ function observedStatus(value: unknown): GatewayStatus {
 
 function GatewayStatusConnection({ children }: { children: ReactNode }) {
   const [state, setState] = useState(INITIAL_STATE);
+
+  useEffect(() => {
+    let controller: AbortController | null = null;
+    let active = true;
+    let checkedAt = 0;
+    let retryAfter = 0;
+    const check = async () => {
+      if (document.hidden || controller || Date.now() - checkedAt < retryAfter)
+        return;
+      const request = new AbortController();
+      controller = request;
+      try {
+        const response = await fetch("/api/system/releases", {
+          signal: request.signal,
+        });
+        if (!response.ok) throw new Error("Release check unavailable");
+        const { data } = (await response.json()) as {
+          data: { releases: Release[] };
+        };
+        if (!Array.isArray(data.releases)) throw new Error("Invalid releases");
+        if (active && !request.signal.aborted) {
+          checkedAt = Date.now();
+          retryAfter = 3_600_000;
+          setState((current) => ({
+            ...current,
+            releases: data.releases,
+            releaseCheckStatus: "ready",
+          }));
+        }
+      } catch {
+        if (active && !request.signal.aborted) {
+          checkedAt = Date.now();
+          retryAfter = 300_000;
+          setState((current) => ({
+            ...current,
+            releases: null,
+            releaseCheckStatus: "error",
+          }));
+        }
+      } finally {
+        if (controller === request) controller = null;
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.hidden) {
+        controller?.abort();
+        controller = null;
+      } else void check();
+    };
+    void check();
+    const timer = window.setInterval(() => void check(), 300_000);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      active = false;
+      controller?.abort();
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, []);
 
   useEffect(() => {
     let refreshController: AbortController | null = null;
@@ -41,7 +109,9 @@ function GatewayStatusConnection({ children }: { children: ReactNode }) {
         const next = { ...current, ...patch };
         return current.gatewayName === next.gatewayName &&
           current.gatewayStatus === next.gatewayStatus &&
-          current.streamStatus === next.streamStatus
+          current.streamStatus === next.streamStatus &&
+          current.controllerVersion === next.controllerVersion &&
+          current.agentVersion === next.agentVersion
           ? current
           : next;
       });
@@ -59,11 +129,13 @@ function GatewayStatusConnection({ children }: { children: ReactNode }) {
         const { data } = (await response.json()) as {
           data: {
             gateway_status: string;
+            controller_version?: string;
             gateway: {
               id: string;
               name: string;
               last_seen: number;
               offline_after_ms: number;
+              agent_version?: string;
             } | null;
           };
         };
@@ -72,7 +144,11 @@ function GatewayStatusConnection({ children }: { children: ReactNode }) {
         gatewayId = gateway?.id ?? null;
         if (gateway?.offline_after_ms && gateway.offline_after_ms > 0)
           offlineAfterMs = gateway.offline_after_ms;
-        update({ gatewayName: gateway?.name || gateway?.id || null });
+        update({
+          gatewayName: gateway?.name || gateway?.id || null,
+          controllerVersion: data.controller_version || null,
+          agentVersion: gateway?.agent_version || null,
+        });
         // A slow overview request must not overwrite a newer SSE observation.
         if (!gateway || gateway.last_seen >= lastSeen) {
           lastSeen = gateway?.last_seen ?? 0;
@@ -183,6 +259,10 @@ export function useGatewayStatus() {
   return {
     gatewayName: state.gatewayName,
     gatewayStatus: state.gatewayStatus,
+    controllerVersion: state.controllerVersion,
+    agentVersion: state.agentVersion,
+    releases: state.releases,
+    releaseCheckStatus: state.releaseCheckStatus,
     isLive:
       state.streamStatus === "loading"
         ? ("loading" as const)

@@ -27,6 +27,7 @@ import {
   SPRING_PRESS,
 } from "@/lib/ease";
 import { cn } from "@/lib/utils";
+import { SystemVersions } from "@/components/app-shell/system-versions";
 
 export interface NavItem {
   key:
@@ -239,9 +240,9 @@ export function Sidebar({
           : t("statusOfflineDesc");
 
   const sidebarContent = (
-    <div className="flex h-full flex-col justify-between p-2.5">
+    <div className="flex h-full flex-col justify-between gap-5 overflow-y-auto overscroll-contain p-2.5">
       {/* Top Branding and Navigation */}
-      <div>
+      <div className="shrink-0">
         {/* Top Header: Logo (Centered) */}
         {isExpanded ? (
           <div className="relative flex h-10 items-center justify-center mb-3">
@@ -285,22 +286,25 @@ export function Sidebar({
       </div>
 
       {/* Bottom Section: System Status */}
-      <div className="pt-2.5">
+      <div className="shrink-0 pt-2.5">
         {isExpanded ? (
-          <div className="rounded-xl border border-border/60 bg-surface-subtle/50 p-2.5 shadow-2xs">
-            <div className="flex items-center gap-1.5 text-xs font-medium text-foreground-muted mb-1">
+          <section
+            aria-label={t("systemStatus")}
+            className="overflow-hidden rounded-xl border border-border/70 bg-surface-subtle/40"
+          >
+            <div
+              className="flex items-center gap-2 px-3 py-3"
+              title={`${t("systemStatus")}: ${statusDesc}`}
+            >
               <span
-                className={cn("size-2 rounded-full shrink-0", statusColor)}
+                className={cn("size-1.5 shrink-0 rounded-full", statusColor)}
               />
-              <span>{t("systemStatus")}</span>
+              <span className="text-[11px] font-semibold leading-none text-foreground">
+                {statusTitle}
+              </span>
             </div>
-            <div className="text-xs font-bold text-foreground">
-              {statusTitle}
-            </div>
-            <div className="text-[10px] text-foreground-muted mt-0.5 leading-snug">
-              {statusDesc}
-            </div>
-          </div>
+            <SystemVersions />
+          </section>
         ) : (
           <div
             className="flex flex-col items-center justify-center p-2 rounded-lg border border-border/60 bg-surface-subtle/50 text-center"

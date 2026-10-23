@@ -332,13 +332,13 @@ async fn overview_status(State(state): State<CollectorState>) -> Response {
     let inner = state.query();
     let gateway = if let Some(clickhouse) = inner.storage.clickhouse_storage() {
         match clickhouse.client().query_json(
-            "SELECT id, name, last_seen FROM gateways FINAL ORDER BY created_at LIMIT 1 FORMAT JSON",
+            "SELECT id, name, last_seen, agent_version FROM gateways FINAL ORDER BY created_at LIMIT 1 FORMAT JSON",
         ) {
             Ok(value) => value["data"].as_array().and_then(|rows| rows.first()).map(|row| {
                 let last_seen = row["last_seen"].as_u64()
                     .or_else(|| row["last_seen"].as_str().and_then(|value| value.parse().ok()))
                     .unwrap_or(0);
-                json!({ "id": row["id"], "name": row["name"], "last_seen": last_seen })
+                json!({ "id": row["id"], "name": row["name"], "last_seen": last_seen, "agent_version": row["agent_version"] })
             }),
             Err(error) => return storage_error(error),
         }
@@ -347,13 +347,14 @@ async fn overview_status(State(state): State<CollectorState>) -> Response {
             .storage
             .connection()
             .query_row(
-                "SELECT id, name, last_seen FROM gateways ORDER BY created_at LIMIT 1",
+                "SELECT id, name, last_seen, agent_version FROM gateways ORDER BY created_at LIMIT 1",
                 [],
                 |row| {
                     Ok(json!({
                         "id": row.get::<_, String>(0)?,
                         "name": row.get::<_, String>(1)?,
                         "last_seen": to_u64(row.get::<_, i64>(2)?),
+                        "agent_version": row.get::<_, String>(3)?,
                     }))
                 },
             )
@@ -375,7 +376,11 @@ async fn overview_status(State(state): State<CollectorState>) -> Response {
         gateway["offline_after_ms"] = json!(offline_after_ms);
         gateway
     });
-    api_ok(json!({ "gateway_status": gateway_status, "gateway": gateway }))
+    api_ok(json!({
+        "gateway_status": gateway_status,
+        "gateway": gateway,
+        "controller_version": env!("CARGO_PKG_VERSION"),
+    }))
 }
 
 #[allow(clippy::too_many_lines)]

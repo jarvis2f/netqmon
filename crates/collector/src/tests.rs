@@ -3055,14 +3055,21 @@ async fn overview_status_is_small_and_matches_overview() {
         }
         let status = &responses[0]["data"];
         let full = &responses[1]["data"];
-        assert_eq!(status.as_object().unwrap().len(), 2);
+        assert_eq!(status.as_object().unwrap().len(), 3);
+        assert_eq!(status["controller_version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(
             status["gateway_status"],
             if online { "online" } else { "offline" }
         );
         assert_eq!(status["gateway_status"], full["gateway_status"]);
-        assert_eq!(status["gateway"].as_object().unwrap().len(), 4);
-        for field in ["id", "name", "last_seen", "offline_after_ms"] {
+        assert_eq!(status["gateway"].as_object().unwrap().len(), 5);
+        for field in [
+            "id",
+            "name",
+            "last_seen",
+            "offline_after_ms",
+            "agent_version",
+        ] {
             assert_eq!(status["gateway"][field], full["gateway"][field]);
         }
     }
@@ -3084,7 +3091,10 @@ async fn overview_status_handles_unenrolled_gateway() {
     let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(
         value["data"],
-        serde_json::json!({ "gateway_status": "unenrolled", "gateway": null })
+        serde_json::json!({
+            "gateway_status": "unenrolled", "gateway": null,
+            "controller_version": env!("CARGO_PKG_VERSION"),
+        })
     );
 }
 

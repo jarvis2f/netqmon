@@ -174,7 +174,20 @@
     "statusDegraded": "运行降级",
     "statusDegradedDesc": "部分系统存在异常",
     "statusOffline": "离线",
-    "statusOfflineDesc": "无法连接到网关"
+    "statusOfflineDesc": "无法连接到网关",
+    "versions": {
+      "loading": "加载中",
+      "checking": "检查中",
+      "unknown": "未知版本",
+      "notConnected": "未连接",
+      "lastConnected": "上次连接的版本",
+      "unavailable": "暂无法检查",
+      "checkFailed": "检查失败",
+      "updateAvailable": "有新版本",
+      "updateAction": "更新",
+      "upToDate": "已是最新",
+      "viewRelease": "查看 {name} v{version} 发布说明"
+    }
   },
   "auth": {
     "controlPlane": "netqmon · 路由器流量监控",

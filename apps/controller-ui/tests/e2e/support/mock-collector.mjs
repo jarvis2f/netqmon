@@ -822,16 +822,15 @@ function handleInternal(request, response, pathname, params, state) {
     return true;
   }
   if (path === "overview/status" && request.method === "GET") {
-    const { id, name, last_seen, offline_after_ms, status } = gateway(
-      now,
-      scenario,
-    );
+    const { id, name, last_seen, offline_after_ms, status, agent_version } =
+      gateway(now, scenario);
     json(
       response,
       200,
       envelope({
         gateway_status: status,
-        gateway: { id, name, last_seen, offline_after_ms },
+        controller_version: "1.1.0-beta.5",
+        gateway: { id, name, last_seen, offline_after_ms, agent_version },
       }),
     );
     return true;
