@@ -14,9 +14,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  detect-changes:
+    name: Check agent and OpenWrt package changes
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.changes.outputs.build }}
+    steps:
+      - name: Check out repository and release history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect relevant changes since the previous release in this channel
+        id: changes
+        run: python3 scripts/release/detect_openwrt_changes.py
+
   # 1. Official Release Blocking Native Agent Builds
   build-agent-binaries:
     name: Build Agent Binary (${{ matrix.arch }}) [Official]
+    needs: detect-changes
+    if: needs.detect-changes.outputs.build == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -73,6 +90,8 @@ jobs:
   # 2. Official Cross-Compilation for armv7hf (Release Blocking)
   build-agent-armv7hf:
     name: Build Agent Binary (armv7hf) [Official]
+    needs: detect-changes
+    if: needs.detect-changes.outputs.build == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -124,6 +143,8 @@ jobs:
   # 3. Candidate Official Cross-Compilation for RISC-V64 (Non-blocking)
   build-agent-riscv64:
     name: Build Agent Binary (riscv64) [Candidate Official]
+    needs: detect-changes
+    if: needs.detect-changes.outputs.build == 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -179,6 +200,8 @@ jobs:
   # 3b. Experimental: MIPSEL (MIPS32r2 little-endian, soft-float)
   build-agent-mipsel:
     name: Build Agent [mipsel-unknown-linux-musl] (Experimental)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.build == 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -236,7 +259,8 @@ jobs:
   # 4. Official OpenWrt Packages (Blocking: x86_64, aarch64, and armv7hf)
   job_build:
     name: Build OpenWrt Package [${{ matrix.platform }}-${{ matrix.ver }}]
-    needs: [build-agent-binaries, build-agent-armv7hf]
+    needs: [detect-changes, build-agent-binaries, build-agent-armv7hf]
+    if: needs.detect-changes.outputs.build == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -454,7 +478,8 @@ jobs:
   # 5. Experimental OpenWrt Packages (Non-blocking: RISC-V64 & MIPSEL)
   job_build_experimental:
     name: Build OpenWrt Package [${{ matrix.platform }}-${{ matrix.ver }}] [${{ matrix.status }}]
-    needs: [build-agent-riscv64, build-agent-mipsel]
+    needs: [detect-changes, build-agent-riscv64, build-agent-mipsel]
+    if: needs.detect-changes.outputs.build == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -645,8 +670,8 @@ jobs:
 
   publish-release-assets:
     name: Publish OpenWrt packages and manifest
-    needs: [job_build, job_build_experimental]
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [detect-changes, job_build, job_build_experimental]
+    if: needs.detect-changes.outputs.build == 'true' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
