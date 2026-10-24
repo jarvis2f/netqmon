@@ -32,18 +32,34 @@ impl IntoResponse for CachedResponse {
 
 pub(super) fn wrap(router: Router<CollectorState>) -> Router<CollectorState> {
     let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
-    let permits = Arc::new(Semaphore::new(parallelism.saturating_sub(1).clamp(1, 4)));
+    wrap_with_parallelism(router, parallelism)
+}
+
+fn wrap_with_parallelism(
+    router: Router<CollectorState>,
+    parallelism: usize,
+) -> Router<CollectorState> {
+    // A dashboard fetches several independent panels together. Reserve separate
+    // capacity for analysis and status reads so a slow insight cannot stall
+    // every page, including on one- and two-core hosts. All lanes stay bounded.
+    let interactive_permits = Arc::new(Semaphore::new(parallelism.clamp(2, 4)));
+    let analysis_permits = Arc::new(Semaphore::new(1));
+    let status_permits = Arc::new(Semaphore::new(2));
     let insights = Cache::<String, CachedResponse>::builder()
         .max_capacity(32)
         .time_to_live(Duration::from_secs(10))
         .build();
     router.route_layer(from_fn(move |request: Request, next: Next| {
-        let permits = Arc::clone(&permits);
+        let permits = Arc::clone(match request.uri().path() {
+            "/internal/insights" | "/internal/settings/diagnostics" => &analysis_permits,
+            "/internal/overview" | "/internal/overview/status" | "/internal/settings/license" => {
+                &status_permits
+            }
+            _ => &interactive_permits,
+        });
         let insights = insights.clone();
         async move {
-            if request.method() != Method::GET
-                || request.uri().path() == "/internal/overview/status"
-            {
+            if request.method() != Method::GET {
                 return next.run(request).await;
             }
             if request.uri().path() != "/internal/insights" {
@@ -114,6 +130,115 @@ mod tests {
 
     fn request(uri: &str) -> Request<Body> {
         Request::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_insights_do_not_queue_interactive_or_status_reads_on_two_cores() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let notify = Arc::clone(&entered);
+        let (resume, wait) = std::sync::mpsc::channel();
+        let wait = Arc::new(std::sync::Mutex::new(wait));
+        let router = wrap_with_parallelism(
+            Router::new()
+                .route(
+                    "/internal/insights",
+                    get(move || {
+                        let notify = Arc::clone(&notify);
+                        let wait = Arc::clone(&wait);
+                        async move {
+                            notify.notify_one();
+                            wait.lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(2))
+                                .unwrap();
+                            StatusCode::OK
+                        }
+                    }),
+                )
+                .route("/internal/destinations", get(|| async { StatusCode::OK }))
+                .route(
+                    "/internal/settings/license",
+                    get(|| async { StatusCode::OK }),
+                ),
+            2,
+        )
+        .with_state(CollectorState::new("test"));
+        let slow = tokio::spawn(router.clone().oneshot(request("/internal/insights")));
+        entered.notified().await;
+        let fast = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                router.clone().oneshot(request("/internal/destinations")),
+                router.oneshot(request("/internal/settings/license")),
+            )
+        })
+        .await;
+        resume.send(()).unwrap();
+        assert_eq!(slow.await.unwrap().unwrap().status(), StatusCode::OK);
+        let (destinations, license) = fast.expect("insights must not hold up other pages");
+        assert_eq!(destinations.unwrap().status(), StatusCode::OK);
+        assert_eq!(license.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_reads_have_capacity_when_both_interactive_slots_are_busy() {
+        let entered = Arc::new(Semaphore::new(0));
+        let notify = Arc::clone(&entered);
+        let (resume, wait) = std::sync::mpsc::channel();
+        let wait = Arc::new(std::sync::Mutex::new(wait));
+        let router = wrap_with_parallelism(
+            Router::new()
+                .route(
+                    "/internal/destinations",
+                    get(move || {
+                        let notify = Arc::clone(&notify);
+                        let wait = Arc::clone(&wait);
+                        async move {
+                            notify.add_permits(1);
+                            wait.lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(2))
+                                .unwrap();
+                            StatusCode::OK
+                        }
+                    }),
+                )
+                .route(
+                    "/internal/overview/status",
+                    get(|| async { StatusCode::OK }),
+                )
+                .route("/internal/overview", get(|| async { StatusCode::OK })),
+            2,
+        )
+        .with_state(CollectorState::new("test"));
+        let first = tokio::spawn(
+            router
+                .clone()
+                .oneshot(request("/internal/destinations?offset=0")),
+        );
+        let second = tokio::spawn(
+            router
+                .clone()
+                .oneshot(request("/internal/destinations?offset=50")),
+        );
+        let started = tokio::time::timeout(Duration::from_secs(1), entered.acquire_many(2)).await;
+        let fast = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                router.clone().oneshot(request("/internal/overview/status")),
+                router.oneshot(request("/internal/overview?summary=true")),
+            )
+        })
+        .await;
+        resume.send(()).unwrap();
+        resume.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert!(
+            started.is_ok(),
+            "a two-core host must run both dashboard reads"
+        );
+        let (status, overview) = fast.expect("overview and status must have reserved capacity");
+        assert_eq!(status.unwrap().status(), StatusCode::OK);
+        assert_eq!(overview.unwrap().status(), StatusCode::OK);
     }
 
     #[tokio::test]

@@ -47,7 +47,15 @@ test("renders live overview metrics and links to ranked applications", async ({
   request,
 }) => {
   await setCollectorScenario(request, "live");
+  const rankings = page.waitForRequest((request) => {
+    const url = new URL(request.url());
+    return (
+      url.pathname === "/api/applications" &&
+      url.searchParams.get("summary") === "true"
+    );
+  });
   await login(page);
+  await rankings;
 
   await expect(page.getByText("LIVE", { exact: true })).toBeVisible();
   await expect(page.getByText("Internet Download").first()).toBeVisible();

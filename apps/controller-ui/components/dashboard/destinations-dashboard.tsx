@@ -108,6 +108,7 @@ export function DestinationsDashboard({
   const [error, setError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
   const [geoSummary, setGeoSummary] = useState<GeoSummary | null>(null);
+  const [geoLoading, setGeoLoading] = useState(true);
   const [geoError, setGeoError] = useState<string | null>(null);
 
   const selected =
@@ -155,72 +156,59 @@ export function DestinationsDashboard({
     const controller = new AbortController();
     async function load() {
       setLoading(true);
+      setGeoLoading(true);
+      setGeoError(null);
       try {
         const bounds = rangeBounds(initialRange, initialFrom, initialTo);
         const timeQuery = `from=${bounds.from}&to=${bounds.to}`;
         const offset = (initialPage - 1) * PAGE_SIZE;
 
-        if (initialView === "map") {
-          const [mapResp, geoResponse] = await Promise.all([
-            fetch(
-              `/api/destinations?limit=${MAP_FETCH_LIMIT}&offset=0&${timeQuery}&lang=${encodeURIComponent(locale)}`,
+        // The table/map is usable as soon as destinations arrive. A slower
+        // country/ASN summary must not hold the entire page in its loading state.
+        void (async () => {
+          try {
+            const response = await fetch(
+              `/api/geo?${timeQuery}&lang=${encodeURIComponent(locale)}`,
               { cache: "no-store", signal: controller.signal },
-            ),
-            fetch(`/api/geo?${timeQuery}&lang=${encodeURIComponent(locale)}`, {
-              cache: "no-store",
-              signal: controller.signal,
-            }),
-          ]);
-          const mapEnvelope = (await mapResp.json()) as ApiEnvelope<
-            DestinationSummary[]
-          >;
-          if (!mapResp.ok)
-            throw new Error(
-              mapEnvelope.error?.message ??
-                `Destinations request failed (${mapResp.status})`,
             );
-          setMapItems(mapEnvelope.data);
-          setTotal(mapEnvelope.pagination?.total ?? mapEnvelope.data.length);
-
-          if (geoResponse.ok) {
-            const geoEnvelope =
-              (await geoResponse.json()) as ApiEnvelope<GeoSummary>;
-            setGeoSummary(geoEnvelope.data);
-            setGeoError(null);
-          } else {
-            setGeoError(`Geo summary request failed (${geoResponse.status})`);
+            if (!response.ok)
+              throw new Error(
+                `Geo summary request failed (${response.status})`,
+              );
+            const envelope = (await response.json()) as ApiEnvelope<GeoSummary>;
+            if (!controller.signal.aborted) {
+              setGeoSummary(envelope.data);
+              setGeoError(null);
+            }
+          } catch (loadError) {
+            if (!controller.signal.aborted)
+              setGeoError(
+                loadError instanceof Error
+                  ? loadError.message
+                  : t("unavailable"),
+              );
+          } finally {
+            if (!controller.signal.aborted) setGeoLoading(false);
           }
-        } else {
-          const [response, geoResponse] = await Promise.all([
-            fetch(
-              `/api/destinations?limit=${PAGE_SIZE}&offset=${offset}&${timeQuery}&lang=${encodeURIComponent(locale)}`,
-              { cache: "no-store", signal: controller.signal },
-            ),
-            fetch(`/api/geo?${timeQuery}&lang=${encodeURIComponent(locale)}`, {
-              cache: "no-store",
-              signal: controller.signal,
-            }),
-          ]);
-          const envelope = (await response.json()) as ApiEnvelope<
-            DestinationSummary[]
-          >;
-          if (!response.ok)
-            throw new Error(
-              envelope.error?.message ??
-                `Destinations request failed (${response.status})`,
-            );
-          setItems(envelope.data);
-          setTotal(envelope.pagination?.total ?? envelope.data.length);
+        })();
 
-          if (geoResponse.ok) {
-            const geoEnvelope =
-              (await geoResponse.json()) as ApiEnvelope<GeoSummary>;
-            setGeoSummary(geoEnvelope.data);
-            setGeoError(null);
-          } else {
-            setGeoError(`Geo summary request failed (${geoResponse.status})`);
-          }
-        }
+        const limit = initialView === "map" ? MAP_FETCH_LIMIT : PAGE_SIZE;
+        const response = await fetch(
+          `/api/destinations?limit=${limit}&offset=${initialView === "map" ? 0 : offset}&${timeQuery}&lang=${encodeURIComponent(locale)}`,
+          { cache: "no-store", signal: controller.signal },
+        );
+        const envelope = (await response.json()) as ApiEnvelope<
+          DestinationSummary[]
+        >;
+        if (!response.ok)
+          throw new Error(
+            envelope.error?.message ??
+              `Destinations request failed (${response.status})`,
+          );
+        if (controller.signal.aborted) return;
+        if (initialView === "map") setMapItems(envelope.data);
+        else setItems(envelope.data);
+        setTotal(envelope.pagination?.total ?? envelope.data.length);
 
         setError(null);
       } catch (loadError) {
@@ -422,30 +410,30 @@ export function DestinationsDashboard({
         />
       ) : (
         <>
-          {!loading && geoError && (
+          {!geoLoading && geoError && (
             <div className="rounded-md border border-warning/30 bg-warning/5 px-3 py-2 text-[11px] text-foreground-secondary">
               {t("geoError", { error: geoError })}
             </div>
           )}
-          {!loading && geoSummary && !geoSummary.enabled && (
+          {!geoLoading && geoSummary && !geoSummary.enabled && (
             <div className="rounded-md border border-border bg-surface-subtle px-3 py-2 text-[11px] text-foreground-secondary">
               {t("geoNotEnabled")}
             </div>
           )}
-          {(loading || geoSummary?.enabled) && (
+          {(geoLoading || geoSummary?.enabled) && (
             <div className="grid grid-cols-1 gap-3 xl:grid-cols-3">
               <RankList
                 compact
                 title={t("topCountries")}
                 items={topCountries}
-                loading={loading}
+                loading={geoLoading}
                 emptyMessage={t("noCountryMatches")}
               />
               <RankList
                 compact
                 title={t("topAsns")}
                 items={topAsns}
-                loading={loading}
+                loading={geoLoading}
                 emptyMessage={t("noAsnMatches")}
                 onItemClick={(item) =>
                   window.open(
@@ -460,7 +448,7 @@ export function DestinationsDashboard({
                 variant="country"
                 title={t("countryDistribution")}
                 items={countryDistribution}
-                loading={loading}
+                loading={geoLoading}
                 emptyMessage={t("noCountryMatches")}
               />
             </div>

@@ -392,6 +392,7 @@ export function OverviewDashboard({ username }: { username: string }) {
       setRankErrors((current) => ({ ...current, [resource]: undefined }));
       try {
         const params = new URLSearchParams(summaryParams);
+        if (resource === "applications") params.set("summary", "true");
         if (resource === "destinations") params.set("lang", locale);
         const response = await fetch(`/api/${resource}?${params}`, {
           signal: controller.signal,

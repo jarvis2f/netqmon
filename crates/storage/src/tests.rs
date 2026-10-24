@@ -1560,3 +1560,4 @@ mod active_cache;
 mod bounded;
 mod incremental;
 mod performance;
+mod scope_totals;

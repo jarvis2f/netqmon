@@ -27,7 +27,7 @@ uuid = { version = "1.19.0", features = ["serde", "v4"] }
 sha2 = "0.11.0"
 subtle = "2.6.1"
 futures-util = "0.3.34"
-moka = { version = "0.12.16", features = ["future"] }
+moka = { version = "0.12.16", features = ["future", "sync"] }
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tower-http = { version = "0.7.0", features = ["limit", "timeout"] }
 tracing = "0.1.44"

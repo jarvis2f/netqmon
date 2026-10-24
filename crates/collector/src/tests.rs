@@ -1468,6 +1468,84 @@ async fn update_client_info_modifies_display_name_and_device_type() {
 }
 
 #[tokio::test]
+async fn application_rankings_match_detail_totals_and_pagination_without_flow_statistics() {
+    let state = query_state();
+    {
+        let inner = state.lock();
+        let connection = inner.storage.connection();
+        let gateway: String = connection
+            .query_row("SELECT id FROM gateways LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        connection.execute(
+            "INSERT INTO traffic_application_minute
+                (timestamp,gateway_id,application_id,category_id,upload_bytes,download_bytes,packets,flow_count)
+             VALUES (1700000000000,?1,'youtube','streaming',1000,5000,20,2),
+                    (1700000060000,?1,'youtube','streaming',2000,6000,30,3),
+                    (1700000000000,?1,'protocol:quic','unknown',300,700,10,1),
+                    (1700000000000,?1,'unknown','custom',100,500,5,1)",
+            [gateway],
+        ).unwrap();
+    }
+    let router = internal_router(state);
+    for params in [
+        "limit=2",
+        "limit=2&offset=1",
+        "limit=2&offset=1000",
+        "limit=10&from=1700000000000&to=1700000060000",
+        "limit=10&from=1700000060000&to=1700000120000",
+        "limit=10&from=1&to=2",
+    ] {
+        let full = parse_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/internal/applications?{params}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let summary = parse_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/internal/applications?{params}&summary=true"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(full["pagination"], summary["pagination"], "{params}");
+        let expected = full["data"].as_array().unwrap();
+        let actual = summary["data"].as_array().unwrap();
+        assert_eq!(expected.len(), actual.len());
+        for (full, summary) in expected.iter().zip(actual) {
+            for field in [
+                "application_id",
+                "category_id",
+                "name",
+                "icon",
+                "upload_bytes",
+                "download_bytes",
+                "packets",
+                "flow_count",
+                "last_seen",
+            ] {
+                assert_eq!(full[field], summary[field], "{params}: {field}");
+            }
+            assert!(summary.get("client_count").is_none());
+            assert!(summary.get("organization_id").is_none());
+        }
+    }
+}
+
+#[tokio::test]
 async fn application_detail_filters_duplicate_unknown_rows_by_category() {
     let state = query_state();
     {
@@ -2409,6 +2487,25 @@ async fn topology_health_is_exposed_in_diagnostics_and_insights() {
         "br-lan"
     );
 
+    let status = parse_json(
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/overview/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status["data"]["topology"]["topology_mode"],
+        "one-arm-router"
+    );
+    assert!(status["data"].get("recognition").is_none());
+
     let insights = parse_json(
         router
             .oneshot(
@@ -2458,6 +2555,65 @@ async fn destinations_include_identity_traffic_clients_and_geo_placeholders() {
     assert!(destination.get("country_code").is_some());
     assert!(destination.get("asn").is_some());
     assert!(destination.get("organization").is_some());
+}
+
+#[tokio::test]
+async fn destinations_cached_totals_preserve_empty_pages_and_refresh_metadata() {
+    let state = query_state();
+    let router = internal_router(state.clone());
+    let first = parse_json(
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/destinations?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let total = first["pagination"]["total"].as_u64().unwrap();
+    assert!(total > 0);
+    state
+        .lock()
+        .storage
+        .connection()
+        .execute(
+            "UPDATE flow_sessions SET domain = 'fresh.example' WHERE remote_ip = X'C6336401'",
+            [],
+        )
+        .unwrap();
+    let refreshed = parse_json(
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/destinations?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(refreshed["data"][0]["domain"], "fresh.example");
+    assert_eq!(refreshed["pagination"]["total"], total);
+    let empty = parse_json(
+        router
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/destinations?limit=1&offset=1000000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(empty["data"], json!([]));
+    assert_eq!(empty["pagination"]["total"], total);
 }
 
 #[tokio::test]
@@ -3175,7 +3331,7 @@ async fn overview_status_is_small_and_matches_overview() {
         }
         let status = &responses[0]["data"];
         let full = &responses[1]["data"];
-        assert_eq!(status.as_object().unwrap().len(), 3);
+        assert_eq!(status.as_object().unwrap().len(), 4);
         assert_eq!(status["controller_version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(
             status["gateway_status"],
@@ -3214,6 +3370,7 @@ async fn overview_status_handles_unenrolled_gateway() {
         serde_json::json!({
             "gateway_status": "unenrolled", "gateway": null,
             "controller_version": env!("CARGO_PKG_VERSION"),
+            "topology": null,
         })
     );
 }

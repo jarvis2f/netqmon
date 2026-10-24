@@ -9,6 +9,12 @@ test.beforeEach(async ({ page, request }) => {
 test("combines flow filters in the URL and keeps list context when a flow opens", async ({
   page,
 }) => {
+  let diagnosticsRequests = 0;
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/api/settings/diagnostics")
+      diagnosticsRequests += 1;
+  });
+  await page.route("**/api/settings/diagnostics", (route) => route.abort());
   let flowRequests = 0;
   page.on("request", (request) => {
     if (new URL(request.url()).pathname === "/api/flows") flowRequests += 1;
@@ -43,6 +49,8 @@ test("combines flow filters in the URL and keeps list context when a flow opens"
     page.getByText("dns:video.youtube.com", { exact: true }),
   ).toBeVisible();
   expect(flowRequests).toBe(requestsBeforeOpen);
+  expect(diagnosticsRequests).toBe(0);
+  await expect(page.getByText("One-arm router", { exact: true })).toBeVisible();
 
   await page.keyboard.press("Escape");
   await expect(page).toHaveURL(/search=youtube/);

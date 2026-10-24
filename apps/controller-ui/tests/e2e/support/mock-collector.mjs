@@ -874,6 +874,7 @@ function handleInternal(request, response, pathname, params, state) {
         gateway_status: status,
         controller_version: "1.1.0-beta.5",
         gateway: { id, name, last_seen, offline_after_ms, agent_version },
+        topology: realtimeSnapshot(now, scenario).gateway_health.topology,
       }),
     );
     return true;

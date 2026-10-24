@@ -48,7 +48,11 @@ In a standard deployment (such as via `docker-compose.yml`), the Controller cont
 
 SQLite upgrades automatically replace the scope/time index with an index that covers destination distinct counts without indexing mutable traffic counters. Building this index takes additional startup time and disk space proportional to retained minute data; existing traffic records are preserved.
 
-Read APIs execute on a bounded blocking pool (at most four concurrent queries), while gateway status remains independent of that queue. Insights responses are cached for 10 seconds per exact request URI; concurrent identical requests share a computation, and failed responses are not cached. The UI requests compact realtime summaries with connection counts, while the existing full snapshot API remains available.
+Read APIs execute on bounded blocking workers: two to four interactive reads, one analysis/diagnostics read, and two overview/status/license reads have separate capacity. Slow diagnostics and insights cannot occupy interactive or overview slots, including on small hosts. Insights responses are cached for 10 seconds per exact request URI; concurrent identical requests share a computation, and failed responses are not cached.
+
+SQLite traffic charts read `traffic_scope_total_minute`, an exact per-minute/gateway/scope/direction total maintained transactionally by source-table triggers. Migration 11 backfills existing minute records; ingestion, counter updates, late classification, moves, deletes and rollback keep the total consistent. Both tables follow `minute_days`, including the previously omitted scope detail cleanup. Backfilling adds startup work proportional to retained detail rows. Grouped breakdowns still read the detail table, while chart totals no longer scan it.
+
+SQLite destination lists/maps and geo summaries share the same exact-window aggregation for up to two seconds, retaining at most 100,000 destination rows across cached windows; failed loads are not cached. Pagination and metadata enrichment use that shared snapshot. The UI displays destination results independently of the geo summary. SQLite overview uses `applications?summary=true` for minute-rollup rankings without detail-only client/organization counts. Flows obtains topology mode from `overview/status`, without loading complete diagnostics. The UI requests compact realtime summaries with connection counts, while the existing full snapshot API remains available.
 
 ### 2.3 Network Listeners & Service Bindings
 

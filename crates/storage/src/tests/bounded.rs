@@ -414,6 +414,11 @@ fn v5_upgrade_preserves_history_and_enables_correction_for_new_traffic() {
          DROP INDEX dns_observations_answer_lookup;
          DROP INDEX flow_sessions_sample_lookup;
          DROP INDEX flow_sessions_open_checkpoint;
+         DROP TRIGGER traffic_scope_total_insert;
+         DROP TRIGGER traffic_scope_total_counters;
+         DROP TRIGGER traffic_scope_total_move;
+         DROP TRIGGER traffic_scope_total_delete;
+         DROP TABLE traffic_scope_total_minute;
          DELETE FROM schema_migrations WHERE version>=6;",
         )
         .unwrap();

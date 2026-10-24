@@ -256,7 +256,7 @@ export function FlowsDashboard(props: Props) {
 
   useEffect(() => {
     const controller = new AbortController();
-    void fetch("/api/settings/diagnostics", { signal: controller.signal })
+    void fetch("/api/overview/status", { signal: controller.signal })
       .then((response) => (response.ok ? response.json() : null))
       .then((envelope) =>
         setTopologyMode(envelope?.data?.topology?.topology_mode || ""),

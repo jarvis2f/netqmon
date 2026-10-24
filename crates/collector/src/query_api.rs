@@ -31,7 +31,9 @@ const DEFAULT_INSIGHT_WINDOW_MS: u64 = DAY_MS;
 const MAX_INSIGHT_WINDOW_MS: u64 = 30 * DAY_MS;
 const PROTOCOL_APPLICATION_PREFIX: &str = "protocol:";
 
+pub(crate) mod destination_cache;
 mod execution;
+mod rankings;
 
 pub(crate) fn router() -> Router<CollectorState> {
     let router = Router::new()
@@ -154,6 +156,17 @@ struct WindowPageQuery {
     offset: Option<u64>,
     from: Option<u64>,
     to: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplicationListQuery {
+    limit: Option<u32>,
+    offset: Option<u64>,
+    from: Option<u64>,
+    to: Option<u64>,
+    #[serde(default)]
+    summary: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -341,6 +354,12 @@ struct FlowPageOptions {
 
 // The persistent page header needs no traffic history, flows, or aggregate scans.
 async fn overview_status(State(state): State<CollectorState>) -> Response {
+    let topology = state
+        .realtime_snapshot()
+        .gateway_health
+        .as_ref()
+        .and_then(|health| health.topology.as_ref())
+        .map(|topology| json!({ "topology_mode": topology.topology_mode }));
     let inner = state.query();
     let gateway = if let Some(clickhouse) = inner.storage.clickhouse_storage() {
         match clickhouse.client().query_json(
@@ -392,6 +411,7 @@ async fn overview_status(State(state): State<CollectorState>) -> Response {
         "gateway_status": gateway_status,
         "gateway": gateway,
         "controller_version": env!("CARGO_PKG_VERSION"),
+        "topology": topology,
     }))
 }
 
@@ -723,7 +743,7 @@ fn traffic_breakdown(
             &format!(
                 "SELECT (timestamp / ?1) * ?1 AS bucket, SUM(upload_bytes),
                     SUM(download_bytes), SUM(packets), SUM(flow_count){totals_sql}
-             FROM traffic_scope_minute WHERE timestamp >= ?2 AND timestamp < ?3
+             FROM traffic_scope_total_minute WHERE timestamp >= ?2 AND timestamp < ?3
                AND (?4 IS NULL OR scope = ?4) AND (?5 IS NULL OR direction = ?5)
              GROUP BY bucket ORDER BY bucket"
             ),
@@ -1404,7 +1424,7 @@ fn query_client_flows(
 
 async fn applications(
     State(state): State<CollectorState>,
-    query: Result<Query<WindowPageQuery>, QueryRejection>,
+    query: Result<Query<ApplicationListQuery>, QueryRejection>,
 ) -> Response {
     let Query(query) = match query {
         Ok(query) => query,
@@ -1461,6 +1481,9 @@ async fn applications(
                 page_ok(items, page, total)
             })
             .unwrap_or_else(storage_error);
+    }
+    if query.summary {
+        return rankings::applications(&inner, page, window);
     }
     let connection = inner.storage.connection();
     let result = (|| -> rusqlite::Result<(Vec<Value>, u64)> {
@@ -2396,101 +2419,29 @@ async fn destinations(
             .unwrap_or_else(storage_error);
     }
     let connection = inner.storage.connection();
-    let result = (|| -> rusqlite::Result<(Vec<Value>, u64)> {
-        let (total, items) = match (query.from, query.to) {
-            (Some(from), Some(to)) => {
-                let from_i = to_i64(from);
-                let to_i = to_i64(to);
-                let total: i64 = scalar(
-                    connection,
-                    "SELECT COUNT(DISTINCT hex(remote_ip)) FROM traffic_scope_minute
-                     WHERE scope = ?1 AND timestamp >= ?2 AND timestamp < ?3",
-                    params![
-                        netqmon_protocol::v1::FlowScope::Internet as i32,
-                        from_i,
-                        to_i
-                    ],
-                )?;
-                let mut statement = connection.prepare(
-                    "WITH page AS (
-                        SELECT t.remote_ip, SUM(t.upload_bytes) AS upload_bytes,
-                               SUM(t.download_bytes) AS download_bytes, SUM(t.packets) AS packets,
-                               SUM(t.flow_count) AS flow_count, MAX(t.timestamp) AS last_seen
-                        FROM traffic_scope_minute t
-                        WHERE t.scope = ?1 AND t.timestamp >= ?2 AND t.timestamp < ?3
-                        GROUP BY t.remote_ip
-                        ORDER BY SUM(t.upload_bytes + t.download_bytes) DESC, hex(t.remote_ip)
-                        LIMIT ?4 OFFSET ?5
-                     )
-                     SELECT page.remote_ip, page.upload_bytes, page.download_bytes, page.packets,
-                            page.flow_count, page.last_seen,
-                            (SELECT f.domain FROM flow_sessions f
-                             WHERE f.remote_ip = page.remote_ip AND f.domain IS NOT NULL
-                             ORDER BY f.last_seen_at DESC LIMIT 1),
-                            (SELECT COUNT(DISTINCT f.device_id) FROM flow_sessions f
-                             WHERE f.remote_ip = page.remote_ip AND f.device_id IS NOT NULL),
-                            (SELECT f.application_id FROM flow_sessions f
-                             WHERE f.remote_ip = page.remote_ip AND f.application_id IS NOT NULL AND f.application_id != 'unknown'
-                             ORDER BY f.last_seen_at DESC LIMIT 1)
-                     FROM page",
-                )?;
-                let rows = statement
-                    .query_map(
-                        params![
-                            netqmon_protocol::v1::FlowScope::Internet as i32,
-                            from_i,
-                            to_i,
-                            i64::from(page.limit),
-                            to_i64(page.offset)
-                        ],
-                        |row| map_destination_row(row, &inner, query.lang.as_deref()),
-                    )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                (total, rows)
-            }
-            _ => {
-                let total: i64 = scalar(
-                    connection,
-                    "SELECT COUNT(DISTINCT hex(remote_ip)) FROM traffic_scope_minute WHERE scope = ?1",
-                    [netqmon_protocol::v1::FlowScope::Internet as i32],
-                )?;
-                let mut statement = connection.prepare(
-                    "WITH page AS (
-                        SELECT t.remote_ip, SUM(t.upload_bytes) AS upload_bytes,
-                               SUM(t.download_bytes) AS download_bytes, SUM(t.packets) AS packets,
-                               SUM(t.flow_count) AS flow_count, MAX(t.timestamp) AS last_seen
-                        FROM traffic_scope_minute t WHERE t.scope = ?1 GROUP BY t.remote_ip
-                        ORDER BY SUM(t.upload_bytes + t.download_bytes) DESC, hex(t.remote_ip)
-                        LIMIT ?2 OFFSET ?3
-                     )
-                     SELECT page.remote_ip, page.upload_bytes, page.download_bytes, page.packets,
-                            page.flow_count, page.last_seen,
-                            (SELECT f.domain FROM flow_sessions f
-                             WHERE f.remote_ip = page.remote_ip AND f.domain IS NOT NULL
-                             ORDER BY f.last_seen_at DESC LIMIT 1),
-                            (SELECT COUNT(DISTINCT f.device_id) FROM flow_sessions f
-                             WHERE f.remote_ip = page.remote_ip AND f.device_id IS NOT NULL),
-                            (SELECT f.application_id FROM flow_sessions f
-                             WHERE f.remote_ip = page.remote_ip AND f.application_id IS NOT NULL AND f.application_id != 'unknown'
-                             ORDER BY f.last_seen_at DESC LIMIT 1)
-                     FROM page",
-                )?;
-                let rows = statement
-                    .query_map(
-                        params![
-                            netqmon_protocol::v1::FlowScope::Internet as i32,
-                            i64::from(page.limit),
-                            to_i64(page.offset)
-                        ],
-                        |row| map_destination_row(row, &inner, query.lang.as_deref()),
-                    )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                (total, rows)
-            }
-        };
-        Ok((items, to_u64(total)))
+    let traffic = match state
+        .destination_traffic
+        .get(connection, query.from, query.to)
+    {
+        Ok(traffic) => traffic,
+        Err(error) => return storage_error(error),
+    };
+    let total = traffic.len() as u64;
+    let result = (|| -> rusqlite::Result<Vec<Value>> {
+        let mut statement =
+            connection.prepare_cached(destination_cache::destination_metadata_sql())?;
+        traffic
+            .iter()
+            .skip(usize::try_from(page.offset).unwrap_or(usize::MAX))
+            .take(page.limit as usize)
+            .map(|row| {
+                statement.query_row(destination_cache::destination_params(row), |row| {
+                    map_destination_row(row, &inner, query.lang.as_deref())
+                })
+            })
+            .collect()
     })();
-    result.map_or_else(storage_error, |(items, total)| page_ok(items, page, total))
+    result.map_or_else(storage_error, |items| page_ok(items, page, total))
 }
 
 fn map_destination_row(
@@ -2574,8 +2525,14 @@ async fn geo_summary(
             .map(|rows| aggregate_geo_values(&inner, rows, query.lang.as_deref()))
             .map_or_else(storage_error, api_ok);
     }
-    aggregate_geo_traffic(&inner, query.from, query.to, query.lang.as_deref())
-        .map_or_else(storage_error, api_ok)
+    aggregate_geo_traffic(
+        &inner,
+        &state.destination_traffic,
+        query.from,
+        query.to,
+        query.lang.as_deref(),
+    )
+    .map_or_else(storage_error, api_ok)
 }
 
 async fn insights(
@@ -2615,37 +2572,18 @@ async fn insights(
 
 fn aggregate_geo_traffic(
     inner: &crate::QueryContext<'_>,
+    cache: &destination_cache::DestinationTrafficCache,
     from: Option<u64>,
     to: Option<u64>,
     lang: Option<&str>,
-) -> rusqlite::Result<Value> {
-    let (sql, params_vec): (&str, Vec<SqlValue>) = match (from, to) {
-        (Some(from), Some(to)) => (
-            "SELECT remote_ip, SUM(upload_bytes + download_bytes)
-             FROM traffic_scope_minute
-             WHERE scope = ?1 AND timestamp >= ?2 AND timestamp < ?3
-             GROUP BY remote_ip",
-            vec![
-                SqlValue::Integer(netqmon_protocol::v1::FlowScope::Internet as i64),
-                SqlValue::Integer(to_i64(from)),
-                SqlValue::Integer(to_i64(to)),
-            ],
-        ),
-        _ => (
-            "SELECT remote_ip, SUM(upload_bytes + download_bytes)
-             FROM traffic_scope_minute WHERE scope = ?1 GROUP BY remote_ip",
-            vec![SqlValue::Integer(
-                netqmon_protocol::v1::FlowScope::Internet as i64,
-            )],
-        ),
-    };
-    let mut statement = inner.storage.connection().prepare(sql)?;
-    let rows = statement
-        .query_map(rusqlite::params_from_iter(params_vec), |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(aggregate_geo_values(inner, rows, lang))
+) -> Result<Value, Arc<rusqlite::Error>> {
+    let rows = cache.get(inner.storage.connection(), from, to)?;
+    Ok(aggregate_geo_values(
+        inner,
+        rows.iter()
+            .map(|row| (row.address.clone(), row.upload_bytes + row.download_bytes)),
+        lang,
+    ))
 }
 
 fn aggregate_geo_values(

@@ -21,7 +21,7 @@ const PROTOCOL_ONLY_APPLICATION_MIGRATION: &str =
     include_str!("../../../migrations/sqlite/0004_protocol_only_app_rollup.sql");
 const PROTOCOL_APPLICATION_ROLLUP_MIGRATION: &str =
     include_str!("../../../migrations/sqlite/0005_protocol_application_rollup.sql");
-const MIGRATIONS: [(i64, &str); 10] = [
+const MIGRATIONS: [(i64, &str); 11] = [
     (1, INITIAL_MIGRATION),
     (2, PROTOCOL_MIGRATION),
     (3, SCOPE_TIMESTAMP_MIGRATION),
@@ -46,6 +46,10 @@ const MIGRATIONS: [(i64, &str); 10] = [
     (
         10,
         include_str!("../../../migrations/sqlite/0010_scope_query_covering.sql"),
+    ),
+    (
+        11,
+        include_str!("../../../migrations/sqlite/0011_scope_totals.sql"),
     ),
 ];
 const SAME_DEVICE_DNS_QUERY: &str =
@@ -999,6 +1003,15 @@ impl SqliteStorage {
             &transaction,
             "ingest_batches",
             "received_at",
+            now,
+            policy.minute_days,
+        )?;
+        // Scope data has minute resolution only and is not in DIMENSIONS.
+        // Its chart totals are removed by the same transaction's delete trigger.
+        delete_older_than(
+            &transaction,
+            "traffic_scope_minute",
+            "timestamp",
             now,
             policy.minute_days,
         )?;
