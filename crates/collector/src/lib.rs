@@ -1960,6 +1960,10 @@ fn internal_router(state: CollectorState) -> Router {
 struct RealtimeStreamQuery {
     #[serde(default)]
     status_only: bool,
+    #[serde(default)]
+    summary: bool,
+    #[serde(default)]
+    clients: bool,
 }
 
 async fn realtime_stream(
@@ -1972,6 +1976,7 @@ async fn realtime_stream(
         (Some(initial), receiver),
         move |(mut initial, mut receiver)| async move {
             loop {
+                let include_history = initial.is_some();
                 let event = if let Some(initial) = initial.take() {
                     initial
                 } else {
@@ -1988,6 +1993,8 @@ async fn realtime_stream(
                         continue;
                     };
                     payload
+                } else if query.summary {
+                    event.summary_json(include_history, query.clients)
                 } else {
                     event.json()
                 }

@@ -134,6 +134,46 @@ pub(crate) struct RealtimeSnapshot {
     pub(crate) gateway_health: Option<GatewayHealthSnapshot>,
 }
 
+impl RealtimeSnapshot {
+    pub(crate) fn client_summary(&self, include_history: bool) -> serde_json::Value {
+        let mut counts: HashMap<&str, HashMap<&str, usize>> = HashMap::new();
+        for flow in &self.active_flows {
+            let scopes = counts.entry(&flow.client_ip).or_default();
+            *scopes.entry(&flow.scope).or_default() += 1;
+            *scopes.entry("all").or_default() += 1;
+        }
+        let mut summary = self.summary(include_history);
+        summary["clients"] = serde_json::json!(self.clients);
+        summary["client_scopes"] = serde_json::json!(self.client_scopes);
+        summary["active_flow_counts"] = serde_json::json!(counts);
+        summary
+    }
+
+    /// Overview metrics do not need the full flow list or per-application maps.
+    /// Reconnects receive history; subsequent events carry just the newest point.
+    pub(crate) fn summary(&self, include_history: bool) -> serde_json::Value {
+        let history = if include_history {
+            self.history.as_slice()
+        } else {
+            &self.history[self.history.len().saturating_sub(1)..]
+        };
+        serde_json::json!({
+            "generated_at": self.generated_at,
+            "total": self.total,
+            "internet": self.internet,
+            "internal": self.internal,
+            "tunnel": self.tunnel,
+            "unknown": self.unknown,
+            "active_client_count": self.clients.len(),
+            "active_internet_flow_count": self.active_flows.iter()
+                .filter(|flow| flow.scope == "internet").count(),
+            "history": history,
+            "history_complete": include_history,
+            "gateway_health": self.gateway_health,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct GatewayStatusEvent {
     pub(crate) gateway_id: String,
@@ -167,6 +207,20 @@ pub(crate) enum RealtimeEvent {
 }
 
 impl RealtimeEvent {
+    pub(crate) fn summary_json(
+        &self,
+        include_history: bool,
+        clients: bool,
+    ) -> serde_json::Result<String> {
+        match self {
+            Self::Snapshot(value) if clients => {
+                serde_json::to_string(&value.client_summary(include_history))
+            }
+            Self::Snapshot(value) => serde_json::to_string(&value.summary(include_history)),
+            _ => self.json(),
+        }
+    }
+
     pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::Snapshot(_) => "snapshot",

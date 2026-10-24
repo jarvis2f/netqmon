@@ -98,7 +98,11 @@ interface RealtimeSnapshot {
   generated_at: number;
   clients: Record<string, Throughput>;
   client_scopes?: Record<string, ScopedThroughput>;
-  active_flows: RealtimeFlow[];
+  active_flows?: RealtimeFlow[];
+  active_flow_counts?: Record<
+    string,
+    Partial<Record<Scope | "unknown", number>>
+  >;
 }
 interface DetailData {
   detail: ClientDetailPayload;
@@ -265,12 +269,18 @@ export function ClientDetailDashboard({
       const addresses = new Set(
         data.detail.addresses.map((address) => address.ip),
       );
-      const matchingFlows = snapshot.active_flows.filter(
-        (flow) =>
-          addresses.has(flow.client_ip) &&
-          (scope === "all" || flow.scope === scope),
-      );
-      setActiveFlows(matchingFlows.length);
+      const count = snapshot.active_flow_counts
+        ? Array.from(addresses).reduce(
+            (total, address) =>
+              total + (snapshot.active_flow_counts?.[address]?.[scope] ?? 0),
+            0,
+          )
+        : (snapshot.active_flows?.filter(
+            (flow) =>
+              addresses.has(flow.client_ip) &&
+              (scope === "all" || flow.scope === scope),
+          ).length ?? 0);
+      setActiveFlows(count);
       const hasTraffic =
         (clientTraffic?.upload_bytes_per_second ?? 0) > 0 ||
         (clientTraffic?.download_bytes_per_second ?? 0) > 0;
@@ -295,17 +305,20 @@ export function ClientDetailDashboard({
 
   useEffect(() => {
     if (!data) return;
-    return subscribeVisibleEventSource("/api/realtime", (events) => {
-      events.onopen = () => setStreamConnected(true);
-      events.addEventListener("snapshot", (event) => {
-        try {
-          applySnapshot(JSON.parse(event.data) as RealtimeSnapshot);
-        } catch {
-          setStreamConnected(false);
-        }
-      });
-      events.onerror = () => setStreamConnected(false);
-    });
+    return subscribeVisibleEventSource(
+      "/api/realtime?summary=true&clients=true",
+      (events) => {
+        events.onopen = () => setStreamConnected(true);
+        events.addEventListener("snapshot", (event) => {
+          try {
+            applySnapshot(JSON.parse(event.data) as RealtimeSnapshot);
+          } catch {
+            setStreamConnected(false);
+          }
+        });
+        events.onerror = () => setStreamConnected(false);
+      },
+    );
   }, [applySnapshot, data]);
 
   const client = data?.detail.client;

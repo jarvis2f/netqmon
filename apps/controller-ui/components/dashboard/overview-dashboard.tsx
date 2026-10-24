@@ -45,9 +45,12 @@ interface RealtimeSnapshot {
   internal: Throughput;
   tunnel: Throughput;
   unknown: Throughput;
-  clients: Record<string, Throughput>;
-  applications: Record<string, Throughput>;
-  active_flows: Array<{ scope?: string }>;
+  clients?: Record<string, Throughput>;
+  applications?: Record<string, Throughput>;
+  active_flows?: Array<{ scope?: string }>;
+  active_client_count?: number;
+  active_internet_flow_count?: number;
+  history_complete?: boolean;
   history: RealtimePoint[];
   gateway_health?: {
     observed_at: number;
@@ -77,6 +80,8 @@ interface ApiEnvelope<T> {
   schema_version: number;
   data: T;
 }
+
+type RankingResource = "applications" | "clients" | "destinations";
 
 interface SummaryItem {
   application_id?: string;
@@ -130,6 +135,14 @@ export function OverviewDashboard({ username }: { username: string }) {
   const [topClients, setTopClients] = useState<RankItem[]>([]);
   const [topDestinations, setTopDestinations] = useState<RankItem[]>([]);
   const [categories, setCategories] = useState<CategoryItem[]>([]);
+  const [rankLoading, setRankLoading] = useState({
+    applications: true,
+    clients: true,
+    destinations: true,
+  });
+  const [rankErrors, setRankErrors] = useState<
+    Partial<Record<RankingResource, string>>
+  >({});
   const [gateway, setGateway] = useState<GatewayHealthData | null>(null);
   const mounted = useRef(true);
 
@@ -234,9 +247,25 @@ export function OverviewDashboard({ username }: { username: string }) {
 
   const applySnapshot = useCallback(
     (next: RealtimeSnapshot) => {
-      setSnapshot({
-        ...next,
-        history: next.history.slice(-MAX_REALTIME_POINTS),
+      setSnapshot((current) => {
+        if (next.generated_at < current.generated_at) return current;
+        const history =
+          next.history_complete === false
+            ? [
+                ...new Map(
+                  [...current.history, ...next.history].map((point) => [
+                    point.timestamp,
+                    point,
+                  ]),
+                ).values(),
+              ]
+            : [...next.history];
+        return {
+          ...next,
+          history: history
+            .sort((a, b) => a.timestamp - b.timestamp)
+            .slice(-MAX_REALTIME_POINTS),
+        };
       });
       if (next.generated_at) {
         setGateway((current) => {
@@ -326,96 +355,82 @@ export function OverviewDashboard({ username }: { username: string }) {
     mounted.current = true;
     const controller = new AbortController();
 
+    const active = () => mounted.current && !controller.signal.aborted;
     async function loadOverview() {
       try {
-        const destinationTo = Date.now();
-        const destinationFrom = destinationTo - 24 * 60 * 60 * 1_000;
-        const destinationParams = new URLSearchParams({
-          limit: "5",
-          from: String(destinationFrom),
-          to: String(destinationTo),
-          lang: locale,
+        const response = await fetch("/api/overview?summary=true", {
+          signal: controller.signal,
         });
-        const summaryParams = new URLSearchParams({
-          limit: "5",
-          from: String(destinationFrom),
-          to: String(destinationTo),
-        });
-        const [overviewRes, appsRes, clientsRes, destsRes] = await Promise.all([
-          fetch("/api/overview", { signal: controller.signal }),
-          fetch(`/api/applications?${summaryParams.toString()}`, {
-            signal: controller.signal,
-          }),
-          fetch(`/api/clients?${summaryParams.toString()}`, {
-            signal: controller.signal,
-          }),
-          fetch(`/api/destinations?${destinationParams.toString()}`, {
-            signal: controller.signal,
-          }),
-        ]);
-
-        if (overviewRes.ok) {
-          const payload =
-            (await overviewRes.json()) as ApiEnvelope<OverviewData>;
-          if (mounted.current && payload.data) {
-            setGateway(payload.data.gateway);
-            const rawStatus = payload.data.gateway_status;
-            const finalStatus: "online" | "offline" | "degraded" =
-              rawStatus === "online" || rawStatus === "degraded"
-                ? rawStatus
-                : "offline";
-            setGatewayStatus(finalStatus);
-            applySnapshot(payload.data.realtime);
-            setDeviceCount(payload.data.device_count);
-          }
-        }
-
-        if (appsRes.ok) {
-          const payload = (await appsRes.json()) as ApiEnvelope<
-            { items?: SummaryItem[] } | SummaryItem[]
-          >;
-          const items = Array.isArray(payload.data)
-            ? payload.data
-            : (payload.data?.items ?? []);
-          if (mounted.current) {
-            setTopApplications(rankItems(items, "application"));
-            setCategories(categoryItems(items));
-          }
-        }
-
-        if (clientsRes.ok) {
-          const payload = (await clientsRes.json()) as ApiEnvelope<
-            { items?: SummaryItem[] } | SummaryItem[]
-          >;
-          const items = Array.isArray(payload.data)
-            ? payload.data
-            : (payload.data?.items ?? []);
-          if (mounted.current) setTopClients(rankItems(items, "client"));
-        }
-
-        if (destsRes.ok) {
-          const payload = (await destsRes.json()) as ApiEnvelope<
-            { items?: SummaryItem[] } | SummaryItem[]
-          >;
-          const items = Array.isArray(payload.data)
-            ? payload.data
-            : (payload.data?.items ?? []);
-          if (mounted.current)
-            setTopDestinations(rankItems(items, "destination"));
+        if (!response.ok) throw new Error("Overview request failed");
+        const payload = (await response.json()) as ApiEnvelope<OverviewData>;
+        if (active() && payload.data) {
+          setGateway(payload.data.gateway);
+          const status = payload.data.gateway_status;
+          setGatewayStatus(
+            status === "online" || status === "degraded" ? status : "offline",
+          );
+          applySnapshot(payload.data.realtime);
+          setDeviceCount(payload.data.device_count);
         }
       } catch (err) {
-        if ((err as Error).name !== "AbortError" && mounted.current) {
+        if ((err as Error).name !== "AbortError" && active()) {
           setError(t("loadError"));
-          setGatewayStatus("offline");
         }
       } finally {
-        if (mounted.current) setLoading(false);
+        if (active()) setLoading(false);
+      }
+    }
+
+    const to = Date.now();
+    const summaryParams = new URLSearchParams({
+      limit: "5",
+      from: String(to - 24 * 60 * 60 * 1_000),
+      to: String(to),
+    });
+    async function loadRank(resource: RankingResource) {
+      setRankLoading((current) => ({ ...current, [resource]: true }));
+      setRankErrors((current) => ({ ...current, [resource]: undefined }));
+      try {
+        const params = new URLSearchParams(summaryParams);
+        if (resource === "destinations") params.set("lang", locale);
+        const response = await fetch(`/api/${resource}?${params}`, {
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error("Summary request failed");
+        const payload = (await response.json()) as ApiEnvelope<
+          { items?: SummaryItem[] } | SummaryItem[]
+        >;
+        const items = Array.isArray(payload.data)
+          ? payload.data
+          : (payload.data?.items ?? []);
+        if (!active()) return;
+        if (resource === "applications") {
+          setTopApplications(rankItems(items, "application"));
+          setCategories(categoryItems(items));
+        } else if (resource === "clients") {
+          setTopClients(rankItems(items, "client"));
+        } else {
+          setTopDestinations(rankItems(items, "destination"));
+        }
+      } catch (err) {
+        if ((err as Error).name !== "AbortError" && active()) {
+          setRankErrors((current) => ({
+            ...current,
+            [resource]: t("loadError"),
+          }));
+        }
+      } finally {
+        if (active())
+          setRankLoading((current) => ({ ...current, [resource]: false }));
       }
     }
 
     void loadOverview();
+    void loadRank("applications");
+    void loadRank("clients");
+    void loadRank("destinations");
     const stopRealtime = subscribeVisibleEventSource(
-      "/api/realtime",
+      "/api/realtime?summary=true",
       (events) => {
         events.onopen = () => {
           if (!mounted.current) return;
@@ -487,9 +502,10 @@ export function OverviewDashboard({ username }: { username: string }) {
     snapshot.internet.upload_bytes_per_second,
     dataAvailable,
   );
-  const activeInternetFlows = snapshot.active_flows.filter(
-    (flow) => flow.scope === "internet",
-  ).length;
+  const activeInternetFlows =
+    snapshot.active_internet_flow_count ??
+    snapshot.active_flows?.filter((flow) => flow.scope === "internet").length ??
+    0;
   const trafficData: TrafficDataPoint[] = snapshot.history.map((point) => ({
     timestamp: point.timestamp,
     downloadBps: point.download_bytes_per_second * 8,
@@ -531,7 +547,10 @@ export function OverviewDashboard({ username }: { username: string }) {
           label={t("onlineClients")}
           value={
             dataAvailable
-              ? Object.keys(snapshot.clients).length.toLocaleString()
+              ? (
+                  snapshot.active_client_count ??
+                  Object.keys(snapshot.clients ?? {}).length
+                ).toLocaleString()
               : "—"
           }
           icon={Users}
@@ -562,7 +581,8 @@ export function OverviewDashboard({ username }: { username: string }) {
         <CategoryDistribution
           variant="category"
           items={categories}
-          loading={loading}
+          loading={rankLoading.applications}
+          emptyMessage={rankErrors.applications}
           className="min-w-0 xl:min-h-[364px]"
         />
       </div>
@@ -571,7 +591,8 @@ export function OverviewDashboard({ username }: { username: string }) {
         <RankList
           title={recentRankingTitle(t("topApplications"))}
           items={topApplications}
-          loading={loading}
+          loading={rankLoading.applications}
+          emptyMessage={rankErrors.applications}
           viewAllHref="/applications"
           onItemClick={(item) =>
             router.push(`/applications?id=${encodeURIComponent(item.id)}`)
@@ -580,7 +601,8 @@ export function OverviewDashboard({ username }: { username: string }) {
         <RankList
           title={recentRankingTitle(t("topClients"))}
           items={topClients}
-          loading={loading}
+          loading={rankLoading.clients}
+          emptyMessage={rankErrors.clients}
           viewAllHref="/clients"
           onItemClick={(item) =>
             router.push(`/clients?id=${encodeURIComponent(item.id)}`)
@@ -589,7 +611,8 @@ export function OverviewDashboard({ username }: { username: string }) {
         <RankList
           title={recentRankingTitle(t("topDestinations"))}
           items={topDestinations}
-          loading={loading}
+          loading={rankLoading.destinations}
+          emptyMessage={rankErrors.destinations}
           viewAllHref="/destinations"
           onItemClick={(item) =>
             router.push(`/destinations?id=${encodeURIComponent(item.id)}`)

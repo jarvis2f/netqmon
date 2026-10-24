@@ -103,6 +103,72 @@ fn status_snapshots_stay_small_with_10000_active_flows() {
     assert!(warning.status_json().is_none());
 }
 
+#[test]
+fn overview_summary_omits_flows_and_sends_history_only_on_connect() {
+    let mut engine = RealtimeEngine::default();
+    let mut input = batch(1, FlowLifecycle::Active);
+    let prototype = input.flows[0].clone();
+    input.flows = (0..10_000)
+        .map(|index| {
+            let mut flow = prototype.clone();
+            flow.remote_port = 1_000 + index;
+            flow
+        })
+        .collect();
+    engine.update(&input, &[], 2_000, 2_000);
+    input.sequence = 2;
+    engine.update(&input, &[], 3_000, 3_000);
+    let snapshot = engine.snapshot();
+    let initial = snapshot.summary(true);
+    let update = snapshot.summary(false);
+    assert!(initial.get("active_flows").is_none());
+    assert!(initial.get("clients").is_none());
+    assert!(initial.get("applications").is_none());
+    assert_eq!(initial["active_client_count"], snapshot.clients.len());
+    assert_eq!(
+        initial["active_internet_flow_count"],
+        snapshot
+            .active_flows
+            .iter()
+            .filter(|flow| flow.scope == "internet")
+            .count()
+    );
+    assert_eq!(initial["history"].as_array().unwrap().len(), 2);
+    assert_eq!(update["history"].as_array().unwrap().len(), 1);
+    assert_eq!(update["history"][0]["timestamp"], 3_000);
+    assert_eq!(update["history_complete"], false);
+    let bytes = serde_json::to_vec(&update).unwrap().len();
+    eprintln!("overview summary with 10000 flows: {bytes} bytes");
+    assert!(bytes < 4096);
+}
+
+#[test]
+fn client_summary_counts_each_address_and_scope_without_flow_details() {
+    let mut engine = RealtimeEngine::default();
+    let mut input = batch(1, FlowLifecycle::Active);
+    input.flows[0].scope = WireFlowScope::Internet as i32;
+    let mut second = input.flows[0].clone();
+    second.remote_port += 1;
+    second.scope = WireFlowScope::Internal as i32;
+    input.flows.push(second);
+    engine.update(&input, &[], 2_000, 2_000);
+    let snapshot = engine.snapshot();
+    let summary = snapshot.client_summary(false);
+    let ip = snapshot.active_flows[0].client_ip.as_str();
+    assert_eq!(summary["active_flow_counts"][ip]["internet"], 1);
+    assert_eq!(summary["active_flow_counts"][ip]["internal"], 1);
+    assert_eq!(summary["active_flow_counts"][ip]["all"], 2);
+    assert_eq!(
+        summary["clients"],
+        serde_json::to_value(&snapshot.clients).unwrap()
+    );
+    assert_eq!(
+        summary["client_scopes"],
+        serde_json::to_value(&snapshot.client_scopes).unwrap()
+    );
+    assert!(summary.get("active_flows").is_none());
+}
+
 fn batch(sequence: u64, lifecycle: FlowLifecycle) -> TelemetryBatch {
     TelemetryBatch {
         gateway_id: "gateway-1".to_owned(),

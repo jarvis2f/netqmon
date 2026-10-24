@@ -383,6 +383,40 @@ function flowRows(now) {
   }));
 }
 
+function overviewSnapshot(
+  snapshot,
+  includeHistory = true,
+  includeClients = false,
+) {
+  const summary = {
+    generated_at: snapshot.generated_at,
+    total: snapshot.total,
+    internet: snapshot.internet,
+    internal: snapshot.internal,
+    tunnel: snapshot.tunnel,
+    unknown: snapshot.unknown,
+    active_client_count: Object.keys(snapshot.clients).length,
+    active_internet_flow_count: snapshot.active_flows.filter(
+      (flow) => flow.scope === "internet",
+    ).length,
+    history: includeHistory ? snapshot.history : snapshot.history.slice(-1),
+    history_complete: includeHistory,
+    gateway_health: snapshot.gateway_health,
+  };
+  if (includeClients) {
+    summary.clients = snapshot.clients;
+    summary.client_scopes = snapshot.client_scopes;
+    summary.active_flow_counts = {};
+    for (const flow of snapshot.active_flows) {
+      const scopes = (summary.active_flow_counts[flow.client_ip] ??= {});
+      const scope = flow.scope ?? "unknown";
+      scopes[scope] = (scopes[scope] ?? 0) + 1;
+      scopes.all = (scopes.all ?? 0) + 1;
+    }
+  }
+  return summary;
+}
+
 function realtimeSnapshot(now, scenario) {
   const offline = scenario === "offline";
   const hfo = scenario === "hfo";
@@ -792,6 +826,8 @@ function handleInternal(request, response, pathname, params, state) {
   }
   if (path === "realtime/stream" && request.method === "GET") {
     const statusOnly = params.get("status_only") === "true";
+    const summary = params.get("summary") === "true";
+    let initial = true;
     const writeSnapshot = () => {
       const snapshot = realtimeSnapshot(Date.now(), state.scenario);
       writeSse(
@@ -804,8 +840,15 @@ function handleInternal(request, response, pathname, params, state) {
                 observed_at: snapshot.gateway_health.observed_at,
               },
             }
-          : snapshot,
+          : summary
+            ? overviewSnapshot(
+                snapshot,
+                initial,
+                params.get("clients") === "true",
+              )
+            : snapshot,
       );
+      initial = false;
     };
     response.writeHead(200, {
       "content-type": "text/event-stream",
@@ -841,7 +884,10 @@ function handleInternal(request, response, pathname, params, state) {
       200,
       envelope({
         gateway_status: scenario === "offline" ? "offline" : "online",
-        realtime: realtimeSnapshot(now, scenario),
+        realtime:
+          params.get("summary") === "true"
+            ? overviewSnapshot(realtimeSnapshot(now, scenario))
+            : realtimeSnapshot(now, scenario),
         device_count: clientRows(now, scenario).length,
         gateway: gateway(now, scenario),
       }),

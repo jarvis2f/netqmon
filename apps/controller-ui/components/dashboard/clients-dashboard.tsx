@@ -42,7 +42,8 @@ interface RealtimeSnapshot {
   total: ThroughputRate;
   internet: ThroughputRate;
   clients: Record<string, ThroughputRate>;
-  active_flows: Array<{ scope?: string }>;
+  active_flows?: Array<{ scope?: string }>;
+  active_internet_flow_count?: number;
   gateway_health?: { topology?: TopologySummary | null } | null;
 }
 
@@ -144,7 +145,7 @@ export function ClientsDashboard({
             cache: "no-store",
             signal: controller.signal,
           }),
-          fetch("/api/overview", {
+          fetch("/api/overview?summary=true", {
             cache: "no-store",
             signal: controller.signal,
           }).catch(() => null),
@@ -192,8 +193,10 @@ export function ClientsDashboard({
       },
     );
     setActiveFlowCount(
-      snapshot.active_flows?.filter((flow) => flow.scope === "internet")
-        .length || 0,
+      snapshot.active_internet_flow_count ??
+        snapshot.active_flows?.filter((flow) => flow.scope === "internet")
+          .length ??
+        0,
     );
     setRealtimeRates(snapshot.clients ?? {});
     setTopology(snapshot.gateway_health?.topology ?? null);
@@ -220,38 +223,42 @@ export function ClientsDashboard({
   }, []);
 
   useEffect(() => {
-    return subscribeVisibleEventSource("/api/realtime", (events) => {
-      events.onopen = () => setStreamConnected(true);
-      events.addEventListener("snapshot", (event) => {
-        try {
-          applySnapshot(JSON.parse(event.data) as RealtimeSnapshot);
-        } catch {
-          // Ignore decode issues
-        }
-      });
-      events.addEventListener("device_seen", (event) => {
-        try {
-          const seen = JSON.parse(event.data) as DeviceSeenEvent;
-          const observedAt = seen.observed_at;
-          if (!seen.mac || typeof observedAt !== "number") return;
-          const mac = seen.mac.toLowerCase();
-          setItems((current) =>
-            current.map((client) =>
-              client.mac.toLowerCase() === mac && observedAt > client.last_seen
-                ? {
-                    ...client,
-                    ip: client.ip || seen.ip || null,
-                    last_seen: observedAt,
-                  }
-                : client,
-            ),
-          );
-        } catch {
-          // Ignore decode issues
-        }
-      });
-      events.onerror = () => setStreamConnected(false);
-    });
+    return subscribeVisibleEventSource(
+      "/api/realtime?summary=true&clients=true",
+      (events) => {
+        events.onopen = () => setStreamConnected(true);
+        events.addEventListener("snapshot", (event) => {
+          try {
+            applySnapshot(JSON.parse(event.data) as RealtimeSnapshot);
+          } catch {
+            // Ignore decode issues
+          }
+        });
+        events.addEventListener("device_seen", (event) => {
+          try {
+            const seen = JSON.parse(event.data) as DeviceSeenEvent;
+            const observedAt = seen.observed_at;
+            if (!seen.mac || typeof observedAt !== "number") return;
+            const mac = seen.mac.toLowerCase();
+            setItems((current) =>
+              current.map((client) =>
+                client.mac.toLowerCase() === mac &&
+                observedAt > client.last_seen
+                  ? {
+                      ...client,
+                      ip: client.ip || seen.ip || null,
+                      last_seen: observedAt,
+                    }
+                  : client,
+              ),
+            );
+          } catch {
+            // Ignore decode issues
+          }
+        });
+        events.onerror = () => setStreamConnected(false);
+      },
+    );
   }, [applySnapshot]);
 
   useEffect(() => {

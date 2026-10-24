@@ -1,6 +1,47 @@
 import { expect, test } from "@playwright/test";
 import { login, setCollectorScenario } from "./support/session";
 
+test("loads overview and applications while destinations is still pending", async ({
+  page,
+  request,
+}) => {
+  await setCollectorScenario(request, "live");
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route("**/api/destinations?**", async (route) => {
+    await pending;
+    await route.continue();
+  });
+  try {
+    await login(page);
+    await expect(page.getByText("youtube").first()).toBeVisible();
+    await expect(
+      page.getByLabel("Gateway Health").getByText("Online", { exact: true }),
+    ).toBeVisible();
+    await expect(page.getByText("chatgpt.com", { exact: true })).toHaveCount(0);
+  } finally {
+    release();
+  }
+  await expect(page.getByText("chatgpt.com", { exact: true })).toBeVisible();
+});
+
+test("a destinations failure leaves overview and applications available", async ({
+  page,
+  request,
+}) => {
+  await setCollectorScenario(request, "live");
+  await page.route("**/api/destinations?**", (route) =>
+    route.fulfill({ status: 503, json: { error: "unavailable" } }),
+  );
+  await login(page);
+  await expect(page.getByText("youtube").first()).toBeVisible();
+  await expect(
+    page.getByLabel("Gateway Health").getByText("Online", { exact: true }),
+  ).toBeVisible();
+});
+
 test("renders live overview metrics and links to ranked applications", async ({
   page,
   request,

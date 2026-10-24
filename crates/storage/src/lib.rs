@@ -21,7 +21,7 @@ const PROTOCOL_ONLY_APPLICATION_MIGRATION: &str =
     include_str!("../../../migrations/sqlite/0004_protocol_only_app_rollup.sql");
 const PROTOCOL_APPLICATION_ROLLUP_MIGRATION: &str =
     include_str!("../../../migrations/sqlite/0005_protocol_application_rollup.sql");
-const MIGRATIONS: [(i64, &str); 9] = [
+const MIGRATIONS: [(i64, &str); 10] = [
     (1, INITIAL_MIGRATION),
     (2, PROTOCOL_MIGRATION),
     (3, SCOPE_TIMESTAMP_MIGRATION),
@@ -42,6 +42,10 @@ const MIGRATIONS: [(i64, &str); 9] = [
     (
         9,
         include_str!("../../../migrations/sqlite/0009_incremental_rollups.sql"),
+    ),
+    (
+        10,
+        include_str!("../../../migrations/sqlite/0010_scope_query_covering.sql"),
     ),
 ];
 const SAME_DEVICE_DNS_QUERY: &str =

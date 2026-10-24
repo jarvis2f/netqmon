@@ -46,6 +46,10 @@ In a standard deployment (such as via `docker-compose.yml`), the Controller cont
 | `NETQMON_CLICKHOUSE_USER` | `default` | ClickHouse authentication username (optional). |
 | `NETQMON_CLICKHOUSE_PASSWORD` | *(empty)* | ClickHouse authentication password (optional). |
 
+SQLite upgrades automatically replace the scope/time index with an index that covers destination distinct counts without indexing mutable traffic counters. Building this index takes additional startup time and disk space proportional to retained minute data; existing traffic records are preserved.
+
+Read APIs execute on a bounded blocking pool (at most four concurrent queries), while gateway status remains independent of that queue. Insights responses are cached for 10 seconds per exact request URI; concurrent identical requests share a computation, and failed responses are not cached. The UI requests compact realtime summaries with connection counts, while the existing full snapshot API remains available.
+
 ### 2.3 Network Listeners & Service Bindings
 
 | Variable | Default | Description |

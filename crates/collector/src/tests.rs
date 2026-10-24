@@ -1177,6 +1177,74 @@ async fn realtime_sse_sends_initial_snapshot_after_every_reconnect() {
 }
 
 #[tokio::test]
+async fn overview_summary_uses_counts_and_sse_reconnects_restore_history() {
+    let state = query_state();
+    let router = internal_router(state.clone());
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/internal/overview?summary=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let value = parse_json(response).await;
+    assert!(value["data"]["realtime"].get("active_flows").is_none());
+    assert_eq!(
+        value["data"]["realtime"]["active_client_count"],
+        state.realtime_snapshot().clients.len()
+    );
+    for _ in 0..2 {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/realtime/stream?summary=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut stream = response.into_body().into_data_stream();
+        let first = stream.next().await.unwrap().unwrap();
+        let text = String::from_utf8_lossy(&first);
+        let data = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert!(snapshot.get("active_flows").is_none());
+        assert_eq!(snapshot["history_complete"], true);
+        assert_eq!(
+            snapshot["history"].as_array().unwrap().len(),
+            state.realtime_snapshot().history.len()
+        );
+        state.lock().realtime.update(
+            &sample_batch("test-gateway", 99),
+            &[],
+            1700000100000,
+            1700000100000,
+        );
+        let next = stream.next().await.unwrap().unwrap();
+        let text = String::from_utf8_lossy(&next);
+        // Updates may first announce gateway/device events. Find the snapshot.
+        let mut text = text.into_owned();
+        while !text.contains("event: snapshot") {
+            text = String::from_utf8_lossy(&stream.next().await.unwrap().unwrap()).into_owned();
+        }
+        let data = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        let update: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert_eq!(update["history_complete"], false);
+        assert_eq!(update["history"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
 async fn realtime_sse_status_only_omits_traffic_and_preserves_gateway_events() {
     let state = query_state();
     let router = internal_router(state.clone());
@@ -2390,6 +2458,58 @@ async fn destinations_include_identity_traffic_clients_and_geo_placeholders() {
     assert!(destination.get("country_code").is_some());
     assert!(destination.get("asn").is_some());
     assert!(destination.get("organization").is_some());
+}
+
+#[tokio::test]
+async fn traffic_totals_reuse_chart_scan_without_losing_last_seen_or_empty_results() {
+    let state = query_state();
+    let expected_last_seen: i64 = state
+        .query()
+        .storage
+        .connection()
+        .query_row(
+            "SELECT MAX(timestamp) FROM traffic_scope_minute",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let router = internal_router(state);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/internal/traffic?from=1699913600000&to=1700000061000&scope=all")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let value = parse_json(response).await;
+    assert_eq!(
+        value["data"]["breakdown"][0]["last_seen"],
+        expected_last_seen
+    );
+    let points = value["data"]["points"].as_array().unwrap();
+    for metric in ["upload_bytes", "download_bytes", "packets", "flow_count"] {
+        let total: i64 = points
+            .iter()
+            .map(|point| point[metric].as_i64().unwrap())
+            .sum();
+        assert_eq!(value["data"]["breakdown"][0][metric], total);
+    }
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/internal/traffic?from=0&to=1&scope=all")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let value = parse_json(response).await;
+    assert!(value["data"]["points"].as_array().unwrap().is_empty());
+    assert_eq!(value["data"]["breakdown"][0]["upload_bytes"], 0);
+    assert!(value["data"]["breakdown"][0]["last_seen"].is_null());
 }
 
 #[derive(Debug)]

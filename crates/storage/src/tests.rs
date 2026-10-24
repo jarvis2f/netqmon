@@ -8,6 +8,67 @@ use super::*;
 
 const NOW: u64 = 1_700_000_000_000;
 
+#[test]
+fn destination_counts_use_the_covering_index() {
+    let storage = setup();
+    for sql in [
+        "SELECT COUNT(DISTINCT hex(remote_ip)) FROM traffic_scope_minute WHERE scope=1 AND timestamp>=0 AND timestamp<2000000000000",
+        "SELECT COUNT(DISTINCT hex(remote_ip)) FROM traffic_scope_minute WHERE scope=1",
+    ] {
+        let mut statement = storage
+            .connection()
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let plan = statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("COVERING INDEX traffic_scope_minute_scope_timestamp")),
+            "{plan:?}"
+        );
+    }
+}
+
+#[test]
+fn covering_index_upgrade_preserves_existing_traffic() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v9.db");
+    let mut storage = open_at(&path, NOW).unwrap();
+    storage
+        .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
+        .unwrap();
+    storage
+        .persist_classified_batch(&batch(1, FlowLifecycle::Ended), &[], &[], NOW)
+        .unwrap();
+    let before = metrics(storage.connection(), "traffic_scope_minute", "1=1");
+    storage
+        .connection()
+        .execute_batch(
+            "DROP INDEX traffic_scope_minute_scope_timestamp;
+         CREATE INDEX traffic_scope_minute_scope_timestamp ON traffic_scope_minute(scope,timestamp);
+         DELETE FROM schema_migrations WHERE version=10;",
+        )
+        .unwrap();
+    drop(storage);
+    let upgraded = open_at(&path, NOW + 1).unwrap();
+    assert_eq!(
+        metrics(upgraded.connection(), "traffic_scope_minute", "1=1"),
+        before
+    );
+    let columns = upgraded
+        .connection()
+        .prepare("PRAGMA index_info(traffic_scope_minute_scope_timestamp)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(2))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(columns, ["scope", "timestamp", "remote_ip"]);
+}
+
 fn open_at(path: &Path, now: u64) -> rusqlite::Result<SqliteStorage> {
     SqliteStorage::from_connection_at(Connection::open(path)?, now)
 }

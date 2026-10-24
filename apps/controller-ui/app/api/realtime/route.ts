@@ -7,10 +7,13 @@ export async function GET(request: Request) {
   if (!(await verifySession()))
     return Response.json({ error: "unauthorized" }, { status: 401 });
   try {
-    const statusOnly =
-      new URL(request.url).searchParams.get("status_only") === "true";
+    const incoming = new URL(request.url).searchParams;
+    const params = new URLSearchParams();
+    for (const key of ["status_only", "summary", "clients"]) {
+      if (incoming.get(key) === "true") params.set(key, "true");
+    }
     const response = await collectorFetch(
-      `internal/realtime/stream${statusOnly ? "?status_only=true" : ""}`,
+      `internal/realtime/stream?${params}`,
       {
         signal: request.signal,
       },

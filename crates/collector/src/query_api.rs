@@ -31,8 +31,10 @@ const DEFAULT_INSIGHT_WINDOW_MS: u64 = DAY_MS;
 const MAX_INSIGHT_WINDOW_MS: u64 = 30 * DAY_MS;
 const PROTOCOL_APPLICATION_PREFIX: &str = "protocol:";
 
+mod execution;
+
 pub(crate) fn router() -> Router<CollectorState> {
-    Router::new()
+    let router = Router::new()
         .route("/internal/overview", get(overview))
         .route("/internal/overview/status", get(overview_status))
         .route("/internal/traffic", get(traffic))
@@ -69,7 +71,8 @@ pub(crate) fn router() -> Router<CollectorState> {
             "/internal/settings/license/activate",
             post(activate_license),
         )
-        .route("/internal/settings/license/check", post(check_license))
+        .route("/internal/settings/license/check", post(check_license));
+    execution::wrap(router)
 }
 
 #[derive(Deserialize)]
@@ -133,6 +136,15 @@ async fn check_license(State(state): State<CollectorState>) -> Response {
 struct PageQuery {
     limit: Option<u32>,
     offset: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OverviewQuery {
+    limit: Option<u32>,
+    offset: Option<u64>,
+    #[serde(default)]
+    summary: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -386,12 +398,26 @@ async fn overview_status(State(state): State<CollectorState>) -> Response {
 #[allow(clippy::too_many_lines)]
 async fn overview(
     State(state): State<CollectorState>,
-    query: Result<Query<PageQuery>, QueryRejection>,
+    query: Result<Query<OverviewQuery>, QueryRejection>,
 ) -> Response {
-    if let Err(response) = Page::parse(query) {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => {
+            return api_error(StatusCode::BAD_REQUEST, "invalid_query", &error.body_text());
+        }
+    };
+    if let Err(response) = Page::from_query(PageQuery {
+        limit: query.limit,
+        offset: query.offset,
+    }) {
         return *response;
     }
     let snapshot = state.realtime_snapshot();
+    let realtime = if query.summary {
+        snapshot.summary(true)
+    } else {
+        serde_json::to_value(&snapshot).unwrap_or(Value::Null)
+    };
     let inner = state.query();
     if let Some(clickhouse) = inner.storage.clickhouse_storage() {
         let now = now_ms();
@@ -448,7 +474,7 @@ async fn overview(
                 json!({
                     "gateway_status": gateway_status,
                     "gateway": value["gateway"].clone(),
-                    "realtime": snapshot,
+                    "realtime": realtime,
                     "last_24_hours": {
                         "upload_bytes": value["traffic_total_upload_bytes_24h"].clone(),
                         "download_bytes": value["traffic_total_download_bytes_24h"].clone(),
@@ -523,7 +549,7 @@ async fn overview(
         Ok(json!({
             "gateway_status": gateway_status,
             "gateway": gateway,
-            "realtime": snapshot,
+            "realtime": realtime,
             "last_24_hours": {
                 "upload_bytes": historical.0,
                 "download_bytes": historical.1,
@@ -684,13 +710,30 @@ fn traffic_breakdown(
         let duration = to.saturating_sub(from);
         let raw_bucket = duration.div_ceil(180);
         let bucket_ms = raw_bucket.max(60_000).div_ceil(60_000) * 60_000;
-        let mut points_statement = connection.prepare(
-            "SELECT (timestamp / ?1) * ?1 AS bucket, SUM(upload_bytes),
-                    SUM(download_bytes), SUM(packets), SUM(flow_count)
+        // The ungrouped breakdown is the same scan as the chart. Window
+        // aggregates retain SQLite's integer overflow and last_seen semantics.
+        let totals_sql = if group_by == "none" {
+            ", SUM(SUM(upload_bytes)) OVER (), SUM(SUM(download_bytes)) OVER (),
+               SUM(SUM(packets)) OVER (), SUM(SUM(flow_count)) OVER (),
+               MAX(MAX(timestamp)) OVER ()"
+        } else {
+            ""
+        };
+        let points_sql = traffic_filter_sql(
+            &format!(
+                "SELECT (timestamp / ?1) * ?1 AS bucket, SUM(upload_bytes),
+                    SUM(download_bytes), SUM(packets), SUM(flow_count){totals_sql}
              FROM traffic_scope_minute WHERE timestamp >= ?2 AND timestamp < ?3
                AND (?4 IS NULL OR scope = ?4) AND (?5 IS NULL OR direction = ?5)
-             GROUP BY bucket ORDER BY bucket",
-        )?;
+             GROUP BY bucket ORDER BY bucket"
+            ),
+            scope,
+            direction,
+            4,
+            5,
+        );
+        let mut totals = None;
+        let mut points_statement = connection.prepare(&points_sql)?;
         let points = points_statement
             .query_map(
                 params![
@@ -701,6 +744,16 @@ fn traffic_breakdown(
                     direction
                 ],
                 |row| {
+                    if group_by == "none" && totals.is_none() {
+                        totals = Some(json!({
+                            "id": "total", "name": "All traffic", "mac": null,
+                            "upload_bytes": row.get::<_, i64>(5)?,
+                            "download_bytes": row.get::<_, i64>(6)?,
+                            "packets": row.get::<_, i64>(7)?,
+                            "flow_count": row.get::<_, i64>(8)?,
+                            "last_seen": row.get::<_, Option<i64>>(9)?,
+                        }));
+                    }
                     Ok(json!({
                         "timestamp": row.get::<_, i64>(0)?,
                         "upload_bytes": row.get::<_, i64>(1)?,
@@ -713,7 +766,7 @@ fn traffic_breakdown(
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let (breakdown_sql, has_limit) = traffic_breakdown_query(group_by);
-        let mut breakdown_statement = connection.prepare(breakdown_sql)?;
+        let breakdown_sql = traffic_filter_sql(breakdown_sql, scope, direction, 3, 4);
         let map_row = |row: &rusqlite::Row<'_>| {
             let mac = row
                 .get::<_, Option<Vec<u8>>>(2)?
@@ -746,6 +799,7 @@ fn traffic_breakdown(
             Ok(value)
         };
         let breakdown = if has_limit {
+            let mut breakdown_statement = connection.prepare(&breakdown_sql)?;
             breakdown_statement
                 .query_map(
                     params![
@@ -760,9 +814,13 @@ fn traffic_breakdown(
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         } else {
-            breakdown_statement
-                .query_map(params![to_i64(from), to_i64(to), scope, direction], map_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?
+            vec![totals.unwrap_or_else(|| {
+                json!({
+                    "id": "total", "name": "All traffic", "mac": null,
+                    "upload_bytes": 0, "download_bytes": 0, "packets": 0,
+                    "flow_count": 0, "last_seen": null,
+                })
+            })]
         };
         Ok(json!({
             "from": from,
@@ -776,6 +834,33 @@ fn traffic_breakdown(
         }))
     })();
     result.map_or_else(storage_error, api_ok)
+}
+
+// Select predicates before preparing SQL so SQLite can use scope/time indexes.
+// Retain numbered parameters for the unfiltered case to keep binding stable.
+fn traffic_filter_sql(
+    sql: &str,
+    scope: Option<i64>,
+    direction: Option<i64>,
+    scope_param: u8,
+    direction_param: u8,
+) -> String {
+    let mut sql = sql.to_owned();
+    for (column, param, value) in [
+        ("scope", scope_param, scope),
+        ("direction", direction_param, direction),
+    ] {
+        for prefix in ["", "t."] {
+            let predicate = format!("(?{param} IS NULL OR {prefix}{column} = ?{param})");
+            let selected = if value.is_some() {
+                format!("{prefix}{column} = ?{param}")
+            } else {
+                format!("?{param} IS NULL")
+            };
+            sql = sql.replace(&predicate, &selected);
+        }
+    }
+    sql
 }
 
 fn traffic_breakdown_query(group_by: &str) -> (&'static str, bool) {

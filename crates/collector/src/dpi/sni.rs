@@ -78,8 +78,14 @@ fn find_client_hello(data: &[u8]) -> Option<String> {
         if body_end > data.len() {
             return None;
         }
-        if data.get(offset + 5) == Some(&TLS_CLIENT_HELLO) {
-            return parse_client_hello(&data[offset + 9..body_end]);
+        let record = data.get(offset + 5..body_end)?;
+        if record.first() == Some(&TLS_CLIENT_HELLO) {
+            // The handshake header is four bytes, even for a short TLS record.
+            let header = record.get(..4)?;
+            let handshake_len = (usize::from(header[1]) << 16)
+                | (usize::from(header[2]) << 8)
+                | usize::from(header[3]);
+            return parse_client_hello(record.get(4..4 + handshake_len)?);
         }
         offset = body_end;
     }
@@ -242,5 +248,25 @@ mod tests {
         assert_eq!(extract_tls_sni(&[packet(&record, false)]), None);
         let invalid = client_hello("not a host");
         assert_eq!(extract_tls_sni(&[packet(&invalid, true)]), None);
+    }
+
+    #[test]
+    fn rejects_short_handshake_records_without_panicking() {
+        for length in 0..4 {
+            let mut record = vec![22, 3, 3, 0, length];
+            record.extend(std::iter::repeat_n(1, usize::from(length)));
+            assert_eq!(extract_tls_sni(&[packet(&record, true)]), None);
+        }
+        let mut record = client_hello("example.com");
+        record[6..9].copy_from_slice(&[0xff, 0xff, 0xff]);
+        assert_eq!(extract_tls_sni(&[packet(&record, true)]), None);
+    }
+
+    #[test]
+    fn rejects_every_truncated_client_hello_without_panicking() {
+        let record = client_hello("example.com");
+        for end in 0..record.len() {
+            assert_eq!(extract_tls_sni(&[packet(&record[..end], true)]), None);
+        }
     }
 }
