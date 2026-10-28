@@ -2,6 +2,11 @@ name: OpenWrt Packages
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing version tag to publish packages to
+        required: false
+        type: string
   push:
     tags:
       - 'v*'
@@ -13,17 +18,25 @@ concurrency:
   group: openwrt-packages-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  RELEASE_TAG: ${{ inputs.release_tag || (startsWith(github.ref, 'refs/tags/v') && github.ref_name) || '' }}
+
 jobs:
   detect-changes:
     name: Check agent and OpenWrt package changes
     runs-on: ubuntu-latest
     outputs:
-      build: ${{ steps.changes.outputs.build }}
+      build: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_tag != '') && 'true' || steps.changes.outputs.build }}
     steps:
       - name: Check out repository and release history
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag || github.ref }}
           fetch-depth: 0
+
+      - name: Validate requested release tag
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        run: git show-ref --verify --quiet "refs/tags/${RELEASE_TAG}"
 
       - name: Detect relevant changes since the previous release in this channel
         id: changes
@@ -46,14 +59,16 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Validate release version
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
         shell: bash
         run: |
           set -euo pipefail
           cargo_version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
-          release_version="${GITHUB_REF_NAME#v}"
+          release_version="${RELEASE_TAG#v}"
           test "${cargo_version}" = "${release_version}" \
             || { echo "Cargo workspace version ${cargo_version} does not match tag ${release_version}" >&2; exit 1; }
 
@@ -96,14 +111,16 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Validate release version
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
         shell: bash
         run: |
           set -euo pipefail
           cargo_version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
-          release_version="${GITHUB_REF_NAME#v}"
+          release_version="${RELEASE_TAG#v}"
           test "${cargo_version}" = "${release_version}" \
             || { echo "Cargo workspace version ${cargo_version} does not match tag ${release_version}" >&2; exit 1; }
 
@@ -130,9 +147,9 @@ jobs:
 
       - name: Smoke test execution via QEMU user
         run: |
-          sudo apt-get update && sudo apt-get install -y qemu-user-static
+          sudo apt-get update && sudo apt-get install -y qemu-user
           expected="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
-          test "$(qemu-arm-static dist/netqmon-agent_armv7hf --version)" = "netqmon-agent ${expected}"
+          test "$(qemu-arm dist/netqmon-agent_armv7hf --version)" = "netqmon-agent ${expected}"
 
       - name: Upload agent binary artifact
         uses: actions/upload-artifact@v4
@@ -150,14 +167,16 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Validate release version
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
         shell: bash
         run: |
           set -euo pipefail
           cargo_version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
-          release_version="${GITHUB_REF_NAME#v}"
+          release_version="${RELEASE_TAG#v}"
           test "${cargo_version}" = "${release_version}" \
             || { echo "Cargo workspace version ${cargo_version} does not match tag ${release_version}" >&2; exit 1; }
 
@@ -187,9 +206,9 @@ jobs:
           readelf -h dist/netqmon-agent_riscv64 | grep -q "RISC-V"
 
           # Smoke test execution via QEMU user
-          sudo apt-get update && sudo apt-get install -y qemu-user-static
+          sudo apt-get update && sudo apt-get install -y qemu-user
           expected="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
-          test "$(qemu-riscv64-static dist/netqmon-agent_riscv64 --version)" = "netqmon-agent ${expected}"
+          test "$(qemu-riscv64 dist/netqmon-agent_riscv64 --version)" = "netqmon-agent ${expected}"
 
       - name: Upload agent binary artifact
         uses: actions/upload-artifact@v4
@@ -207,14 +226,16 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Validate release version
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
         shell: bash
         run: |
           set -euo pipefail
           cargo_version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
-          release_version="${GITHUB_REF_NAME#v}"
+          release_version="${RELEASE_TAG#v}"
           test "${cargo_version}" = "${release_version}" \
             || { echo "Cargo workspace version ${cargo_version} does not match tag ${release_version}" >&2; exit 1; }
 
@@ -246,9 +267,9 @@ jobs:
           readelf -A dist/netqmon-agent_mipsel32r2 | grep -i "soft float"
 
           # Smoke test execution via QEMU user
-          sudo apt-get update && sudo apt-get install -y qemu-user-static
+          sudo apt-get update && sudo apt-get install -y qemu-user
           expected="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
-          test "$(qemu-mipsel-static dist/netqmon-agent_mipsel32r2 --version)" = "netqmon-agent ${expected}"
+          test "$(qemu-mipsel dist/netqmon-agent_mipsel32r2 --version)" = "netqmon-agent ${expected}"
 
       - name: Upload agent binary artifact
         uses: actions/upload-artifact@v4
@@ -372,6 +393,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag || github.ref }}
           fetch-depth: 0
 
       - name: Download agent binary
@@ -388,13 +410,13 @@ jobs:
           echo "CONFIG_PACKAGE_netqmon-agent=m" > .config
           echo "CONFIG_PACKAGE_luci-app-netqmon=m" >> .config
           version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            test "${GITHUB_REF_NAME#v}" = "${version}"
+          if [ -n "${RELEASE_TAG}" ]; then
+            test "${RELEASE_TAG#v}" = "${version}"
           fi
           package_version="${version}"
           if [ "${{ matrix.ver }}" = "apk" ] && [[ "${version}" == *-* ]]; then
             # Normalize prereleases for both tag releases and manual validation builds.
-            package_version="${version%%-*}~${GITHUB_SHA}"
+            package_version="${version%%-*}~$(git rev-parse --short=12 HEAD)"
           fi
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${package_version}/" packaging/openwrt/netqmon/Makefile
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${package_version}/" packaging/openwrt/luci-app-netqmon/Makefile
@@ -540,6 +562,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag || github.ref }}
           fetch-depth: 0
 
       - name: Download agent binary
@@ -556,13 +579,13 @@ jobs:
           echo "CONFIG_PACKAGE_netqmon-agent=m" > .config
           echo "CONFIG_PACKAGE_luci-app-netqmon=m" >> .config
           version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            test "${GITHUB_REF_NAME#v}" = "${version}"
+          if [ -n "${RELEASE_TAG}" ]; then
+            test "${RELEASE_TAG#v}" = "${version}"
           fi
           package_version="${version}"
           if [ "${{ matrix.ver }}" = "apk" ] && [[ "${version}" == *-* ]]; then
             # Normalize prereleases for both tag releases and manual validation builds.
-            package_version="${version%%-*}~${GITHUB_SHA}"
+            package_version="${version%%-*}~$(git rev-parse --short=12 HEAD)"
           fi
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${package_version}/" packaging/openwrt/netqmon/Makefile
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${package_version}/" packaging/openwrt/luci-app-netqmon/Makefile
@@ -671,13 +694,15 @@ jobs:
   publish-release-assets:
     name: Publish OpenWrt packages and manifest
     needs: [detect-changes, job_build, job_build_experimental]
-    if: needs.detect-changes.outputs.build == 'true' && startsWith(github.ref, 'refs/tags/v')
+    if: needs.detect-changes.outputs.build == 'true' && (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != ''))
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Download package artifacts
         uses: actions/download-artifact@v4
@@ -699,7 +724,8 @@ jobs:
             fi
           done < <(find "$package_root" -type f \( -name '*.ipk' -o -name '*.apk' \) -print0 | sort -z)
 
-          version="${GITHUB_REF_NAME#v}"
+          release_tag="${RELEASE_TAG}"
+          version="${release_tag#v}"
           if [[ "$version" == *-* ]]; then
             channel=beta
           else
@@ -707,7 +733,7 @@ jobs:
           fi
           python3 scripts/release/generate_openwrt_manifest.py \
             --repository "$GITHUB_REPOSITORY" \
-            --release "$channel:$GITHUB_REF_NAME:$package_root" \
+            --release "$channel:$release_tag:$package_root" \
             --output "$release_assets/openwrt-agent-manifest.json"
 
       - name: Publish packages and manifest to GitHub Release
@@ -715,5 +741,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           files: ${{ runner.temp }}/openwrt-release-assets/*
