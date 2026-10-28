@@ -438,9 +438,13 @@ export function SettingsDashboard({ username }: { username: string }) {
     setGeoUpdating(true);
     setGeoMessage(null);
     try {
-      const res = await fetch("/api/settings/geo/update", { method: "POST" });
-      const data = await res.json();
-      if (!res.ok) {
+      const res = await fetch("/api/settings/geo/update", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data) {
         throw new Error(
           data?.error?.message || data?.error || t("geo.updateError"),
         );

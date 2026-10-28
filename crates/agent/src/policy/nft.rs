@@ -11,7 +11,7 @@ use super::capabilities::PolicyTopology;
 
 pub(super) const TABLE_NAME: &str = "netqmon_policy";
 const TABLE_MARKER: &str = "netqmon:managed-policy:v1";
-pub(super) const RULESET_VERSION: u8 = 2;
+pub(super) const RULESET_VERSION: u8 = 3;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BLOCKED_ADDRESSES_PER_FAMILY: usize = 16_384;
 const MAX_NFT_SCRIPT_BYTES: usize = 2 * 1024 * 1024;
@@ -429,6 +429,7 @@ mod tests {
             client_limit_reason: None,
             lan_interfaces: vec!["br-lan".to_owned()],
             wan_interfaces: vec!["eth0".to_owned()],
+            wan_shaping_interface: None,
             lan_ifindex: Some(1),
             wan_ifindex: Some(2),
             lan_capacity_bps: Some(100_000_000),

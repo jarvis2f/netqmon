@@ -147,15 +147,24 @@ static __always_inline void record_policy_drop(const __u8 policy_identity_hash[1
     }
 }
 
-/* Verify this subprogram independently: inlining the endpoint lookup into all
- * IPv4/IPv6 parser paths exceeds the supported kernel's verifier state budget. */
-__attribute__((noinline)) int apply_flow_policy(struct __sk_buff *skb,
-                                               struct flow_key *key)
+struct flow_policy_packet {
+    __u32 length;
+    __u32 ifindex;
+    __u32 mark;
+    __u32 priority;
+    __u8 ethernet_addresses[12];
+};
+
+/* Keep policy verification independent of the parser's branches, but pass only
+ * ordinary memory. Global skb arguments require kernel BTF context metadata
+ * that is absent on some OpenWrt kernels ("btf_vmlinux is malformed"). */
+__attribute__((noinline)) int evaluate_flow_policy(
+    struct flow_policy_packet *packet, struct flow_key *key)
 {
     /* Older verifiers do not accept a global subprogram's generic memory
      * argument as a map key. Copy the bounded BTF argument onto our stack. */
     struct flow_key local_key;
-    if (!key)
+    if (!packet || !key)
         return TC_ACT_OK;
     __builtin_memcpy(&local_key, key, sizeof(local_key));
     key = &local_key;
@@ -163,21 +172,18 @@ __attribute__((noinline)) int apply_flow_policy(struct __sk_buff *skb,
 
     if (!verdict) {
         struct endpoint_block_key endpoint = {};
-        __u8 ethernet_addresses[12];
-        if (bpf_skb_load_bytes(skb, 0, ethernet_addresses, sizeof(ethernet_addresses)) != 0)
-            return TC_ACT_OK;
         endpoint.ip_version = key->ip_version;
         endpoint.protocol = key->protocol;
         if (key->hook == NETQMON_HOOK_INGRESS) {
             endpoint.remote_port = key->destination_port;
             __builtin_memcpy(endpoint.client_address, key->source_address, 16);
             __builtin_memcpy(endpoint.remote_address, key->destination_address, 16);
-            __builtin_memcpy(endpoint.client_mac, ethernet_addresses + 6, 6);
+            __builtin_memcpy(endpoint.client_mac, packet->ethernet_addresses + 6, 6);
         } else {
             endpoint.remote_port = key->source_port;
             __builtin_memcpy(endpoint.client_address, key->destination_address, 16);
             __builtin_memcpy(endpoint.remote_address, key->source_address, 16);
-            __builtin_memcpy(endpoint.client_mac, ethernet_addresses, 6);
+            __builtin_memcpy(endpoint.client_mac, packet->ethernet_addresses, 6);
         }
         verdict = bpf_map_lookup_elem(&endpoint_blocks, &endpoint);
         if (!verdict)
@@ -191,7 +197,7 @@ __attribute__((noinline)) int apply_flow_policy(struct __sk_buff *skb,
 
     if (verdict->verdict == NETQMON_VERDICT_SHAPE) {
 #ifdef NETQMON_QOS_PRIORITY
-        __u32 ifindex = skb->ifindex;
+        __u32 ifindex = packet->ifindex;
         __u32 zero = 0;
         __u32 *priority_ifb = bpf_map_lookup_elem(&qos_priority_ifb, &zero);
         if (priority_ifb && *priority_ifb) {
@@ -204,23 +210,21 @@ __attribute__((noinline)) int apply_flow_policy(struct __sk_buff *skb,
                       major == NETQMON_QOS_DOWNLOAD_MAJOR)) &&
                     minor >= NETQMON_QOS_APPLICATION_FIRST &&
                     minor <= NETQMON_QOS_APPLICATION_LAST)
-                    skb->priority = verdict->policy_tag;
+                    packet->priority = verdict->policy_tag;
             }
-        } else if (key->hook == NETQMON_HOOK_EGRESS &&
-                   verdict->policy_tag > 0 &&
+        } else if (verdict->policy_tag > 0 &&
                    verdict->policy_tag <= NETQMON_APPLICATION_MARK_MAX_TAG) {
             /* The priority feature can still be built into a Legacy-mode
              * Agent. Marks are available only when the priority runtime has
              * not published its active IFB configuration. */
-            skb->mark = (skb->mark & ~NETQMON_APPLICATION_MARK_MASK) |
+            packet->mark = (packet->mark & ~NETQMON_APPLICATION_MARK_MASK) |
                         ((verdict->policy_tag << NETQMON_APPLICATION_MARK_SHIFT) &
                          NETQMON_APPLICATION_MARK_MASK);
         }
 #else
-        if (key->hook == NETQMON_HOOK_EGRESS &&
-            verdict->policy_tag > 0 &&
+        if (verdict->policy_tag > 0 &&
             verdict->policy_tag <= NETQMON_APPLICATION_MARK_MAX_TAG) {
-            skb->mark = (skb->mark & ~NETQMON_APPLICATION_MARK_MASK) |
+            packet->mark = (packet->mark & ~NETQMON_APPLICATION_MARK_MASK) |
                         ((verdict->policy_tag << NETQMON_APPLICATION_MARK_SHIFT) &
                          NETQMON_APPLICATION_MARK_MASK);
         }
@@ -233,9 +237,30 @@ __attribute__((noinline)) int apply_flow_policy(struct __sk_buff *skb,
     /* Keep accounting blocked packets so the Agent can report continued flow
      * activity and refresh the bounded verdict lease. Do not run the normal
      * packet path, which can capture sample or discovery payloads. */
-    record_flow(key, skb->len, 0);
-    record_policy_drop(verdict->policy_identity_hash, verdict->policy_client_mac, skb->len);
+    record_flow(key, packet->length, 0);
+    record_policy_drop(verdict->policy_identity_hash, verdict->policy_client_mac, packet->length);
     return TC_ACT_SHOT;
+}
+
+/* Static preserves the caller's skb type without kernel BTF; noinline keeps
+ * the packet snapshot off the parser's already crowded stack. */
+static __attribute__((noinline)) int apply_flow_policy(
+    struct __sk_buff *skb, struct flow_key *key, const __u8 *source_mac)
+{
+    struct flow_policy_packet packet = {
+        .length = skb->len,
+        .ifindex = skb->ifindex,
+        .mark = skb->mark,
+        .priority = skb->priority,
+    };
+    /* parse_packet has already checked the complete Ethernet header. Copy it
+     * to the stack so the global helper never receives a packet pointer. */
+    __builtin_memcpy(packet.ethernet_addresses, source_mac - 6,
+                     sizeof(packet.ethernet_addresses));
+    int action = evaluate_flow_policy(&packet, key);
+    skb->mark = packet.mark;
+    skb->priority = packet.priority;
+    return action;
 }
 
 static __always_inline void record_dns_drop(void)
@@ -804,7 +829,7 @@ static __always_inline int parse_ipv4(struct __sk_buff *skb, __u8 *cursor,
         key.source_port = ports->source;
         key.destination_port = ports->destination;
         if (flow_policy_state.enabled) {
-            int action = apply_flow_policy(skb, &key);
+            int action = apply_flow_policy(skb, &key, source_mac);
             if (action != TC_ACT_OK) {
                 return action;
             }
@@ -896,7 +921,7 @@ static __always_inline int parse_ipv6(struct __sk_buff *skb, __u8 *cursor,
                 key.source_port = ports->source;
                 key.destination_port = ports->destination;
                 if (flow_policy_state.enabled) {
-                    int action = apply_flow_policy(skb, &key);
+                    int action = apply_flow_policy(skb, &key, source_mac);
                     if (action != TC_ACT_OK) {
                         return action;
                     }
@@ -1048,12 +1073,9 @@ static __always_inline int parse_packet(struct __sk_buff *skb, void *data,
 }
 
 #ifdef NETQMON_QOS_PRIORITY
-/* A global BPF subprogram is verified independently of all IPv4/IPv6 parser
- * branches. Inlining this continuation multiplies those states through the
- * map-in-map classifier and path observer, exceeding the verifier complexity
- * bound on the supported 6.1 test kernel. Keep the ordering explicit: policy
- * verdict first, priority only for accepted packets, then one observation. */
-__attribute__((noinline)) int qos_priority_finish_egress(struct __sk_buff *skb, int action)
+/* Keep skb helpers static so context verification does not require kernel BTF.
+ * Policy verdict first, priority only for accepted packets, then observation. */
+static __attribute__((noinline)) int qos_priority_finish_egress(struct __sk_buff *skb, int action)
 {
     if (action == TC_ACT_OK) {
 #ifdef NETQMON_QOS_POC
@@ -1093,7 +1115,7 @@ int netqmon_ingress(struct __sk_buff *skb)
 
 #ifdef NETQMON_QOS_PRIORITY
 __attribute__((noinline))
-int netqmon_policy_account_egress(struct __sk_buff *skb)
+static int netqmon_policy_account_egress(struct __sk_buff *skb)
 #else
 SEC("tc")
 int netqmon_egress(struct __sk_buff *skb)

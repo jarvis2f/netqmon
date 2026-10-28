@@ -239,7 +239,7 @@ impl FlowVerdictWriter {
             .iter()
             .any(|(key, classid)| key.ifindex == 0 || !valid_shape_tag(key.hook, *classid))
         {
-            return Err("application shape alias has no valid egress class tag".to_owned());
+            return Err("application shape alias has no valid hook or class tag".to_owned());
         }
         let identity = VerdictIdentity {
             flow_hash: flow_identity_hash(policy_flow_id)?,
@@ -517,7 +517,7 @@ fn valid_application_classid(hook: u8, classid: u32) -> bool {
 
 fn valid_shape_tag(hook: u8, tag: u32) -> bool {
     valid_application_classid(hook, tag)
-        || (hook == 2 && (1..=super::shaper::MAX_APPLICATION_TAG as u32).contains(&tag))
+        || (matches!(hook, 1 | 2) && (1..=super::shaper::MAX_APPLICATION_TAG as u32).contains(&tag))
 }
 
 fn client_mac_identity(client_mac: &str) -> Result<[u8; 6], String> {
@@ -559,6 +559,78 @@ fn encode_policy_state(enabled: bool, generation: u64) -> [u8; POLICY_STATE_VALU
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires Linux BPF privileges; run on the Debian test server"]
+    fn ingress_application_verdict_sets_the_packet_mark() {
+        use libbpf_rs::skel::{OpenSkel as _, SkelBuilder as _};
+        let mut open_object = std::mem::MaybeUninit::uninit();
+        let skeleton = crate::bpf::FlowSkelBuilder::default()
+            .open(&mut open_object)
+            .unwrap()
+            .load()
+            .unwrap();
+        let writer = FlowVerdictWriter::new(
+            MapHandle::try_from(&skeleton.maps.flow_verdict_map).unwrap(),
+            MapHandle::try_from(&skeleton.maps.endpoint_blocks).unwrap(),
+            MapHandle::try_from(&skeleton.maps.bss).unwrap(),
+            Some(MapHandle::try_from(&skeleton.maps.policy_drop_counters).unwrap()),
+        );
+        for version in [4, 6] {
+            for protocol in [6, 17] {
+                writer.reset(7, true).unwrap();
+                let mut alias = FlowKey {
+                    ip_version: version,
+                    protocol,
+                    direction: 0,
+                    hook: 1,
+                    ifindex: 1,
+                    source_address: [0; 16],
+                    destination_address: [0; 16],
+                    source_port: 50_000,
+                    destination_port: 443,
+                };
+                if version == 4 {
+                    alias.source_address[..4].copy_from_slice(&[192, 0, 2, 1]);
+                    alias.destination_address[..4].copy_from_slice(&[198, 51, 100, 1]);
+                } else {
+                    alias.source_address = "2001:db8::1"
+                        .parse::<std::net::Ipv6Addr>()
+                        .unwrap()
+                        .octets();
+                    alias.destination_address = "2001:db8::2"
+                        .parse::<std::net::Ipv6Addr>()
+                        .unwrap()
+                        .octets();
+                }
+                writer
+                    .install_shape(
+                        &[(alias.clone(), 3)],
+                        "shape",
+                        "00112233445566778899aabbccddeeff",
+                        7,
+                        crate::linux::monotonic_ns() + 30_000_000_000,
+                    )
+                    .unwrap();
+                let packet = endpoint_test_packet(&alias, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+                let mut context = [0_u8; 192];
+                let output = skeleton
+                    .progs
+                    .netqmon_ingress
+                    .test_run(libbpf_rs::ProgramInput {
+                        data_in: Some(&packet),
+                        context_out: Some(&mut context),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                assert_eq!(output.return_value, 0);
+                assert_eq!(
+                    u32::from_ne_bytes(output.context.unwrap()[8..12].try_into().unwrap()),
+                    3 << 25
+                );
+            }
+        }
+    }
 
     #[test]
     #[ignore = "requires Linux BPF privileges; run on the Debian test server"]

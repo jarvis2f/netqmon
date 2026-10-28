@@ -12,7 +12,9 @@ use super::shaper::{ClientClass, Direction, client_mark_value};
 #[cfg(target_os = "linux")]
 use super::shaper::{ManagedInterface, ShapingState};
 
-pub(super) const PRESERVED_MARK_MASK: u32 = 0x0000_ffff;
+// The application tag can be set at LAN ingress, before this forward rule.
+// Replace the client bits while preserving both the application and user bits.
+pub(super) const PRESERVED_MARK_MASK: u32 = !super::shaper::CLIENT_MARK_MASK;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -337,7 +339,7 @@ mod tests {
         let upload = rule.render();
         assert!(upload.contains("ct direction original ct original ip saddr 192.0.2.2"));
         assert!(upload.contains("ct direction reply ct reply ip saddr 192.0.2.2"));
-        assert!(upload.contains("meta mark & 0x0000ffff"));
+        assert!(upload.contains("meta mark & 0xfe00ffff"));
         rule.direction = Direction::Download;
         rule.tag = 0x107;
         rule.address = "fd00::2".parse().unwrap();
@@ -359,7 +361,7 @@ mod tests {
         let rendered = rule.render();
         assert!(rendered.contains("iifname \"br-lan\" oifname \"eth0\""));
         assert!(rendered.contains("ip saddr 192.0.2.10"));
-        assert!(rendered.contains("meta mark & 0x0000ffff"));
+        assert!(rendered.contains("meta mark & 0xfe00ffff"));
         assert!(rendered.contains("0x00070000"));
     }
 

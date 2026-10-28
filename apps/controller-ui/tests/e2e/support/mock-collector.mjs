@@ -673,6 +673,57 @@ function handleInternal(request, response, pathname, params, state) {
     return handlePolicies(request, response, path, params, state);
   }
 
+  const geoStatus = {
+    enabled: false,
+    directory: "/data/geo",
+    attribution: "GeoLite2 data by MaxMind",
+    databases: ["GeoLite2-City.mmdb", "GeoLite2-ASN.mmdb"].map((filename) => ({
+      filename,
+      installed: false,
+      file_size_bytes: 0,
+      source_url: `https://example.com/${filename}`,
+    })),
+  };
+  if (path === "settings/geo" && request.method === "GET") {
+    json(response, 200, envelope(geoStatus));
+    return true;
+  }
+  if (path === "settings/geo/update" && request.method === "POST") {
+    textBody(request).then((raw) => {
+      // Match Collector's JSON extractor: application/json with an empty body
+      // is rejected as text before the update handler can run.
+      try {
+        JSON.parse(raw);
+      } catch {
+        response.writeHead(400, { "content-type": "text/plain" });
+        response.end(
+          "Failed to parse the request body as JSON: EOF while parsing a value",
+        );
+        return;
+      }
+      json(
+        response,
+        200,
+        envelope({
+          success: true,
+          updated_files: geoStatus.databases.map(
+            (database) => database.filename,
+          ),
+          status: {
+            ...geoStatus,
+            enabled: true,
+            databases: geoStatus.databases.map((database) => ({
+              ...database,
+              installed: true,
+              file_size_bytes: 1024,
+            })),
+          },
+        }),
+      );
+    });
+    return true;
+  }
+
   if (path === "settings/diagnostics" && request.method === "GET") {
     json(
       response,

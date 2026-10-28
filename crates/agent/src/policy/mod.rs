@@ -2,6 +2,8 @@ mod capabilities;
 #[cfg(target_os = "linux")]
 mod capacity;
 pub(crate) mod classid;
+#[cfg(target_os = "linux")]
+mod egress;
 pub(crate) mod endpoint_block;
 #[cfg(target_os = "linux")]
 pub(crate) mod executor;

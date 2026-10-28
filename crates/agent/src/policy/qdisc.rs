@@ -67,20 +67,34 @@ pub(super) fn inspect_capability(topology: &PolicyTopology) -> FeatureSupport {
                 .unwrap_or("the client Internet route is not verified"),
         );
     }
-    if topology.lan_interfaces.len() != 1 || topology.wan_interfaces.len() != 1 {
+    if topology.lan_interfaces.len() != 1 || topology.shaping_wan().is_none() {
         return FeatureSupport::unsupported(
             "unsupported_multi_egress",
             "aggregate client shaping requires one verified LAN egress and one WAN egress",
         );
     }
-    if topology
-        .wan_interfaces
-        .iter()
-        .any(|interface| is_tunnel_interface(interface))
-    {
+    let wan_queue = topology.shaping_wan().expect("checked above");
+    if is_tunnel_interface(wan_queue) || super::egress::is_ppp_interface(wan_queue) {
         return FeatureSupport::unsupported(
             "unsupported_topology",
             "VPN and tunnel default routes are outside the verified Internet shaping path",
+        );
+    }
+    if !topology.is_one_arm_router() && topology.lan_interfaces.iter().any(|lan| lan == wan_queue) {
+        return FeatureSupport::unsupported(
+            "unsupported_topology",
+            "LAN and WAN shaping queues overlap without a verified one-arm path",
+        );
+    }
+    if topology.wan_shaping_interface.is_some()
+        && topology
+            .lan_interfaces
+            .iter()
+            .any(|lan| super::egress::overlaps_lan(lan, wan_queue))
+    {
+        return FeatureSupport::unsupported(
+            "unsupported_topology",
+            "the common WAN queue is also reachable through the managed LAN",
         );
     }
     if topology.lan_capacity_bps.is_none() || topology.wan_capacity_bps.is_none() {
@@ -103,13 +117,14 @@ pub(super) fn inspect_ownership(topology: &PolicyTopology, state_path: &Path) ->
     for name in topology
         .lan_interfaces
         .iter()
-        .chain(topology.wan_interfaces.iter())
+        .map(String::as_str)
+        .chain(topology.shaping_wan())
         .collect::<BTreeSet<_>>()
     {
         let owned = saved
             .as_ref()
             .and_then(|state| state.shaping_state.as_ref())
-            .and_then(|state| state.interfaces().find(|interface| interface.name == *name));
+            .and_then(|state| state.interfaces().find(|interface| interface.name == name));
         let result = owned.map_or_else(|| inspect_default_root(name).map(|_| ()), verify_owned);
         if let Err(error) = result {
             return FeatureSupport::unsupported("qdisc_ownership_conflict", error);

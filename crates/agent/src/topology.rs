@@ -217,9 +217,9 @@ impl TopologySnapshot {
             .map(|route| route.interface.as_str())
             .collect::<Vec<_>>();
         let forwarding = self.ipv4_forwarding || self.ipv6_forwarding;
-        let capture_is_default = default_interfaces.contains(&capture_interface);
-        let gateway_on_capture_subnet = self.routes.iter().any(|route| {
-            route.interface == capture_interface
+        let default_gateway_on_capture_subnet = self.routes.iter().any(|route| {
+            route.destination.prefix_length == 0
+                && route.interface == capture_interface
                 && route.gateway.is_some_and(|gateway| {
                     self.interfaces.iter().any(|interface| {
                         interface.name == capture_interface
@@ -234,10 +234,7 @@ impl TopologySnapshot {
             .interfaces
             .iter()
             .any(|interface| interface.name == capture_interface && interface.is_bridge);
-        self.mode = if forwarding
-            && (capture_is_default || gateway_on_capture_subnet)
-            && gateway_on_capture_subnet
-        {
+        self.mode = if forwarding && default_gateway_on_capture_subnet {
             TopologyMode::OneArmRouter
         } else if forwarding && !default_interfaces.is_empty() {
             TopologyMode::Router
@@ -372,6 +369,75 @@ mod tests {
         };
         snapshot.infer_mode("br-lan");
         assert_eq!(snapshot.mode, TopologyMode::OneArmRouter);
+    }
+
+    #[test]
+    fn downstream_lan_route_does_not_turn_pppoe_router_into_one_arm_router() {
+        let mut snapshot = TopologySnapshot {
+            interfaces: vec![InterfaceInfo {
+                name: "br-lan".into(),
+                addresses: vec![
+                    ("192.168.2.1".parse().unwrap(), 24),
+                    ("fe80::52da:9eff:fe5e:3348".parse().unwrap(), 64),
+                ],
+                is_bridge: true,
+                is_tunnel: false,
+            }],
+            routes: vec![
+                RouteInfo {
+                    destination: "0.0.0.0/0".parse().unwrap(),
+                    gateway: None,
+                    interface: "pppoe-wan".into(),
+                },
+                RouteInfo {
+                    destination: "::/0".parse().unwrap(),
+                    gateway: Some("fe80::200:5eff:fe00:106".parse().unwrap()),
+                    interface: "pppoe-wan".into(),
+                },
+                RouteInfo {
+                    destination: "::/0".parse().unwrap(),
+                    gateway: Some("fe80::52da:9eff:fe5e:3348".parse().unwrap()),
+                    interface: "eth2".into(),
+                },
+                RouteInfo {
+                    destination: "240e:390:2865:44c4::/62".parse().unwrap(),
+                    gateway: Some("fe80::5054:ff:feb0:7ea".parse().unwrap()),
+                    interface: "br-lan".into(),
+                },
+            ],
+            ipv4_forwarding: true,
+            ..TopologySnapshot::default()
+        };
+        snapshot.infer_mode("br-lan");
+        assert_eq!(snapshot.mode, TopologyMode::Router);
+    }
+
+    #[test]
+    fn default_route_and_gateway_must_belong_to_the_same_route() {
+        let mut snapshot = TopologySnapshot {
+            interfaces: vec![InterfaceInfo {
+                name: "br-lan".into(),
+                addresses: vec![("192.168.2.1".parse().unwrap(), 24)],
+                is_bridge: true,
+                is_tunnel: false,
+            }],
+            routes: vec![
+                RouteInfo {
+                    destination: "0.0.0.0/0".parse().unwrap(),
+                    gateway: None,
+                    interface: "br-lan".into(),
+                },
+                RouteInfo {
+                    destination: "192.168.3.0/24".parse().unwrap(),
+                    gateway: Some("192.168.2.2".parse().unwrap()),
+                    interface: "br-lan".into(),
+                },
+            ],
+            ipv4_forwarding: true,
+            ..TopologySnapshot::default()
+        };
+        snapshot.infer_mode("br-lan");
+        assert_eq!(snapshot.mode, TopologyMode::Router);
     }
 
     #[test]

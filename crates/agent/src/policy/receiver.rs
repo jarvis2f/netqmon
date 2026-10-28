@@ -1322,35 +1322,63 @@ fn apply_flow_command(
                                 None => None,
                             }
                         } else {
-                            saved
-                                .as_ref()
-                                .and_then(|state| state.shaping_state.as_ref())
-                                .and_then(|shaping| {
-                                    application_shape_tags(
-                                        shaping,
-                                        &aliases,
-                                        client_mac.as_deref()?,
-                                        &policy_ids,
-                                        &direction,
-                                    )
-                                })
-                        }
-                        #[cfg(not(feature = "qos-client-priority"))]
-                        saved
-                            .as_ref()
-                            .and_then(|state| state.shaping_state.as_ref())
-                            .and_then(|shaping| {
+                            saved.as_ref().and_then(|state| {
                                 application_shape_tags(
-                                    shaping,
+                                    state.shaping_state.as_ref()?,
                                     &aliases,
                                     client_mac.as_deref()?,
                                     &policy_ids,
                                     &direction,
+                                    &shared_wan_ingress_ifindices(state),
                                 )
                             })
+                        }
+                        #[cfg(not(feature = "qos-client-priority"))]
+                        saved.as_ref().and_then(|state| {
+                            application_shape_tags(
+                                state.shaping_state.as_ref()?,
+                                &aliases,
+                                client_mac.as_deref()?,
+                                &policy_ids,
+                                &direction,
+                                &shared_wan_ingress_ifindices(state),
+                            )
+                        })
                     };
                     match tags {
                         Some(tags) if !tags.is_empty() => {
+                            #[cfg(feature = "qos-client-priority")]
+                            let legacy_shaping = priority_runtime.is_none();
+                            #[cfg(not(feature = "qos-client-priority"))]
+                            let legacy_shaping = true;
+                            if legacy_shaping
+                                && let Some(state) = saved.as_ref()
+                                && !shared_wan_ingress_ifindices(state).is_empty()
+                                && state
+                                    .shaping_state
+                                    .as_ref()
+                                    .and_then(|shape| shape.upload_interface.as_ref())
+                                    .is_some_and(|upload| {
+                                        upload.application_classes.iter().any(|class| {
+                                            client_mac.as_deref().is_some_and(|mac| {
+                                                class.mac.eq_ignore_ascii_case(mac)
+                                            }) && policy_ids.contains(&class.policy_id)
+                                        })
+                                    })
+                                && !tags.iter().any(|(alias, _)| alias.hook == 1)
+                            {
+                                unresolved_class = true;
+                            }
+                            if legacy_shaping
+                                && proxy_resolution.expected
+                                && saved.as_ref().is_some_and(|state| {
+                                    !shared_wan_ingress_ifindices(state).is_empty()
+                                })
+                            {
+                                // A REDIRECT/TPROXY can terminate the client
+                                // packet locally before the common WAN queue.
+                                unresolved_class = true;
+                            }
                             let remaining_ms = expires_at_ms.saturating_sub(now_ms).max(0) as u64;
                             let deadline = crate::linux::monotonic_ns()
                                 .saturating_add(remaining_ms.saturating_mul(1_000_000));
@@ -1638,18 +1666,31 @@ fn application_shape_tags(
     client_mac: &str,
     policy_ids: &[String],
     direction: &impl Fn(&crate::flow::FlowKey) -> Option<super::shaper::Direction>,
+    shared_wan_ingress: &[u32],
 ) -> Option<Vec<(crate::flow::FlowKey, u32)>> {
     let mut tags = Vec::new();
-    for alias in aliases.iter().filter(|alias| alias.hook == 2) {
+    for alias in aliases.iter().filter(|alias| {
+        alias.hook == 2 || (alias.hook == 1 && shared_wan_ingress.contains(&alias.ifindex))
+    }) {
         let class = policy_ids.iter().find_map(|policy_id| {
             shaping
                 .interfaces()
-                .filter(|interface| interface.ifindex == alias.ifindex)
+                .filter(|interface| {
+                    if alias.hook == 1 {
+                        shaping
+                            .upload_interface
+                            .as_ref()
+                            .is_some_and(|upload| upload.ifindex == interface.ifindex)
+                            && direction(alias) == Some(super::shaper::Direction::Upload)
+                    } else {
+                        interface.ifindex == alias.ifindex
+                    }
+                })
                 .find_map(|interface| {
                     interface.application_classes.iter().find(|class| {
                         class.policy_id == *policy_id
                             && class.mac.eq_ignore_ascii_case(client_mac)
-                            && class.ifindex == alias.ifindex
+                            && class.ifindex == interface.ifindex
                             && (!interface.shared_egress
                                 || direction(alias) == Some(class.direction))
                     })
@@ -1660,6 +1701,29 @@ fn application_shape_tags(
         }
     }
     (!tags.is_empty()).then_some(tags)
+}
+
+fn shared_wan_ingress_ifindices(state: &super::state::PolicyState) -> Vec<u32> {
+    let Some(upload) = state
+        .shaping_state
+        .as_ref()
+        .and_then(|shape| shape.upload_interface.as_ref())
+    else {
+        return Vec::new();
+    };
+    if !state.shaping_marks.iter().any(|rule| {
+        rule.direction == super::shaper::Direction::Upload && rule.interface_out != upload.name
+    }) {
+        return Vec::new();
+    }
+    state
+        .shaping_marks
+        .iter()
+        .filter(|rule| rule.direction == super::shaper::Direction::Upload)
+        .filter_map(|rule| nix::net::if_::if_nametoindex(rule.interface_in.as_str()).ok())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn mark_flow_capability_unsupported(
@@ -2151,6 +2215,7 @@ mod tests {
             "AA:BB:CC:DD:EE:FF",
             &policy_ids,
             &|_| None,
+            &[],
         )
         .unwrap();
         assert_eq!(tags.len(), 1);
@@ -2171,7 +2236,8 @@ mod tests {
                 &aliases,
                 "00:11:22:33:44:55",
                 &policy_ids,
-                &|_| None
+                &|_| None,
+                &[],
             )
             .is_none()
         );
@@ -2182,6 +2248,40 @@ mod tests {
                 "aa:bb:cc:dd:ee:ff",
                 &["another-policy".to_owned()],
                 &|_| None,
+                &[],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn shared_wan_application_upload_is_tagged_on_verified_lan_ingress() {
+        let shaping = shaping_state();
+        let ingress = flow_key(1, 1);
+        let unrelated = flow_key(1, 3);
+        let tags = application_shape_tags(
+            &shaping,
+            &[ingress.clone(), unrelated],
+            "aa:bb:cc:dd:ee:ff",
+            &["policy-a".into()],
+            &|_| Some(Direction::Upload),
+            &[1],
+        )
+        .unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].0, ingress);
+        assert_eq!(
+            tags[0].1,
+            u32::from(shaping.upload_interface.unwrap().application_classes[0].tag)
+        );
+        assert!(
+            application_shape_tags(
+                &shaping_state(),
+                &[flow_key(1, 1)],
+                "aa:bb:cc:dd:ee:ff",
+                &["policy-a".into()],
+                &|_| Some(Direction::Download),
+                &[1]
             )
             .is_none()
         );
@@ -2215,6 +2315,7 @@ mod tests {
                     Direction::Download
                 })
             },
+            &[],
         )
         .unwrap();
         assert_eq!(tags, vec![(up, u32::from(upload_tag)), (down, 2)]);
@@ -2224,7 +2325,8 @@ mod tests {
                 &aliases,
                 "AA:BB:CC:DD:EE:FF",
                 &policy_ids,
-                &|_| None
+                &|_| None,
+                &[],
             )
             .is_none()
         );

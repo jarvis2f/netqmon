@@ -126,6 +126,20 @@ For Router application shaping, include both LAN and WAN in `interfaces` so
 the Agent can mark the exact egress tuples in both directions. The capability
 check rejects application shaping when a shaping interface is not observed.
 
+For client aggregate shaping, multiple routed WAN interfaces can share one
+upload queue when the Agent verifies that all of them lead to the same Ethernet
+interface. This includes VLAN lower links and OpenWrt PPPoE sessions whose
+active `ubus` interface status and kernel PPPoE session agree on the underlying
+device. The Agent marks traffic for each routed WAN and shapes it once on the
+common queue. The common queue must not also be part of the managed LAN, and
+its capacity and qdisc ownership must be verifiable. `policies status --json`
+reports it as `wan_shaping_interface`. Application upload limits use the
+verified LAN ingress flow tuple before encapsulation; the application mark is
+preserved through forwarding into the common WAN queue. Download application
+limits use the managed LAN egress. A locally redirected proxy flow can bypass
+the WAN queue and is reported as partial when detected. Distinct physical WAN queues still require a
+shared aggregation mechanism and remain unsupported for aggregate shaping.
+
 ### 2.4 `diagnostics` / `diag` (Runtime Diagnostics & Control)
 
 Connects to the running agent via its local Unix domain socket (default `/run/netqmon/agent.sock`) to inspect performance counters or adjust runtime collection.

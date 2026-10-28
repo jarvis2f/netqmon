@@ -22,6 +22,8 @@ pub(crate) struct PolicyTopology {
     pub client_limit_reason: Option<String>,
     pub lan_interfaces: Vec<String>,
     pub wan_interfaces: Vec<String>,
+    /// A verified common packet queue, distinct from the routed WAN interfaces.
+    pub wan_shaping_interface: Option<String>,
     pub lan_ifindex: Option<u32>,
     pub wan_ifindex: Option<u32>,
     pub lan_capacity_bps: Option<u64>,
@@ -32,6 +34,12 @@ pub(crate) struct PolicyTopology {
 }
 
 impl PolicyTopology {
+    pub(crate) fn shaping_wan(&self) -> Option<&str> {
+        self.wan_shaping_interface
+            .as_deref()
+            .or_else(|| (self.wan_interfaces.len() == 1).then(|| self.wan_interfaces[0].as_str()))
+    }
+
     pub(crate) fn is_one_arm_router(&self) -> bool {
         self.supported
             && self.lan_interfaces.len() == 1
@@ -50,6 +58,7 @@ impl PolicyTopology {
             client_limit_reason: Some(reason),
             lan_interfaces: Vec::new(),
             wan_interfaces: Vec::new(),
+            wan_shaping_interface: None,
             lan_ifindex: None,
             wan_ifindex: None,
             lan_capacity_bps: None,
@@ -261,6 +270,7 @@ pub(crate) fn inspect(config: &AgentConfig) -> PolicyTopology {
             client_limit_reason: None,
             lan_interfaces: lan_interfaces.into_iter().collect(),
             wan_interfaces: wan_interfaces.into_iter().collect(),
+            wan_shaping_interface: None,
             lan_ifindex: None,
             wan_ifindex: None,
             lan_capacity_bps: None,
@@ -281,14 +291,19 @@ pub(crate) fn inspect(config: &AgentConfig) -> PolicyTopology {
             .ok()
             .map(|capacity| capacity.bps);
         }
-        if report.wan_interfaces.len() == 1 {
-            let interface = &report.wan_interfaces[0];
+        if !one_arm_router {
+            report.wan_shaping_interface = super::egress::common_egress(&report.wan_interfaces);
+        }
+        if let Some(interface) = report.shaping_wan().map(str::to_owned) {
             report.wan_ifindex = nix::net::if_::if_nametoindex(interface.as_str())
                 .ok()
                 .filter(|index| *index > 0);
             report.wan_capacity_bps = super::capacity::effective(
-                interface,
-                config.policy_interface_capacity_bps.get(interface).copied(),
+                &interface,
+                config
+                    .policy_interface_capacity_bps
+                    .get(&interface)
+                    .copied(),
             )
             .ok()
             .map(|capacity| capacity.bps);

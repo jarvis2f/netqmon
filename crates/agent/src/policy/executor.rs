@@ -135,8 +135,12 @@ fn runtime_topology(config: &AgentConfig, flow_bpf_ready: bool) -> PolicyTopolog
             && topology
                 .lan_interfaces
                 .iter()
-                .chain(&topology.wan_interfaces)
                 .all(|interface| config.interfaces.contains(interface))
+            && (topology.wan_shaping_interface.is_some()
+                || topology
+                    .wan_interfaces
+                    .iter()
+                    .all(|interface| config.interfaces.contains(interface)))
             && qdisc::application_shaping_supported().is_ok()
         {
             topology.capabilities.application_limit = PolicyCapability::Supported;
@@ -239,6 +243,9 @@ impl NftRunner for SystemNftRunner {
             .iter()
             .chain(topology.wan_interfaces.iter())
             .cloned()
+            .chain(topology.shaping_wan().map(str::to_owned))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect::<Vec<_>>();
         mark::inspect_conflicts(&interfaces, owned)
     }
@@ -1146,7 +1153,8 @@ pub(crate) fn status_json(config: &AgentConfig) -> serde_json::Value {
         "client_limit_reason_code": topology.client_limit_reason_code,
         "client_limit_reason": topology.client_limit_reason,
         "one_arm_return_path_verified": config.policy_one_arm_return_path_verified,
-        "interface_capacities": topology.lan_interfaces.iter().chain(topology.wan_interfaces.iter()).collect::<std::collections::BTreeSet<_>>().into_iter().map(|interface| {
+        "wan_shaping_interface": topology.shaping_wan(),
+        "interface_capacities": topology.lan_interfaces.iter().chain(topology.wan_interfaces.iter()).map(String::as_str).chain(topology.shaping_wan()).collect::<std::collections::BTreeSet<_>>().into_iter().map(|interface| {
             let capacity = super::capacity::effective(interface, config.policy_interface_capacity_bps.get(interface).copied());
             let measured = capacity.as_ref().ok();
             serde_json::json!({"interface": interface, "capacity_bps": measured.map(|capacity| capacity.bps), "source": measured.map(|capacity| capacity.source), "link_interfaces": measured.map(|capacity| &capacity.link_interfaces), "reason": capacity.as_ref().err()})
@@ -1722,9 +1730,9 @@ fn build_plan(
             if clients
                 .iter()
                 .any(|client| client.effective_upload_bps.is_some())
-                && let Some(interface) = topology.wan_interfaces.first()
+                && let Some(interface) = topology.shaping_wan()
             {
-                interfaces.insert(interface.clone());
+                interfaces.insert(interface.to_owned());
             }
             if clients
                 .iter()
@@ -1814,7 +1822,7 @@ fn build_shaping_state(
         Some(wan_capacity),
     ) = (
         topology.lan_interfaces.first(),
-        topology.wan_interfaces.first(),
+        topology.shaping_wan(),
         topology.lan_ifindex,
         topology.wan_ifindex,
         topology.lan_capacity_bps,
@@ -2068,10 +2076,14 @@ fn compile_shaping_plan(
     let Some(lan) = topology.lan_interfaces.first() else {
         return Err("unsupported_multi_egress: no verified LAN interface is available".to_owned());
     };
-    let Some(wan) = topology.wan_interfaces.first() else {
+    if topology.wan_interfaces.is_empty() {
         return Err("unsupported_multi_egress: no verified WAN interface is available".to_owned());
-    };
-    plan.mark_rules = mark::rules_for_clients(upload, download, &plan.client_addresses, lan, wan);
+    }
+    plan.mark_rules = topology
+        .wan_interfaces
+        .iter()
+        .flat_map(|wan| mark::rules_for_clients(upload, download, &plan.client_addresses, lan, wan))
+        .collect();
     if let Some(shared) = &state.shared_egress {
         let upload = shared
             .clients
@@ -2085,8 +2097,13 @@ fn compile_shaping_plan(
             .filter(|client| client.direction == Direction::Download)
             .cloned()
             .collect::<Vec<_>>();
-        plan.mark_rules =
-            mark::rules_for_clients(&upload, &download, &plan.client_addresses, lan, wan);
+        plan.mark_rules = topology
+            .wan_interfaces
+            .iter()
+            .flat_map(|wan| {
+                mark::rules_for_clients(&upload, &download, &plan.client_addresses, lan, wan)
+            })
+            .collect();
     }
     plan.shaping_state = Some(state);
     Ok(())
@@ -2388,6 +2405,9 @@ fn topology_fingerprint(topology: &PolicyTopology) -> String {
         super::nft::RULESET_VERSION,
         &topology.lan_interfaces,
         &topology.wan_interfaces,
+        topology.shaping_wan(),
+        topology.lan_ifindex,
+        topology.wan_ifindex,
         &topology.internal_networks,
         topology.ipv6_coverage,
     ))
@@ -2700,6 +2720,7 @@ mod tests {
             client_limit_reason: Some("limit capability is disabled in this fixture".to_owned()),
             lan_interfaces: vec!["br-lan".to_owned()],
             wan_interfaces: vec!["eth0".to_owned()],
+            wan_shaping_interface: None,
             lan_ifindex: Some(1),
             wan_ifindex: Some(2),
             lan_capacity_bps: Some(100_000_000),
@@ -2708,6 +2729,62 @@ mod tests {
             neighbor_bindings,
             ipv6_coverage,
         }
+    }
+
+    #[test]
+    fn common_queue_keeps_one_budget_and_marks_each_routed_wan() {
+        let mac = "aa:bb:cc:dd:ee:ff".to_owned();
+        let mut topology = topology(Vec::new(), true);
+        topology.wan_interfaces = vec!["eth0".into(), "pppoe-wan".into()];
+        topology.wan_shaping_interface = Some("eth0".into());
+        let mut plan = BuiltPlan {
+            blocked_v4: BTreeSet::new(),
+            blocked_v6: BTreeSet::new(),
+            results: Vec::new(),
+            ack_status: PolicyAckStatus::Applied,
+            has_supported_policy: true,
+            client_rates: BTreeMap::from([(
+                mac.clone(),
+                ClientRates {
+                    upload_bps: Some(1_000_000),
+                    download_bps: Some(2_000_000),
+                },
+            )]),
+            application_rates: BTreeMap::new(),
+            client_addresses: vec![(mac, "192.168.1.42".parse().unwrap())],
+            mark_rules: Vec::new(),
+            shaping_state: None,
+        };
+        compile_shaping_plan("gw", &topology, None, &mut plan).unwrap();
+        let state = plan.shaping_state.unwrap();
+        assert_eq!(state.upload_interface.unwrap().name, "eth0");
+        assert_eq!(state.download_interface.unwrap().name, "br-lan");
+        assert_eq!(plan.mark_rules.len(), 4);
+        for wan in ["eth0", "pppoe-wan"] {
+            assert!(
+                plan.mark_rules
+                    .iter()
+                    .any(|rule| rule.interface_in == "br-lan" && rule.interface_out == wan)
+            );
+            assert!(
+                plan.mark_rules
+                    .iter()
+                    .any(|rule| rule.interface_in == wan && rule.interface_out == "br-lan")
+            );
+        }
+    }
+
+    #[test]
+    fn changing_the_common_queue_invalidates_the_topology_fingerprint() {
+        let mut topology = topology(Vec::new(), true);
+        topology.wan_interfaces = vec!["eth0".into(), "pppoe-wan".into()];
+        topology.wan_shaping_interface = Some("eth0".into());
+        let original = topology_fingerprint(&topology);
+        topology.wan_shaping_interface = Some("eth1".into());
+        assert_ne!(original, topology_fingerprint(&topology));
+        let moved = topology_fingerprint(&topology);
+        topology.wan_ifindex = Some(42);
+        assert_ne!(moved, topology_fingerprint(&topology));
     }
 
     #[test]
