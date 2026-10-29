@@ -168,7 +168,7 @@ download_manifest() {
 
 manifest_field() {
     local channel="$1" arch="$2" format="$3" expr="$4"
-    jsonfilter -i "$MANIFEST" -e "@.channels.${channel}.packages[@.name='netqmon-agent'][@.openwrt_arch='${arch}'][@.package_format='${format}'].${expr}" 2>/dev/null | head -n 1
+    jsonfilter -i "$MANIFEST" -e "@.channels.${channel}.packages[@.name='netqmon-agent' && @.openwrt_arch='${arch}' && @.package_format='${format}'].${expr}" 2>/dev/null | head -n 1
 }
 
 channel_field() {
@@ -197,7 +197,7 @@ resolve_update() {
     latest_package_version="$(manifest_field "$channel" "$arch" "$format" version)"
 
     [ -n "$latest_version" ] || fail "manifest channel has no version"
-    [ "$package_arch" = "$arch" ] || fail "manifest has no package for this architecture"
+    [ "$package_arch" = "$arch" ] || fail "manifest has no package for this architecture ($arch, $format)"
     [ -n "$package_url" ] || fail "manifest package has no URL"
     [ -n "$sha256" ] || fail "manifest package has no SHA256"
     [ -n "$latest_package_version" ] || fail "manifest package has no version"

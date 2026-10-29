@@ -154,10 +154,10 @@ install_openwrt_packages() {
         download_file "${base_url}/openwrt-agent-manifest.json" "$manifest" || return 1
 
         if command -v jsonfilter >/dev/null 2>&1; then
-            agent_url="$(jsonfilter -i "$manifest" -e "@.channels.stable.packages[@.name='netqmon-agent'][@.openwrt_arch='${TARGET_ARCH}'][@.package_format='${PACKAGE_FORMAT}'].url" 2>/dev/null | head -n 1)"
-            agent_sha="$(jsonfilter -i "$manifest" -e "@.channels.stable.packages[@.name='netqmon-agent'][@.openwrt_arch='${TARGET_ARCH}'][@.package_format='${PACKAGE_FORMAT}'].sha256" 2>/dev/null | head -n 1)"
-            luci_url="$(jsonfilter -i "$manifest" -e "@.channels.stable.packages[@.name='luci-app-netqmon'][@.openwrt_arch='${luci_arch}'][@.package_format='${PACKAGE_FORMAT}'].url" 2>/dev/null | head -n 1)"
-            luci_sha="$(jsonfilter -i "$manifest" -e "@.channels.stable.packages[@.name='luci-app-netqmon'][@.openwrt_arch='${luci_arch}'][@.package_format='${PACKAGE_FORMAT}'].sha256" 2>/dev/null | head -n 1)"
+            agent_url="$(jsonfilter -i "$manifest" -e "@.channels.stable.packages[@.name='netqmon-agent' && @.openwrt_arch='${TARGET_ARCH}' && @.package_format='${PACKAGE_FORMAT}'].url" 2>/dev/null | head -n 1)"
+            agent_sha="$(jsonfilter -i "$manifest" -e "@.channels.stable.packages[@.name='netqmon-agent' && @.openwrt_arch='${TARGET_ARCH}' && @.package_format='${PACKAGE_FORMAT}'].sha256" 2>/dev/null | head -n 1)"
+            luci_url="$(jsonfilter -i "$manifest" -e "@.channels.stable.packages[@.name='luci-app-netqmon' && @.openwrt_arch='${luci_arch}' && @.package_format='${PACKAGE_FORMAT}'].url" 2>/dev/null | head -n 1)"
+            luci_sha="$(jsonfilter -i "$manifest" -e "@.channels.stable.packages[@.name='luci-app-netqmon' && @.openwrt_arch='${luci_arch}' && @.package_format='${PACKAGE_FORMAT}'].sha256" 2>/dev/null | head -n 1)"
         fi
 
         [ -n "${agent_url:-}" ] || return 1
