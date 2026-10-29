@@ -419,6 +419,7 @@ fn v5_upgrade_preserves_history_and_enables_correction_for_new_traffic() {
          DROP TRIGGER traffic_scope_total_move;
          DROP TRIGGER traffic_scope_total_delete;
          DROP TABLE traffic_scope_total_minute;
+         ALTER TABLE devices DROP COLUMN device_type_override;
          DELETE FROM schema_migrations WHERE version>=6;",
         )
         .unwrap();

@@ -1060,8 +1060,18 @@ async fn client_detail(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UpdateClientRequest {
+    #[serde(default, deserialize_with = "deserialize_client_update")]
     name: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_client_update")]
     device_type: Option<Option<String>>,
+}
+
+// Missing fields leave a setting unchanged; explicit null clears it.
+fn deserialize_client_update<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 async fn update_client_info(
@@ -2139,7 +2149,7 @@ fn query_application_clients(
     };
     let mut statement = connection.prepare(&format!(
         "SELECT d.id, d.mac, COALESCE(d.display_name, d.hostname, ''), d.vendor,
-                d.device_type, d.os_family, d.model, d.identity_confidence,
+                COALESCE(d.device_type_override, d.device_type), d.os_family, d.model, d.identity_confidence,
                 COALESCE((SELECT json_group_array(json_object(
                     'source', e.source, 'field', e.field, 'value', e.value,
                     'confidence', e.confidence, 'first_seen', e.first_seen,
@@ -2148,7 +2158,7 @@ fn query_application_clients(
                   FROM device_evidence e WHERE e.gateway_id = d.gateway_id AND e.mac = d.mac), '[]'),
                 d.vendor_confidence, d.device_type_confidence, d.os_confidence,
                 d.model_confidence, d.private_mac, d.last_seen,
-                SUM(f.upload_bytes), SUM(f.download_bytes), COUNT(*)
+                SUM(f.upload_bytes), SUM(f.download_bytes), COUNT(*), d.device_type_override
          FROM flow_sessions f JOIN devices d ON d.id = f.device_id
          WHERE {application_filter}
            AND ({category_filter})
@@ -2851,7 +2861,7 @@ fn query_flow_page(
                 f.classification_reason, f.classification_evidence_json, f.upload_bytes,
                 f.download_bytes, f.packets, f.started_at, f.last_seen_at, f.ended_at,
                 f.device_id, COALESCE(d.display_name, d.hostname, ''), d.mac,
-                d.device_type, d.model, d.vendor, d.os_family,
+                COALESCE(d.device_type_override, d.device_type) AS device_type, d.model, d.vendor, d.os_family,
                 f.scope, f.path_type, f.nat, f.source_segment, f.destination_segment, {}
          FROM flow_sessions f LEFT JOIN devices d ON d.id = f.device_id{where_clause}
          ORDER BY {} {order}, f.id ASC LIMIT ?",
@@ -3024,7 +3034,7 @@ fn query_flow_page_clickhouse(
                 f.classification_reason, f.classification_evidence_json, f.upload_bytes,
                 f.download_bytes, f.packets, f.started_at, f.last_seen_at, f.ended_at,
                 f.device_id, coalesce(d.display_name, d.hostname, '') AS client_name, d.mac,
-                d.device_type, d.model, d.vendor, d.os_family,
+                COALESCE(d.device_type_override, d.device_type) AS device_type, d.model, d.vendor, d.os_family,
                 f.scope, f.path_type, f.nat, f.source_segment, f.destination_segment,
                 {sort_column} AS cursor_value
          FROM flow_sessions AS f FINAL LEFT JOIN devices AS d FINAL ON d.id = f.device_id{where_clause}
@@ -3536,7 +3546,7 @@ fn query_clients(
     };
     let sql = format!(
         "SELECT d.id, d.mac, COALESCE(d.display_name, d.hostname, ''), d.vendor,
-                d.device_type, d.os_family, d.model, d.identity_confidence,
+                COALESCE(d.device_type_override, d.device_type), d.os_family, d.model, d.identity_confidence,
                 COALESCE((SELECT json_group_array(json_object(
                     'source', e.source, 'field', e.field, 'value', e.value,
                     'confidence', e.confidence, 'first_seen', e.first_seen,
@@ -3561,7 +3571,7 @@ fn query_clients(
                      ELSE 0 END,
                 CASE WHEN (SELECT COUNT(*) FROM device_addresses a WHERE a.device_id=d.id)=1
                      THEN (SELECT application_source FROM device_addresses a WHERE a.device_id=d.id LIMIT 1)
-                END
+                END, d.device_type_override
          FROM devices d LEFT JOIN {traffic_join} t ON t.device_id = d.id
          GROUP BY d.id ORDER BY SUM(COALESCE(t.upload_bytes, 0) + COALESCE(t.download_bytes, 0)) DESC,
                   d.id LIMIT {page_window}"
@@ -3610,7 +3620,7 @@ fn query_client_detail(connection: &Connection, id: i64) -> rusqlite::Result<Opt
     let client = connection
         .query_row(
             "SELECT d.id, d.mac, COALESCE(d.display_name, d.hostname, ''), d.vendor,
-                    d.device_type, d.os_family, d.model, d.identity_confidence,
+                    COALESCE(d.device_type_override, d.device_type), d.os_family, d.model, d.identity_confidence,
                     COALESCE((SELECT json_group_array(json_object(
                         'source', e.source, 'field', e.field, 'value', e.value,
                         'confidence', e.confidence, 'first_seen', e.first_seen,
@@ -3624,7 +3634,8 @@ fn query_client_detail(connection: &Connection, id: i64) -> rusqlite::Result<Opt
                        AND (flow_sessions.upload_bytes > 0 OR flow_sessions.download_bytes > 0
                             OR flow_sessions.packets > 0)),
                     COALESCE(SUM(t.upload_bytes), 0),
-                    COALESCE(SUM(t.download_bytes), 0), COALESCE(SUM(t.flow_count), 0)
+                    COALESCE(SUM(t.download_bytes), 0), COALESCE(SUM(t.flow_count), 0),
+                    d.device_type_override
              FROM devices d LEFT JOIN traffic_device_minute t ON t.device_id = d.id
              WHERE d.id = ?1 GROUP BY d.id",
             [id],
@@ -3965,6 +3976,7 @@ pub(crate) fn format_mac(bytes: &[u8]) -> String {
 }
 
 fn device_identity_json(row: &Row<'_>, vendor_index: usize) -> rusqlite::Result<Value> {
+    let device_type_override: Option<String> = row.get("device_type_override")?;
     let evidence_text: String = row
         .get::<_, Option<String>>(vendor_index + 5)?
         .unwrap_or_else(|| "[]".to_owned());
@@ -3978,7 +3990,8 @@ fn device_identity_json(row: &Row<'_>, vendor_index: usize) -> rusqlite::Result<
             .get::<_, Option<String>>(vendor_index + 4)?
             .unwrap_or_else(|| "unknown".to_owned()),
         "vendor_confidence": row.get::<_, f64>(vendor_index + 6)?,
-        "device_type_confidence": row.get::<_, f64>(vendor_index + 7)?,
+        "device_type_confidence": if device_type_override.is_some() { 1.0 } else { row.get::<_, f64>(vendor_index + 7)? },
+        "device_type_override": device_type_override,
         "os_confidence": row.get::<_, f64>(vendor_index + 8)?,
         "model_confidence": row.get::<_, f64>(vendor_index + 9)?,
         "private_mac": row.get::<_, bool>(vendor_index + 10)?,

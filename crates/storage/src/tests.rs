@@ -646,6 +646,92 @@ fn device_evidence_accumulates_and_survives_reopen() {
 }
 
 #[test]
+fn manual_device_type_survives_identification_and_reopen() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("netqmon.db");
+    let mut storage = open_at(&path, NOW).unwrap();
+    storage
+        .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
+        .unwrap();
+    for sequence in 1..=3 {
+        let identity = DeviceIdentityUpdate {
+            mac: vec![2, 0, 0, 0, 0, 1],
+            vendor: None,
+            device_type: Some(if sequence == 1 { "laptop" } else { "desktop" }.to_owned()),
+            os_family: None,
+            model: None,
+            confidence: Some("high".to_owned()),
+            vendor_confidence: 0.0,
+            device_type_confidence: 0.9,
+            os_confidence: 0.0,
+            model_confidence: 0.0,
+            private_mac: false,
+            evidence_json: "[]".to_owned(),
+            evidence: vec![],
+        };
+        storage
+            .persist_classified_batch(
+                &batch(sequence, FlowLifecycle::Active),
+                &[],
+                &[identity],
+                NOW,
+            )
+            .unwrap();
+        if sequence == 1 {
+            assert!(
+                storage
+                    .update_client(1, Some(Some("Office")), Some(Some("printer")))
+                    .unwrap()
+            );
+        }
+        if sequence == 2 {
+            drop(storage);
+            storage = open_at(&path, NOW).unwrap();
+        }
+        let (effective, detected, manual, name): (String, String, String, String) = storage.connection()
+            .query_row("SELECT COALESCE(device_type_override, device_type), device_type, device_type_override, display_name FROM devices WHERE id=1", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .unwrap();
+        assert_eq!(effective, "printer");
+        assert_eq!(detected, if sequence == 1 { "laptop" } else { "desktop" });
+        assert_eq!(manual, "printer");
+        assert_eq!(name, "Office");
+    }
+    storage.update_client(1, None, Some(None)).unwrap();
+    let (effective, manual): (String, Option<String>) = storage.connection()
+        .query_row("SELECT COALESCE(device_type_override, device_type), device_type_override FROM devices WHERE id=1", [], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap();
+    assert_eq!(effective, "desktop");
+    assert!(manual.is_none());
+}
+
+#[test]
+fn device_type_override_upgrade_preserves_automatic_identity() {
+    let mut storage = setup();
+    storage
+        .persist_batch(&batch(1, FlowLifecycle::Active), NOW)
+        .unwrap();
+    storage
+        .connection()
+        .execute_batch(
+            "UPDATE devices SET device_type='laptop';
+         ALTER TABLE devices DROP COLUMN device_type_override;
+         DELETE FROM schema_migrations WHERE version=12;",
+        )
+        .unwrap();
+    let storage = SqliteStorage::from_connection_at(storage.connection, NOW).unwrap();
+    let (detected, manual): (String, Option<String>) = storage
+        .connection()
+        .query_row(
+            "SELECT device_type, device_type_override FROM devices WHERE id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(detected, "laptop");
+    assert!(manual.is_none());
+}
+
+#[test]
 fn device_upsert_keeps_identity_when_ip_changes() {
     let mut storage = setup();
     storage

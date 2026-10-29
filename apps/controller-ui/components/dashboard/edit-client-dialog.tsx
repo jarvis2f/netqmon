@@ -64,7 +64,7 @@ function EditClientForm({
   showToast,
 }: EditClientFormProps) {
   const t = useTranslations("clients");
-  const initialExplicitType = client.identity?.device_type;
+  const initialExplicitType = client.identity?.device_type_override;
   const [name, setName] = useState(client.name || "");
   const [deviceType, setDeviceType] = useState(
     initialExplicitType

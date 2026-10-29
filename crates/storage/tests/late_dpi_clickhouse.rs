@@ -1,9 +1,10 @@
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use netqmon_protocol::v1::{DeviceObservation, FlowDelta, TelemetryBatch};
+use netqmon_protocol::v1::{DeviceObservation, FlowDelta, FlowLifecycle, TelemetryBatch};
 use netqmon_storage::{
-    ClickHouseConfig, ClickHouseStorage, FlowAttribution, RetentionPolicy, Storage,
+    ClickHouseConfig, ClickHouseStorage, DeviceIdentityUpdate, FlowAttribution, RetentionPolicy,
+    Storage,
 };
 
 static CLICKHOUSE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -18,6 +19,151 @@ fn disposable_clickhouse() -> ClickHouseStorage {
         ..Default::default()
     })
     .unwrap()
+}
+
+fn device_type_fixture(gateway_id: String, now: u64) -> (TelemetryBatch, DeviceIdentityUpdate) {
+    let mac = vec![2, 0, 0, 0, 0, 99];
+    let batch = TelemetryBatch {
+        gateway_id,
+        boot_id: "device-type-test".into(),
+        sequence: 1,
+        sent_at: now,
+        device_observations: vec![DeviceObservation {
+            mac: mac.clone(),
+            ip: vec![192, 0, 2, 99],
+            hostname: "device-type-test".into(),
+            last_seen_unix_ms: now,
+            dhcp: None,
+        }],
+        flows: vec![FlowDelta {
+            client_mac: mac.clone(),
+            client_ip: vec![192, 0, 2, 99],
+            client_port: 50000,
+            remote_ip: vec![198, 51, 100, 1],
+            remote_port: 443,
+            protocol: 6,
+            ip_version: 4,
+            first_seen_unix_ms: now,
+            last_seen_unix_ms: now,
+            upload_bytes: 100,
+            lifecycle: FlowLifecycle::Ended as i32,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let identity = DeviceIdentityUpdate {
+        mac,
+        vendor: None,
+        device_type: Some("laptop".into()),
+        os_family: None,
+        model: None,
+        confidence: Some("high".into()),
+        vendor_confidence: 0.0,
+        device_type_confidence: 0.9,
+        os_confidence: 0.0,
+        model_confidence: 0.0,
+        private_mac: false,
+        evidence_json: "[]".into(),
+        evidence: vec![],
+    };
+    (batch, identity)
+}
+
+#[test]
+#[ignore = "requires a disposable ClickHouse database"]
+fn manual_device_type_survives_clickhouse_ingestion_and_restores_auto() {
+    let _guard = CLICKHOUSE_TEST_LOCK.lock().unwrap();
+    let mut storage = Storage::clickhouse(disposable_clickhouse());
+    let now = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let gateway_id = format!("device-type-{}-{now}", std::process::id());
+    storage
+        .save_gateway(&gateway_id, "test", "test", &[42; 32], now)
+        .unwrap();
+    let (mut batch, mut identity) = device_type_fixture(gateway_id, now);
+    let attribution = FlowAttribution {
+        application_id: "device-type-test".into(),
+        ..Default::default()
+    };
+    storage
+        .persist_classified_batch(
+            &batch,
+            std::slice::from_ref(&attribution),
+            std::slice::from_ref(&identity),
+            now,
+        )
+        .unwrap();
+    let clients = storage
+        .clickhouse_storage()
+        .unwrap()
+        .query_clients(200, 0)
+        .unwrap()
+        .0;
+    let client = clients
+        .iter()
+        .find(|row| row["hostname"] == "device-type-test")
+        .unwrap();
+    let id = client["id"].as_i64().unwrap();
+    storage
+        .update_client(id, Some(Some("Office")), Some(Some("printer")))
+        .unwrap();
+
+    for sequence in 2..=3 {
+        if sequence == 3 {
+            drop(storage);
+            storage = Storage::clickhouse(disposable_clickhouse());
+        }
+        batch.sequence = sequence;
+        batch.sent_at = now + sequence;
+        batch.device_observations[0].last_seen_unix_ms = now + sequence;
+        identity.device_type = Some("desktop".into());
+        storage
+            .persist_classified_batch(
+                &batch,
+                std::slice::from_ref(&attribution),
+                std::slice::from_ref(&identity),
+                now + sequence,
+            )
+            .unwrap();
+        let backend = storage.clickhouse_storage().unwrap();
+        let detail = backend.query_client_detail(id).unwrap().unwrap();
+        assert_eq!(detail["client"]["identity"]["device_type"], "printer");
+        assert_eq!(
+            detail["client"]["identity"]["device_type_override"],
+            "printer"
+        );
+        assert_eq!(detail["client"]["name"], "Office");
+        let clients = backend.query_clients(200, 0).unwrap().0;
+        let client = clients.iter().find(|row| row["id"] == id).unwrap();
+        assert_eq!(client["identity"]["device_type"], "printer");
+        let related = backend
+            .query_application_related(
+                "device-type-test",
+                None,
+                "clients",
+                now,
+                now + 1000,
+                200,
+                0,
+                true,
+            )
+            .unwrap();
+        assert_eq!(related[0]["identity"]["device_type"], "printer");
+    }
+    storage.update_client(id, None, Some(None)).unwrap();
+    let detail = storage
+        .clickhouse_storage()
+        .unwrap()
+        .query_client_detail(id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(detail["client"]["identity"]["device_type"], "desktop");
+    assert!(detail["client"]["identity"]["device_type_override"].is_null());
 }
 
 #[test]

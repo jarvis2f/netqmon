@@ -69,7 +69,7 @@ const PROTOCOL_ONLY_APPLICATION_MIGRATION: &str =
     include_str!("../../../migrations/clickhouse/0006_protocol_only_app_rollup.sql");
 const PROTOCOL_APPLICATION_ROLLUP_MIGRATION: &str =
     include_str!("../../../migrations/clickhouse/0007_protocol_application_rollup.sql");
-const MIGRATIONS: [(u32, &str); 7] = [
+const MIGRATIONS: [(u32, &str); 8] = [
     (1, INITIAL_MIGRATION),
     (2, PROTOCOL_MIGRATION),
     (3, BATCH_DEDUPLICATION_MIGRATION),
@@ -77,6 +77,10 @@ const MIGRATIONS: [(u32, &str); 7] = [
     (5, QUERY_AND_ACTIVITY_MIGRATION),
     (6, PROTOCOL_ONLY_APPLICATION_MIGRATION),
     (7, PROTOCOL_APPLICATION_ROLLUP_MIGRATION),
+    (
+        8,
+        include_str!("../../../migrations/clickhouse/0008_device_type_override.sql"),
+    ),
 ];
 const MINUTE_MS: i64 = 60 * 1_000;
 const HOUR_MS: i64 = 60 * MINUTE_MS;
@@ -1205,7 +1209,8 @@ impl ClickHouseStorage {
         let sql = format!(
             "SELECT d.id AS id, d.gateway_id AS gateway_id, d.mac AS mac,
                     d.hostname AS hostname, d.display_name AS display_name, d.vendor AS vendor,
-                    d.device_type AS device_type, d.os_family AS os_family, d.model AS model,
+                    coalesce(d.device_type_override, d.device_type) AS device_type,
+                    d.device_type_override AS device_type_override, d.os_family AS os_family, d.model AS model,
                     d.identity_confidence AS identity_confidence,
                     d.identity_evidence_json AS identity_evidence_json,
                     d.vendor_confidence AS vendor_confidence,
@@ -1221,7 +1226,7 @@ impl ClickHouseStorage {
              LEFT JOIN {traffic_table} ON d.gateway_id = t.gateway_id AND d.id = t.device_id
              LEFT JOIN {activity_join}
              GROUP BY d.id, d.gateway_id, d.mac, d.hostname, d.display_name, d.vendor,
-                      d.device_type, d.os_family, d.model, d.identity_confidence,
+                      d.device_type, d.device_type_override, d.os_family, d.model, d.identity_confidence,
                       d.identity_evidence_json, d.vendor_confidence, d.device_type_confidence,
                       d.os_confidence, d.model_confidence, d.private_mac, d.first_seen,
                       d.last_seen, f.last_traffic_seen
@@ -1317,11 +1322,12 @@ impl ClickHouseStorage {
                     "identity": {
                         "vendor": r["vendor"].as_str(),
                         "device_type": r["device_type"].as_str(),
+                        "device_type_override": r["device_type_override"].as_str(),
                         "os_family": r["os_family"].as_str(),
                         "model": r["model"].as_str(),
                         "confidence": r["identity_confidence"].as_str().unwrap_or("unknown"),
                         "vendor_confidence": json_f64(&r["vendor_confidence"]),
-                        "device_type_confidence": json_f64(&r["device_type_confidence"]),
+                        "device_type_confidence": if r["device_type_override"].is_string() { 1.0 } else { json_f64(&r["device_type_confidence"]) },
                         "os_confidence": json_f64(&r["os_confidence"]),
                         "model_confidence": json_f64(&r["model_confidence"]),
                         "private_mac": json_u64(&r["private_mac"]) != 0,
@@ -1345,8 +1351,8 @@ impl ClickHouseStorage {
     /// Returns `StorageError` on query error.
     pub fn query_client_detail(&self, id: i64) -> StorageResult<Option<Value>> {
         let sql = format!(
-            "SELECT id, gateway_id, mac, hostname, display_name, vendor, device_type,
-                    os_family, model, identity_confidence, identity_evidence_json,
+            "SELECT id, gateway_id, mac, hostname, display_name, vendor, coalesce(device_type_override, device_type) AS device_type,
+                    device_type_override, os_family, model, identity_confidence, identity_evidence_json,
                     vendor_confidence, device_type_confidence, os_confidence, model_confidence,
                     private_mac, first_seen, last_seen
              FROM devices FINAL WHERE id = {id} LIMIT 1 FORMAT JSON"
@@ -1439,11 +1445,12 @@ impl ClickHouseStorage {
                 "identity": {
                     "vendor": row["vendor"].as_str(),
                     "device_type": row["device_type"].as_str(),
+                    "device_type_override": row["device_type_override"].as_str(),
                     "os_family": row["os_family"].as_str(),
                     "model": row["model"].as_str(),
                     "confidence": row["identity_confidence"].as_str().unwrap_or("unknown"),
                     "vendor_confidence": row["vendor_confidence"].as_f64().or_else(|| row["vendor_confidence"].as_str().and_then(|value| value.parse().ok())).unwrap_or(0.0),
-                    "device_type_confidence": row["device_type_confidence"].as_f64().or_else(|| row["device_type_confidence"].as_str().and_then(|value| value.parse().ok())).unwrap_or(0.0),
+                    "device_type_confidence": if row["device_type_override"].is_string() { 1.0 } else { json_f64(&row["device_type_confidence"]) },
                     "os_confidence": row["os_confidence"].as_f64().or_else(|| row["os_confidence"].as_str().and_then(|value| value.parse().ok())).unwrap_or(0.0),
                     "model_confidence": row["model_confidence"].as_f64().or_else(|| row["model_confidence"].as_str().and_then(|value| value.parse().ok())).unwrap_or(0.0),
                     "private_mac": json_u64(&row["private_mac"]) != 0,
@@ -1514,10 +1521,13 @@ impl ClickHouseStorage {
         if let Some(type_opt) = device_type {
             match type_opt {
                 Some(dtype) if !dtype.trim().is_empty() => {
-                    sets.push(format!("device_type = '{}'", escape_sql(dtype.trim())));
+                    sets.push(format!(
+                        "device_type_override = '{}'",
+                        escape_sql(dtype.trim())
+                    ));
                 }
                 _ => {
-                    sets.push("device_type = NULL".to_owned());
+                    sets.push("device_type_override = NULL".to_owned());
                 }
             }
         }
@@ -2058,7 +2068,8 @@ impl ClickHouseStorage {
         let sql = match relation {
             "clients" => format!(
                 "SELECT d.id, d.mac, coalesce(d.display_name, d.hostname, '') AS name,
-                        d.gateway_id, d.vendor, d.device_type, d.os_family, d.model,
+                        d.gateway_id, d.vendor, coalesce(d.device_type_override, d.device_type) AS device_type,
+                        d.device_type_override, d.os_family, d.model,
                         d.identity_confidence, d.vendor_confidence,
                         d.device_type_confidence, d.os_confidence, d.model_confidence,
                         d.private_mac, d.last_seen, sum(f.upload_bytes) AS upload_bytes,
@@ -2066,7 +2077,7 @@ impl ClickHouseStorage {
                  FROM flow_sessions AS f FINAL INNER JOIN devices AS d FINAL ON d.id = f.device_id
                  WHERE {flow_application_filter}{flow_category_filter}
                    AND f.last_seen_at >= {from} AND f.last_seen_at < {to}
-                 GROUP BY d.id, d.mac, name, d.gateway_id, d.vendor, d.device_type,
+                 GROUP BY d.id, d.mac, name, d.gateway_id, d.vendor, d.device_type, d.device_type_override,
                           d.os_family, d.model, d.identity_confidence, d.vendor_confidence,
                           d.device_type_confidence, d.os_confidence, d.model_confidence,
                           d.private_mac, d.last_seen
@@ -2149,11 +2160,12 @@ impl ClickHouseStorage {
                         "identity": {
                             "vendor": row["vendor"].as_str(),
                             "device_type": row["device_type"].as_str(),
+                            "device_type_override": row["device_type_override"].as_str(),
                             "os_family": row["os_family"].as_str(),
                             "model": row["model"].as_str(),
                             "confidence": row["identity_confidence"].as_str().unwrap_or("unknown"),
                             "vendor_confidence": confidence("vendor_confidence"),
-                            "device_type_confidence": confidence("device_type_confidence"),
+                            "device_type_confidence": if row["device_type_override"].is_string() { 1.0 } else { confidence("device_type_confidence") },
                             "os_confidence": confidence("os_confidence"),
                             "model_confidence": confidence("model_confidence"),
                             "private_mac": private_mac,
@@ -3073,7 +3085,7 @@ impl StorageBackend for ClickHouseStorage {
         if !mac_values.is_empty() {
             let mac_list = mac_values.into_iter().collect::<Vec<_>>().join(", ");
             let sql = format!(
-                "SELECT mac, hostname, display_name, vendor, device_type, os_family, model,
+                "SELECT mac, hostname, display_name, vendor, device_type, device_type_override, os_family, model,
                         identity_confidence, vendor_confidence, device_type_confidence,
                         os_confidence, model_confidence, private_mac, identity_evidence_json,
                         first_seen, last_seen
@@ -3156,6 +3168,7 @@ impl StorageBackend for ClickHouseStorage {
                     .unwrap_or(Value::Null),
                 "vendor": preserve_identity("vendor", identity.and_then(|value| value.vendor.as_deref())),
                 "device_type": preserve_identity("device_type", identity.and_then(|value| value.device_type.as_deref())),
+                "device_type_override": existing_string("device_type_override"),
                 "os_family": preserve_identity("os_family", identity.and_then(|value| value.os_family.as_deref())),
                 "model": preserve_identity("model", identity.and_then(|value| value.model.as_deref())),
                 "identity_confidence": identity_confidence,

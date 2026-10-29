@@ -1468,6 +1468,110 @@ async fn update_client_info_modifies_display_name_and_device_type() {
 }
 
 #[tokio::test]
+async fn client_device_type_override_is_used_by_queries_and_null_restores_auto() {
+    let state = query_state();
+    state
+        .lock()
+        .storage
+        .connection()
+        .execute(
+            "UPDATE devices SET device_type='laptop', device_type_confidence=0.8 WHERE id=1",
+            [],
+        )
+        .unwrap();
+    let router = internal_router(state.clone());
+    for (payload, expected_type, expected_override) in [
+        (
+            serde_json::json!({"device_type":"printer", "name":"Office"}),
+            "printer",
+            Some("printer"),
+        ),
+        (serde_json::json!({"name":null}), "printer", Some("printer")),
+        (serde_json::json!({}), "printer", Some("printer")),
+        (serde_json::json!({"device_type":null}), "desktop", None),
+        (
+            serde_json::json!({"device_type":"camera"}),
+            "camera",
+            Some("camera"),
+        ),
+        (serde_json::json!({"device_type":""}), "desktop", None),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/internal/clients/1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        let client = &value["data"]["client"];
+        assert_eq!(client["identity"]["device_type"], expected_type);
+        assert_eq!(
+            client["identity"]["device_type_override"],
+            serde_json::json!(expected_override)
+        );
+        if payload.get("name").is_some_and(serde_json::Value::is_null) {
+            assert_eq!(client["name"], "laptop");
+        }
+
+        // A later automatic result is retained underneath the manual selection.
+        state
+            .lock()
+            .storage
+            .connection()
+            .execute("UPDATE devices SET device_type='desktop' WHERE id=1", [])
+            .unwrap();
+        for uri in ["/internal/clients/1", "/internal/clients?limit=10"] {
+            let response = router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let value: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                    .unwrap();
+            let client = if uri.contains('?') {
+                &value["data"][0]
+            } else {
+                &value["data"]["client"]
+            };
+            assert_eq!(client["identity"]["device_type"], expected_type, "{uri}");
+            assert_eq!(
+                client["identity"]["device_type_override"],
+                serde_json::json!(expected_override)
+            );
+        }
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/flows?limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            value["data"][0]["client_identity"]["device_type"],
+            expected_type
+        );
+    }
+}
+
+#[tokio::test]
 async fn application_rankings_match_detail_totals_and_pagination_without_flow_statistics() {
     let state = query_state();
     {

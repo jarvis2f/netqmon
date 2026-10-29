@@ -21,7 +21,7 @@ const PROTOCOL_ONLY_APPLICATION_MIGRATION: &str =
     include_str!("../../../migrations/sqlite/0004_protocol_only_app_rollup.sql");
 const PROTOCOL_APPLICATION_ROLLUP_MIGRATION: &str =
     include_str!("../../../migrations/sqlite/0005_protocol_application_rollup.sql");
-const MIGRATIONS: [(i64, &str); 11] = [
+const MIGRATIONS: [(i64, &str); 12] = [
     (1, INITIAL_MIGRATION),
     (2, PROTOCOL_MIGRATION),
     (3, SCOPE_TIMESTAMP_MIGRATION),
@@ -50,6 +50,10 @@ const MIGRATIONS: [(i64, &str); 11] = [
     (
         11,
         include_str!("../../../migrations/sqlite/0011_scope_totals.sql"),
+    ),
+    (
+        12,
+        include_str!("../../../migrations/sqlite/0012_device_type_override.sql"),
     ),
 ];
 const SAME_DEVICE_DNS_QUERY: &str =
@@ -729,7 +733,7 @@ impl SqliteStorage {
         }
 
         if let Some(type_opt) = device_type {
-            sets.push(format!("device_type = ?{}", params.len() + 1));
+            sets.push(format!("device_type_override = ?{}", params.len() + 1));
             match type_opt {
                 Some(dtype) if !dtype.trim().is_empty() => {
                     params.push(rusqlite::types::Value::Text(dtype.trim().to_owned()));

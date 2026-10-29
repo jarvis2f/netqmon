@@ -50,6 +50,7 @@ export interface SelfHostApplication {
 export interface DeviceIdentity {
   vendor: string | null;
   device_type: string | null;
+  device_type_override?: string | null;
   os_family: string | null;
   model: string | null;
   confidence: "unknown" | "low" | "medium" | "high" | (string & {});
