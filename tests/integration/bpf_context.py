@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify TC programs without kernel BTF context-name recognition (issue #7).
+"""Verify TC programs without kernel BTF and MIPS32 subprogram calls (#1/#6/#7).
 
 Run as root on Linux with clang and bpftool. Renaming the UAPI context makes
 global skb arguments unrecognizable even on CI kernels with working BTF.
@@ -10,6 +10,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import struct
 import subprocess
@@ -51,9 +52,27 @@ def bpf(*args):
     return run(BPFTOOL, *args)
 
 
+def check_subprogram_calls(obj, expected):
+    instructions = run("llvm-objdump", "-d", obj)
+    # BPF_PSEUDO_CALL (src_reg=1), unlike ordinary helper or tail calls.
+    calls = re.findall(r"^\s*\d+:\s+85\s+10\s", instructions, re.MULTILINE)
+    assert bool(calls) == expected, (obj, len(calls))
+
+
 def update(path, key, value):
     bpf("map", "update", "pinned", path, "key", "hex", *key.hex(" ").split(),
         "value", "hex", *value.hex(" ").split())
+
+
+def lookup_u64(path, key):
+    result = json.loads(bpf("-j", "map", "lookup", "pinned", path,
+                            "key", "hex", *key.hex(" ").split()))
+    value = result["value"]
+    if isinstance(value, dict):
+        return value["packets"]
+    if isinstance(value, int):
+        return value
+    return struct.unpack_from("=Q", bytes(int(byte, 16) for byte in value))[0]
 
 
 def verdict(kind, tag=0):
@@ -90,8 +109,10 @@ def check_policy(pins, work):
             key = (struct.pack("=BBBBI", version, 17, 0, hook, 1)
                    + source.ljust(16, b"\0") + destination.ljust(16, b"\0")
                    + struct.pack("!HH", *ports))
+            packet_count = 0
 
-            def packet(expected_action, expected_mark=original_mark):
+            def packet(expected_action, expected_mark=original_mark, accounted=True):
+                nonlocal packet_count
                 result = json.loads(bpf(
                     "-j", "prog", "run", "pinned", pins / "progs" / program,
                     "data_in", work / "packet", "ctx_in", work / "ctx",
@@ -100,6 +121,8 @@ def check_policy(pins, work):
                 output = (work / "ctx-out").read_bytes()
                 assert struct.unpack_from("=I", output, 8)[0] == expected_mark
                 assert struct.unpack_from("=I", output, 32)[0] == original_priority
+                packet_count += int(accounted)
+                assert lookup_u64(maps / "flow_map", key) == packet_count
 
             packet(0)
             update(maps / "flow_verdict_map", key, verdict(1))
@@ -115,6 +138,33 @@ def check_policy(pins, work):
             bpf("map", "delete", "pinned", maps / "endpoint_blocks", "key", "hex",
                 *endpoint.hex(" ").split())
             packet(0)
+
+            if hook == 2:
+                # Forwarded packets already observed at ingress still enforce
+                # policy at egress, without recording or sampling them twice.
+                update(maps / "observed_ifindexes", struct.pack("=I", 7), bytes([1]))
+                struct.pack_into("=I", context, 36, 7)
+                (work / "ctx").write_bytes(context)
+                packet(0, accounted=False)
+                update(maps / "flow_verdict_map", key, verdict(1))
+                packet(2)
+                bpf("map", "delete", "pinned", maps / "flow_verdict_map", "key", "hex",
+                    *key.hex(" ").split())
+                bpf("map", "delete", "pinned", maps / "observed_ifindexes", "key", "hex",
+                    "07", "00", "00", "00")
+                struct.pack_into("=I", context, 36, 0)
+                (work / "ctx").write_bytes(context)
+
+    # Allowed packets 1 and 3 are sampled; blocked packets are only accounted.
+    assert lookup_u64(maps / "sample_counters", struct.pack("=I", 4)) == 8
+    assert lookup_u64(maps / "sample_counters", struct.pack("=I", 1)) == 304
+
+    if (maps / "packet_stages").exists():
+        # A missing QoS continuation must not silently bypass enforcement.
+        bpf("map", "delete", "pinned", maps / "packet_stages", "key", "hex", "04", "00", "00", "00")
+        result = json.loads(bpf("-j", "prog", "run", "pinned", pins / "progs" / "netqmon_ingress",
+                                "data_in", work / "packet", "ctx_in", work / "ctx"))
+        assert result["retval"] == 2, result
 
 
 def main():
@@ -141,10 +191,14 @@ def main():
                  "type", "classifier"], text=True, capture_output=True)
             assert rejected.returncode and "Caller passes invalid args" in rejected.stderr, rejected
 
-        for name, defines in VARIANTS.items():
+        variants = [(name, defines, False) for name, defines in VARIANTS.items()]
+        variants += [(f"mips32-{name}", defines + ["NETQMON_BPF_NO_SUBPROGRAMS"], True)
+                     for name, defines in VARIANTS.items()]
+        for name, defines, mips32 in variants:
             obj = work / "flow.bpf.o"
             run(*clang, *(f"-D{define}=1" for define in defines), "-c", ROOT / "bpf/flow.bpf.c",
                 "-o", obj)
+            check_subprogram_calls(obj, expected=not mips32)
             with tempfile.TemporaryDirectory(prefix="nqm-ctx-", dir="/sys/fs/bpf") as pin_dir:
                 pins = Path(pin_dir)
                 (pins / "maps").mkdir()

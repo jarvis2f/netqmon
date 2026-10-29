@@ -158,7 +158,7 @@ struct flow_policy_packet {
 /* Keep policy verification independent of the parser's branches, but pass only
  * ordinary memory. Global skb arguments require kernel BTF context metadata
  * that is absent on some OpenWrt kernels ("btf_vmlinux is malformed"). */
-__attribute__((noinline)) int evaluate_flow_policy(
+NETQMON_BPF_SUBPROGRAM int evaluate_flow_policy(
     struct flow_policy_packet *packet, struct flow_key *key)
 {
     /* Older verifiers do not accept a global subprogram's generic memory
@@ -244,7 +244,7 @@ __attribute__((noinline)) int evaluate_flow_policy(
 
 /* Static preserves the caller's skb type without kernel BTF; noinline keeps
  * the packet snapshot off the parser's already crowded stack. */
-static __attribute__((noinline)) int apply_flow_policy(
+static NETQMON_BPF_SUBPROGRAM int apply_flow_policy(
     struct __sk_buff *skb, struct flow_key *key, const __u8 *source_mac)
 {
     struct flow_policy_packet packet = {
@@ -281,7 +281,7 @@ static __always_inline void sample_count(__u32 index, __u64 amount)
 
 /* Keep this helper static so the verifier propagates the caller's skb context
    without kernel BTF; retain noinline to limit the inlined parser stack. */
-static __attribute__((noinline)) int maybe_capture_sample(struct __sk_buff *skb,
+static NETQMON_BPF_SUBPROGRAM int NETQMON_SAMPLE_BODY(struct __sk_buff *skb,
                                       struct flow_key *key, __u32 network_offset,
                                       __u32 original_length)
 {
@@ -400,7 +400,72 @@ static __attribute__((noinline)) int maybe_capture_sample(struct __sk_buff *skb,
     return 0;
 }
 
-static __attribute__((noinline)) void maybe_capture_dns(struct __sk_buff *skb,
+#ifdef NETQMON_BPF_NO_SUBPROGRAMS
+/* MIPS32 JITs cannot compile BPF-to-BPF calls. Tail calls keep policy,
+ * observation, sampling and QoS verification independent without disabling
+ * any packet features. This scratch value is private to the current CPU. */
+enum packet_stage {
+    STAGE_SAMPLE_INGRESS,
+    STAGE_SAMPLE_EGRESS,
+    STAGE_OBSERVE_INGRESS,
+    STAGE_OBSERVE_EGRESS,
+    STAGE_FINISH_INGRESS,
+    STAGE_FINISH_EGRESS,
+    STAGE_COUNT,
+};
+int netqmon_observe_ingress(struct __sk_buff *skb);
+int netqmon_observe_egress(struct __sk_buff *skb);
+int netqmon_finish_ingress(struct __sk_buff *skb);
+int netqmon_finish_egress(struct __sk_buff *skb);
+int netqmon_sample_ingress(struct __sk_buff *skb);
+int netqmon_sample_egress(struct __sk_buff *skb);
+struct packet_stage_context {
+    struct flow_key key;
+    __u32 network_offset;
+    __u32 original_length;
+    __u32 policy_only;
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct packet_stage_context);
+} packet_context SEC(".maps");
+struct {
+    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+    __uint(max_entries, STAGE_COUNT);
+    __type(value, __u32);
+    __type(key, __u32);
+    __array(values, int (void *));
+} packet_stages SEC(".maps") = {
+    .values = {[STAGE_SAMPLE_INGRESS] = (void *)&netqmon_sample_ingress,
+               [STAGE_SAMPLE_EGRESS] = (void *)&netqmon_sample_egress,
+               [STAGE_OBSERVE_INGRESS] = (void *)&netqmon_observe_ingress,
+               [STAGE_OBSERVE_EGRESS] = (void *)&netqmon_observe_egress,
+               [STAGE_FINISH_INGRESS] = (void *)&netqmon_finish_ingress,
+               [STAGE_FINISH_EGRESS] = (void *)&netqmon_finish_egress},
+};
+static void (*bpf_tail_call)(void *ctx, void *map, __u32 index) = (void *)12;
+static __always_inline int maybe_capture_sample(struct __sk_buff *skb,
+    struct flow_key *key, __u32 network_offset, __u32 original_length)
+{
+    if (!sample_enabled)
+        return 0;
+    __u32 zero = 0;
+    struct packet_stage_context *ctx = bpf_map_lookup_elem(&packet_context, &zero);
+    if (!ctx)
+        return 0;
+    ctx->key = *key;
+    ctx->network_offset = network_offset;
+    ctx->original_length = original_length;
+    bpf_tail_call(skb, &packet_stages, key->hook == NETQMON_HOOK_EGRESS
+                  ? STAGE_SAMPLE_EGRESS : STAGE_SAMPLE_INGRESS);
+    return 0;
+}
+
+#endif
+
+static NETQMON_BPF_SUBPROGRAM void maybe_capture_dns(struct __sk_buff *skb,
                                                         struct udp_header *udp,
                                                         const __u8 *client_address,
                                                         __u8 ip_version,
@@ -684,7 +749,7 @@ static __always_inline void maybe_capture_discovery(struct __sk_buff *skb,
    TLS on port 80 and every other binary fails the prefix check. Marked
    noinline like maybe_capture_sample so the inlined ingress stack stays
    within the 512-byte verifier limit. */
-__attribute__((noinline)) static void maybe_capture_http_discovery(
+NETQMON_BPF_SUBPROGRAM static void maybe_capture_http_discovery(
     struct __sk_buff *skb, struct tcp_header_prefix *tcp,
     struct http_capture_ctx *ctx)
 {
@@ -814,7 +879,7 @@ static __always_inline int parse_ipv4(struct __sk_buff *skb, __u8 *cursor,
     fragment_offset = netqmon_ntohs(ipv4->fragment_offset);
     if ((fragment_offset & IPV4_FRAGMENT_OFFSET_MASK) == 0) {
         if (key.protocol == IPPROTO_ESP || key.protocol == IPPROTO_GRE) {
-            if (policy_only)
+            if (NETQMON_POLICY_ONLY(policy_only))
                 return TC_ACT_OK;
             __u64 flow_packets = record_flow(&key, packet_length, 0);
             if (sample_enabled &&
@@ -828,13 +893,13 @@ static __always_inline int parse_ipv4(struct __sk_buff *skb, __u8 *cursor,
             return TC_ACT_OK;
         key.source_port = ports->source;
         key.destination_port = ports->destination;
-        if (flow_policy_state.enabled) {
+        if (NETQMON_CHECK_POLICY(policy_only)) {
             int action = apply_flow_policy(skb, &key, source_mac);
             if (action != TC_ACT_OK) {
                 return action;
             }
         }
-        if (policy_only)
+        if (NETQMON_POLICY_ONLY(policy_only))
             return TC_ACT_OK;
         if (key.protocol == IPPROTO_TCP) {
             tcp_flags = read_tcp_flags(cursor + ihl, data_end);
@@ -868,7 +933,7 @@ static __always_inline int parse_ipv4(struct __sk_buff *skb, __u8 *cursor,
         }
     }
 
-    if (policy_only)
+    if (NETQMON_POLICY_ONLY(policy_only))
         return TC_ACT_OK;
 
     __u64 flow_packets = record_flow(&key, packet_length, tcp_flags);
@@ -920,13 +985,13 @@ static __always_inline int parse_ipv6(struct __sk_buff *skb, __u8 *cursor,
             if ((void *)(ports + 1) <= data_end) {
                 key.source_port = ports->source;
                 key.destination_port = ports->destination;
-                if (flow_policy_state.enabled) {
+                if (NETQMON_CHECK_POLICY(policy_only)) {
                     int action = apply_flow_policy(skb, &key, source_mac);
                     if (action != TC_ACT_OK) {
                         return action;
                     }
                 }
-                if (policy_only)
+                if (NETQMON_POLICY_ONLY(policy_only))
                     return TC_ACT_OK;
             }
             if (next_header == IPPROTO_UDP) {
@@ -1003,7 +1068,7 @@ static __always_inline int parse_ipv6(struct __sk_buff *skb, __u8 *cursor,
         transport_offset += extension_length;
     }
 
-    if (policy_only)
+    if (NETQMON_POLICY_ONLY(policy_only))
         return TC_ACT_OK;
 
     key.protocol = next_header;
@@ -1075,7 +1140,7 @@ static __always_inline int parse_packet(struct __sk_buff *skb, void *data,
 #ifdef NETQMON_QOS_PRIORITY
 /* Keep skb helpers static so context verification does not require kernel BTF.
  * Policy verdict first, priority only for accepted packets, then observation. */
-static __attribute__((noinline)) int qos_priority_finish_egress(struct __sk_buff *skb, int action)
+static NETQMON_BPF_SUBPROGRAM int qos_priority_finish_egress(struct __sk_buff *skb, int action)
 {
     if (action == TC_ACT_OK) {
 #ifdef NETQMON_QOS_POC
@@ -1088,17 +1153,19 @@ static __attribute__((noinline)) int qos_priority_finish_egress(struct __sk_buff
 }
 #endif
 
-SEC("tc")
-int netqmon_ingress(struct __sk_buff *skb)
+#ifdef NETQMON_BPF_NO_SUBPROGRAMS
+static __always_inline int tail_finish(struct __sk_buff *skb, int action, __u32 slot)
 {
-#ifdef NETQMON_QOS_PATH_PROBE
-    qos_path_observe(skb, NETQMON_HOOK_INGRESS);
+    if (action != TC_ACT_OK)
+        return action;
+    bpf_tail_call(skb, &packet_stages, slot);
+    /* Missing QoS continuation must not bypass enforcement. */
+    return TC_ACT_SHOT;
+}
 #endif
-    void *data = (void *)(long)skb->data;
-    void *data_end = (void *)(long)skb->data_end;
 
-    int action = parse_packet(skb, data, data_end, skb->ifindex, skb->len,
-                              NETQMON_HOOK_INGRESS, 0);
+static __always_inline int finish_ingress(struct __sk_buff *skb, int action)
+{
 #ifdef NETQMON_QOS_PRIORITY
     if (action == TC_ACT_OK) {
         int priority_action = qos_priority_ingress(skb);
@@ -1113,8 +1180,30 @@ int netqmon_ingress(struct __sk_buff *skb)
     return action;
 }
 
+SEC("tc")
+int netqmon_ingress(struct __sk_buff *skb)
+{
+#ifdef NETQMON_QOS_PATH_PROBE
+    qos_path_observe(skb, NETQMON_HOOK_INGRESS);
+#endif
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+
+#ifdef NETQMON_BPF_NO_SUBPROGRAMS
+    int action = parse_packet(skb, data, data_end, skb->ifindex, skb->len,
+                              NETQMON_HOOK_INGRESS, NETQMON_PARSE_POLICY);
+    if (action == TC_ACT_OK)
+        bpf_tail_call(skb, &packet_stages, STAGE_OBSERVE_INGRESS);
+    return tail_finish(skb, action, STAGE_FINISH_INGRESS);
+#else
+    int action = parse_packet(skb, data, data_end, skb->ifindex, skb->len,
+                              NETQMON_HOOK_INGRESS, 0);
+    return finish_ingress(skb, action);
+#endif
+}
+
 #ifdef NETQMON_QOS_PRIORITY
-__attribute__((noinline))
+NETQMON_BPF_SUBPROGRAM
 static int netqmon_policy_account_egress(struct __sk_buff *skb)
 #else
 SEC("tc")
@@ -1149,11 +1238,25 @@ int netqmon_egress(struct __sk_buff *skb)
         policy_only = 1;
     }
 
+#ifdef NETQMON_BPF_NO_SUBPROGRAMS
+    __u32 zero = 0;
+    struct packet_stage_context *ctx = bpf_map_lookup_elem(&packet_context, &zero);
+    if (!ctx)
+        return TC_ACT_SHOT;
+    ctx->policy_only = policy_only;
+#endif
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
 
+#ifdef NETQMON_BPF_NO_SUBPROGRAMS
+    int action = parse_packet(skb, data, data_end, skb->ifindex, skb->len,
+                              NETQMON_HOOK_EGRESS, NETQMON_PARSE_POLICY);
+    if (action == TC_ACT_OK && !ctx->policy_only)
+        bpf_tail_call(skb, &packet_stages, STAGE_OBSERVE_EGRESS);
+#else
     int action = parse_packet(skb, data, data_end, skb->ifindex, skb->len,
                               NETQMON_HOOK_EGRESS, policy_only);
+#endif
     return action;
 }
 
@@ -1162,7 +1265,73 @@ SEC("tc")
 int netqmon_egress(struct __sk_buff *skb)
 {
     int action = netqmon_policy_account_egress(skb);
+#ifdef NETQMON_BPF_NO_SUBPROGRAMS
+    return tail_finish(skb, action, STAGE_FINISH_EGRESS);
+#else
     return qos_priority_finish_egress(skb, action);
+#endif
+}
+#endif
+
+#ifdef NETQMON_BPF_NO_SUBPROGRAMS
+SEC("tc")
+int netqmon_observe_ingress(struct __sk_buff *skb)
+{
+    int action = parse_packet(skb, (void *)(long)skb->data, (void *)(long)skb->data_end,
+                             skb->ifindex, skb->len, NETQMON_HOOK_INGRESS, NETQMON_PARSE_OBSERVE);
+    return tail_finish(skb, action, STAGE_FINISH_INGRESS);
+}
+
+SEC("tc")
+int netqmon_observe_egress(struct __sk_buff *skb)
+{
+    int action = parse_packet(skb, (void *)(long)skb->data, (void *)(long)skb->data_end,
+                             skb->ifindex, skb->len, NETQMON_HOOK_EGRESS, NETQMON_PARSE_OBSERVE);
+#ifdef NETQMON_QOS_PRIORITY
+    return tail_finish(skb, action, STAGE_FINISH_EGRESS);
+#else
+    return action;
+#endif
+}
+
+SEC("tc")
+int netqmon_sample_ingress(struct __sk_buff *skb)
+{
+    __u32 zero = 0;
+    struct packet_stage_context *ctx = bpf_map_lookup_elem(&packet_context, &zero);
+    if (ctx)
+        capture_sample_body(skb, &ctx->key, ctx->network_offset, ctx->original_length);
+    return tail_finish(skb, TC_ACT_OK, STAGE_FINISH_INGRESS);
+}
+
+SEC("tc")
+int netqmon_sample_egress(struct __sk_buff *skb)
+{
+    __u32 zero = 0;
+    struct packet_stage_context *ctx = bpf_map_lookup_elem(&packet_context, &zero);
+    if (ctx)
+        capture_sample_body(skb, &ctx->key, ctx->network_offset, ctx->original_length);
+#ifdef NETQMON_QOS_PRIORITY
+    return tail_finish(skb, TC_ACT_OK, STAGE_FINISH_EGRESS);
+#else
+    return TC_ACT_OK;
+#endif
+}
+
+SEC("tc")
+int netqmon_finish_ingress(struct __sk_buff *skb)
+{
+    return finish_ingress(skb, TC_ACT_OK);
+}
+
+SEC("tc")
+int netqmon_finish_egress(struct __sk_buff *skb)
+{
+#ifdef NETQMON_QOS_PRIORITY
+    return qos_priority_finish_egress(skb, TC_ACT_OK);
+#else
+    return TC_ACT_OK;
+#endif
 }
 #endif
 

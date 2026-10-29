@@ -60,5 +60,15 @@ NetQmon Agent 采用完全静态编译 (Fully Static ELF)，运行时不依赖�
 ### 3.2 运行前检测诊断机制 (Doctor & Self-Probe)
 Agent 在执行 `netqmon-agent run` 启动时，以及 `netqmon-agent doctor` 诊断时，会自动执行**非破坏性探测**：
 1. 探测 `BPF syscall`、`Hash`、`LRU Hash`、`Array`、`Ringbuf` map 创建与即时销毁。
-2. 探测 TC clsact 与 BPF hook 挂载（使用高优先级 `0x7ffe` 与独立 handle `0x4e514d44`，探测结束立即安全卸载）。
-3. 遇到缺少特性时输出精确报错（例如提示缺少 `kmod-sched-core` 或 Ringbuf 不支持），避免静默崩溃。
+2. `doctor` 报告 `/sys/kernel/btf/vmlinux` 是否可读。缺少内核 BTF 只显示警告：静态 skb 子函数可在无内核 BTF 的固件上工作，不应仅因此拒绝启动。
+3. `doctor` 实际加载完整 ingress/egress 程序后立即释放，不挂载到流量接口。只有完整程序通过校验器，才报告 `BPF program OK`；最小挂载探针成功不能替代这项检查。
+4. 探测 TC clsact 与 BPF hook 挂载（使用高优先级 `0x7ffe` 与独立 handle `0x4e514d44`，探测结束立即安全卸载）。
+5. 遇到缺少特性时输出精确报错（例如提示缺少 `kmod-sched-core` 或 Ringbuf 不支持），避免静默崩溃。
+
+### 3.3 MIPS32 与无内核 BTF 固件的兼容性
+
+- [#1](https://github.com/jarvis2f/netqmon/issues/1)：skb 参数必须保留上下文类型。采样和 HTTP/DNS 等 skb 辅助函数采用静态声明，避免依赖固件可能缺失的内核 BTF。原始加载故障已在 v1.0.1 修复，issue 中有 iStoreOS 启动成功及 MT7621 无内核 BTF 的实机反馈。
+- [#4](https://github.com/jarvis2f/netqmon/issues/4)：`bpf_map_create_opts.sz` 使用最后一个有效字段的末端，排除 Rust 结构体尾部填充，避免 libbpf 将填充字节误判为非零扩展字段。现有 ABI 回归断言覆盖 MIPS/ARM32 的 64 字节及 64 位架构的 68 字节边界；原始问题已有 MT7621 实机确认。
+- [#6](https://github.com/jarvis2f/netqmon/issues/6)：部分 MIPS32 内核的 JIT 不支持 BPF-to-BPF 子函数调用，加载成功后会退回解释器，并记录 `unknown opcode 85`。当前源码为 MIPS32 自动选择全内联的尾调用阶段，分别处理策略、观测、采样和 QoS 收尾，保留采样与识别能力，同时限制单个程序的校验复杂度。其他架构保留原有子函数布局。
+
+集成测试会检查 MIPS32 变体不含 `BPF_PSEUDO_CALL`，并在 Linux 内核上验证无上下文 BTF 的加载及 IPv4/IPv6 策略行为。通用 Linux 内核测试和 QEMU 用户态启动不能替代目标路由器上的 JIT、吞吐量及 CPU 占用测量；MIPS32 支持层级仍为 Experimental。

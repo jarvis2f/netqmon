@@ -40,7 +40,7 @@ struct {
     __type(value, __u64);
 } qos_path_overflow SEC(".maps");
 
-static __attribute__((noinline)) void qos_path_observe_record(struct __sk_buff *skb, __u32 hook)
+static NETQMON_BPF_SUBPROGRAM void qos_path_observe_record(struct __sk_buff *skb, __u32 hook)
 {
     __u32 zero = 0;
     void *data = (void *)(long)skb->data;

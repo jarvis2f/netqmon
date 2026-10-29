@@ -10,6 +10,22 @@
 #define SEC(name) __attribute__((section(name), used))
 #define __always_inline inline __attribute__((always_inline))
 
+#ifdef NETQMON_BPF_NO_SUBPROGRAMS
+#define NETQMON_BPF_SUBPROGRAM __always_inline
+#define NETQMON_SAMPLE_BODY capture_sample_body
+#define NETQMON_POLICY_ONLY(mode) ((mode) == NETQMON_PARSE_POLICY)
+#define NETQMON_CHECK_POLICY(mode) ((mode) != NETQMON_PARSE_OBSERVE && flow_policy_state.enabled)
+#else
+#define NETQMON_BPF_SUBPROGRAM __attribute__((noinline))
+#define NETQMON_SAMPLE_BODY maybe_capture_sample
+#define NETQMON_POLICY_ONLY(mode) (mode)
+#define NETQMON_CHECK_POLICY(mode) (flow_policy_state.enabled)
+#endif
+
+#define NETQMON_PARSE_POLICY 1
+#define NETQMON_PARSE_OBSERVE 2
+
+#define BPF_MAP_TYPE_PROG_ARRAY 3
 #define BPF_MAP_TYPE_LRU_HASH 9
 #define BPF_MAP_TYPE_ARRAY 2
 #define BPF_MAP_TYPE_ARRAY_OF_MAPS 12

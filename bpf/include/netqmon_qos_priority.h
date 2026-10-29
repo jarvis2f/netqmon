@@ -128,7 +128,7 @@ static __always_inline int qos_priority_assignment_valid(struct qos_client_assig
 /* Return true only for routed IP packets outside all configured internal
  * prefixes. Non-IP control traffic stays available; malformed IP is dropped
  * for a blocked client so parser uncertainty cannot create an Internet bypass. */
-static __attribute__((noinline)) int qos_priority_is_internet_packet(
+static NETQMON_BPF_SUBPROGRAM int qos_priority_is_internet_packet(
     struct __sk_buff *skb, int source_address)
 {
     void *data = (void *)(long)skb->data;
@@ -199,7 +199,7 @@ static __always_inline int qos_priority_upload_classid_valid(__u32 classid)
 
 #define NETQMON_QOS_MIRRED_CB_MAGIC 0x4e514d52U
 
-static __attribute__((noinline)) int qos_priority_ingress(struct __sk_buff *skb)
+static NETQMON_BPF_SUBPROGRAM int qos_priority_ingress(struct __sk_buff *skb)
 {
     __u32 zero = 0, ifindex = skb->ifindex;
     __u32 *ifb = bpf_map_lookup_elem(&qos_priority_ifb, &zero);
@@ -243,7 +243,7 @@ static __attribute__((noinline)) int qos_priority_ingress(struct __sk_buff *skb)
     return -1; /* Sampling/blocking already ran. Continue to the mirred matcher. */
 }
 
-static __attribute__((noinline)) int qos_priority_egress(struct __sk_buff *skb)
+static NETQMON_BPF_SUBPROGRAM int qos_priority_egress(struct __sk_buff *skb)
 {
     __u32 ifindex = skb->ifindex;
     if (!bpf_map_lookup_elem(&qos_priority_roots, &ifindex))

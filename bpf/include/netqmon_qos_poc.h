@@ -122,7 +122,7 @@ static __always_inline int qos_poc_direction(struct __sk_buff *skb,
     return 0;
 }
 
-static __attribute__((noinline)) int qos_poc_ingress(struct __sk_buff *skb)
+static NETQMON_BPF_SUBPROGRAM int qos_poc_ingress(struct __sk_buff *skb)
 {
     struct qos_poc_config *config = qos_poc_config();
     if (!config || skb->ifindex != config->ingress_ifindex ||
@@ -135,7 +135,7 @@ static __attribute__((noinline)) int qos_poc_ingress(struct __sk_buff *skb)
     return -1; /* TC_ACT_UNSPEC / TCX_NEXT: reach the mirred matcher. */
 }
 
-static __attribute__((noinline)) void qos_poc_egress(struct __sk_buff *skb)
+static NETQMON_BPF_SUBPROGRAM void qos_poc_egress(struct __sk_buff *skb)
 {
     struct qos_poc_config *config = qos_poc_config();
     if (!config || skb->ifindex != config->lan_ifindex)

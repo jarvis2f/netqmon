@@ -141,7 +141,12 @@ impl fmt::Display for CapabilityReport {
 pub(super) fn probe(config: &AgentConfig) -> CapabilityReport {
     let interface = interfaces_check(&config.interfaces);
     let interface_available = interface.status == Status::Ok;
-    let mut checks = vec![architecture_check(), kernel_check(), interface];
+    let mut checks = vec![
+        architecture_check(),
+        kernel_check(),
+        kernel_btf_check(),
+        interface,
+    ];
     checks.push(map_check("BPF syscall", MapType::Hash, 4, 4, 1));
     checks.push(map_check("BPF_MAP_TYPE_HASH", MapType::Hash, 4, 4, 1));
     checks.push(map_check(
@@ -159,6 +164,7 @@ pub(super) fn probe(config: &AgentConfig) -> CapabilityReport {
         0,
         4096,
     ));
+    checks.push(program_load_check(config));
     let (attach_check, attach_backend, attach_detail) = if interface_available {
         attach_check(config)
     } else {
@@ -374,6 +380,73 @@ fn kernel_check() -> Check {
     }
 }
 
+fn kernel_btf_check() -> Check {
+    kernel_btf_check_at(std::path::Path::new("/sys/kernel/btf/vmlinux"))
+}
+
+fn kernel_btf_check_at(path: &std::path::Path) -> Check {
+    match fs::File::open(path) {
+        Ok(_) => Check {
+            name: "Kernel BTF",
+            status: Status::Ok,
+            detail: path.display().to_string(),
+            required: false,
+        },
+        Err(error) => Check {
+            name: "Kernel BTF",
+            status: Status::Warn,
+            detail: format!(
+                "{}: {error}; static skb helpers support kernels without BTF; see BPF program load result",
+                path.display()
+            ),
+            required: false,
+        },
+    }
+}
+
+// A minimal attach probe cannot detect verifier failures in the real packet
+// parser. Load the actual programs without attaching them to live traffic.
+fn program_load_check(config: &AgentConfig) -> Check {
+    let result = (|| -> libbpf_rs::Result<()> {
+        let mut object = MaybeUninit::uninit();
+        let mut skeleton = FlowSkelBuilder::default().open(&mut object)?;
+        skeleton.progs.netqmon_attach_probe.set_autoload(false);
+        skeleton.maps.flow_map.set_max_entries(config.max_flows)?;
+        skeleton
+            .maps
+            .sample_budgets
+            .set_max_entries(if config.sample_enabled {
+                config.max_flows
+            } else {
+                1
+            })?;
+        if let Some(rodata) = skeleton.maps.rodata_data.as_deref_mut() {
+            rodata.sample_enabled = u8::from(config.sample_enabled);
+            rodata.sample_max_packets_per_direction =
+                u32::from(config.sample_max_packets_per_direction);
+            rodata.sample_max_bytes_per_packet =
+                u32::try_from(config.sample_max_bytes_per_packet).unwrap_or(1024);
+            rodata.sample_max_bytes_per_flow =
+                u32::try_from(config.sample_max_bytes_per_flow).unwrap_or(4096);
+        }
+        let _loaded = skeleton.load()?;
+        Ok(())
+    })();
+    Check {
+        name: "BPF program",
+        status: if result.is_ok() {
+            Status::Ok
+        } else {
+            Status::Fail
+        },
+        detail: result.map_or_else(
+            |error| format!("ingress/egress load failed: {error}; see verifier log above"),
+            |()| "full ingress/egress programs loaded; no traffic hooks changed".into(),
+        ),
+        required: true,
+    }
+}
+
 fn interfaces_check(interfaces: &[String]) -> Check {
     let resolved = interfaces
         .iter()
@@ -477,7 +550,21 @@ fn firewall_hw_flow_offload_enabled(firewall: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CapabilityReport, Check, Status, firewall_hw_flow_offload_enabled};
+    use super::{
+        CapabilityReport, Check, Status, firewall_hw_flow_offload_enabled, kernel_btf_check_at,
+    };
+
+    #[test]
+    fn missing_kernel_btf_is_reported_without_rejecting_compatible_kernels() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vmlinux");
+        let check = kernel_btf_check_at(&path);
+        assert_eq!(check.status, Status::Warn);
+        assert!(!check.required);
+        assert!(check.detail.contains("BPF program load result"));
+        std::fs::write(&path, []).unwrap();
+        assert_eq!(kernel_btf_check_at(&path).status, Status::Ok);
+    }
 
     #[test]
     fn required_failure_controls_health_and_report_is_tabular() {

@@ -42,6 +42,11 @@ mod linux {
             OsString::from("-Wno-error=unused-command-line-argument"),
             OsString::from(target_arch_define),
         ];
+        // MIPS32 JITs reject BPF_PSEUDO_CALL. Keep each tail-call stage fully
+        // inlined while leaving other architectures' verifier layout unchanged.
+        if matches!(target_arch.as_str(), "mips" | "mipsel") {
+            clang_args.push(OsString::from("-DNETQMON_BPF_NO_SUBPROGRAMS=1"));
+        }
         if env::var_os("CARGO_FEATURE_QOS_COMPATIBILITY_POC").is_some() {
             clang_args.push(OsString::from("-DNETQMON_QOS_POC=1"));
         }

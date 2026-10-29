@@ -110,6 +110,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes \
             clang \
+            llvm \
             autoconf automake libtool pkg-config \
             iproute2 iperf3 jq netcat-openbsd nftables ripgrep \
             libelf-dev \
@@ -128,7 +129,7 @@ jobs:
       - name: Build agent and eBPF object
         run: cargo build --package netqmon-agent
 
-      - name: Test BPF loading without kernel context BTF
+      - name: Test BPF context compatibility and MIPS32 call-free stages
         run: sudo python3 tests/integration/bpf_context.py
 
       - name: Check Clippy
