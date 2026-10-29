@@ -1,24 +1,64 @@
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use netqmon_protocol::v1::{DeviceObservation, FlowDelta, FlowLifecycle, TelemetryBatch};
 use netqmon_storage::{
-    ClickHouseConfig, ClickHouseStorage, DeviceIdentityUpdate, FlowAttribution, RetentionPolicy,
-    Storage,
+    ClickHouseClient, ClickHouseConfig, ClickHouseStorage, DeviceIdentityUpdate, FlowAttribution,
+    RetentionPolicy, Storage,
 };
 
-static CLICKHOUSE_TEST_LOCK: Mutex<()> = Mutex::new(());
+static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
 
-fn disposable_clickhouse() -> ClickHouseStorage {
-    ClickHouseStorage::open(ClickHouseConfig {
+struct TestDatabase {
+    admin: ClickHouseClient,
+    config: ClickHouseConfig,
+}
+
+impl TestDatabase {
+    fn open(&self) -> ClickHouseStorage {
+        ClickHouseStorage::open(self.config.clone()).unwrap()
+    }
+}
+
+impl Drop for TestDatabase {
+    fn drop(&mut self) {
+        if let Err(error) = self
+            .admin
+            .execute(&format!("DROP DATABASE {} SYNC", self.config.database))
+        {
+            eprintln!(
+                "failed to remove ClickHouse test database {}: {error}",
+                self.config.database
+            );
+        }
+    }
+}
+
+fn disposable_clickhouse() -> TestDatabase {
+    let mut config = ClickHouseConfig {
         url: std::env::var("NETQMON_TEST_CLICKHOUSE_URL").expect("disposable server URL"),
         database: std::env::var("NETQMON_TEST_CLICKHOUSE_DATABASE")
             .expect("disposable database name"),
         user: std::env::var("NETQMON_TEST_CLICKHOUSE_USER").ok(),
         password: std::env::var("NETQMON_TEST_CLICKHOUSE_PASSWORD").ok(),
         ..Default::default()
-    })
-    .unwrap()
+    };
+    let admin = ClickHouseClient::new(config.clone());
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    // Only generated ASCII identifiers reach the CREATE/DROP statements. Keep
+    // the configured database untouched, even when several tests share a server.
+    config.database = format!(
+        "netqmon_test_{}_{timestamp}_{}",
+        std::process::id(),
+        NEXT_DATABASE.fetch_add(1, Ordering::Relaxed)
+    );
+    admin
+        .execute(&format!("CREATE DATABASE {}", config.database))
+        .unwrap();
+    TestDatabase { admin, config }
 }
 
 fn device_type_fixture(gateway_id: String, now: u64) -> (TelemetryBatch, DeviceIdentityUpdate) {
@@ -72,8 +112,8 @@ fn device_type_fixture(gateway_id: String, now: u64) -> (TelemetryBatch, DeviceI
 #[test]
 #[ignore = "requires a disposable ClickHouse database"]
 fn manual_device_type_survives_clickhouse_ingestion_and_restores_auto() {
-    let _guard = CLICKHOUSE_TEST_LOCK.lock().unwrap();
-    let mut storage = Storage::clickhouse(disposable_clickhouse());
+    let database = disposable_clickhouse();
+    let mut storage = Storage::clickhouse(database.open());
     let now = u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -116,7 +156,7 @@ fn manual_device_type_survives_clickhouse_ingestion_and_restores_auto() {
     for sequence in 2..=3 {
         if sequence == 3 {
             drop(storage);
-            storage = Storage::clickhouse(disposable_clickhouse());
+            storage = Storage::clickhouse(database.open());
         }
         batch.sequence = sequence;
         batch.sent_at = now + sequence;
@@ -169,8 +209,8 @@ fn manual_device_type_survives_clickhouse_ingestion_and_restores_auto() {
 #[test]
 #[ignore = "requires a disposable ClickHouse database"]
 fn late_dpi_updates_only_matching_sessions_without_changing_counters() {
-    let _guard = CLICKHOUSE_TEST_LOCK.lock().unwrap();
-    let backend = disposable_clickhouse();
+    let database = disposable_clickhouse();
+    let backend = database.open();
     let one_flow_id = format!(
         "one:4:6:{:x?}:50000:{:x?}:443:2",
         [192, 0, 2, 2],
@@ -231,8 +271,8 @@ fn late_dpi_updates_only_matching_sessions_without_changing_counters() {
 #[test]
 #[ignore = "requires a disposable ClickHouse database"]
 fn protocol_applications_are_listed_separately_from_clickhouse() {
-    let _guard = CLICKHOUSE_TEST_LOCK.lock().unwrap();
-    let backend = disposable_clickhouse();
+    let database = disposable_clickhouse();
+    let backend = database.open();
     let storage = Storage::clickhouse(backend);
     let now = u64::try_from(
         SystemTime::now()
@@ -314,8 +354,8 @@ fn protocol_applications_are_listed_separately_from_clickhouse() {
 #[test]
 #[ignore = "requires a disposable ClickHouse database"]
 fn self_host_client_identity_is_single_application_per_ip() {
-    let _guard = CLICKHOUSE_TEST_LOCK.lock().unwrap();
-    let backend = disposable_clickhouse();
+    let database = disposable_clickhouse();
+    let backend = database.open();
     let mut storage = Storage::clickhouse(backend);
     let now = u64::try_from(
         SystemTime::now()
@@ -401,8 +441,8 @@ fn self_host_client_identity_is_single_application_per_ip() {
 #[test]
 #[ignore = "requires a disposable ClickHouse database"]
 fn retention_removes_expired_incremental_rollup_metadata() {
-    let _guard = CLICKHOUSE_TEST_LOCK.lock().unwrap();
-    let backend = disposable_clickhouse();
+    let database = disposable_clickhouse();
+    let backend = database.open();
     let mut storage = Storage::clickhouse(backend);
     let now = u64::try_from(
         SystemTime::now()
