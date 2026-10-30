@@ -29,6 +29,13 @@ fail() {
 current_version() {
     local manager version
     manager="$(package_manager 2>/dev/null || true)"
+    if [ "$manager" = apk ] && [ -x "$AGENT" ]; then
+        version="$("$AGENT" --version 2>/dev/null | awk '{print $2; exit}')"
+        if [ -n "$version" ]; then
+            printf '%s' "$version"
+            return 0
+        fi
+    fi
     version=
     case "$manager" in
         opkg)
@@ -42,10 +49,26 @@ current_version() {
         printf '%s' "$version"
         return 0
     fi
-
     if [ -x "$AGENT" ]; then
         "$AGENT" --version 2>/dev/null | awk '{print $2; exit}'
     fi
+}
+
+apk_release_version() {
+    local version="$1" base suffix stage number
+    case "$version" in
+        *-*)
+            base="${version%%-*}"
+            suffix="${version#*-}"
+            stage="${suffix%%.*}"
+            number="${suffix#*.}"
+            case "$stage" in alpha|beta|rc) ;; *) return 1 ;; esac
+            [ "$number" != "$suffix" ] || return 1
+            case "$number" in ''|*[!0-9]*) return 1 ;; esac
+            printf '%s_%s%s' "$base" "$stage" "$number"
+            ;;
+        *) printf '%s' "$version" ;;
+    esac
 }
 
 package_manager() {
@@ -213,8 +236,33 @@ resolve_update() {
             fi
             ;;
         apk)
-            if [ "$(apk version -t "$latest_package_version" "$current" 2>/dev/null)" = ">" ]; then
+            # Older beta APKs used a commit hash as the package version, whose
+            # ordering is unrelated to release order. Compare the Agent's
+            # embedded release version to the manifest channel version instead.
+            if [ -x "$AGENT" ]; then
+                installed_release="$("$AGENT" --version 2>/dev/null | awk '{print $2; exit}')"
+            else
+                installed_release=
+            fi
+            [ -n "$installed_release" ] || fail "cannot determine installed agent release version"
+            latest_comparable="$(apk_release_version "$latest_version")" || fail "unsupported manifest release version"
+            installed_comparable="$(apk_release_version "$installed_release")" || fail "unsupported installed agent release version"
+            comparison="$(apk version -t "$latest_comparable" "$installed_comparable" 2>/dev/null)" || fail "failed to compare agent release versions"
+            case "$comparison" in '<'|'='|'>') ;; *) fail "failed to compare agent release versions" ;; esac
+            if [ "$comparison" = ">" ]; then
                 update_available=true
+            elif [ "$comparison" = "=" ]; then
+                # Keep package revision upgrades working once both releases
+                # use the canonical APK version format.
+                installed_package="$(apk list --installed netqmon-agent 2>/dev/null | awk '$1 ~ /^netqmon-agent-/ {sub(/^netqmon-agent-/, "", $1); print $1; exit}')"
+                case "$installed_package" in
+                    "${installed_comparable}"-r*)
+                        package_comparison="$(apk version -t "$latest_package_version" "$installed_package" 2>/dev/null)" || fail "failed to compare agent package versions"
+                        case "$package_comparison" in '<'|'='|'>') ;; *) fail "failed to compare agent package versions" ;; esac
+                        [ "$package_comparison" = ">" ] && update_available=true || update_available=false
+                        ;;
+                    *) update_available=false ;;
+                esac
             else
                 update_available=false
             fi

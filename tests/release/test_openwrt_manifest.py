@@ -186,6 +186,16 @@ class OpenWrtManifestTests(unittest.TestCase):
                 )
                 self.assertEqual(record["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
 
+    def test_ordered_beta_apk_version_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_ipk(root / "luci.ipk", "luci-app-netqmon", "all", "1.1.1-beta.5-r1")
+            make_apk_artifact(root, "netqmon-agent", "x86_64", "1.1.1_beta5-r1")
+            manifest = create_manifest("jarvis2f/netqmon", [f"beta:v1.1.1-beta.5:{root}"])
+            package = next(item for item in manifest["channels"]["beta"]["packages"] if item["package_format"] == "apk")
+            self.assertEqual(package["version"], "1.1.1_beta5-r1")
+            self.assertTrue(package["url"].endswith("netqmon-agent-1.1.1_beta5-r1_x86_64.apk"))
+
     def test_manifest_rejects_apk_without_artifact_architecture(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -13,11 +13,11 @@ done
 printf 'test package\n' > "$work/package"
 sha=$(sha256sum "$work/package" | awk '{print $1}')
 cat > "$work/manifest" <<EOF
-{"channels":{"beta":{"version":"1.1.1-beta.4","packages":[
+{"channels":{"beta":{"version":"1.1.1-beta.5","packages":[
  {"name":"luci-app-netqmon","openwrt_arch":"aarch64_cortex-a53","package_format":"apk","version":"999","url":"wrong","sha256":"wrong"},
  {"name":"netqmon-agent","openwrt_arch":"aarch64_cortex-a72","package_format":"apk","version":"999","url":"wrong","sha256":"wrong"},
- {"name":"netqmon-agent","openwrt_arch":"aarch64_cortex-a53","package_format":"ipk","version":"1.1.1-beta.4-r1","url":"https://github.com/jarvis2f/netqmon/releases/download/v1/netqmon-agent_1.ipk","sha256":"$sha"},
- {"name":"netqmon-agent","openwrt_arch":"aarch64_cortex-a53","package_format":"apk","version":"1.1.1-r1","url":"https://github.com/jarvis2f/netqmon/releases/download/v1/netqmon-agent-1.apk","sha256":"$sha"}
+ {"name":"netqmon-agent","openwrt_arch":"aarch64_cortex-a53","package_format":"ipk","version":"1.1.1-beta.5-r1","url":"https://github.com/jarvis2f/netqmon/releases/download/v1/netqmon-agent_1.ipk","sha256":"$sha"},
+ {"name":"netqmon-agent","openwrt_arch":"aarch64_cortex-a53","package_format":"apk","version":"1.1.1_beta5-r1","url":"https://github.com/jarvis2f/netqmon/releases/download/v1/netqmon-agent-1.apk","sha256":"$sha"}
 ]}}}
 EOF
 cat > "$work/bin/wget" <<'EOF'
@@ -37,9 +37,18 @@ case "$1 $2" in
   'print-architecture ') printf 'arch all 1\narch aarch64_cortex-a53 10\n' ;;
   '--print-arch ') printf '%s\n' "${TEST_ARCH:-aarch64_cortex-a53}" ;;
   'list-installed netqmon-agent') printf 'netqmon-agent - 1.0-r1\n' ;;
-  'info -v') printf 'netqmon-agent-1.0-r1\n' ;;
+  'info -v') printf 'netqmon-agent-1.1.1~d5a52e63aaed-r1\n' ;;
+  'list --installed') printf 'netqmon-agent-%s aarch64 [installed]\n' "${TEST_INSTALLED_PACKAGE:-1.1.1~d5a52e63aaed-r1}" ;;
   'compare-versions '*) exit 0 ;;
-  'version -t') printf '>\n' ;;
+  'version -t')
+    case "$3:$4" in
+      1.1.1_beta5:1.1.1_beta4) printf '>\n' ;;
+      1.1.1_beta5:1.1.1_beta5) printf '=\n' ;;
+      1.1.1_beta5:1.1.1_beta6|1.1.1_beta5:1.1.1) printf '<\n' ;;
+      1.1.1_beta5-r1:1.1.1_beta5-r0) printf '>\n' ;;
+      1.1.1_beta5-r1:1.1.1_beta5-r1) printf '=\n' ;;
+      *) exit 1 ;;
+    esac ;;
   'install '*|'add '*) printf '%s\n' "$*" >> "$TEST_WORK/install-log" ;;
   *) exit 1 ;;
 esac
@@ -50,6 +59,7 @@ printf '%s\n' "$1" >> "$TEST_WORK/service-log"
 EOF
 cat > "$work/agent" <<'EOF'
 #!/bin/sh
+if [ "${1:-}" = --version ]; then printf 'netqmon-agent %s\n' "${TEST_CURRENT_VERSION:-1.1.1-beta.4}"; fi
 exit 0
 EOF
 chmod +x "$work/bin/wget" "$work/manager" "$work/service" "$work/agent"
@@ -72,7 +82,7 @@ for manager in opkg apk; do
     ln -s "$work/manager" "$work/bin/$manager"
     result=$(/bin/sh "$work/update-agent" check)
     assert_json "$result" ok true
-    assert_json "$result" latest_version 1.1.1-beta.4
+    assert_json "$result" latest_version 1.1.1-beta.5
     assert_json "$result" update_available true
     [ "$manager" = opkg ] && format=ipk || format=apk
     assert_json "$result" package_format "$format"
@@ -81,10 +91,28 @@ for manager in opkg apk; do
     [ -s "$work/install-log" ] && [ -s "$work/service-log" ]
 done
 
+export TEST_CURRENT_VERSION=1.1.1-beta.5
+result=$(/bin/sh "$work/update-agent" check)
+assert_json "$result" update_available false
+export TEST_INSTALLED_PACKAGE=1.1.1_beta5-r0
+result=$(/bin/sh "$work/update-agent" check)
+assert_json "$result" update_available true
+export TEST_INSTALLED_PACKAGE=1.1.1_beta5-r1
+result=$(/bin/sh "$work/update-agent" check)
+assert_json "$result" update_available false
+unset TEST_INSTALLED_PACKAGE
+export TEST_CURRENT_VERSION=1.1.1-beta.6
+result=$(/bin/sh "$work/update-agent" check)
+assert_json "$result" update_available false
+export TEST_CURRENT_VERSION=1.1.1
+result=$(/bin/sh "$work/update-agent" check)
+assert_json "$result" update_available false
+unset TEST_CURRENT_VERSION
+
 export TEST_ARCH=aarch64_unknown
 result=$(/bin/sh "$work/update-agent" check)
 assert_json "$result" ok false
-assert_json "$result" latest_version 1.1.1-beta.4
+assert_json "$result" latest_version 1.1.1-beta.5
 assert_json "$result" error 'manifest has no package for this architecture (aarch64_unknown, apk)'
 unset TEST_ARCH
 printf 'corrupt package\n' > "$work/package"

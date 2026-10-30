@@ -415,8 +415,8 @@ jobs:
           fi
           package_version="${version}"
           if [ "${{ matrix.ver }}" = "apk" ] && [[ "${version}" == *-* ]]; then
-            # Normalize prereleases for both tag releases and manual validation builds.
-            package_version="${version%%-*}~$(git rev-parse --short=12 HEAD)"
+            # APK prerelease numbers must sort by release, not by Git hash.
+            package_version="$(python3 scripts/release/openwrt_apk_version.py "$version")"
           fi
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${package_version}/" packaging/openwrt/netqmon/Makefile
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${package_version}/" packaging/openwrt/luci-app-netqmon/Makefile
@@ -584,8 +584,8 @@ jobs:
           fi
           package_version="${version}"
           if [ "${{ matrix.ver }}" = "apk" ] && [[ "${version}" == *-* ]]; then
-            # Normalize prereleases for both tag releases and manual validation builds.
-            package_version="${version%%-*}~$(git rev-parse --short=12 HEAD)"
+            # APK prerelease numbers must sort by release, not by Git hash.
+            package_version="$(python3 scripts/release/openwrt_apk_version.py "$version")"
           fi
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${package_version}/" packaging/openwrt/netqmon/Makefile
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${package_version}/" packaging/openwrt/luci-app-netqmon/Makefile

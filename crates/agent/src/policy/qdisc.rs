@@ -3338,16 +3338,20 @@ exec "${NETQMON_SHARED_TEST_TC_BIN:-/usr/sbin/tc}" "$@"
             "qdisc", "add", "dev", "one0", "root", "handle", "1:", "htb", "default", "1",
         ])
         .unwrap();
-        let foreign = run_capture("tc", &["qdisc", "show", "dev", "one0"]).unwrap();
-        assert!(prepare_state(&desired, None).is_err());
+        let foreign = inspect_root("one0").unwrap();
+        let isolated = prepare_state(&desired, None).unwrap();
         assert_eq!(
-            foreign,
-            run_capture("tc", &["qdisc", "show", "dev", "one0"]).unwrap()
+            isolated.shared_egress.as_ref().unwrap().original_root_kind,
+            "ifb"
         );
+        apply(&isolated, None).unwrap();
+        assert_eq!(foreign, inspect_root("one0").unwrap());
+        restore(&isolated).unwrap();
+        assert_eq!(foreign, inspect_root("one0").unwrap());
         run_tc(&["qdisc", "del", "dev", "one0", "root"]).unwrap();
         run_output("ip", &["link", "del", "one0"]).unwrap();
         println!(
-            "PASS Agent component: one physical root, separate directions/fallbacks, repeat/update/delete, failure rollback, journal restart recovery and foreign-root refusal; no product throughput claim"
+            "PASS Agent component: shared directions, rollback, journal recovery and foreign-root coexistence; no product throughput claim"
         );
     }
 
