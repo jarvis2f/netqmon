@@ -1,7 +1,7 @@
 //! Keep synchronous SQLite/ClickHouse reads off Tokio's request workers.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
@@ -101,11 +101,15 @@ fn wrap_with_parallelism(
 }
 
 async fn read(permits: Arc<Semaphore>, request: Request, next: Next) -> Response {
+    let started = Instant::now();
+    // Do not log query strings: they may contain search terms or addresses.
+    let path = request.uri().path().to_owned();
     let Ok(permit) = permits.acquire_owned().await else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let queue_wait = started.elapsed();
     let runtime = tokio::runtime::Handle::current();
-    match tokio::task::spawn_blocking(move || {
+    let response = match tokio::task::spawn_blocking(move || {
         // Retain the slot even if the client disconnects while SQLite is busy.
         let _permit = permit;
         runtime.block_on(next.run(request))
@@ -117,7 +121,18 @@ async fn read(permits: Arc<Semaphore>, request: Request, next: Next) -> Response
             tracing::error!(%error, "query worker failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+    };
+    let elapsed = started.elapsed();
+    if elapsed >= Duration::from_secs(1) {
+        tracing::warn!(
+            path = %path,
+            queue_wait_ms = u64::try_from(queue_wait.as_millis()).unwrap_or(u64::MAX),
+            elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            status = response.status().as_u16(),
+            "slow query handler"
+        );
     }
+    response
 }
 
 #[cfg(test)]

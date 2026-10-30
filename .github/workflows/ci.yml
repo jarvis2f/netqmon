@@ -142,6 +142,7 @@ jobs:
           sudo unshare -n "$test_binary" --exact policy::qdisc::tests::live_shared_application_classes_update_replace_and_remove --ignored --nocapture
           sudo unshare -n "$test_binary" --exact policy::qdisc::tests::live_router_client_to_application_migration_preserves_queues_and_rolls_back --ignored --nocapture
           sudo unshare -n "$test_binary" --exact policy::qdisc::tests::live_shared_egress_updates_rolls_back_and_recovers_one_root --ignored --nocapture
+          sudo unshare -m -n "$test_binary" ifb_fallback_ --ignored --nocapture --test-threads=1
 
       - name: Test bounded bidirectional packet sampling
         run: sudo bash tests/integration/flow_sample.sh target/debug/netqmon-agent

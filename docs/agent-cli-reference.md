@@ -64,6 +64,16 @@ netqmon-agent doctor
 The report also includes policy enforcement eligibility. Client aggregate shaping
 is only reported as supported when the Agent verifies its LAN/WAN path, link
 capacity, qdisc ownership, packet-mark availability, and disabled flow offload.
+The isolated shaping feature probe needs an `ip` implementation and kernel
+that support veth devices; on OpenWrt check `ip-full` and `kmod-veth` if veth
+creation fails. The running Agent must be restarted after installing missing
+probe dependencies, because the probe result is cached for that process.
+When an existing egress root cannot be safely owned, the Agent can instead
+redirect egress through its own IFB shaping queue without replacing that root.
+This requires IFB, matchall and mirred support (`kmod-ifb` and `tc-full` on
+OpenWrt). Existing egress classifiers or unverified TCX programs are treated
+as conflicts. IFB resources are journaled so interrupted changes can be
+recovered; the Agent removes only resources whose ownership it can verify.
 
 ### 2.3 `policies` (Local Policy Status and Recovery)
 

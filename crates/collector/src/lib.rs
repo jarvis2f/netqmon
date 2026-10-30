@@ -2157,7 +2157,18 @@ async fn telemetry(
     {
         return error(StatusCode::PAYLOAD_TOO_LARGE, "invalid probe results");
     }
-    match state.accept_batch(&batch) {
+    let ingest_started = std::time::Instant::now();
+    let disposition = state.accept_batch(&batch);
+    let ingest_elapsed = ingest_started.elapsed();
+    if ingest_elapsed >= std::time::Duration::from_secs(2) {
+        tracing::warn!(
+            elapsed_ms = u64::try_from(ingest_elapsed.as_millis()).unwrap_or(u64::MAX),
+            flows = batch.flows.len(),
+            encoded_bytes = body.len(),
+            "slow telemetry batch processing"
+        );
+    }
+    match disposition {
         Ok(BatchDisposition::Accepted) => {
             let requests = state.take_probe_requests();
             if requests.is_empty() {

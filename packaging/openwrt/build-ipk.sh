@@ -50,7 +50,7 @@ chmod 0755 "${DATA_DIR}/usr/share/netqmon/openwrt-sfo-compatibility.sh"
 cat << EOF > "${CONTROL_DIR}/control"
 Package: netqmon-agent
 Version: ${VERSION}
-Depends: kmod-sched-core, kmod-sched-bpf
+Depends: kmod-sched-core, kmod-sched-bpf, kmod-veth, kmod-ifb, ip-full, tc-full
 Section: net
 Architecture: ${ARCH}
 Maintainer: netqmon Authors

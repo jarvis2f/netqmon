@@ -4,7 +4,7 @@ LUCI_TITLE:=LuCI support for NetQMon Agent
 LUCI_DEPENDS:=+netqmon-agent +rpcd +jsonfilter
 
 PKG_NAME:=luci-app-netqmon
-PKG_VERSION:=1.1.1-beta.4
+PKG_VERSION:=1.1.1-beta.5
 PKG_RELEASE:=1
 PKG_MAINTAINER:=netqmon Authors
 PKG_LICENSE:=Apache-2.0

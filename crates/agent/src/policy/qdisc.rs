@@ -125,7 +125,7 @@ pub(super) fn inspect_ownership(topology: &PolicyTopology, state_path: &Path) ->
             .as_ref()
             .and_then(|state| state.shaping_state.as_ref())
             .and_then(|state| state.interfaces().find(|interface| interface.name == name));
-        let result = owned.map_or_else(|| inspect_default_root(name).map(|_| ()), verify_owned);
+        let result = owned.map_or_else(|| inspect_shaping_backend(name).map(|_| ()), verify_owned);
         if let Err(error) = result {
             return FeatureSupport::unsupported("qdisc_ownership_conflict", error);
         }
@@ -170,7 +170,8 @@ pub(super) fn prepare_state(
             verify_owned(prior)?;
             desired_interface.original_root_kind = prior.original_root_kind.clone();
         } else {
-            desired_interface.original_root_kind = inspect_default_root(&desired_interface.name)?;
+            desired_interface.original_root_kind =
+                inspect_shaping_backend(&desired_interface.name)?;
         }
     }
     if let Some(previous) = previous {
@@ -252,7 +253,12 @@ pub(super) fn read_metrics(state: &ShapingState) -> Result<Vec<ClassCounters>, S
     let mut metrics = Vec::new();
     for interface in state_interfaces(state) {
         verify_owned(interface)?;
-        let output = run_capture("tc", &["-s", "class", "show", "dev", &interface.name])?;
+        let queue_name = if interface.original_root_kind == "ifb" {
+            ifb_name(interface.ifindex)
+        } else {
+            interface.name.clone()
+        };
+        let output = run_capture("tc", &["-s", "class", "show", "dev", &queue_name])?;
         let counters = parse_class_counters(&output);
         for client in &interface.clients {
             let class_id = format!("51:{}", client.class_minor);
@@ -449,6 +455,9 @@ fn restore_from_journal(
     interface: &ManagedInterface,
     journal: &ShapingJournal,
 ) -> Result<(), String> {
+    if interface.original_root_kind == "ifb" {
+        return recover_ifb(interface, journal);
+    }
     let ifindex = nix::net::if_::if_nametoindex(interface.name.as_str()).map_err(|error| {
         format!(
             "manual_cleanup_required: interface {} disappeared during recovery: {error}",
@@ -752,6 +761,17 @@ fn apply_interface(
     interface: &ManagedInterface,
     previous: Option<&ManagedInterface>,
 ) -> Result<(), String> {
+    if interface.original_root_kind == "ifb" {
+        return apply_ifb(interface, previous);
+    }
+    apply_interface_tree(interface, previous, false)
+}
+
+fn apply_interface_tree(
+    interface: &ManagedInterface,
+    previous: Option<&ManagedInterface>,
+    freshly_created_ifb: bool,
+) -> Result<(), String> {
     let ifindex = nix::net::if_::if_nametoindex(interface.name.as_str()).map_err(|error| {
         format!(
             "degraded_ownership_conflict: interface {} disappeared: {error}",
@@ -790,7 +810,7 @@ fn apply_interface(
         if previous == interface && !migrate_legacy {
             return Ok(());
         }
-    } else {
+    } else if !freshly_created_ifb {
         let current = inspect_default_root(&interface.name)?;
         if current != interface.original_root_kind {
             return Err(format!(
@@ -1380,6 +1400,10 @@ fn add_application_class(
 }
 
 fn restore_interface(interface: &ManagedInterface) -> Result<(), String> {
+    if interface.original_root_kind == "ifb" {
+        verify_owned(interface)?;
+        return remove_ifb(interface);
+    }
     verify_owned(interface)?;
     run_tc(&[
         "qdisc",
@@ -1408,6 +1432,375 @@ fn restore_interface(interface: &ManagedInterface) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+// An IFB lets the shaper coexist with an existing root qdisc. The name and
+// address derive from the physical ifindex, so the journal can identify a
+// partially created device even if the process dies during setup.
+fn ifb_name(ifindex: u32) -> String {
+    format!("nqi{ifindex:x}")
+}
+
+fn ifb_address(ifindex: u32) -> String {
+    let bytes = ifindex.to_be_bytes();
+    format!(
+        "02:4e:{:02x}:{:02x}:{:02x}:{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3]
+    )
+}
+
+fn physical_identity(interface: &ManagedInterface) -> Result<(), String> {
+    let actual = nix::net::if_::if_nametoindex(interface.name.as_str())
+        .map_err(|error| format!("degraded_ownership_conflict: {}: {error}", interface.name))?;
+    if actual != interface.ifindex {
+        return Err(format!(
+            "degraded_ownership_conflict: {} changed ifindex",
+            interface.name
+        ));
+    }
+    Ok(())
+}
+
+fn ifb_shadow(interface: &ManagedInterface) -> Result<ManagedInterface, String> {
+    physical_identity(interface)?;
+    let name = ifb_name(interface.ifindex);
+    let index = nix::net::if_::if_nametoindex(name.as_str())
+        .map_err(|error| format!("ifb_ownership_conflict: {name}: {error}"))?;
+    let links = run_json("ip", &["-j", "-d", "link", "show", "dev", &name])?;
+    let valid = links.as_array().is_some_and(|links| {
+        links.len() == 1
+            && links[0]["linkinfo"]["info_kind"] == "ifb"
+            && links[0]["address"].as_str() == Some(ifb_address(interface.ifindex).as_str())
+    });
+    if !valid {
+        return Err(format!(
+            "ifb_ownership_conflict: {name} is not the owned IFB"
+        ));
+    }
+    let mut shadow = interface.clone();
+    shadow.name = name;
+    shadow.ifindex = index;
+    shadow.original_root_kind = "noqueue".to_owned();
+    Ok(shadow)
+}
+
+fn egress_filters(name: &str) -> Result<Vec<Value>, String> {
+    let filters = run_json("tc", &["-j", "-d", "filter", "show", "dev", name, "egress"])?;
+    filters
+        .as_array()
+        .cloned()
+        .ok_or_else(|| format!("ifb_filter_conflict: invalid egress filter list on {name}"))
+}
+
+fn inspect_ifb_candidate(name: &str) -> Result<(), String> {
+    let index = nix::net::if_::if_nametoindex(name)
+        .map_err(|error| format!("ifb_ownership_conflict: {name}: {error}"))?;
+    let target = ifb_name(index);
+    if nix::net::if_::if_nametoindex(target.as_str()).is_ok() {
+        return Err(format!("ifb_ownership_conflict: {target} already exists"));
+    }
+    if !egress_filters(name)?.is_empty() {
+        return Err(format!(
+            "ifb_filter_conflict: {name} has existing egress filters"
+        ));
+    }
+    verify_tcx_compatibility(index)?;
+    // Require a valid physical root even though it is never modified.
+    inspect_root(name)?;
+    probe_ifb_features()?;
+    Ok(())
+}
+
+fn verify_tcx_compatibility(ifindex: u32) -> Result<(), String> {
+    use libbpf_rs::query::ProgInfoIter;
+    let links = tcx_program_ids(ifindex, libbpf_rs::libbpf_sys::BPF_TCX_EGRESS)?;
+    if links.is_empty() {
+        return Ok(());
+    }
+    let known = ProgInfoIter::default()
+        .filter(|program| program.name == "netqmon_egress")
+        .map(|program| program.id)
+        .collect::<BTreeSet<_>>();
+    if !links.is_subset(&known) {
+        return Err("ifb_filter_conflict: an unverified TCX egress program is attached".to_owned());
+    }
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+fn tcx_program_ids(ifindex: u32, attach_type: u32) -> Result<BTreeSet<u32>, String> {
+    let mut ids = [0_u32; 128];
+    let mut count = ids.len() as u32;
+    let mut flags = 0_u32;
+    // TCX targets an interface index, and BPF_PROG_QUERY reads the chain in
+    // the calling network namespace. Link enumeration misses legacy-attached
+    // TCX programs and can confuse equal ifindices in different namespaces.
+    // SAFETY: all output pointers refer to initialized, writable local values;
+    // `count` is the capacity of the `ids` array for the duration of the call.
+    let result = unsafe {
+        libbpf_rs::libbpf_sys::bpf_prog_query(
+            ifindex as i32,
+            attach_type,
+            0,
+            &mut flags,
+            ids.as_mut_ptr(),
+            &mut count,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        let old_kernel = fs::read_to_string("/proc/sys/kernel/osrelease")
+            .ok()
+            .and_then(|release| {
+                let mut parts = release.split('.');
+                Some((
+                    parts.next()?.parse::<u32>().ok()?,
+                    parts.next()?.parse::<u32>().ok()?,
+                ))
+            })
+            .is_some_and(|version| version < (6, 6));
+        if old_kernel
+            && matches!(
+                error.raw_os_error(),
+                Some(nix::libc::EINVAL | nix::libc::EOPNOTSUPP)
+            )
+        {
+            return Ok(BTreeSet::new());
+        }
+        return Err(format!(
+            "ifb_filter_conflict: cannot query TCX attachments on ifindex {ifindex}: {error}"
+        ));
+    }
+    if count as usize > ids.len() {
+        return Err("ifb_filter_conflict: too many TCX programs".to_owned());
+    }
+    Ok(ids[..count as usize].iter().copied().collect())
+}
+
+fn inspect_shaping_backend(name: &str) -> Result<String, String> {
+    match inspect_default_root(name) {
+        Ok(kind) => Ok(kind),
+        Err(original) => inspect_ifb_candidate(name)
+            .map(|()| "ifb".to_owned())
+            .map_err(|error| format!("{original}; {error}")),
+    }
+}
+
+fn verify_ifb_redirect(interface: &ManagedInterface) -> Result<(), String> {
+    let shadow = ifb_shadow(interface)?;
+    verify_tcx_compatibility(interface.ifindex)?;
+    let filters = egress_filters(&interface.name)?;
+    let mut actual = 0;
+    for filter in &filters {
+        if filter["kind"] != "matchall" || filter["pref"] != 49100 || filter["protocol"] != "all" {
+            return Err(format!(
+                "ifb_filter_conflict: unexpected egress filter on {}",
+                interface.name
+            ));
+        }
+        if let Some(options) = filter.get("options") {
+            let actions = options["actions"]
+                .as_array()
+                .ok_or_else(|| "ifb_filter_conflict: missing redirect action".to_owned())?;
+            if options["handle"] != 0x4e510001_u64
+                || options["skip_hw"] != true
+                || actions.len() != 1
+                || actions[0]["kind"] != "mirred"
+                || actions[0]["mirred_action"] != "redirect"
+                || actions[0]["direction"] != "egress"
+                || actions[0]["to_dev"] != shadow.name
+                || actions[0]["control_action"]["type"] != "stolen"
+            {
+                return Err(format!(
+                    "ifb_filter_conflict: redirect on {} changed",
+                    interface.name
+                ));
+            }
+            actual += 1;
+        }
+    }
+    if actual != 1 {
+        return Err(format!(
+            "ifb_filter_conflict: owned redirect on {} is missing",
+            interface.name
+        ));
+    }
+    Ok(())
+}
+
+fn apply_ifb(
+    interface: &ManagedInterface,
+    previous: Option<&ManagedInterface>,
+) -> Result<(), String> {
+    physical_identity(interface)?;
+    if let Some(previous) = previous {
+        verify_owned(previous)?;
+        return apply_interface_tree(&ifb_shadow(interface)?, Some(&ifb_shadow(previous)?), false);
+    }
+    inspect_ifb_candidate(&interface.name)?;
+    let name = ifb_name(interface.ifindex);
+    let address = ifb_address(interface.ifindex);
+    let links = run_json("ip", &["-j", "link", "show", "dev", &interface.name])?;
+    let mtu = links
+        .as_array()
+        .and_then(|links| links.first())
+        .and_then(|link| link["mtu"].as_u64())
+        .filter(|mtu| (1..=u32::MAX as u64).contains(mtu))
+        .ok_or_else(|| "ifb_setup_failed: invalid interface MTU".to_owned())?
+        .to_string();
+    run_ip(&[
+        "link", "add", &name, "address", &address, "mtu", &mtu, "type", "ifb",
+    ])?;
+    run_ip(&["link", "set", "dev", &name, "addrgenmode", "none"])?;
+    run_ip(&["link", "set", "dev", &name, "up"])?;
+    let shadow = ifb_shadow(interface)?;
+    apply_interface_tree(&shadow, None, true)?;
+    if !egress_filters(&interface.name)?.is_empty() {
+        return Err(format!(
+            "ifb_filter_conflict: egress filters appeared on {}",
+            interface.name
+        ));
+    }
+    let qdiscs = run_json("tc", &["-j", "qdisc", "show", "dev", &interface.name])?;
+    if !qdiscs
+        .as_array()
+        .is_some_and(|items| items.iter().any(is_observation_clsact))
+    {
+        run_tc(&["qdisc", "add", "dev", &interface.name, "clsact"])?;
+    }
+    run_tc(&[
+        "filter",
+        "add",
+        "dev",
+        &interface.name,
+        "egress",
+        "pref",
+        "49100",
+        "handle",
+        "0x4e510001",
+        "matchall",
+        "skip_hw",
+        "action",
+        "mirred",
+        "egress",
+        "redirect",
+        "dev",
+        &name,
+    ])?;
+    verify_owned(interface)
+}
+
+fn remove_ifb(interface: &ManagedInterface) -> Result<(), String> {
+    verify_ifb_redirect(interface)?;
+    let shadow = ifb_shadow(interface)?;
+    ensure_ifb_unshared(&shadow.name, shadow.ifindex)?;
+    run_tc(&[
+        "filter",
+        "del",
+        "dev",
+        &interface.name,
+        "egress",
+        "pref",
+        "49100",
+        "handle",
+        "0x4e510001",
+        "matchall",
+    ])?;
+    run_ip(&["link", "del", "dev", &shadow.name])
+}
+
+fn ensure_ifb_unshared(name: &str, ifindex: u32) -> Result<(), String> {
+    if !egress_filters(name)?.is_empty()
+        || !run_json("tc", &["-j", "filter", "show", "dev", name, "ingress"])?
+            .as_array()
+            .is_some_and(Vec::is_empty)
+        || !tcx_program_ids(ifindex, libbpf_rs::libbpf_sys::BPF_TCX_EGRESS)?.is_empty()
+        || !tcx_program_ids(ifindex, libbpf_rs::libbpf_sys::BPF_TCX_INGRESS)?.is_empty()
+    {
+        return Err(format!(
+            "manual_cleanup_required: IFB {name} has foreign filters"
+        ));
+    }
+    let addresses = run_json("ip", &["-j", "addr", "show", "dev", name])?;
+    if addresses
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(|item| item["addr_info"].as_array())
+        .is_none_or(|items| !items.is_empty())
+    {
+        return Err(format!("manual_cleanup_required: IFB {name} has addresses"));
+    }
+    Ok(())
+}
+
+fn recover_ifb(interface: &ManagedInterface, journal: &ShapingJournal) -> Result<(), String> {
+    physical_identity(interface)?;
+    let name = ifb_name(interface.ifindex);
+    let exists = nix::net::if_::if_nametoindex(name.as_str()).is_ok();
+    let filters = egress_filters(&interface.name)?;
+    if !filters.is_empty() {
+        if !exists {
+            return Err("manual_cleanup_required: IFB redirect target disappeared".to_owned());
+        }
+        verify_ifb_redirect(interface)?;
+    }
+    if !exists {
+        return Ok(());
+    }
+    let shadow = ifb_shadow(interface)?;
+    ensure_ifb_unshared(&shadow.name, shadow.ifindex)?;
+    let qdiscs = run_json("tc", &["-j", "qdisc", "show", "dev", &shadow.name])?;
+    let kind = qdiscs
+        .as_array()
+        .and_then(|items| items.iter().find(|q| q["root"] == true))
+        .and_then(root_kind)
+        .unwrap_or_default();
+    if kind == "htb" {
+        let known = [journal.previous.as_ref(), journal.next.as_ref()]
+            .into_iter()
+            .flatten()
+            .flat_map(state_interfaces)
+            .filter(|item| item.name == interface.name)
+            .collect::<Vec<_>>();
+        let clients = known
+            .iter()
+            .flat_map(|item| item.clients.iter().cloned())
+            .collect::<Vec<_>>();
+        let apps = known
+            .iter()
+            .flat_map(|item| item.application_classes.iter().cloned())
+            .collect::<Vec<_>>();
+        verify_partial_tree(&shadow, &clients, &apps)?;
+    } else if !matches!(kind.as_str(), "" | "noqueue" | "fq_codel" | "noop") {
+        return Err(format!("manual_cleanup_required: unknown IFB root {kind}"));
+    }
+    if kind != "htb" {
+        if qdiscs.as_array().is_none_or(|items| items.len() > 1)
+            || !run_capture("tc", &["class", "show", "dev", &name])?
+                .trim()
+                .is_empty()
+            || !egress_filters(&name)?.is_empty()
+        {
+            return Err(format!(
+                "manual_cleanup_required: IFB {name} has unexpected qdiscs, classes or filters"
+            ));
+        }
+    }
+    if !filters.is_empty() {
+        run_tc(&[
+            "filter",
+            "del",
+            "dev",
+            &interface.name,
+            "egress",
+            "pref",
+            "49100",
+            "handle",
+            "0x4e510001",
+            "matchall",
+        ])?;
+    }
+    run_ip(&["link", "del", "dev", &name])
 }
 
 fn inspect_default_root(interface: &str) -> Result<String, String> {
@@ -1509,6 +1902,10 @@ fn option_near(
 }
 
 pub(super) fn verify_owned(interface: &ManagedInterface) -> Result<(), String> {
+    if interface.original_root_kind == "ifb" {
+        verify_ifb_redirect(interface)?;
+        return verify_owned(&ifb_shadow(interface)?);
+    }
     let ifindex = nix::net::if_::if_nametoindex(interface.name.as_str()).map_err(|error| {
         format!(
             "degraded_ownership_conflict: cannot resolve {}: {error}",
@@ -2078,6 +2475,31 @@ fn probe_kernel_features() -> Result<(), String> {
     RESULT.get_or_init(run_kernel_feature_probe).clone()
 }
 
+fn probe_ifb_features() -> Result<(), String> {
+    static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+    RESULT.get_or_init(|| {
+        let namespace = format!("nqi{}", std::process::id());
+        run_ip(&["netns", "add", &namespace])?;
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = run_ip(&["netns", "del", &self.0]); }
+        }
+        let _cleanup = Cleanup(namespace.clone());
+        for args in [
+            vec!["-n", namespace.as_str(), "link", "add", "nqprobe0", "type", "veth", "peer", "name", "nqprobe1"],
+            vec!["-n", namespace.as_str(), "link", "add", "nqprobeifb", "type", "ifb"],
+            vec!["-n", namespace.as_str(), "link", "set", "nqprobe0", "up"],
+            vec!["-n", namespace.as_str(), "link", "set", "nqprobeifb", "up"],
+            vec!["netns", "exec", namespace.as_str(), "tc", "qdisc", "add", "dev", "nqprobe0", "clsact"],
+            vec!["netns", "exec", namespace.as_str(), "tc", "filter", "add", "dev", "nqprobe0", "egress", "matchall", "skip_hw", "action", "mirred", "egress", "redirect", "dev", "nqprobeifb"],
+            vec!["netns", "exec", namespace.as_str(), "tc", "qdisc", "add", "dev", "nqprobeifb", "root", "htb"],
+        ] {
+            run_ip(&args).map_err(|error| format!("unsupported_ifb_feature: {error}; check IFB, matchall and mirred support (on OpenWrt check kmod-ifb and tc-full)"))?;
+        }
+        Ok(())
+    }).clone()
+}
+
 pub(super) fn application_shaping_supported() -> Result<(), String> {
     probe_kernel_features()
 }
@@ -2101,7 +2523,12 @@ fn run_kernel_feature_probe() -> Result<(), String> {
         "peer",
         "name",
         &peer_interface,
-    ])?;
+    ])
+    .map_err(|error| {
+        format!(
+            "{error}; the isolated shaping probe needs veth support from both ip and the kernel (on OpenWrt check ip-full and kmod-veth)"
+        )
+    })?;
     run_ip(&["link", "set", &peer_interface, "netns", &namespace])?;
     run_ip(&["link", "set", &host_interface, "up"])?;
     run_ip(&["-n", &namespace, "link", "set", "lo", "up"])?;
@@ -2933,7 +3360,7 @@ exec "${NETQMON_SHARED_TEST_TC_BIN:-/usr/sbin/tc}" "$@"
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires root and CAP_NET_ADMIN in a private Linux network namespace"]
-    fn rejects_existing_cake_root_without_mutating_it() {
+    fn preserves_existing_cake_root_with_ifb_shaping() {
         use std::process::Command;
 
         assert!(nix::unistd::geteuid().is_root(), "test requires root");
@@ -2976,18 +3403,570 @@ exec "${NETQMON_SHARED_TEST_TC_BIN:-/usr/sbin/tc}" "$@"
             }),
             download_interface: None,
         };
-        let error = prepare_state(&desired, None).unwrap_err();
-        assert!(error.starts_with("unsupported_existing_qdisc:"), "{error}");
+        let prepared = prepare_state(&desired, None).expect("select a safe shaping backend");
+        assert_eq!(
+            prepared
+                .upload_interface
+                .as_ref()
+                .unwrap()
+                .original_root_kind,
+            "ifb"
+        );
+        apply(&prepared, None).expect("install IFB shaping");
         let after: Value =
             serde_json::from_slice(&run("tc", &["-j", "qdisc", "show", "dev", "wan0"]).stdout)
                 .unwrap();
         assert_eq!(
-            before, after,
-            "rejected policy changed the existing CAKE qdisc"
+            before
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|q| q["root"] == true),
+            after.as_array().unwrap().iter().find(|q| q["root"] == true),
+            "IFB shaping changed the existing CAKE root"
+        );
+        restore(&prepared).expect("remove IFB shaping");
+        let after_restore: Value =
+            serde_json::from_slice(&run("tc", &["-j", "qdisc", "show", "dev", "wan0"]).stdout)
+                .unwrap();
+        assert_eq!(
+            before
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|q| q["root"] == true),
+            after_restore
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|q| q["root"] == true)
         );
 
         run("ip", &["link", "del", "wan0"]);
-        println!("PASS: existing CAKE root was rejected and remained unchanged");
+        println!("PASS: existing CAKE root remained unchanged throughout IFB shaping");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root, CAP_NET_ADMIN, and isolated Linux network and mount namespaces"]
+    fn ifb_fallback_preserves_mq_and_recovers_interrupted_transactions() {
+        assert_ne!(
+            std::fs::read_link("/proc/self/ns/net").unwrap(),
+            std::fs::read_link("/proc/1/ns/net").unwrap()
+        );
+        run_ip(&[
+            "link",
+            "add",
+            "mqtest0",
+            "numtxqueues",
+            "32",
+            "type",
+            "veth",
+            "peer",
+            "name",
+            "mqtest1",
+        ])
+        .unwrap();
+        run_ip(&["link", "set", "mqtest0", "up"]).unwrap();
+        run_ip(&["link", "set", "mqtest1", "up"]).unwrap();
+        run_tc(&[
+            "qdisc", "replace", "dev", "mqtest0", "root", "handle", "10:", "mq",
+        ])
+        .unwrap();
+        run_tc(&[
+            "qdisc",
+            "replace",
+            "dev",
+            "mqtest0",
+            "parent",
+            "10:1",
+            "fq_codel",
+            "memory_limit",
+            "4Mb",
+        ])
+        .unwrap();
+        let original = run_json("tc", &["-j", "-d", "qdisc", "show", "dev", "mqtest0"]).unwrap();
+        let ifindex = nix::net::if_::if_nametoindex("mqtest0").unwrap();
+        let state = ShapingState {
+            schema_version: 1,
+            upload_interface: Some(ManagedInterface {
+                shared_egress: false,
+                name: "mqtest0".to_owned(),
+                ifindex,
+                capacity_bps: 100_000_000,
+                original_root_kind: String::new(),
+                clients: Vec::new(),
+                application_classes: Vec::new(),
+            }),
+            download_interface: None,
+            shared_egress: None,
+        };
+        let prepared = prepare_state(&state, None).unwrap();
+        assert_eq!(
+            prepared
+                .upload_interface
+                .as_ref()
+                .unwrap()
+                .original_root_kind,
+            "ifb"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("policy.json");
+
+        // Crash after creating the device but before it is raised or attached.
+        write_journal(&state_path, None, Some(&prepared)).unwrap();
+        run_ip(&[
+            "link",
+            "add",
+            &ifb_name(ifindex),
+            "address",
+            &ifb_address(ifindex),
+            "type",
+            "ifb",
+        ])
+        .unwrap();
+        assert!(recover_journal(&state_path, None).unwrap());
+        assert!(nix::net::if_::if_nametoindex(ifb_name(ifindex).as_str()).is_err());
+
+        // Crash after the IFB tree was installed but before traffic was redirected.
+        write_journal(&state_path, None, Some(&prepared)).unwrap();
+        run_ip(&[
+            "link",
+            "add",
+            &ifb_name(ifindex),
+            "address",
+            &ifb_address(ifindex),
+            "type",
+            "ifb",
+        ])
+        .unwrap();
+        run_ip(&[
+            "link",
+            "set",
+            "dev",
+            &ifb_name(ifindex),
+            "addrgenmode",
+            "none",
+        ])
+        .unwrap();
+        run_ip(&["link", "set", "dev", &ifb_name(ifindex), "up"]).unwrap();
+        run_tc(&[
+            "qdisc",
+            "replace",
+            "dev",
+            &ifb_name(ifindex),
+            "root",
+            "handle",
+            "51:",
+            "htb",
+        ])
+        .unwrap();
+        run_tc(&[
+            "class",
+            "add",
+            "dev",
+            &ifb_name(ifindex),
+            "parent",
+            "51:",
+            "classid",
+            "51:1",
+            "htb",
+            "rate",
+            "100mbit",
+        ])
+        .unwrap();
+        assert!(recover_journal(&state_path, None).unwrap());
+        assert!(nix::net::if_::if_nametoindex(ifb_name(ifindex).as_str()).is_err());
+
+        // Crash after the redirect was attached, before committing the state.
+        write_journal(&state_path, None, Some(&prepared)).unwrap();
+        apply(&prepared, None).unwrap();
+        assert!(recover_journal(&state_path, None).unwrap());
+        assert!(nix::net::if_::if_nametoindex(ifb_name(ifindex).as_str()).is_err());
+
+        // Crash after committing: recovery must reapply the intended policy.
+        write_journal(&state_path, None, Some(&prepared)).unwrap();
+        apply(&prepared, None).unwrap();
+        assert!(recover_journal(&state_path, Some(&prepared)).unwrap());
+        verify_owned(prepared.upload_interface.as_ref().unwrap()).unwrap();
+        run_tc(&[
+            "filter", "add", "dev", "mqtest0", "egress", "pref", "100", "matchall", "action",
+            "pass",
+        ])
+        .unwrap();
+        assert!(
+            restore(&prepared).is_err(),
+            "foreign egress filter must block cleanup"
+        );
+        assert!(nix::net::if_::if_nametoindex(ifb_name(ifindex).as_str()).is_ok());
+        run_tc(&["filter", "del", "dev", "mqtest0", "egress", "pref", "100"]).unwrap();
+        restore(&prepared).unwrap();
+        let restored = run_json("tc", &["-j", "-d", "qdisc", "show", "dev", "mqtest0"]).unwrap();
+        let preserved = restored
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|q| !is_observation_clsact(q))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(original.as_array().unwrap(), &preserved);
+
+        // Existing egress classifiers cannot be silently bypassed.
+        run_tc(&[
+            "filter", "add", "dev", "mqtest0", "egress", "pref", "100", "matchall", "action",
+            "pass",
+        ])
+        .unwrap();
+        let error = prepare_state(&state, None).unwrap_err();
+        assert!(error.contains("ifb_filter_conflict"), "{error}");
+        run_ip(&["link", "del", "mqtest0"]).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root, iperf3, nft, and isolated Linux network and mount namespaces"]
+    fn ifb_fallback_enforces_marked_client_throughput() {
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+        assert_ne!(
+            std::fs::read_link("/proc/self/ns/net").unwrap(),
+            std::fs::read_link("/proc/1/ns/net").unwrap()
+        );
+        let peer = format!("nqpeer{}", std::process::id());
+        run_ip(&["netns", "add", &peer]).unwrap();
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = run_ip(&["netns", "del", &self.0]);
+            }
+        }
+        let _cleanup = Cleanup(peer.clone());
+        run_ip(&[
+            "link",
+            "add",
+            "mqflow0",
+            "numtxqueues",
+            "4",
+            "type",
+            "veth",
+            "peer",
+            "name",
+            "mqflow1",
+        ])
+        .unwrap();
+        run_ip(&["link", "set", "mqflow1", "netns", &peer]).unwrap();
+        run_ip(&["addr", "add", "192.0.2.1/24", "dev", "mqflow0"]).unwrap();
+        run_ip(&["-n", &peer, "addr", "add", "192.0.2.2/24", "dev", "mqflow1"]).unwrap();
+        run_ip(&[
+            "-6",
+            "addr",
+            "add",
+            "2001:db8::1/64",
+            "dev",
+            "mqflow0",
+            "nodad",
+        ])
+        .unwrap();
+        run_ip(&[
+            "-n",
+            &peer,
+            "-6",
+            "addr",
+            "add",
+            "2001:db8::2/64",
+            "dev",
+            "mqflow1",
+            "nodad",
+        ])
+        .unwrap();
+        run_ip(&["link", "set", "mqflow0", "up"]).unwrap();
+        run_ip(&["-n", &peer, "link", "set", "mqflow1", "up"]).unwrap();
+        run_tc(&[
+            "qdisc", "replace", "dev", "mqflow0", "root", "handle", "10:", "mq",
+        ])
+        .unwrap();
+        // The OpenWrt compatibility run can attach a separately loaded TCX
+        // observation program before the real policy backend is selected.
+        if let Ok(program_id) = std::env::var("NETQMON_TEST_TCX_PROGRAM_ID") {
+            run_output(
+                "bpftool",
+                &[
+                    "net",
+                    "attach",
+                    "tcx_egress",
+                    "id",
+                    &program_id,
+                    "dev",
+                    "mqflow0",
+                ],
+            )
+            .unwrap();
+        }
+        let index = nix::net::if_::if_nametoindex("mqflow0").unwrap();
+        let clients = super::super::shaper::allocate_classes(
+            "gateway",
+            super::super::shaper::Direction::Upload,
+            "mqflow0",
+            index,
+            &BTreeMap::from([("02:00:00:00:00:01".to_owned(), 1_000_000)]),
+            &[],
+        )
+        .unwrap();
+        let mark = format!("0x{:x}", client_mark_value(clients[0].tag));
+        let state = ShapingState {
+            schema_version: 1,
+            upload_interface: Some(ManagedInterface {
+                shared_egress: false,
+                name: "mqflow0".to_owned(),
+                ifindex: index,
+                capacity_bps: 100_000_000,
+                original_root_kind: String::new(),
+                clients,
+                application_classes: Vec::new(),
+            }),
+            download_interface: None,
+            shared_egress: None,
+        };
+        if std::env::var_os("NETQMON_TEST_TCX_EXPECT_CONFLICT").is_some() {
+            let error = prepare_state(&state, None).unwrap_err();
+            assert!(error.contains("unverified TCX egress program"), "{error}");
+            return;
+        }
+        let prepared = prepare_state(&state, None).unwrap();
+        apply(&prepared, None).unwrap();
+        run_output("nft", &["add", "table", "inet", "nq_ifb_flow_test"]).unwrap();
+        run_output(
+            "nft",
+            &[
+                "add",
+                "chain",
+                "inet",
+                "nq_ifb_flow_test",
+                "output",
+                "{ type route hook output priority mangle; }",
+            ],
+        )
+        .unwrap();
+        run_output(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "inet",
+                "nq_ifb_flow_test",
+                "output",
+                "meta",
+                "mark",
+                "set",
+                &mark,
+            ],
+        )
+        .unwrap();
+        let transfer = || {
+            let mut server = Command::new("ip")
+                .args([
+                    "netns",
+                    "exec",
+                    &peer,
+                    "iperf3",
+                    "-s",
+                    "-1",
+                    "--idle-timeout",
+                    "15",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+            let output = Command::new("iperf3")
+                .args(["-c", "192.0.2.2", "-t", "3", "-J"])
+                .output()
+                .unwrap();
+            let _ = server.wait();
+            assert!(
+                output.status.success(),
+                "iperf3 failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            report["end"]["sum_received"]["bits_per_second"]
+                .as_f64()
+                .unwrap()
+        };
+        let rate = transfer();
+        assert!(
+            (300_000.0..=1_500_000.0).contains(&rate),
+            "unexpected throughput: {rate}"
+        );
+        let metrics = read_metrics(&prepared).unwrap();
+        assert!(
+            metrics[0].bytes.unwrap_or(0) > 0,
+            "client class did not receive packets"
+        );
+        let mut updated = prepared.clone();
+        let interface = updated.upload_interface.as_mut().unwrap();
+        interface.application_classes = super::super::shaper::allocate_application_classes(
+            "gateway",
+            super::super::shaper::Direction::Upload,
+            "mqflow0",
+            index,
+            &BTreeMap::from([(("app".to_owned(), "02:00:00:00:00:01".to_owned()), 500_000)]),
+            &interface.clients,
+            &[],
+        )
+        .unwrap();
+        let app_mark = client_mark_value(interface.clients[0].tag)
+            | application_mark_value(interface.application_classes[0].tag);
+        apply(&updated, Some(&prepared)).unwrap();
+        run_output(
+            "nft",
+            &["flush", "chain", "inet", "nq_ifb_flow_test", "output"],
+        )
+        .unwrap();
+        run_output(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "inet",
+                "nq_ifb_flow_test",
+                "output",
+                "meta",
+                "mark",
+                "set",
+                &format!("0x{app_mark:x}"),
+            ],
+        )
+        .unwrap();
+        let app_rate = transfer();
+        assert!(
+            (150_000.0..=750_000.0).contains(&app_rate),
+            "unexpected application throughput: {app_rate}"
+        );
+        let metrics = read_metrics(&updated).unwrap();
+        assert!(
+            metrics
+                .iter()
+                .any(|metric| metric.application.is_some() && metric.bytes.unwrap_or(0) > 0)
+        );
+        let before_v6 = metrics
+            .iter()
+            .find(|metric| metric.application.is_some())
+            .unwrap()
+            .bytes
+            .unwrap();
+        run_output("ping", &["-6", "-c", "2", "-W", "2", "2001:db8::2"]).unwrap();
+        let after_v6 = read_metrics(&updated)
+            .unwrap()
+            .into_iter()
+            .find(|metric| metric.application.is_some())
+            .unwrap()
+            .bytes
+            .unwrap();
+        assert!(
+            after_v6 > before_v6,
+            "IPv6 traffic did not enter the application class"
+        );
+        restore(&updated).unwrap();
+        run_output("nft", &["delete", "table", "inet", "nq_ifb_flow_test"]).unwrap();
+        run_ip(&["link", "del", "mqflow0"]).unwrap();
+        println!(
+            "PASS: IFB client and application shaping enforced {rate:.0} and {app_rate:.0} bit/s and reported counters"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root, CAP_NET_ADMIN, and isolated Linux network and mount namespaces"]
+    fn ifb_fallback_supports_shared_direction_and_application_classes() {
+        use super::super::shaper::{
+            Direction, allocate_application_classes_reserved, allocate_shared_client_classes,
+        };
+        assert_ne!(
+            std::fs::read_link("/proc/self/ns/net").unwrap(),
+            std::fs::read_link("/proc/1/ns/net").unwrap()
+        );
+        run_ip(&[
+            "link",
+            "add",
+            "shared0",
+            "numtxqueues",
+            "4",
+            "type",
+            "veth",
+            "peer",
+            "name",
+            "shared1",
+        ])
+        .unwrap();
+        run_ip(&["link", "set", "shared0", "up"]).unwrap();
+        run_ip(&["link", "set", "shared1", "up"]).unwrap();
+        run_tc(&[
+            "qdisc", "replace", "dev", "shared0", "root", "handle", "10:", "mq",
+        ])
+        .unwrap();
+        let index = nix::net::if_::if_nametoindex("shared0").unwrap();
+        let rates = BTreeMap::from([("02:00:00:00:00:01".to_owned(), 1_000_000)]);
+        let mut clients = allocate_shared_client_classes(
+            "gateway",
+            Direction::Upload,
+            "shared0",
+            index,
+            &rates,
+            &[],
+        )
+        .unwrap();
+        clients.extend(
+            allocate_shared_client_classes(
+                "gateway",
+                Direction::Download,
+                "shared0",
+                index,
+                &rates,
+                &[],
+            )
+            .unwrap(),
+        );
+        let apps = allocate_application_classes_reserved(
+            "gateway",
+            Direction::Upload,
+            "shared0",
+            index,
+            &BTreeMap::from([(("app".to_owned(), "02:00:00:00:00:01".to_owned()), 500_000)]),
+            &clients,
+            &[],
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let state = ShapingState {
+            schema_version: 2,
+            upload_interface: None,
+            download_interface: None,
+            shared_egress: Some(ManagedInterface {
+                shared_egress: true,
+                name: "shared0".to_owned(),
+                ifindex: index,
+                capacity_bps: 100_000_000,
+                original_root_kind: String::new(),
+                clients,
+                application_classes: apps,
+            }),
+        };
+        let prepared = prepare_state(&state, None).unwrap();
+        assert_eq!(
+            prepared.shared_egress.as_ref().unwrap().original_root_kind,
+            "ifb"
+        );
+        apply(&prepared, None).unwrap();
+        verify_owned(prepared.shared_egress.as_ref().unwrap()).unwrap();
+        assert_eq!(read_metrics(&prepared).unwrap().len(), 3);
+        restore(&prepared).unwrap();
+        assert_eq!(
+            root_kind(&inspect_root("shared0").unwrap()).as_deref(),
+            Some("mq")
+        );
+        run_ip(&["link", "del", "shared0"]).unwrap();
     }
 
     #[cfg(target_os = "linux")]

@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=netqmon-agent
-PKG_VERSION:=1.1.1-beta.4
+PKG_VERSION:=1.1.1-beta.5
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=netqmon Authors
@@ -15,7 +15,7 @@ define Package/netqmon-agent
   CATEGORY:=Network
   TITLE:=NetQMon eBPF network telemetry agent
   URL:=https://github.com/jarvis2f/netqmon
-  DEPENDS:=+kmod-sched-core +kmod-sched-bpf +kmod-sched +tc-full +nftables-json +libelf +zlib
+  DEPENDS:=+kmod-sched-core +kmod-sched-bpf +kmod-sched +kmod-veth +kmod-ifb +ip-full +tc-full +nftables-json +libelf +zlib
 endef
 
 define Package/netqmon-agent/description

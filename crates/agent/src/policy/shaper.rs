@@ -166,7 +166,7 @@ impl ShapingState {
                     .contains(&interface.capacity_bps)
                 || !matches!(
                     interface.original_root_kind.as_str(),
-                    "" | "fq_codel" | "pfifo_fast" | "noqueue"
+                    "" | "fq_codel" | "pfifo_fast" | "noqueue" | "ifb"
                 )
                 || !names.insert(interface.name.as_str())
                 || interface.clients.len()

@@ -1,12 +1,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::{Read as _, Write as _};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs as _};
+use std::io::Write as _;
+use std::net::{SocketAddr, ToSocketAddrs as _};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use portable_atomic::AtomicU64;
 use std::thread::{self, JoinHandle};
@@ -480,54 +480,40 @@ fn post(
         bail!("HTTPS transport is not available in this agent build");
     }
     let authority = uri.authority().context("controller URL has no authority")?;
-    let host = authority.host();
-    let port = authority.port_u16().unwrap_or(80);
-    let address = (host, port)
-        .to_socket_addrs()
-        .context("could not resolve controller address")?
-        .next()
-        .context("controller address did not resolve")?;
-    let mut stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
-        .context("could not connect to controller")?;
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let base_path = uri.path().trim_end_matches('/');
-    let path = format!("{base_path}{endpoint}");
-    let mut request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        body.len()
-    );
+    let url = format!("http://{authority}{base_path}{endpoint}");
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(IO_TIMEOUT)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("static telemetry HTTP client configuration is valid")
+    });
+    let mut request = client.post(url).body(body.to_vec());
     for (name, value) in headers {
-        request.push_str(name);
-        request.push_str(": ");
-        request.push_str(value);
-        request.push_str("\r\n");
+        request = request.header(*name, value);
     }
-    request.push_str("\r\n");
-    stream.write_all(request.as_bytes())?;
-    stream.write_all(body)?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
-    parse_response(&response)
-}
-
-fn parse_response(response: &[u8]) -> Result<HttpResponse> {
-    let separator = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .context("HTTP response has no header terminator")?;
-    let headers = std::str::from_utf8(&response[..separator]).context("invalid HTTP headers")?;
-    let status = headers
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .context("HTTP response has no status")?
-        .parse()
-        .context("invalid HTTP status")?;
-    Ok(HttpResponse {
-        status,
-        body: response[separator + 4..].to_vec(),
-    })
+    let response = request.send().map_err(|error| {
+        let context = if error.is_connect() && error.is_timeout() {
+            "controller connection timed out"
+        } else if error.is_connect() {
+            "could not connect to controller"
+        } else if error.is_timeout() {
+            "controller HTTP request timed out while sending or waiting for response"
+        } else {
+            "controller HTTP request failed"
+        };
+        anyhow::Error::new(error).context(context)
+    })?;
+    let status = response.status().as_u16();
+    let body = response
+        .bytes()
+        .context("could not read controller HTTP response body")?
+        .to_vec();
+    Ok(HttpResponse { status, body })
 }
 
 fn load_credentials(path: &Path) -> Result<Option<Credentials>> {
@@ -615,11 +601,60 @@ mod tests {
         assert_eq!(stats.queue_bytes.load(Ordering::Relaxed), 0);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn parses_protobuf_http_response_body() {
-        let response = parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc").unwrap();
+    fn complete_http_response_does_not_wait_for_connection_close() {
+        use std::io::Read as _;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (done, wait) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc")
+                .unwrap();
+            wait.recv_timeout(Duration::from_secs(3)).is_ok()
+        });
+        let response = post(&format!("http://{address}"), "/test", &[], b"").unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"abc");
+        done.send(()).unwrap();
+        assert!(
+            server.join().unwrap(),
+            "client waited for the server to close the connection"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn chunked_http_response_is_decoded_before_connection_close() {
+        use std::io::Read as _;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (done, wait) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+                )
+                .unwrap();
+            wait.recv_timeout(Duration::from_secs(3)).is_ok()
+        });
+        let response = post(&format!("http://{address}"), "/test", &[], b"").unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"abc");
+        done.send(()).unwrap();
+        assert!(
+            server.join().unwrap(),
+            "client waited for the server to close the connection"
+        );
     }
 
     #[test]
