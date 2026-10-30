@@ -97,7 +97,7 @@ assert_json "$result" error 'downloaded package checksum mismatch'
 # Exercise the installer's actual package selection without starting system services.
 printf 'test package\n' > "$work/package"
 cat > "$work/manifest" <<EOF
-{"channels":{"stable":{"packages":[
+{"channels":{"stable":{"version":"1.0.0","packages":[
  {"name":"netqmon-agent","openwrt_arch":"aarch64_cortex-a53","package_format":"ipk","url":"https://example.invalid/agent.ipk","sha256":"$sha"},
  {"name":"luci-app-netqmon","openwrt_arch":"all","package_format":"ipk","url":"https://example.invalid/luci.ipk","sha256":"$sha"},
  {"name":"netqmon-agent","openwrt_arch":"aarch64_cortex-a53","package_format":"apk","url":"https://example.invalid/agent.apk","sha256":"$sha"},
@@ -125,4 +125,23 @@ for PACKAGE_MANAGER in opkg apk; do
     grep -q "agent.$PACKAGE_FORMAT" "$work/download-log"
     grep -q "luci.$PACKAGE_FORMAT" "$work/download-log"
 done
+sed 's/"stable"/"beta"/; s/"1.0.0"/"1.1.1-beta.5"/' "$work/manifest" > "$work/beta-manifest"
+cp "$work/beta-manifest" "$work/manifest"
+for PACKAGE_MANAGER in opkg apk; do
+    rm -f "$work/bin/opkg" "$work/bin/apk" "$work/install-log" "$work/download-log"
+    ln -s "$work/manager" "$work/bin/$PACKAGE_MANAGER"
+    [ "$PACKAGE_MANAGER" = opkg ] && PACKAGE_FORMAT=ipk || PACKAGE_FORMAT=apk
+    NETQMON_RELEASE_TAG=v1.1.1-beta.5
+    install_openwrt_packages >/dev/null
+    [ -s "$work/install-log" ]
+    grep -q "agent.$PACKAGE_FORMAT" "$work/download-log"
+    grep -q "luci.$PACKAGE_FORMAT" "$work/download-log"
+done
+unset NETQMON_RELEASE_TAG
+install_openwrt_packages >/dev/null # A direct beta release URL also works.
+NETQMON_RELEASE_TAG=v1.1.1
+if install_openwrt_packages >/dev/null; then
+    printf 'FAIL: stable tag unexpectedly accepted a beta-only manifest\n' >&2
+    exit 1
+fi
 printf 'OpenWrt update and installer checks passed (real jsonfilter, opkg and apk).\n'

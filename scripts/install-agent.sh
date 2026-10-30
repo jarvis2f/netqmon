@@ -123,7 +123,7 @@ install_openwrt_packages() {
     [ "${NETQMON_INSTALL_IPK:-1}" = "1" ] || return 1
     [ -n "$PACKAGE_MANAGER" ] || return 1
 
-    local tmp_dir base_url manifest agent_pkg luci_pkg agent_url luci_url agent_sha luci_sha actual luci_arch
+    local tmp_dir base_url manifest manifest_channel tag stable_version beta_version agent_pkg luci_pkg agent_url luci_url agent_sha luci_sha actual luci_arch
     tmp_dir="${TMPDIR:-/tmp}/netqmon-install"
     base_url="${NETQMON_RELEASE_BASE_URL:-$(release_download_base_url)}"
     mkdir -p "$tmp_dir"
@@ -154,10 +154,25 @@ install_openwrt_packages() {
         download_file "${base_url}/openwrt-agent-manifest.json" "$manifest" || return 1
 
         if command -v jsonfilter >/dev/null 2>&1; then
-            agent_url="$(jsonfilter -i "$manifest" -e "@.channels.stable.packages[@.name='netqmon-agent' && @.openwrt_arch='${TARGET_ARCH}' && @.package_format='${PACKAGE_FORMAT}'].url" 2>/dev/null | head -n 1)"
-            agent_sha="$(jsonfilter -i "$manifest" -e "@.channels.stable.packages[@.name='netqmon-agent' && @.openwrt_arch='${TARGET_ARCH}' && @.package_format='${PACKAGE_FORMAT}'].sha256" 2>/dev/null | head -n 1)"
-            luci_url="$(jsonfilter -i "$manifest" -e "@.channels.stable.packages[@.name='luci-app-netqmon' && @.openwrt_arch='${luci_arch}' && @.package_format='${PACKAGE_FORMAT}'].url" 2>/dev/null | head -n 1)"
-            luci_sha="$(jsonfilter -i "$manifest" -e "@.channels.stable.packages[@.name='luci-app-netqmon' && @.openwrt_arch='${luci_arch}' && @.package_format='${PACKAGE_FORMAT}'].sha256" 2>/dev/null | head -n 1)"
+            tag="${NETQMON_RELEASE_TAG:-${NETQMON_DEFAULT_RELEASE_TAG:-}}"
+            stable_version="$(jsonfilter -i "$manifest" -e '@.channels.stable.version' 2>/dev/null | head -n 1)"
+            beta_version="$(jsonfilter -i "$manifest" -e '@.channels.beta.version' 2>/dev/null | head -n 1)"
+            case "$tag" in
+                *-*) manifest_channel=beta ;;
+                ?*) manifest_channel=stable ;;
+                *)
+                    manifest_channel=stable
+                    [ -n "$stable_version" ] || manifest_channel=beta
+                    ;;
+            esac
+            case "$manifest_channel" in
+                stable) [ -n "$stable_version" ] || return 1 ;;
+                beta) [ -n "$beta_version" ] || return 1 ;;
+            esac
+            agent_url="$(jsonfilter -i "$manifest" -e "@.channels.${manifest_channel}.packages[@.name='netqmon-agent' && @.openwrt_arch='${TARGET_ARCH}' && @.package_format='${PACKAGE_FORMAT}'].url" 2>/dev/null | head -n 1)"
+            agent_sha="$(jsonfilter -i "$manifest" -e "@.channels.${manifest_channel}.packages[@.name='netqmon-agent' && @.openwrt_arch='${TARGET_ARCH}' && @.package_format='${PACKAGE_FORMAT}'].sha256" 2>/dev/null | head -n 1)"
+            luci_url="$(jsonfilter -i "$manifest" -e "@.channels.${manifest_channel}.packages[@.name='luci-app-netqmon' && @.openwrt_arch='${luci_arch}' && @.package_format='${PACKAGE_FORMAT}'].url" 2>/dev/null | head -n 1)"
+            luci_sha="$(jsonfilter -i "$manifest" -e "@.channels.${manifest_channel}.packages[@.name='luci-app-netqmon' && @.openwrt_arch='${luci_arch}' && @.package_format='${PACKAGE_FORMAT}'].sha256" 2>/dev/null | head -n 1)"
         fi
 
         [ -n "${agent_url:-}" ] || return 1
