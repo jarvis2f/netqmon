@@ -132,6 +132,9 @@ jobs:
       - name: Test BPF context compatibility and MIPS32 call-free stages
         run: sudo python3 tests/integration/bpf_context.py
 
+      - name: Test restricted BPF token loader regressions
+        run: bash tests/integration/bpf_token.sh
+
       - name: Check Clippy
         run: cargo clippy --workspace --all-targets --all-features
 

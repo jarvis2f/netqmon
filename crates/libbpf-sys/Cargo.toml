@@ -1,0 +1,65 @@
+[package]
+name = "libbpf-sys"
+version = "1.7.0+v1.7.0"
+description = "Rust bindings to libbpf from the Linux kernel"
+readme = "README.md"
+repository = "https://github.com/libbpf/libbpf-sys"
+homepage = "https://github.com/libbpf/libbpf-sys"
+documentation = "https://docs.rs/libbpf-sys"
+keywords = ["bpf", "ebpf", "xdp"]
+authors = [
+    "Alex Forster <alex@alexforster.com>",
+    "Dan Siemon <dan@coverfire.com>",
+    "Daniel Xu <dxu@dxuuu.xyz>",
+]
+license = "BSD-2-Clause"
+edition = "2021"
+rust-version = "1.82" # first stable release to support "unsafe extern"
+build = "build.rs"
+links = "bpf"
+exclude = [
+    "/elfutils/tests/*.bz2",
+    "/libbpf/assets",
+    "/zlib/contrib",
+]
+
+[badges]
+github = { repository = "libbpf/libbpf-sys" }
+maintenance = { status = "passively-maintained" }
+
+[build-dependencies]
+bindgen = { version = "^0.72.0", optional = true }
+cc = "^1.2.27"
+pkg-config = "^0.3.32"
+nix = { version = "^0.31.2", default-features = false, features = ["fs"] }
+
+[lib]
+crate-type = ["lib", "staticlib"]
+
+[features]
+default = ["vendored-libbpf"]
+# Don't vendor anything.
+# This feature is for backward-compatibility only.
+# Set default-features = false instead.
+novendor = []
+# Meta-feature to use vendored versions of all dependencies.
+vendored = ["vendored-libbpf", "vendored-libelf", "vendored-zlib"]
+# Use vendored `libbpf`. Implies linking it statically.
+vendored-libbpf = ["static-libbpf"]
+# Use vendored `libelf`. Implies linking it statically.
+vendored-libelf = ["static-libelf"]
+# Use vendored `zlib`. Implies linking it statically.
+vendored-zlib = ["static-zlib"]
+# Meta-feature to link against all dependencies statically.
+static = ["static-libbpf", "static-libelf", "static-zlib"]
+# Link libbpf statically.
+static-libbpf = []
+# Link libelf statically. Implies linking libbpf statically, because libbpf is
+# the libelf consumer.
+static-libelf = ["static-libbpf"]
+# Link zlib statically. Implies linking libbpf statically, because libbpf is
+# the zlib consumer.
+static-zlib = ["static-libbpf"]
+# Generate bindings into source directory, should only be used for local
+# binding source updating. User should use "bindgen" feature flag instead.
+bindgen-source = ["bindgen"]

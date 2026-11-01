@@ -1,5 +1,7 @@
 # NetQmon Agent 命令与配置参考
 
+非特权 Incus/LXC 容器的配置与验证步骤见 [BPF token 容器部署指南](bpf-token-containers.md)。
+
 `netqmon-agent` 是安装在 OpenWrt 路由器或 Linux 网关上的轻量级网络遥测采集代理。它利用 Linux 内核的 **TC eBPF** 数据面挂载点，无感知地捕获进出流量的元数据、DNS 解析事件、流生命周期与报文样本，并高效批量推送至 NetQmon Controller。
 
 ---

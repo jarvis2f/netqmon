@@ -12,7 +12,7 @@ use portable_atomic::AtomicU64;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use libbpf_rs::skel::{OpenSkel as _, SkelBuilder as _};
+use libbpf_rs::skel::SkelBuilder as _;
 use libbpf_rs::{ErrorKind, MapCore, MapFlags, MapHandle, MapType, RingBufferBuilder};
 use netqmon_protocol::PROTOCOL_VERSION;
 use netqmon_protocol::v1::{
@@ -41,6 +41,8 @@ use crate::telemetry;
 use crate::topology::TopologyContext;
 use crate::transport::{self, SampleQueue, TelemetryQueue};
 
+#[allow(unsafe_code)]
+mod bpf_token;
 mod capabilities;
 mod map_options;
 pub(crate) mod neighbor;
@@ -256,8 +258,7 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
         rodata.sample_max_bytes_per_flow =
             u32::try_from(config.sample_max_bytes_per_flow).unwrap_or(4096);
     }
-    let skeleton = open_skeleton
-        .load()
+    let skeleton = bpf_token::load(open_skeleton)
         .map_err(|error| classify_bpf_error(BpfStage::Load, error))?;
     #[cfg(feature = "qos-client-priority")]
     let priority_maps = Arc::new(Mutex::new(

@@ -3,7 +3,7 @@ use std::fs;
 use std::mem::MaybeUninit;
 use std::os::fd::AsFd as _;
 
-use libbpf_rs::skel::{OpenSkel as _, SkelBuilder as _};
+use libbpf_rs::skel::SkelBuilder as _;
 use libbpf_rs::{MapHandle, MapType};
 use nix::net::if_::if_nametoindex;
 
@@ -147,23 +147,45 @@ pub(super) fn probe(config: &AgentConfig) -> CapabilityReport {
         kernel_btf_check(),
         interface,
     ];
-    checks.push(map_check("BPF syscall", MapType::Hash, 4, 4, 1));
-    checks.push(map_check("BPF_MAP_TYPE_HASH", MapType::Hash, 4, 4, 1));
-    checks.push(map_check(
-        "BPF_MAP_TYPE_LRU_HASH",
-        MapType::LruHash,
-        4,
-        8,
-        1,
-    ));
-    checks.push(map_check("BPF_MAP_TYPE_ARRAY", MapType::Array, 4, 8, 1));
-    checks.push(map_check(
-        "BPF_MAP_TYPE_RINGBUF",
-        MapType::RingBuf,
-        0,
-        0,
-        4096,
-    ));
+    let token = super::bpf_token::BpfToken::discover();
+    checks.push(Check {
+        name: "BPF token",
+        status: if token.is_ok() {
+            Status::Ok
+        } else {
+            Status::Fail
+        },
+        detail: match &token {
+            Ok(Some(_)) => "delegated bpffs token enabled".into(),
+            Ok(None) => "disabled or no delegated bpffs; using system capabilities".into(),
+            Err(error) => format!("token creation failed: {error}"),
+        },
+        required: true,
+    });
+    let options = token.as_ref().map(|token| {
+        token.as_ref().map_or_else(
+            super::map_options::map_create_options,
+            super::bpf_token::BpfToken::map_options,
+        )
+    });
+    for (name, map_type, key_size, value_size, max_entries) in [
+        ("BPF syscall", MapType::Hash, 4, 4, 1),
+        ("BPF_MAP_TYPE_HASH", MapType::Hash, 4, 4, 1),
+        ("BPF_MAP_TYPE_LRU_HASH", MapType::LruHash, 4, 8, 1),
+        ("BPF_MAP_TYPE_ARRAY", MapType::Array, 4, 8, 1),
+        ("BPF_MAP_TYPE_PERCPU_ARRAY", MapType::PercpuArray, 4, 8, 1),
+        ("BPF_MAP_TYPE_PROG_ARRAY", MapType::ProgArray, 4, 4, 1),
+        ("BPF_MAP_TYPE_RINGBUF", MapType::RingBuf, 0, 0, 4096),
+    ] {
+        checks.push(map_check(
+            name,
+            map_type,
+            key_size,
+            value_size,
+            max_entries,
+            &options,
+        ));
+    }
     checks.push(program_load_check(config));
     let (attach_check, attach_backend, attach_detail) = if interface_available {
         attach_check(config)
@@ -297,7 +319,7 @@ pub(super) fn probe_tcx_backend(config: &AgentConfig) -> libbpf_rs::Result<()> {
         .maps
         .flow_map
         .set_max_entries(config.max_flows)?;
-    let skeleton = open_skeleton.load()?;
+    let skeleton = super::bpf_token::load(open_skeleton)?;
     let mut links = Vec::new();
     for ifindex in ifindices {
         links.push(TcxLinks::attach(
@@ -327,7 +349,7 @@ fn probe_netlink_backend(config: &AgentConfig) -> libbpf_rs::Result<()> {
         .maps
         .flow_map
         .set_max_entries(config.max_flows)?;
-    let skeleton = open_skeleton.load()?;
+    let skeleton = super::bpf_token::load(open_skeleton)?;
     let mut hooks = Vec::new();
     for ifindex in ifindices {
         hooks.push(NetlinkHooks::attach_probe(
@@ -429,7 +451,7 @@ fn program_load_check(config: &AgentConfig) -> Check {
             rodata.sample_max_bytes_per_flow =
                 u32::try_from(config.sample_max_bytes_per_flow).unwrap_or(4096);
         }
-        let _loaded = skeleton.load()?;
+        let _loaded = super::bpf_token::load(skeleton)?;
         Ok(())
     })();
     Check {
@@ -477,16 +499,23 @@ fn map_check(
     key_size: u32,
     value_size: u32,
     max_entries: u32,
+    options: &Result<libbpf_rs::libbpf_sys::bpf_map_create_opts, &libbpf_rs::Error>,
 ) -> Check {
-    let options = super::map_options::map_create_options();
-    match MapHandle::create(
-        map_type,
-        Some("nqm_doctor"),
-        key_size,
-        value_size,
-        max_entries,
-        &options,
-    ) {
+    let result = options
+        .as_ref()
+        .map_err(|error| format!("BPF token unavailable: {error}"))
+        .and_then(|options| {
+            MapHandle::create(
+                map_type,
+                Some("nqm_doctor"),
+                key_size,
+                value_size,
+                max_entries,
+                options,
+            )
+            .map_err(|error| error.to_string())
+        });
+    match result {
         Ok(map) => {
             drop(map);
             Check {
@@ -499,7 +528,7 @@ fn map_check(
         Err(error) => Check {
             name,
             status: Status::Fail,
-            detail: error.to_string(),
+            detail: error,
             required: true,
         },
     }

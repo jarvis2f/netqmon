@@ -1,5 +1,7 @@
 # NetQmon Agent CLI & Configuration Reference
 
+For unprivileged Incus/LXC containers, see [BPF token delegation](bpf-token-containers.md).
+
 `netqmon-agent` is a lightweight network telemetry daemon designed for OpenWrt routers and Linux gateways. Leveraging the kernel **TC eBPF** subsystem, it captures flow metrics, DNS query events, connection lifecycles, and bounded packet samples without modifying or intercepting user payloads, streaming batches reliably to the NetQmon Controller.
 
 ---
