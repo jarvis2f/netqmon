@@ -205,12 +205,13 @@ pub(crate) fn restore(connection: &Connection, current: &mut ActiveFlow) -> rusq
 pub(crate) fn restore_active(
     connection: &Connection,
     active: &mut HashMap<FlowKey, ActiveFlow>,
+    now: i64,
 ) -> rusqlite::Result<()> {
     let mut statement = connection.prepare(
         "SELECT metadata_json,attribution_json,upload_bytes,download_bytes,packets,last_seen_at,updated_at
-        FROM flow_rollup_sessions WHERE ended_at IS NULL",
+        FROM flow_rollup_sessions WHERE ended_at IS NULL AND updated_at>?1",
     )?;
-    for state in statement.query_map([], read_recovery)? {
+    for state in statement.query_map([now.saturating_sub(CORRECTION_WINDOW_MS)], read_recovery)? {
         let (key, mut restored) = state?;
         if let Some(current) = active.get_mut(&key) {
             if current.session_id == restored.session_id {

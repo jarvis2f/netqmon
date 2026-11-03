@@ -28,10 +28,51 @@ fn startup_recovery_gc_retries_after_progress_handler_interruptions() {
             NOW + ACTIVE_FLOW_TTL_MS as u64 + 1,
             500,
             Some(Duration::from_nanos(1)),
+            Duration::from_secs(5),
         )
         .unwrap();
 
     assert_eq!(count(&storage, "flow_rollup_sessions"), 0);
+    assert_eq!(count(&storage, "flow_rollup_contributions"), 0);
+    assert_eq!(
+        metrics(storage.connection(), "traffic_total_minute", "1=1"),
+        (100, 50, 3, 1)
+    );
+}
+
+#[test]
+fn startup_recovery_gc_yields_and_background_maintenance_resumes() {
+    let mut storage = setup();
+    storage
+        .persist_classified_batch(
+            &batch(1, FlowLifecycle::Active),
+            &[transport_attribution()],
+            &[],
+            NOW,
+        )
+        .unwrap();
+    let expired = NOW + ACTIVE_FLOW_TTL_MS as u64 + 60_000;
+
+    storage
+        .prune_reclassification_at_startup_with_budget(
+            expired,
+            1,
+            Some(Duration::from_millis(100)),
+            Duration::ZERO,
+        )
+        .unwrap();
+    assert_eq!(count(&storage, "flow_rollup_contributions"), 1);
+    assert!(
+        load_active_flows(storage.connection(), expired)
+            .unwrap()
+            .is_empty()
+    );
+
+    assert!(
+        storage
+            .prune_reclassification_bounded(expired, 1, Duration::from_secs(1))
+            .unwrap()
+    );
     assert_eq!(count(&storage, "flow_rollup_contributions"), 0);
     assert_eq!(
         metrics(storage.connection(), "traffic_total_minute", "1=1"),

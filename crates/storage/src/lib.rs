@@ -607,7 +607,7 @@ impl SqliteStorage {
         storage.connection.busy_timeout(Duration::from_millis(50))?;
         storage.prune_reclassification_at_startup(now_ms)?;
         storage.connection.busy_timeout(Duration::from_secs(5))?;
-        storage.active_flows = load_active_flows(&storage.connection)?;
+        storage.active_flows = load_active_flows(&storage.connection, now_ms)?;
         Ok(storage)
     }
 
@@ -1334,11 +1334,13 @@ impl SqliteStorage {
     }
 
     fn prune_reclassification_at_startup(&mut self, now_ms: u64) -> rusqlite::Result<()> {
-        let max_rows = RetentionBudget::default().max_rows_per_batch.max(1);
+        let budget = RetentionBudget::default();
+        let max_rows = budget.max_rows_per_batch.max(1);
         self.prune_reclassification_at_startup_with_budget(
             now_ms,
             max_rows,
-            Some(RetentionBudget::default().transaction_target),
+            Some(budget.transaction_target),
+            budget.total_budget,
         )
     }
 
@@ -1347,10 +1349,19 @@ impl SqliteStorage {
         now_ms: u64,
         max_rows: usize,
         mut target: Option<Duration>,
+        total_budget: Duration,
     ) -> rusqlite::Result<()> {
         let max_rows = max_rows.max(1);
         let mut rows = max_rows;
+        let started = std::time::Instant::now();
         loop {
+            if started.elapsed() >= total_budget {
+                tracing::warn!(
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "startup recovery GC yielded to background maintenance"
+                );
+                return Ok(());
+            }
             match self.prune_reclassification_batch(now_ms, rows, target)? {
                 RecoveryPruneBatch::Complete => return Ok(()),
                 RecoveryPruneBatch::MoreWork(elapsed) => {
@@ -2382,7 +2393,10 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn load_active_flows(connection: &Connection) -> rusqlite::Result<HashMap<FlowKey, ActiveFlow>> {
+fn load_active_flows(
+    connection: &Connection,
+    now_ms: u64,
+) -> rusqlite::Result<HashMap<FlowKey, ActiveFlow>> {
     let mut statement = connection.prepare(
         "SELECT gateway_id, ip_version, protocol, client_ip, client_port, remote_ip,
                 remote_port, direction, upload_bytes, download_bytes, packets,
@@ -2391,10 +2405,10 @@ fn load_active_flows(connection: &Connection) -> rusqlite::Result<HashMap<FlowKe
                 application_confidence, protocol_confidence, classification_confidence,
                 classification_reason, classification_evidence_json, scope, path_type, nat,
                 source_segment, destination_segment, device_id, id
-         FROM flow_sessions WHERE ended_at IS NULL",
+         FROM flow_sessions WHERE ended_at IS NULL AND checkpointed_at>?1",
     )?;
     let mut active: HashMap<FlowKey, ActiveFlow> = statement
-        .query_map([], |row| {
+        .query_map([to_i64(now_ms).saturating_sub(ACTIVE_FLOW_TTL_MS)], |row| {
             Ok((
                 FlowKey {
                     gateway_id: row.get(0)?,
@@ -2454,7 +2468,7 @@ fn load_active_flows(connection: &Connection) -> rusqlite::Result<HashMap<FlowKe
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    attribution::restore_active(connection, &mut active)?;
+    attribution::restore_active(connection, &mut active, to_i64(now_ms))?;
     Ok(active)
 }
 
