@@ -516,6 +516,13 @@ pub struct SqliteStorage {
     active_flows: HashMap<FlowKey, ActiveFlow>,
 }
 
+enum RecoveryPruneBatch {
+    Complete,
+    MoreWork(Duration),
+    Busy,
+    Interrupted,
+}
+
 impl SqliteStorage {
     fn independent_connection(&self, read_only: bool) -> StorageResult<Option<Self>> {
         let Some(path) = self
@@ -592,17 +599,13 @@ impl SqliteStorage {
             connection,
             active_flows: HashMap::new(),
         };
-        // Close stale persisted state before loading it into memory again, but
-        // commit it in bounded slices so startup cannot hold SQLite's writer
-        // lock for the full history scan.
+        // Close stale persisted state before loading it into memory again.
+        // Recovery commits bounded slices. If a slice exceeds the cooperative
+        // transaction target, startup shrinks the slice and grows its budget;
+        // otherwise an interrupted batch would be retried forever with the
+        // same limit before the Collector can bind its listeners.
         storage.connection.busy_timeout(Duration::from_millis(50))?;
-        while !storage.prune_reclassification_bounded(
-            now_ms,
-            RetentionBudget::default().max_rows_per_batch,
-            RetentionBudget::default().transaction_target,
-        )? {
-            std::thread::yield_now();
-        }
+        storage.prune_reclassification_at_startup(now_ms)?;
         storage.connection.busy_timeout(Duration::from_secs(5))?;
         storage.active_flows = load_active_flows(&storage.connection)?;
         Ok(storage)
@@ -1324,6 +1327,70 @@ impl SqliteStorage {
         limit: usize,
         transaction_target: Duration,
     ) -> rusqlite::Result<bool> {
+        Ok(matches!(
+            self.prune_reclassification_batch(now_ms, limit, Some(transaction_target))?,
+            RecoveryPruneBatch::Complete
+        ))
+    }
+
+    fn prune_reclassification_at_startup(&mut self, now_ms: u64) -> rusqlite::Result<()> {
+        let max_rows = RetentionBudget::default().max_rows_per_batch.max(1);
+        self.prune_reclassification_at_startup_with_budget(
+            now_ms,
+            max_rows,
+            Some(RetentionBudget::default().transaction_target),
+        )
+    }
+
+    fn prune_reclassification_at_startup_with_budget(
+        &mut self,
+        now_ms: u64,
+        max_rows: usize,
+        mut target: Option<Duration>,
+    ) -> rusqlite::Result<()> {
+        let max_rows = max_rows.max(1);
+        let mut rows = max_rows;
+        loop {
+            match self.prune_reclassification_batch(now_ms, rows, target)? {
+                RecoveryPruneBatch::Complete => return Ok(()),
+                RecoveryPruneBatch::MoreWork(elapsed) => {
+                    let ramp_threshold = target
+                        .map(|duration| duration / 2)
+                        .unwrap_or(Duration::from_millis(10));
+                    if rows < max_rows && elapsed < ramp_threshold {
+                        rows = rows.saturating_mul(2).min(max_rows);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                RecoveryPruneBatch::Busy => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                RecoveryPruneBatch::Interrupted => {
+                    if rows > 1 {
+                        rows = (rows / 2).max(1);
+                    } else {
+                        target = match target {
+                            Some(current) if current < Duration::from_secs(1) => {
+                                Some(Duration::from_secs(1))
+                            }
+                            Some(current) if current < Duration::from_secs(30) => {
+                                Some((current * 2).min(Duration::from_secs(30)))
+                            }
+                            Some(_) | None => None,
+                        };
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    fn prune_reclassification_batch(
+        &mut self,
+        now_ms: u64,
+        limit: usize,
+        transaction_target: Option<Duration>,
+    ) -> rusqlite::Result<RecoveryPruneBatch> {
         let now = to_i64(now_ms);
         let cutoff = now.saturating_sub(ACTIVE_FLOW_TTL_MS);
         let mut candidates = Vec::new();
@@ -1338,12 +1405,16 @@ impl SqliteStorage {
         let started = std::time::Instant::now();
         let tx = match self.connection.transaction() {
             Ok(tx) => tx,
-            Err(error) if sqlite_is_busy(&error) => return Ok(false),
+            Err(error) if sqlite_is_busy(&error) => return Ok(RecoveryPruneBatch::Busy),
             Err(error) => return Err(error),
         };
         let begin_elapsed = started.elapsed();
-        let deadline = started + transaction_target;
-        tx.progress_handler(1_000, Some(move || std::time::Instant::now() >= deadline))?;
+        if let Some(transaction_target) = transaction_target {
+            let deadline = started + transaction_target;
+            tx.progress_handler(1_000, Some(move || std::time::Instant::now() >= deadline))?;
+        } else {
+            tx.progress_handler(0, None::<fn() -> bool>)?;
+        }
         let result = (|| -> rusqlite::Result<bool> {
             for (key, flow) in &candidates {
                 write_flow_session(&tx, key, flow, Some(flow.last_seen_at), now)?;
@@ -1358,11 +1429,11 @@ impl SqliteStorage {
                 if code.code == rusqlite::ErrorCode::OperationInterrupted =>
             {
                 drop(tx);
-                return Ok(false);
+                return Ok(RecoveryPruneBatch::Interrupted);
             }
             Err(error) if sqlite_is_busy(&error) => {
                 drop(tx);
-                return Ok(false);
+                return Ok(RecoveryPruneBatch::Busy);
             }
             Err(error) => {
                 drop(tx);
@@ -1372,7 +1443,7 @@ impl SqliteStorage {
         let commit_started = std::time::Instant::now();
         if let Err(error) = tx.commit() {
             if sqlite_is_busy(&error) {
-                return Ok(false);
+                return Ok(RecoveryPruneBatch::Busy);
             }
             return Err(error);
         }
@@ -1397,13 +1468,15 @@ impl SqliteStorage {
         for (key, _) in candidates {
             self.active_flows.remove(&key);
         }
-        if pending {
-            return Ok(false);
+        if pending
+            || self
+                .active_flows
+                .values()
+                .any(|flow| flow.last_received_at <= cutoff && flow.last_seen_at > 0)
+        {
+            return Ok(RecoveryPruneBatch::MoreWork(elapsed));
         }
-        Ok(!self
-            .active_flows
-            .values()
-            .any(|flow| flow.last_received_at <= cutoff && flow.last_seen_at > 0))
+        Ok(RecoveryPruneBatch::Complete)
     }
 
     pub fn connection(&self) -> &Connection {

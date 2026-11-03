@@ -9,6 +9,37 @@ fn count(storage: &SqliteStorage, table: &str) -> i64 {
 }
 
 #[test]
+fn startup_recovery_gc_retries_after_progress_handler_interruptions() {
+    let mut storage = setup();
+    storage
+        .persist_classified_batch(
+            &batch(1, FlowLifecycle::Active),
+            &[transport_attribution()],
+            &[],
+            NOW,
+        )
+        .unwrap();
+
+    // A deliberately tiny initial budget forces SQLite's progress handler to
+    // interrupt the first slices. Startup recovery must relax its budget and
+    // finish instead of retrying an identical, doomed slice forever.
+    storage
+        .prune_reclassification_at_startup_with_budget(
+            NOW + ACTIVE_FLOW_TTL_MS as u64 + 1,
+            500,
+            Some(Duration::from_nanos(1)),
+        )
+        .unwrap();
+
+    assert_eq!(count(&storage, "flow_rollup_sessions"), 0);
+    assert_eq!(count(&storage, "flow_rollup_contributions"), 0);
+    assert_eq!(
+        metrics(storage.connection(), "traffic_total_minute", "1=1"),
+        (100, 50, 3, 1)
+    );
+}
+
+#[test]
 fn session_json_is_stored_once_across_minutes() {
     let mut storage = setup();
     for seq in 1..=6 {
