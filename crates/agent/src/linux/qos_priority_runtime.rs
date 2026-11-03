@@ -58,6 +58,93 @@ struct RuntimeConfig {
     allow_initial_namespace: bool,
 }
 
+impl RuntimeConfig {
+    fn automatic(ifindex: u32, namespace: &str) -> Result<Self> {
+        let inode = namespace
+            .strip_prefix("net:[")
+            .and_then(|value| value.strip_suffix(']'))
+            .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+            .context("priority_namespace_unknown: cannot identify network namespace")?;
+        if ifindex == 0 {
+            bail!("priority_delivery_unknown: capture interface has no index");
+        }
+        Ok(Self {
+            ifb: format!("nqt{ifindex:x}"),
+            output: PathBuf::from(format!("/tmp/netqmon-priority-{inode}-{ifindex}/evidence")),
+            // This configuration is enabled explicitly by the administrator.
+            allow_initial_namespace: true,
+        })
+    }
+}
+
+fn ensure_private_runtime_directory(output: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+    let directory = output
+        .parent()
+        .context("priority evidence directory is missing")?;
+    match fs::DirBuilder::new().mode(0o700).create(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).context("cannot create priority evidence directory"),
+    }
+    let metadata = fs::symlink_metadata(directory)?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.mode() & 0o077 != 0
+    {
+        bail!(
+            "priority_evidence_path_invalid: runtime directory must be private and owned by the Agent user"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub(super) struct PriorityPreflightError(String);
+
+impl std::fmt::Display for PriorityPreflightError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PriorityPreflightError {}
+
+/// A failed read-only preflight can fall back only if no priority transaction,
+/// persisted state, IFB, qdisc, filter or pinned program could be left behind.
+pub(super) fn safe_preflight_fallback(agent: &AgentConfig) -> Result<bool> {
+    let ifindex = nix::net::if_::if_nametoindex(agent.interface.as_str())?;
+    let namespace = fs::read_link("/proc/self/ns/net")?;
+    let config = RuntimeConfig::automatic(ifindex, &namespace.to_string_lossy())?;
+    let state = &agent.policy_state_path;
+    for path in [
+        state.with_extension("priority-state.json"),
+        state.with_extension("priority-journal.json"),
+        config.output.with_extension("priority-runtime.json"),
+        config.output.with_extension("priority-recovery.json"),
+    ] {
+        match fs::symlink_metadata(path) {
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let layout = priority_delivery::inspect(&agent.interface, &BTreeSet::new())
+        .map_err(anyhow::Error::msg)?;
+    let mut interfaces = agent.interfaces.clone();
+    interfaces.extend(layout.egress_ports.iter().map(|port| port.name.clone()));
+    interfaces.sort();
+    interfaces.dedup();
+    Ok(inspect_owned_priority_resources(
+        &layout,
+        &config.ifb,
+        &interfaces,
+        agent.attach_order.tc_handle,
+        &RecoveryEvidence::default(),
+    )?
+    .is_empty())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PriorityState {
@@ -183,22 +270,30 @@ fn ensure_no_hw_tc_offload(dev: &str, is_ifb: bool) -> Result<()> {
                     String::from_utf8_lossy(&output.stderr).trim()
                 );
             }
-            let offload = String::from_utf8(output.stdout)?;
-            if offload
-                .lines()
-                .any(|line| line.starts_with("hw-tc-offload:") && line.contains(": on"))
-            {
-                if is_ifb {
-                    bail!("priority_offload_conflict: IFB hw-tc-offload is enabled");
-                }
-                bail!("priority_offload_conflict: hw-tc-offload is enabled on {dev}");
-            }
-            Ok(())
+            verify_hw_tc_offload(&String::from_utf8(output.stdout)?, dev, is_ifb)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("priority_offload_unknown: ethtool is required to verify {dev}")
+        }
         Err(error) => {
             Err(error).context("priority_offload_unknown: ethtool feature inspection is required")
         }
+    }
+}
+
+fn verify_hw_tc_offload(output: &str, dev: &str, is_ifb: bool) -> Result<()> {
+    let mut states = output.lines().filter_map(|line| {
+        line.trim()
+            .strip_prefix("hw-tc-offload:")
+            .and_then(|value| value.split_whitespace().next())
+    });
+    match (states.next(), states.next()) {
+        (Some("off"), None) => Ok(()),
+        (Some("on"), None) if is_ifb => {
+            bail!("priority_offload_conflict: IFB hw-tc-offload is enabled")
+        }
+        (Some("on"), None) => bail!("priority_offload_conflict: hw-tc-offload is enabled on {dev}"),
+        _ => bail!("priority_offload_unknown: ethtool did not report hw-tc-offload for {dev}"),
     }
 }
 
@@ -306,18 +401,23 @@ fn incompatible_nft(value: &Value) -> bool {
     }
 }
 
-fn has_legacy_netqmon_mark_rule(value: &Value) -> bool {
+fn has_legacy_netqmon_policy(value: &Value) -> bool {
     match value {
-        Value::Array(values) => values.iter().any(has_legacy_netqmon_mark_rule),
+        Value::Array(values) => values.iter().any(has_legacy_netqmon_policy),
         Value::Object(object) => {
-            object
-                .get("comment")
-                .and_then(Value::as_str)
-                .is_some_and(|comment| {
-                    comment.starts_with("netqmon:traffic-limit:")
-                        || comment.starts_with("netqmon:shared:")
-                })
-                || object.values().any(has_legacy_netqmon_mark_rule)
+            object.get("table").is_some_and(|table| {
+                table.get("family").and_then(Value::as_str) == Some("inet")
+                    && table.get("name").and_then(Value::as_str) == Some("netqmon_policy")
+            }) || (object.get("family").and_then(Value::as_str) == Some("inet")
+                && object.get("table").and_then(Value::as_str) == Some("netqmon_policy"))
+                || object
+                    .get("comment")
+                    .and_then(Value::as_str)
+                    .is_some_and(|comment| {
+                        comment.starts_with("netqmon:traffic-limit:")
+                            || comment.starts_with("netqmon:shared:")
+                    })
+                || object.values().any(has_legacy_netqmon_policy)
         }
         _ => false,
     }
@@ -2058,9 +2158,13 @@ impl PriorityRuntime {
         observation_interfaces: &[(String, i32)],
         maps: Arc<Mutex<PriorityMaps>>,
     ) -> Result<Option<Self>> {
-        let Some(path) = std::env::var_os("NETQMON_QOS_PRIORITY_CONFIG") else {
+        let path =
+            std::env::var_os("NETQMON_QOS_PRIORITY_CONFIG").filter(|value| !value.is_empty());
+        if path.is_none() && !agent.policy_client_total_enabled {
             return Ok(None);
-        };
+        }
+        let automatic = path.is_none();
+        let (config, layout, priority) = (|| -> Result<_> {
         if std::env::var_os("NETQMON_QOS_POC_CONFIG").is_some() {
             bail!(
                 "priority_backend_conflict: compatibility PoC and client runtime cannot run together"
@@ -2071,10 +2175,31 @@ impl PriorityRuntime {
                 "priority_order_unverified: the client runtime currently requires explicit netlink attachment"
             );
         }
+        // The nftables table may not exist immediately after reboot, while the
+        // legacy receiver still has a snapshot or shaping transaction to restore.
+        // Priority uses separate state and must not silently skip that policy.
+        for path in [
+            agent.policy_state_path.clone(),
+            agent.policy_state_path.with_extension("shaping-journal.json"),
+        ] {
+            match fs::symlink_metadata(&path) {
+                Ok(_) => bail!("priority_conflict: legacy policy state or transaction exists at {}", path.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(error) => return Err(error.into()),
+            }
+        }
         if super::hardware_flow_offload_status() != netqmon_protocol::v1::OffloadStatus::Disabled {
             bail!("priority_offload_unknown: hardware flow offload is enabled or unspecified");
         }
-        let config: RuntimeConfig = serde_json::from_slice(&fs::read(path)?)?;
+        let config: RuntimeConfig = if let Some(path) = path {
+            serde_json::from_slice(&fs::read(path)?)?
+        } else {
+            let ifindex = nix::net::if_::if_nametoindex(agent.interface.as_str())?;
+            let namespace = fs::read_link("/proc/self/ns/net")?;
+            let config = RuntimeConfig::automatic(ifindex, &namespace.to_string_lossy())?;
+            ensure_private_runtime_directory(&config.output)?;
+            config
+        };
         let initial_namespace =
             fs::read_link("/proc/self/ns/net")? == fs::read_link("/proc/1/ns/net")?;
         require_namespace_opt_in(initial_namespace, config.allow_initial_namespace)?;
@@ -2123,22 +2248,41 @@ impl PriorityRuntime {
         {
             bail!("priority_delivery_unknown: Agent hooks do not cover every actual LAN port");
         }
-        if agent.policy_interface_capacity_bps.is_empty()
-            || layout
-                .egress_ports
-                .iter()
-                .any(|port| !agent.policy_interface_capacity_bps.contains_key(&port.name))
-        {
-            bail!("priority_capacity_unknown: configure capacity for every actual LAN egress port");
+        for port in &layout.egress_ports {
+            crate::policy::capacity::effective(
+                &port.name,
+                agent.policy_interface_capacity_bps.get(&port.name).copied(),
+            )
+            .map_err(|reason| anyhow!("priority_capacity_unknown: {}: {reason}", port.name))?;
         }
-        let policy_state_path = Path::new(&agent.policy_state_path);
+            // If there are provably no old priority resources to recover, check
+            // foreign queues and hooks before any data-plane mutation. A failed
+            // check can then retain the legacy backend safely.
+            if automatic && safe_preflight_fallback(agent).unwrap_or(false) {
+                for port in &layout.egress_ports {
+                    if has_tcx_attachment(port.ifindex) {
+                        bail!("priority_attach_order_unverified: a TCX program is attached to {}", port.name);
+                    }
+                    let qdiscs = parse_json(&tc(&["-j", "qdisc", "show", "dev", &port.name])?, "qdisc dump")?;
+                    let _ = capture_original_root(&qdiscs)?;
+                    ensure_no_hw_tc_offload(&port.name, false)?;
+                    if !tc(&["filter", "show", "dev", &port.name, "ingress"])?.trim().is_empty()
+                        || !tc(&["filter", "show", "dev", &port.name, "egress"])?.trim().is_empty()
+                    {
+                        bail!("priority_tc_conflict: foreign filter exists on {}", port.name);
+                    }
+                }
+            }
         let nft = parse_json(&run("nft", &["-j", "list", "ruleset"])?, "nft ruleset")?;
-        if has_legacy_netqmon_mark_rule(&nft) {
-            bail!("priority_conflict: legacy NetQmon mark rules remain in nftables");
+        if has_legacy_netqmon_policy(&nft) {
+            bail!("priority_conflict: legacy NetQmon policy rules remain in nftables");
         }
         if incompatible_nft(&nft) {
             bail!("priority_conflict: nft priority writer or flowtable/offload is present");
         }
+        Ok((config, layout, priority))
+        })().map_err(|error| PriorityPreflightError(format!("{error:#}")))?;
+        let policy_state_path = Path::new(&agent.policy_state_path);
         let evidence_path = config.output.with_extension("priority-runtime.json");
         let recovery = recover_stale_priority_resources(
             &layout,
@@ -3287,12 +3431,17 @@ impl PriorityRuntime {
             .ports
             .iter()
             .map(|owned| {
-                self.agent
-                    .policy_interface_capacity_bps
-                    .get(&owned.port.name)
-                    .copied()
-                    .map(|capacity| (owned.port.ifindex, capacity))
-                    .ok_or_else(|| anyhow!("priority_capacity_unknown: {}", owned.port.name))
+                crate::policy::capacity::effective(
+                    &owned.port.name,
+                    self.agent
+                        .policy_interface_capacity_bps
+                        .get(&owned.port.name)
+                        .copied(),
+                )
+                .map(|capacity| (owned.port.ifindex, capacity.bps))
+                .map_err(|reason| {
+                    anyhow!("priority_capacity_unknown: {}: {reason}", owned.port.name)
+                })
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
         let budgets = active_leases
@@ -4259,12 +4408,61 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod priority_recovery_gate_tests {
+    #[test]
+    fn automatic_runtime_names_are_stable_and_scope_the_network_namespace() {
+        let first = super::RuntimeConfig::automatic(12, "net:[4026531840]").unwrap();
+        let same = super::RuntimeConfig::automatic(12, "net:[4026531840]").unwrap();
+        let other = super::RuntimeConfig::automatic(12, "net:[4026531841]").unwrap();
+        assert_eq!(first.ifb, same.ifb);
+        assert_eq!(first.output, same.output);
+        assert_ne!(first.output, other.output);
+        assert!(first.allow_initial_namespace);
+        assert!(super::RuntimeConfig::automatic(0, "net:[42]").is_err());
+        assert!(super::RuntimeConfig::automatic(12, "net:[../../x]").is_err());
+    }
+
+    #[test]
+    fn automatic_runtime_directory_rejects_symlinks_and_public_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("private");
+        let output = directory.join("evidence");
+        super::ensure_private_runtime_directory(&output).unwrap();
+        super::ensure_private_runtime_directory(&output).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(super::ensure_private_runtime_directory(&output).is_err());
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&directory, &link).unwrap();
+        assert!(super::ensure_private_runtime_directory(&link.join("evidence")).is_err());
+    }
+    #[test]
+    fn hw_tc_offload_must_be_unambiguously_disabled() {
+        assert!(super::verify_hw_tc_offload("hw-tc-offload: off [fixed]\n", "eth0", false).is_ok());
+        assert!(
+            super::verify_hw_tc_offload("hw-tc-offload: on\n", "eth0", false)
+                .unwrap_err()
+                .to_string()
+                .contains("priority_offload_conflict")
+        );
+        for unknown in [
+            "",
+            "hw-tc-offload: unknown",
+            "hw-tc-offload: off\nhw-tc-offload: on",
+        ] {
+            assert!(
+                super::verify_hw_tc_offload(unknown, "eth0", false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("priority_offload_unknown")
+            );
+        }
+    }
     use super::{
         MATCHER_HANDLE_ID, MATCHER_PROGRAM, OriginalQueueRoot, OwnedFilter, OwnedPriorityResources,
         PinOwnerState, QdiscOwnership, RecoveryEvidence, RecoveryOutcome, RecoveryOwner,
         RuntimeConfig, StalePinDir, capture_original_root, classify_owned_filter,
         classify_owned_filter_with_id, classify_owned_root, classify_pin_owner,
-        current_process_owner, fq_codel_options, has_legacy_netqmon_mark_rule, parse_class_dump,
+        current_process_owner, fq_codel_options, has_legacy_netqmon_policy, parse_class_dump,
         parse_proc_stat, plan_recovery, program_name_matches, recovery_owner_is_live,
         recovery_scope_matches, require_namespace_opt_in, require_priority_transaction_recovered,
         valid_pin_dir_entries, valid_runtime_name,
@@ -4818,9 +5016,13 @@ mod priority_recovery_gate_tests {
         require_priority_transaction_recovered(&state).expect("no unfinished journal");
 
         let passwall = serde_json::json!({"expr":[{"mangle":{"key":{"meta":{"key":"mark"}},"value":1_347_637_042}}]});
-        assert!(!has_legacy_netqmon_mark_rule(&passwall));
+        assert!(!has_legacy_netqmon_policy(&passwall));
 
         let owned = serde_json::json!({"comment":"netqmon:shared:upload"});
-        assert!(has_legacy_netqmon_mark_rule(&owned));
+        assert!(has_legacy_netqmon_policy(&owned));
+        let old_block_only = serde_json::json!({"nftables":[{"table":{"family":"inet","name":"netqmon_policy"}},{"set":{"family":"inet","table":"netqmon_policy","name":"blocked_clients_v4"}}]});
+        assert!(has_legacy_netqmon_policy(&old_block_only));
+        let other_table = serde_json::json!({"table":{"family":"ip","name":"netqmon_policy"}});
+        assert!(!has_legacy_netqmon_policy(&other_table));
     }
 }

@@ -44,6 +44,29 @@ netqmon-agent run -i br-lan -i eth1
 /etc/init.d/netqmon status
 ```
 
+客户端总限速后端仅在使用 `--features qos-client-priority` 构建的 Agent 中可用，
+默认关闭。OpenWrt 可安装与 `netqmon-agent` 版本匹配的可选软件包
+`netqmon-agent-priority`，再通过 LuCI 高级设置或同名 UCI 选项启用。服务会核对两个
+可执行文件的版本；软件包缺失或版本不匹配时继续启动普通 Agent。页面更新会在可选
+软件包已安装时一起更新并校验两个包；通过其他方式更新时需保持版本一致。自行编译时
+也可在 TOML 设置 `policy_client_total_enabled = true` 或设置环境变量
+`NETQMON_POLICY_CLIENT_TOTAL_ENABLED=1`。
+启用时会检查实际 LAN 端口、队列归属、链路容量、硬件卸载及过滤顺序。如果检查失败且
+能确认没有该后端的残留资源，Agent 会保留旧后端；若存在未完成事务或无法确认安全，
+可能拒绝启动。当前后端不支持在同一策略快照中执行互联网范围的客户端限速，也不会自动
+迁移旧版策略、保存的状态或未完成事务。应用限速的双向流关联仍需在目标网络验证；
+别名覆盖不完整时会报告部分应用。请确认 Agent 日志和策略能力状态；交换机直接转发、
+未经过 Agent 挂载点的流量无法控制。
+
+排查应用限速的部分覆盖时，可临时设置 `log_level = "debug"`；Agent 日志中的
+`application shape coverage incomplete` 会区分方向、队列类、未验证元组和别名覆盖问题。
+
+应用阻止默认只作用于已识别的连接。识别完成前，新连接可能先通过少量数据；这样可以
+避免把使用相同目标 IP 和端口的其他应用一并阻止。如需在识别前阻止向已知端点的重连，
+可在 LuCI 高级设置、TOML 的 `policy_application_endpoint_cache_enabled = true` 或
+环境变量 `NETQMON_POLICY_APPLICATION_ENDPOINT_CACHE_ENABLED=1` 中显式开启端点缓存；
+开启后同一客户端访问相同目标 IP 和端口的其他应用也可能被阻止。
+
 ---
 
 ### 2.2 `doctor`（环境与内核自检）

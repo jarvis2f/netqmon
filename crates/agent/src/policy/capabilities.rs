@@ -265,6 +265,7 @@ pub(crate) fn inspect(config: &AgentConfig) -> PolicyTopology {
                 client_limit: PolicyCapability::Unsupported,
                 application_block: PolicyCapability::Unsupported,
                 application_limit: PolicyCapability::Unsupported,
+                client_total_limit: None,
             },
             client_limit_reason_code: None,
             client_limit_reason: None,

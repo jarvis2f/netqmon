@@ -46,6 +46,7 @@ RUN ARCH=$(uname -m) && \
 WORKDIR /usr/src/netqmon
 
 ARG NETQMON_AGENT_FEATURES=""
+ARG NETQMON_BUILD_PRIORITY_BINARY="0"
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
@@ -58,7 +59,12 @@ RUN if [ -n "$NETQMON_AGENT_FEATURES" ]; then \
         cargo build --release --package netqmon-agent; \
     fi && \
     cp /tmp/target/release/netqmon-agent /netqmon-agent && \
-    file /netqmon-agent
+    file /netqmon-agent && \
+    if [ "$NETQMON_BUILD_PRIORITY_BINARY" = "1" ]; then \
+        cargo build --release --package netqmon-agent --features qos-client-priority && \
+        cp /tmp/target/release/netqmon-agent /netqmon-agent-priority && \
+        file /netqmon-agent-priority; \
+    fi
 
 
 FROM scratch

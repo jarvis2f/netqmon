@@ -354,6 +354,7 @@ export interface PolicyCapabilities {
   reason: string;
   client_block: string;
   client_limit: string;
+  client_total_limit?: string;
   application_block: string;
   application_limit: string;
 }

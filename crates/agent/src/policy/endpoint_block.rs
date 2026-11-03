@@ -1,6 +1,8 @@
 //! Client-side endpoint blocks deliberately omit the client's ephemeral port.
 //! These leases outlive exact flow verdicts, but remain bounded by the current
 //! policy snapshot and schedule. Only a validated Block command may create one.
+//! Learning is disabled by default because unrelated applications can share an
+//! endpoint; the Agent only uses it when the operator explicitly opts in.
 
 use crate::flow::FlowKey;
 use netqmon_protocol::policy::{PolicyActionKind, PolicyWireFrame};

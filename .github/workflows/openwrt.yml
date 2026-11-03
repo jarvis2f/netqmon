@@ -79,14 +79,16 @@ jobs:
         run: |
           docker build \
             --target builder \
+            --build-arg NETQMON_BUILD_PRIORITY_BINARY=1 \
             -f deploy/docker/Dockerfile.agent \
             -t netqmon-agent-builder:${{ matrix.arch }} \
             .
           mkdir -p dist
           id=$(docker create netqmon-agent-builder:${{ matrix.arch }})
           docker cp "$id:/netqmon-agent" "dist/netqmon-agent_${{ matrix.arch }}"
+          docker cp "$id:/netqmon-agent-priority" "dist/netqmon-agent-priority_${{ matrix.arch }}"
           docker rm "$id"
-          chmod 0755 "dist/netqmon-agent_${{ matrix.arch }}"
+          chmod 0755 dist/netqmon-agent*_${{ matrix.arch }}
           file "dist/netqmon-agent_${{ matrix.arch }}"
 
       - name: Smoke test agent version
@@ -95,12 +97,13 @@ jobs:
           set -euo pipefail
           expected="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
           test "$("dist/netqmon-agent_${{ matrix.arch }}" --version)" = "netqmon-agent ${expected}"
+          test "$("dist/netqmon-agent-priority_${{ matrix.arch }}" --version)" = "netqmon-agent ${expected}"
 
       - name: Upload agent binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: agent-binaries-${{ matrix.arch }}
-          path: dist/netqmon-agent_${{ matrix.arch }}
+          path: dist/netqmon-agent*_${{ matrix.arch }}
 
   # 2. Official Cross-Compilation for armv7hf (Release Blocking)
   build-agent-armv7hf:
@@ -137,7 +140,9 @@ jobs:
           cross build --release --package netqmon-agent --target armv7-unknown-linux-musleabihf
           mkdir -p dist
           cp target/armv7-unknown-linux-musleabihf/release/netqmon-agent dist/netqmon-agent_armv7hf
-          chmod 0755 dist/netqmon-agent_armv7hf
+          cross build --release --package netqmon-agent --features qos-client-priority --target armv7-unknown-linux-musleabihf
+          cp target/armv7-unknown-linux-musleabihf/release/netqmon-agent dist/netqmon-agent-priority_armv7hf
+          chmod 0755 dist/netqmon-agent*_armv7hf
 
       - name: Smoke test binary metadata
         run: |
@@ -150,12 +155,13 @@ jobs:
           sudo apt-get update && sudo apt-get install -y qemu-user
           expected="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
           test "$(qemu-arm dist/netqmon-agent_armv7hf --version)" = "netqmon-agent ${expected}"
+          test "$(qemu-arm dist/netqmon-agent-priority_armv7hf --version)" = "netqmon-agent ${expected}"
 
       - name: Upload agent binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: agent-binaries-armv7hf
-          path: dist/netqmon-agent_armv7hf
+          path: dist/netqmon-agent*_armv7hf
 
   # 3. Candidate Official Cross-Compilation for RISC-V64 (Non-blocking)
   build-agent-riscv64:
@@ -193,7 +199,9 @@ jobs:
           RUSTFLAGS="-C target-feature=+crt-static" cross build --release --package netqmon-agent --target riscv64gc-unknown-linux-musl
           mkdir -p dist
           cp target/riscv64gc-unknown-linux-musl/release/netqmon-agent dist/netqmon-agent_riscv64
-          chmod 0755 dist/netqmon-agent_riscv64
+          RUSTFLAGS="-C target-feature=+crt-static" cross build --release --package netqmon-agent --features qos-client-priority --target riscv64gc-unknown-linux-musl
+          cp target/riscv64gc-unknown-linux-musl/release/netqmon-agent dist/netqmon-agent-priority_riscv64
+          chmod 0755 dist/netqmon-agent*_riscv64
 
       - name: Verify riscv64 artifact
         run: |
@@ -209,12 +217,13 @@ jobs:
           sudo apt-get update && sudo apt-get install -y qemu-user
           expected="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
           test "$(qemu-riscv64 dist/netqmon-agent_riscv64 --version)" = "netqmon-agent ${expected}"
+          test "$(qemu-riscv64 dist/netqmon-agent-priority_riscv64 --version)" = "netqmon-agent ${expected}"
 
       - name: Upload agent binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: agent-binaries-riscv64
-          path: dist/netqmon-agent_riscv64
+          path: dist/netqmon-agent*_riscv64
 
   # 3b. Experimental: MIPSEL (MIPS32r2 little-endian, soft-float)
   build-agent-mipsel:
@@ -252,7 +261,9 @@ jobs:
           RUSTFLAGS="-C target-feature=+crt-static" cross build --release --package netqmon-agent --target mipsel-unknown-linux-musl
           mkdir -p dist
           cp target/mipsel-unknown-linux-musl/release/netqmon-agent dist/netqmon-agent_mipsel32r2
-          chmod 0755 dist/netqmon-agent_mipsel32r2
+          RUSTFLAGS="-C target-feature=+crt-static" cross build --release --package netqmon-agent --features qos-client-priority --target mipsel-unknown-linux-musl
+          cp target/mipsel-unknown-linux-musl/release/netqmon-agent dist/netqmon-agent-priority_mipsel32r2
+          chmod 0755 dist/netqmon-agent*_mipsel32r2
 
       - name: Verify mipsel artifact
         run: |
@@ -270,12 +281,13 @@ jobs:
           sudo apt-get update && sudo apt-get install -y qemu-user
           expected="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
           test "$(qemu-mipsel dist/netqmon-agent_mipsel32r2 --version)" = "netqmon-agent ${expected}"
+          test "$(qemu-mipsel dist/netqmon-agent-priority_mipsel32r2 --version)" = "netqmon-agent ${expected}"
 
       - name: Upload agent binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: agent-binaries-mipsel32r2
-          path: dist/netqmon-agent_mipsel32r2
+          path: dist/netqmon-agent*_mipsel32r2
 
   # 4. Official OpenWrt Packages (Blocking: x86_64, aarch64, and armv7hf)
   job_build:
@@ -408,6 +420,7 @@ jobs:
           mkdir -p packaging/openwrt/bin
           cp -r packaging/openwrt/netqmon/bin/* packaging/openwrt/bin/
           echo "CONFIG_PACKAGE_netqmon-agent=m" > .config
+          echo "CONFIG_PACKAGE_netqmon-agent-priority=m" >> .config
           echo "CONFIG_PACKAGE_luci-app-netqmon=m" >> .config
           version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
           if [ -n "${RELEASE_TAG}" ]; then
@@ -577,6 +590,7 @@ jobs:
           mkdir -p packaging/openwrt/bin
           cp -r packaging/openwrt/netqmon/bin/* packaging/openwrt/bin/
           echo "CONFIG_PACKAGE_netqmon-agent=m" > .config
+          echo "CONFIG_PACKAGE_netqmon-agent-priority=m" >> .config
           echo "CONFIG_PACKAGE_luci-app-netqmon=m" >> .config
           version="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} in_workspace && /^version = /{print $2; exit}' Cargo.toml)"
           if [ -n "${RELEASE_TAG}" ]; then

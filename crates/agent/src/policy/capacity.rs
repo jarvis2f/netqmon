@@ -8,13 +8,13 @@ use crate::config::{MAX_POLICY_CAPACITY_BPS, MIN_POLICY_CAPACITY_BPS};
 use crate::linux::neighbor::{self, BridgeFdbEntry, NeighborEntry};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Capacity {
+pub(crate) struct Capacity {
     pub bps: u64,
     pub source: &'static str,
     pub link_interfaces: Vec<String>,
 }
 
-pub(super) fn effective(interface: &str, configured: Option<u64>) -> Result<Capacity, String> {
+pub(crate) fn effective(interface: &str, configured: Option<u64>) -> Result<Capacity, String> {
     let root = Path::new("/sys/class/net");
     let bridge = root.join(interface).join("bridge").exists();
     let neighbors = if bridge {

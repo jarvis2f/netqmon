@@ -1,6 +1,6 @@
 mod capabilities;
 #[cfg(target_os = "linux")]
-mod capacity;
+pub(crate) mod capacity;
 pub(crate) mod classid;
 #[cfg(target_os = "linux")]
 mod egress;

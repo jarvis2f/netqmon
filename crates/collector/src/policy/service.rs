@@ -87,6 +87,7 @@ pub(crate) struct PolicyCapabilities {
     pub reason: String,
     pub client_block: String,
     pub client_limit: String,
+    pub client_total_limit: String,
     pub application_block: String,
     pub application_limit: String,
 }
@@ -246,6 +247,11 @@ impl PolicyService {
         let updated = transaction
             .execute(
                 "UPDATE policy_deployments SET agent_connected = 1,
+                 capabilities_json = CASE
+                     WHEN (agent_connection_epoch IS NOT ?2 OR agent_connection_id IS NOT ?3)
+                          AND json_valid(capabilities_json)
+                     THEN json_remove(capabilities_json, '$.client_total_limit')
+                     ELSE capabilities_json END,
                  agent_connection_epoch = ?2, agent_connection_id = ?3,
                  delivered_revision = 0, delivered_at_ms = NULL,
                  status = CASE WHEN desired_revision > reported_revision THEN 'pending' ELSE status END
@@ -812,6 +818,19 @@ impl PolicyService {
         })
     }
 
+    /// Avoid loading every policy and its metrics for a capability check.
+    pub(crate) fn gateway_capabilities(
+        &self,
+        gateway_id: &str,
+    ) -> Result<(bool, PolicyCapabilities), PolicyFailure> {
+        let connection = self.repository.lock().map_err(PolicyFailure::Store)?;
+        let (_, _, row) = read_deployment(&connection, gateway_id)?;
+        Ok((
+            row.as_ref().is_some_and(|row| row.agent_connected),
+            capabilities(row.as_ref()),
+        ))
+    }
+
     pub(crate) fn create(
         &self,
         spec: &PolicySpecV1,
@@ -1349,6 +1368,7 @@ fn policy_execution_from_values(
 }
 
 fn capabilities(row: Option<&DeploymentRow>) -> PolicyCapabilities {
+    let connected = row.is_some_and(|value| value.agent_connected);
     let wire = row
         .and_then(|value| value.capabilities_json.as_deref())
         .and_then(|json| serde_json::from_str::<WireCapabilities>(json).ok());
@@ -1363,13 +1383,19 @@ fn capabilities(row: Option<&DeploymentRow>) -> PolicyCapabilities {
     let client_limit = wire
         .as_ref()
         .map_or("unsupported", |caps| capability_name(caps.client_limit));
+    let client_total_limit = if connected {
+        wire.as_ref()
+            .and_then(|caps| caps.client_total_limit)
+            .map_or("unknown", capability_name)
+    } else {
+        "unknown"
+    };
     let application_block = wire.as_ref().map_or("unsupported", |caps| {
         capability_name(caps.application_block)
     });
     let application_limit = wire.as_ref().map_or("unsupported", |caps| {
         capability_name(caps.application_limit)
     });
-    let connected = row.is_some_and(|value| value.agent_connected);
     let (status, reason) = if !connected {
         ("unsupported", "agent_offline")
     } else if client_block == "supported" {
@@ -1385,6 +1411,7 @@ fn capabilities(row: Option<&DeploymentRow>) -> PolicyCapabilities {
         reason: reason.to_owned(),
         client_block: client_block.to_owned(),
         client_limit: client_limit.to_owned(),
+        client_total_limit: client_total_limit.to_owned(),
         application_block: application_block.to_owned(),
         application_limit: application_limit.to_owned(),
     }
@@ -1922,6 +1949,58 @@ mod tests {
     }
 
     #[test]
+    fn client_total_capability_is_unknown_until_current_session_reports_it() {
+        use netqmon_protocol::policy::PolicyCapability;
+        let service = PolicyService::open_in_memory().unwrap();
+        let old = connect(&service, "gw-1", 1);
+        let mut caps = WireCapabilities::unsupported();
+        caps.client_total_limit = Some(PolicyCapability::Supported);
+        service
+            .record_health("gw-1", old, "boot-1", "controller-1", 0, &caps, false, 100)
+            .unwrap();
+        assert_eq!(
+            service
+                .deployment("gw-1")
+                .unwrap()
+                .capabilities
+                .client_total_limit,
+            "supported"
+        );
+        service
+            .mark_agent_disconnected("gw-1", SESSION_EPOCH, 1)
+            .unwrap();
+        assert_eq!(
+            service
+                .deployment("gw-1")
+                .unwrap()
+                .capabilities
+                .client_total_limit,
+            "unknown"
+        );
+        let new = connect(&service, "gw-1", 2);
+        assert_eq!(
+            service
+                .deployment("gw-1")
+                .unwrap()
+                .capabilities
+                .client_total_limit,
+            "unknown"
+        );
+        caps.client_total_limit = Some(PolicyCapability::Unsupported);
+        service
+            .record_health("gw-1", new, "boot-2", "controller-1", 0, &caps, false, 200)
+            .unwrap();
+        assert_eq!(
+            service
+                .deployment("gw-1")
+                .unwrap()
+                .capabilities
+                .client_total_limit,
+            "unsupported"
+        );
+    }
+
+    #[test]
     fn late_health_from_a_superseded_session_cannot_overwrite_the_new_session() {
         let service = PolicyService::open_in_memory().unwrap();
         let capabilities = WireCapabilities::unsupported();
@@ -1948,6 +2027,7 @@ mod tests {
             client_limit: netqmon_protocol::policy::PolicyCapability::Supported,
             application_block: netqmon_protocol::policy::PolicyCapability::Supported,
             application_limit: netqmon_protocol::policy::PolicyCapability::Supported,
+            client_total_limit: None,
         };
         assert_eq!(
             service
@@ -2642,6 +2722,7 @@ mod tests {
             client_limit: netqmon_protocol::policy::PolicyCapability::Supported,
             application_block: netqmon_protocol::policy::PolicyCapability::Supported,
             application_limit: netqmon_protocol::policy::PolicyCapability::Supported,
+            client_total_limit: None,
         };
         service
             .record_ack(

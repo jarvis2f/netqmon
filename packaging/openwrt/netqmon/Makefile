@@ -23,6 +23,18 @@ define Package/netqmon-agent/description
   device discovery, flow metrics, and DNS observation.
 endef
 
+define Package/netqmon-agent-priority
+  SECTION:=net
+  CATEGORY:=Network
+  TITLE:=NetQMon optional client-total policy backend
+  DEPENDS:=+netqmon-agent +ethtool
+endef
+
+define Package/netqmon-agent-priority/description
+  Optional priority-enabled Agent executable for client-total rate policies.
+  The standard Agent remains the default until explicitly enabled.
+endef
+
 define Package/netqmon-agent/conffiles
 /etc/config/netqmon
 endef
@@ -69,7 +81,29 @@ define Build/Prepare
 	if [ "$$$$copied" -ne 1 ]; then \
 		echo "Error: Precompiled binary for $(ARCH) ($$$${agent_bin}) not found" >&2; \
 		exit 1; \
-	fi
+	fi; \
+	priority_bin="netqmon-agent-priority_$$$${agent_bin#netqmon-agent_}"; \
+	for candidate in \
+		"$(TOPDIR)/feeds/action/netqmon/bin/$$$${priority_bin}" \
+		"/feed/netqmon/bin/$$$${priority_bin}" \
+		"/feed/bin/$$$${priority_bin}" \
+		"$(PKG_BUILD_DIR)/bin/$$$${priority_bin}" \
+		"./bin/$$$${priority_bin}" \
+		"./bin/netqmon-agent-priority" \
+		"$(TOPDIR)/feeds/action/bin/$$$${priority_bin}" \
+		"$(TOPDIR)/bin/$$$${priority_bin}"; do \
+		if [ -f "$$$$candidate" ]; then \
+			cp "$$$$candidate" $(PKG_BUILD_DIR)/netqmon-agent-priority; \
+			chmod 0755 $(PKG_BUILD_DIR)/netqmon-agent-priority; \
+			break; \
+		fi; \
+	done
+endef
+
+define Package/netqmon-agent-priority/install
+	@test -x $(PKG_BUILD_DIR)/netqmon-agent-priority || { echo "Missing priority-enabled Agent binary for $(ARCH)" >&2; exit 1; }
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/netqmon-agent-priority $(1)/usr/bin/netqmon-agent-priority
 endef
 
 define Build/Compile
@@ -105,3 +139,4 @@ exit 0
 endef
 
 $(eval $(call BuildPackage,netqmon-agent))
+$(eval $(call BuildPackage,netqmon-agent-priority))

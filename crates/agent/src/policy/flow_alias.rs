@@ -41,6 +41,8 @@ impl AliasDirection {
 #[derive(Debug)]
 struct AliasEntry {
     keys: Vec<FlowKey>,
+    /// Original packet observations, kept distinct from synthesized aliases.
+    observed: HashSet<FlowKey>,
     directions: HashMap<FlowKey, AliasDirection>,
     /// Aliases whose client-side tuple was verified from conntrack, a direct
     /// client-hook observation, or a direct non-NAT observation carrying the
@@ -57,6 +59,18 @@ struct AliasEntry {
     ended: bool,
     partial: bool,
     last_command_issued_at_ms: Option<i64>,
+    #[cfg(feature = "qos-client-priority")]
+    shape_evidence: Option<ShapeEvidence>,
+}
+
+#[cfg(feature = "qos-client-priority")]
+#[derive(Debug)]
+struct ShapeEvidence {
+    controller_epoch: String,
+    revision: u64,
+    policy_ids: Vec<String>,
+    aliases: HashMap<FlowKey, u32>,
+    expires_monotonic_ns: u64,
 }
 
 fn insert_alias(entry: &mut AliasEntry, alias: FlowKey, direction: AliasDirection) {
@@ -140,12 +154,14 @@ impl PolicyFlowAliasCache {
                 }
             }
             if entry.keys.contains(&key) {
+                entry.observed.insert(key);
                 return Ok(entry.keys.len());
             }
             if entry.keys.len() >= MAX_ALIASES_PER_FLOW {
                 entry.partial = true;
                 return Err(FlowAliasError::AliasLimitReached);
             }
+            entry.observed.insert(key.clone());
             entry.keys.push(key);
             return Ok(entry.keys.len());
         }
@@ -155,7 +171,8 @@ impl PolicyFlowAliasCache {
         self.entries.insert(
             policy_flow_id.to_owned(),
             AliasEntry {
-                keys: vec![key],
+                keys: vec![key.clone()],
+                observed: HashSet::from([key]),
                 directions: HashMap::new(),
                 verified: HashSet::new(),
                 unresolved: Vec::new(),
@@ -167,6 +184,8 @@ impl PolicyFlowAliasCache {
                 ended: false,
                 partial: false,
                 last_command_issued_at_ms: None,
+                #[cfg(feature = "qos-client-priority")]
+                shape_evidence: None,
             },
         );
         Ok(1)
@@ -176,6 +195,14 @@ impl PolicyFlowAliasCache {
         self.entries
             .get(policy_flow_id)
             .map(|entry| entry.keys.as_slice())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn observed_aliases(&self, policy_flow_id: &str) -> Vec<FlowKey> {
+        self.entries
+            .get(policy_flow_id)
+            .map(|entry| entry.observed.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Broader endpoint leases must use the original client-ingress tuple.
@@ -460,11 +487,77 @@ impl PolicyFlowAliasCache {
 
     /// Observed aliases whose client-side tuple could not be verified.
     /// They are tracked separately from the installable aliases.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qos-client-priority"))]
     pub(crate) fn unresolved_aliases(&self, policy_flow_id: &str) -> Option<&[FlowKey]> {
         self.entries
             .get(policy_flow_id)
             .map(|entry| entry.unresolved.as_slice())
+    }
+
+    /// Record only exact aliases successfully installed for this directional
+    /// flow. A peer may use them as coverage evidence, never as aliases to own.
+    #[cfg(feature = "qos-client-priority")]
+    pub(crate) fn remember_shape(
+        &mut self,
+        id: &str,
+        controller_epoch: &str,
+        revision: u64,
+        policy_ids: &[String],
+        tags: &[(FlowKey, u32)],
+        expires_monotonic_ns: u64,
+    ) {
+        let Some(entry) = self.entries.get_mut(id) else {
+            return;
+        };
+        let mut policy_ids = policy_ids.to_vec();
+        policy_ids.sort_unstable();
+        policy_ids.dedup();
+        entry.shape_evidence = Some(ShapeEvidence {
+            controller_epoch: controller_epoch.to_owned(),
+            revision,
+            policy_ids,
+            aliases: tags.iter().cloned().collect(),
+            expires_monotonic_ns,
+        });
+    }
+
+    #[cfg(feature = "qos-client-priority")]
+    pub(crate) fn peer_shape_covers(
+        &self,
+        id: &str,
+        peer: &str,
+        alias: &FlowKey,
+        installed_tag: u32,
+        client_mac: &str,
+        controller_epoch: &str,
+        revision: u64,
+        policy_ids: &[String],
+        now_monotonic_ns: u64,
+    ) -> bool {
+        if id == peer {
+            return false;
+        }
+        let Some(entry) = self.entries.get(peer) else {
+            return false;
+        };
+        let Some(evidence) = &entry.shape_evidence else {
+            return false;
+        };
+        let mut expected = policy_ids.to_vec();
+        expected.sort_unstable();
+        expected.dedup();
+        !entry.ended
+            && !entry.client_identity_conflict
+            && entry
+                .client_mac
+                .as_deref()
+                .is_some_and(|mac| mac.eq_ignore_ascii_case(client_mac))
+            && evidence.revision == revision
+            && evidence.controller_epoch == controller_epoch
+            && evidence.policy_ids == expected
+            && evidence.expires_monotonic_ns > now_monotonic_ns
+            && evidence.aliases.get(alias) == Some(&installed_tag)
+            && entry.verified.contains(alias)
     }
 
     pub(crate) fn has_unverified_aliases(&self, policy_flow_id: &str) -> bool {
@@ -1557,6 +1650,160 @@ mod tests {
             source_port: 50_000,
             destination_port: 443,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn observed_aliases_do_not_include_synthesized_tuples_until_seen() {
+        let mut cache = PolicyFlowAliasCache::default();
+        let upload = key(1, 2);
+        cache
+            .observe_with_client(
+                "flow",
+                upload.clone(),
+                Some("aa:bb:cc:dd:ee:ff"),
+                Instant::now(),
+            )
+            .unwrap();
+        let tracked = ConntrackContext::parse(
+            "ipv4 2 tcp 6 100 ESTABLISHED src=192.0.2.1 dst=198.51.100.1 sport=50000 dport=443 src=198.51.100.1 dst=192.0.2.1 sport=443 dport=50000",
+        );
+        cache.observe_direction(
+            "flow",
+            &upload,
+            crate::normalization::Direction::Upload,
+            Some("192.0.2.1".parse().unwrap()),
+            Some((2, 2)),
+            tracked.resolve(&upload),
+        );
+        let synthesized = cache
+            .aliases("flow")
+            .unwrap()
+            .iter()
+            .find(|key| key.hook == 2)
+            .unwrap()
+            .clone();
+        assert_eq!(cache.observed_aliases("flow"), vec![upload]);
+        cache
+            .observe_with_client(
+                "flow",
+                synthesized.clone(),
+                Some("aa:bb:cc:dd:ee:ff"),
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(cache.observed_aliases("flow").contains(&synthesized));
+    }
+
+    #[cfg(feature = "qos-client-priority")]
+    #[test]
+    fn peer_coverage_requires_exact_verified_live_matching_shape() {
+        let mut cache = PolicyFlowAliasCache::default();
+        let alias = key(1, 3);
+        let client = "aa:bb:cc:dd:ee:ff";
+        let ids = vec!["policy-b".to_owned(), "policy-a".to_owned()];
+        cache
+            .observe_with_client("peer", alias.clone(), Some(client), Instant::now())
+            .unwrap();
+        cache.observe_direction(
+            "peer",
+            &alias,
+            crate::normalization::Direction::Upload,
+            Some("192.0.2.1".parse().unwrap()),
+            Some((3, 3)),
+            None,
+        );
+        cache.remember_shape("peer", "epoch-a", 12, &ids, &[(alias.clone(), 1)], 500);
+        let matches = |cache: &PolicyFlowAliasCache,
+                       id: &str,
+                       peer: &str,
+                       key: &FlowKey,
+                       mac: &str,
+                       revision: u64,
+                       policies: &[String],
+                       now: u64| {
+            cache.peer_shape_covers(id, peer, key, 1, mac, "epoch-a", revision, policies, now)
+        };
+        assert!(matches(
+            &cache, "current", "peer", &alias, client, 12, &ids, 499
+        ));
+        assert!(!cache.peer_shape_covers(
+            "current", "peer", &alias, 1, client, "epoch-b", 12, &ids, 499
+        ));
+        assert!(!cache.peer_shape_covers(
+            "current", "peer", &alias, 2, client, "epoch-a", 12, &ids, 499
+        ));
+        assert!(!matches(
+            &cache, "peer", "peer", &alias, client, 12, &ids, 499
+        ));
+        assert!(!matches(
+            &cache,
+            "current",
+            "peer",
+            &key(2, 3),
+            client,
+            12,
+            &ids,
+            499
+        ));
+        assert!(!matches(
+            &cache,
+            "current",
+            "peer",
+            &alias,
+            "aa:bb:cc:dd:ee:00",
+            12,
+            &ids,
+            499
+        ));
+        assert!(!matches(
+            &cache, "current", "peer", &alias, client, 13, &ids, 499
+        ));
+        assert!(!matches(
+            &cache,
+            "current",
+            "peer",
+            &alias,
+            client,
+            12,
+            &["other".to_owned()],
+            499
+        ));
+        assert!(!matches(
+            &cache, "current", "peer", &alias, client, 12, &ids, 500
+        ));
+        cache.mark_ended("peer");
+        assert!(!matches(
+            &cache, "current", "peer", &alias, client, 12, &ids, 499
+        ));
+
+        let unresolved = key(2, 9);
+        cache
+            .observe_with_client(
+                "unverified",
+                unresolved.clone(),
+                Some(client),
+                Instant::now(),
+            )
+            .unwrap();
+        cache.remember_shape(
+            "unverified",
+            "epoch-a",
+            12,
+            &ids,
+            &[(unresolved.clone(), 1)],
+            500,
+        );
+        assert!(!matches(
+            &cache,
+            "current",
+            "unverified",
+            &unresolved,
+            client,
+            12,
+            &ids,
+            499
+        ));
     }
 
     #[cfg(feature = "qos-client-priority")]

@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 MANIFEST_NAME = "openwrt-agent-manifest.json"
-PACKAGE_NAMES = {"netqmon-agent", "luci-app-netqmon"}
+PACKAGE_NAMES = {"netqmon-agent", "netqmon-agent-priority", "luci-app-netqmon"}
 
 
 def release_asset_url(repository: str, tag: str, filename: str) -> str:

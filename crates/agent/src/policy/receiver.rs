@@ -8,7 +8,7 @@ use anyhow::{Context as _, Result, anyhow};
 use futures_util::{SinkExt as _, StreamExt as _};
 use http::HeaderValue;
 use http::header::AUTHORIZATION;
-use netqmon_protocol::policy::{POLICY_MAX_FRAME_BYTES, PolicyWireFrame};
+use netqmon_protocol::policy::{POLICY_MAX_FRAME_BYTES, PolicyCapability, PolicyWireFrame};
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
@@ -113,6 +113,27 @@ fn health_frame_for_runtime(
             executor::priority_runtime_capabilities(flow_bpf_ready, capabilities.client_block);
     }
     frame
+}
+
+fn client_total_capability_for_peer(
+    headers: &http::HeaderMap,
+    priority_runtime_active: bool,
+) -> Option<PolicyCapability> {
+    headers
+        .get(netqmon_protocol::policy::POLICY_CAPABILITIES_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            value.split(',').any(|entry| {
+                entry.trim() == netqmon_protocol::policy::POLICY_CLIENT_TOTAL_CAPABILITY
+            })
+        })
+        .map(|_| {
+            if priority_runtime_active {
+                PolicyCapability::Supported
+            } else {
+                PolicyCapability::Unsupported
+            }
+        })
 }
 
 fn flow_identity_tracking_enabled(flow_bpf_ready: bool, emergency_disabled: bool) -> bool {
@@ -396,7 +417,7 @@ async fn connect_and_run(
     let mut websocket_config = WebSocketConfig::default();
     websocket_config.max_message_size = Some(POLICY_MAX_FRAME_BYTES);
     websocket_config.max_frame_size = Some(POLICY_MAX_FRAME_BYTES);
-    let (mut socket, _) = tokio::time::timeout(
+    let (mut socket, response) = tokio::time::timeout(
         CONNECT_TIMEOUT,
         connect_async_with_config(request, Some(websocket_config), false),
     )
@@ -407,6 +428,8 @@ async fn connect_and_run(
     let priority_runtime_active = priority_runtime.is_some();
     #[cfg(not(feature = "qos-client-priority"))]
     let priority_runtime_active = false;
+    let client_total_capability =
+        client_total_capability_for_peer(response.headers(), priority_runtime_active);
     tracing::info!(
         policy_backend = if priority_runtime_active {
             "priority"
@@ -424,6 +447,7 @@ async fn connect_and_run(
             flow_bpf_ready.load(Ordering::Acquire),
             priority_runtime_active,
         ),
+        client_total_capability,
     )
     .await?;
 
@@ -451,7 +475,7 @@ async fn connect_and_run(
                     boot_id,
                     flow_bpf_ready.load(Ordering::Acquire),
                     priority_runtime_active,
-                )).await?;
+                ), client_total_capability).await?;
             }
             _ = policy_tick.tick() => {
                 if let Some(acknowledgement) = reconcile_saved(
@@ -518,7 +542,7 @@ async fn connect_and_run(
                     }
                     if let Some(signature) = acknowledgement_signature(&acknowledgement) {
                         if last_reconcile_signature.as_ref() != Some(&signature) {
-                            send_frame(&mut socket, &acknowledgement).await?;
+                            send_frame(&mut socket, &acknowledgement, client_total_capability).await?;
                             last_reconcile_signature = Some(signature);
                         }
                     }
@@ -547,7 +571,7 @@ async fn connect_and_run(
                     flow_verdict_writer,
                 );
                 for metrics in metric_frames {
-                    send_frame(&mut socket, &metrics).await?;
+                    send_frame(&mut socket, &metrics, client_total_capability).await?;
                 }
             }
             _ = emergency_tick.tick() => {
@@ -572,8 +596,8 @@ async fn connect_and_run(
             message = socket.next() => {
                 let Some(message) = message else { return Err(anyhow!("policy WebSocket closed")); };
                 match message? {
-                    Message::Text(text) => handle_frame(&mut socket, text.as_bytes(), credentials, config, boot_id, policy_flows_enabled, flow_commands_enabled, flow_alias_cache, conntrack, topology, flow_verdict_writer, flow_bpf_ready, applied_flow_snapshot, &mut last_reconcile_signature, emergency_disable_applied, #[cfg(feature = "qos-client-priority")] priority_runtime.as_ref()).await?,
-                    Message::Binary(bytes) => handle_frame(&mut socket, bytes.as_ref(), credentials, config, boot_id, policy_flows_enabled, flow_commands_enabled, flow_alias_cache, conntrack, topology, flow_verdict_writer, flow_bpf_ready, applied_flow_snapshot, &mut last_reconcile_signature, emergency_disable_applied, #[cfg(feature = "qos-client-priority")] priority_runtime.as_ref()).await?,
+                    Message::Text(text) => handle_frame(&mut socket, text.as_bytes(), credentials, config, boot_id, policy_flows_enabled, flow_commands_enabled, flow_alias_cache, conntrack, topology, flow_verdict_writer, flow_bpf_ready, applied_flow_snapshot, &mut last_reconcile_signature, emergency_disable_applied, client_total_capability, #[cfg(feature = "qos-client-priority")] priority_runtime.as_ref()).await?,
+                    Message::Binary(bytes) => handle_frame(&mut socket, bytes.as_ref(), credentials, config, boot_id, policy_flows_enabled, flow_commands_enabled, flow_alias_cache, conntrack, topology, flow_verdict_writer, flow_bpf_ready, applied_flow_snapshot, &mut last_reconcile_signature, emergency_disable_applied, client_total_capability, #[cfg(feature = "qos-client-priority")] priority_runtime.as_ref()).await?,
                     Message::Ping(payload) => socket.send(Message::Pong(payload)).await.context("reply to policy ping")?,
                     Message::Pong(_) => {},
                     Message::Close(_) => return Err(anyhow!("Collector closed the policy WebSocket")),
@@ -678,6 +702,7 @@ async fn handle_frame(
     applied_flow_snapshot: &mut Option<(String, u64, u64, String)>,
     last_reconcile_signature: &mut Option<String>,
     emergency_disable_applied: &AtomicBool,
+    client_total_capability: Option<PolicyCapability>,
     #[cfg(feature = "qos-client-priority")] priority_runtime: Option<&Arc<Mutex<PriorityRuntime>>>,
 ) -> Result<()> {
     if std::path::Path::new(&config.policy_disabled_path).exists() {
@@ -831,7 +856,7 @@ async fn handle_frame(
                     aliases.clear();
                 }
             }
-            send_frame(socket, &acknowledgement).await?;
+            send_frame(socket, &acknowledgement, client_total_capability).await?;
             *last_reconcile_signature = acknowledgement_signature(&acknowledgement);
         }
         command @ PolicyWireFrame::FlowCommand { .. } => {
@@ -849,7 +874,7 @@ async fn handle_frame(
                 #[cfg(feature = "qos-client-priority")]
                 priority_runtime,
             );
-            send_frame(socket, &acknowledgement).await?;
+            send_frame(socket, &acknowledgement, client_total_capability).await?;
         }
         _ => return Err(anyhow!("Collector may only send policy_snapshot frames")),
     }
@@ -987,20 +1012,20 @@ fn apply_flow_command(
             }
         }
     }
-    let (aliases, client_mac, flow_ended, flow_partial) =
-        flow_alias_cache
-            .lock()
-            .map_or((Vec::new(), None, false, false), |cache| {
-                (
-                    cache
-                        .aliases(&policy_flow_id)
-                        .map(<[_]>::to_vec)
-                        .unwrap_or_default(),
-                    cache.client_mac(&policy_flow_id).map(str::to_owned),
-                    cache.is_ended(&policy_flow_id),
-                    cache.is_partial(&policy_flow_id),
-                )
-            });
+    let (aliases, observed_aliases, client_mac, flow_ended, flow_partial) = flow_alias_cache
+        .lock()
+        .map_or((Vec::new(), Vec::new(), None, false, false), |cache| {
+            (
+                cache
+                    .aliases(&policy_flow_id)
+                    .map(<[_]>::to_vec)
+                    .unwrap_or_default(),
+                cache.observed_aliases(&policy_flow_id),
+                cache.client_mac(&policy_flow_id).map(str::to_owned),
+                cache.is_ended(&policy_flow_id),
+                cache.is_partial(&policy_flow_id),
+            )
+        });
     let proxy_unresolved = proxy_resolution.expected
         && (proxy_resolution.aliases.is_empty() || proxy_resolution.unresolved);
     let endpoint_aliases = flow_alias_cache
@@ -1161,7 +1186,7 @@ fn apply_flow_command(
                     if let (Some(policy_id), Some(client_mac)) =
                         (policy_ids.first(), client_mac.as_deref())
                     {
-                        let endpoint_expiry = {
+                        let endpoint_expiry = if config.policy_application_endpoint_cache_enabled {
                             #[cfg(feature = "qos-client-priority")]
                             if let Some(runtime) = priority_runtime {
                                 runtime.lock().ok().and_then(|runtime| {
@@ -1193,6 +1218,8 @@ fn apply_flow_command(
                                     now_ms,
                                 )
                             })
+                        } else {
+                            None
                         };
                         // A FlowCommand may only contain the client-to-server
                         // alias. For a block, also install the exact reverse
@@ -1202,6 +1229,7 @@ fn apply_flow_command(
                         match flow_verdict_writer
                             .install_block(
                                 &block_aliases,
+                                &observed_aliases,
                                 &command_id,
                                 &policy_flow_id,
                                 policy_id,
@@ -1235,9 +1263,16 @@ fn apply_flow_command(
                                     flow_partial,
                                 )
                             }
-                            Err(_) => (
+                            Err(error) => (
                                 FlowAckStatus::Failed,
-                                Some("bpf_map_write_failed".to_owned()),
+                                Some(
+                                    if error.starts_with("block_owner_capacity_exceeded:") {
+                                        "block_owner_capacity_exceeded"
+                                    } else {
+                                        "bpf_map_write_failed"
+                                    }
+                                    .to_owned(),
+                                ),
                             ),
                         }
                     } else {
@@ -1291,7 +1326,8 @@ fn apply_flow_command(
                     // Aliases observed on an untranslated WAN hook without
                     // conntrack are deliberately kept out of the installable
                     // set. Report them precisely instead of guessing a tuple.
-                    let tuple_unverified = flow_alias_cache
+                    #[allow(unused_mut)]
+                    let mut tuple_unverified = flow_alias_cache
                         .lock()
                         .ok()
                         .is_some_and(|cache| cache.has_unverified_aliases(&policy_flow_id));
@@ -1392,6 +1428,62 @@ fn apply_flow_command(
                                 Ok(_) => {
                                     if let Ok(mut cache) = flow_alias_cache.lock() {
                                         cache.record_command(&policy_flow_id, issued_at_ms);
+                                        #[cfg(feature = "qos-client-priority")]
+                                        if priority_runtime.is_some() {
+                                            cache.remember_shape(
+                                                &policy_flow_id,
+                                                &controller_epoch,
+                                                config_revision,
+                                                &policy_ids,
+                                                &tags,
+                                                deadline,
+                                            );
+                                            if tuple_unverified
+                                                && let Some(mac) = client_mac.as_deref()
+                                            {
+                                                let now = crate::linux::monotonic_ns();
+                                                if let Some(pending) =
+                                                    cache.unresolved_aliases(&policy_flow_id)
+                                                {
+                                                    // A different directional flow can independently own the
+                                                    // opposite exact tuple. Count it only when its BPF verdict is
+                                                    // live and its recorded client and policy match. We never
+                                                    // install or revoke a peer's alias on this flow's behalf.
+                                                    tuple_unverified = pending.is_empty()
+                                                        || !pending.iter().all(|alias| {
+                                                            flow_verdict_writer
+                                                                .active_shape_owner(
+                                                                    alias,
+                                                                    config_revision,
+                                                                    now,
+                                                                )
+                                                                .is_some_and(|(peer, tag)| {
+                                                                    cache.peer_shape_covers(
+                                                                        &policy_flow_id,
+                                                                        &peer,
+                                                                        alias,
+                                                                        tag,
+                                                                        mac,
+                                                                        &controller_epoch,
+                                                                        config_revision,
+                                                                        &policy_ids,
+                                                                        now,
+                                                                    )
+                                                                })
+                                                        });
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if config.log_level >= crate::config::LogLevel::Debug
+                                        && (unresolved_direction
+                                            || unresolved_class
+                                            || tuple_unverified
+                                            || flow_partial)
+                                    {
+                                        eprintln!(
+                                            "application shape coverage incomplete: flow={policy_flow_id} unresolved_direction={unresolved_direction} unresolved_class={unresolved_class} tuple_unverified={tuple_unverified} flow_partial={flow_partial}"
+                                        );
                                     }
                                     shape_coverage_status(
                                         unresolved_direction
@@ -1885,7 +1977,16 @@ fn flow_command_policy_references_valid(
 async fn send_frame(
     socket: &mut WebSocketStream<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>,
     frame: &PolicyWireFrame,
+    client_total_capability: Option<PolicyCapability>,
 ) -> Result<()> {
+    let mut frame = frame.clone();
+    match &mut frame {
+        PolicyWireFrame::PolicyHealth { capabilities, .. }
+        | PolicyWireFrame::PolicyAck { capabilities, .. } => {
+            capabilities.client_total_limit = client_total_capability;
+        }
+        _ => {}
+    }
     let bytes = frame
         .encode()
         .map_err(anyhow::Error::msg)
@@ -1975,6 +2076,84 @@ fn jitter(delay: Duration) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn policy_frame_capability_extension_is_omitted_for_legacy_peer() {
+        use futures_util::StreamExt as _;
+        use netqmon_protocol::policy::{
+            POLICY_WIRE_VERSION, PolicyCapabilities, PolicyCapability, PolicyWireFrame,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let reader = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut values = Vec::new();
+            for _ in 0..2 {
+                let text = socket.next().await.unwrap().unwrap().into_text().unwrap();
+                values.push(serde_json::from_str::<serde_json::Value>(&text).unwrap());
+            }
+            values
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .unwrap();
+        let frame = PolicyWireFrame::PolicyHealth {
+            wire_version: POLICY_WIRE_VERSION,
+            gateway_id: "gw-test".into(),
+            boot_id: "boot-test".into(),
+            last_applied_revision: 0,
+            controller_epoch: None,
+            bundle_generation: None,
+            checksum: None,
+            capabilities: PolicyCapabilities::unsupported(),
+            reported_at_ms: 1,
+            emergency_disabled: false,
+        };
+        super::send_frame(&mut socket, &frame, None).await.unwrap();
+        super::send_frame(&mut socket, &frame, Some(PolicyCapability::Unsupported))
+            .await
+            .unwrap();
+        let values = reader.await.unwrap();
+        assert!(
+            values[0]["capabilities"]
+                .get("client_total_limit")
+                .is_none()
+        );
+        assert_eq!(
+            values[1]["capabilities"]["client_total_limit"],
+            "unsupported"
+        );
+    }
+
+    #[test]
+    fn total_limit_capability_is_sent_only_when_the_peer_negotiates_it() {
+        use netqmon_protocol::policy::{POLICY_CAPABILITIES_HEADER, PolicyCapability};
+        let mut headers = http::HeaderMap::new();
+        assert_eq!(
+            super::client_total_capability_for_peer(&headers, true),
+            None
+        );
+        headers.insert(
+            POLICY_CAPABILITIES_HEADER,
+            "other, client-total-v1".parse().unwrap(),
+        );
+        assert_eq!(
+            super::client_total_capability_for_peer(&headers, true),
+            Some(PolicyCapability::Supported)
+        );
+        assert_eq!(
+            super::client_total_capability_for_peer(&headers, false),
+            Some(PolicyCapability::Unsupported)
+        );
+        headers.insert(
+            POLICY_CAPABILITIES_HEADER,
+            "client-total-v10".parse().unwrap(),
+        );
+        assert_eq!(
+            super::client_total_capability_for_peer(&headers, true),
+            None
+        );
+    }
     #[test]
     fn empty_alias_revoke_uses_the_current_priority_snapshot() {
         assert!(super::no_app_verdicts_for_empty_alias_revoke(
@@ -2096,6 +2275,7 @@ mod tests {
             client_limit: PolicyCapability::Supported,
             application_block: PolicyCapability::Supported,
             application_limit: PolicyCapability::Supported,
+            client_total_limit: None,
         };
         let mut acknowledgement = crate::policy::executor::priority_policy_ack(
             &snapshot,

@@ -152,7 +152,11 @@ async fn policy_stream_authenticates_and_pushes_an_empty_initial_snapshot() {
     request
         .headers_mut()
         .insert("authorization", "Bearer agent-secret".parse().unwrap());
-    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let (mut socket, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+    assert_eq!(
+        response.headers()[netqmon_protocol::policy::POLICY_CAPABILITIES_HEADER],
+        netqmon_protocol::policy::POLICY_CLIENT_TOTAL_CAPABILITY
+    );
     let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
         .await
         .unwrap()
@@ -402,6 +406,7 @@ async fn policy_mutation_pushes_the_latest_snapshot_and_ack_updates_deployment()
             client_limit: PolicyCapability::Unsupported,
             application_block: PolicyCapability::Unsupported,
             application_limit: PolicyCapability::Unsupported,
+            client_total_limit: None,
         },
         results: vec![PolicyResult {
             policy_id: policy_id.clone(),
@@ -681,6 +686,7 @@ async fn policy_stream_drops_old_boot_frames_without_closing() {
             client_limit: PolicyCapability::Unsupported,
             application_block: PolicyCapability::Unsupported,
             application_limit: PolicyCapability::Unsupported,
+            client_total_limit: None,
         },
         results: vec![PolicyResult {
             policy_id: policy_id.clone(),
@@ -763,6 +769,7 @@ async fn policy_stream_drops_old_boot_frames_without_closing() {
             client_limit: PolicyCapability::Unsupported,
             application_block: PolicyCapability::Unsupported,
             application_limit: PolicyCapability::Unsupported,
+            client_total_limit: None,
         },
         results: vec![PolicyResult {
             policy_id,
@@ -975,6 +982,87 @@ fn serve_clickhouse_request(mut stream: TcpStream) -> std::io::Result<()> {
         response.len()
     )?;
     stream.write_all(response)
+}
+
+#[tokio::test]
+async fn client_total_validation_warns_when_agent_capability_is_unknown() {
+    let state = state_with_gateway();
+    let mut spec = policy_spec("agent");
+    spec["selectors"]["clients"] = serde_json::json!(["AA:BB:CC:DD:EE:FF"]);
+    spec["action"] =
+        serde_json::json!({"type":"limit", "download_bps": 1_000_000, "upload_bps": null});
+    let response = internal_router(state)
+        .oneshot(request(
+            "/internal/policies/validate",
+            "POST",
+            Some("valid-session"),
+            Body::from(serde_json::to_vec(&serde_json::json!({"spec": spec})).unwrap()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["data"]["valid"], true);
+    assert!(
+        value["data"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|s| s.contains("has not reported client-total limit support")))
+    );
+}
+
+#[tokio::test]
+async fn internet_client_limit_validation_warns_when_priority_backend_is_active() {
+    use crate::policy::service::SessionIdentity;
+    let state = state_with_gateway();
+    state
+        .policy_service
+        .mark_agent_connected("gw-1", "session", 1)
+        .unwrap();
+    let mut capabilities = PolicyCapabilities::unsupported();
+    capabilities.client_total_limit = Some(PolicyCapability::Supported);
+    state
+        .policy_service
+        .record_health(
+            "gw-1",
+            SessionIdentity::new("session", 1),
+            "boot",
+            "epoch",
+            0,
+            &capabilities,
+            false,
+            1,
+        )
+        .unwrap();
+    let mut spec = policy_spec("internet");
+    spec["selectors"]["clients"] = serde_json::json!(["AA:BB:CC:DD:EE:FF"]);
+    spec["action"] =
+        serde_json::json!({"type":"limit", "download_bps": 1_000_000, "upload_bps": null});
+    let response = internal_router(state)
+        .oneshot(request(
+            "/internal/policies/validate",
+            "POST",
+            Some("valid-session"),
+            Body::from(serde_json::to_vec(&serde_json::json!({"spec": spec})).unwrap()),
+        ))
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["data"]["valid"], true);
+    assert!(
+        value["data"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|s| s.contains("Internet-scoped client limits are unsupported")))
+    );
 }
 
 #[tokio::test]

@@ -8,6 +8,7 @@ WORKSPACE_VERSION="$(awk -F'"' '/^\[workspace.package\]/{in_workspace=1; next} i
 test -n "${WORKSPACE_VERSION}"
 
 BINARY_PATH="${1:-}"
+PRIORITY_BINARY_PATH="${NETQMON_PRIORITY_BINARY_PATH:-}"
 ARCH="${2:-x86_64}"
 VERSION="${3:-${WORKSPACE_VERSION}-1}"
 OUTPUT_DIR="${4:-${ROOT_DIR}/dist}"
@@ -16,6 +17,10 @@ LUCI_VERSION="${LUCI_VERSION:-${VERSION}}"
 if [[ -z "${BINARY_PATH}" || ! -f "${BINARY_PATH}" ]]; then
     echo "Usage: $0 <binary_path> [architecture] [version] [output_dir]" >&2
     echo "Error: binary_path must be a valid file" >&2
+    exit 1
+fi
+if [[ -n "${PRIORITY_BINARY_PATH}" && ! -f "${PRIORITY_BINARY_PATH}" ]]; then
+    echo "Error: NETQMON_PRIORITY_BINARY_PATH must refer to a file" >&2
     exit 1
 fi
 
@@ -94,6 +99,28 @@ PACKAGE_FILE="${OUTPUT_DIR}/${PACKAGE_NAME}"
 
 echo "Successfully built OpenWrt package: ${PACKAGE_FILE}"
 tar -ztvf "${PACKAGE_FILE}"
+
+if [[ -n "${PRIORITY_BINARY_PATH}" ]]; then
+    PRIORITY_DIR="${TMP_DIR}/priority"
+    mkdir -p "${PRIORITY_DIR}/data/usr/bin" "${PRIORITY_DIR}/control"
+    cp "${PRIORITY_BINARY_PATH}" "${PRIORITY_DIR}/data/usr/bin/netqmon-agent-priority"
+    chmod 0755 "${PRIORITY_DIR}/data/usr/bin/netqmon-agent-priority"
+    cat > "${PRIORITY_DIR}/control/control" << EOF
+Package: netqmon-agent-priority
+Version: ${VERSION}
+Depends: netqmon-agent, ethtool
+Section: net
+Architecture: ${ARCH}
+Maintainer: netqmon Authors
+Description: Optional NetQMon client-total policy backend
+EOF
+    (cd "${PRIORITY_DIR}/data" && tar --format ustar -czf "${PRIORITY_DIR}/data.tar.gz" .)
+    (cd "${PRIORITY_DIR}/control" && tar --format ustar -czf "${PRIORITY_DIR}/control.tar.gz" .)
+    printf "2.0\n" > "${PRIORITY_DIR}/debian-binary"
+    PRIORITY_PACKAGE_FILE="${OUTPUT_DIR}/netqmon-agent-priority_${VERSION}_${ARCH}.ipk"
+    (cd "${PRIORITY_DIR}" && tar --format ustar -czf "${PRIORITY_PACKAGE_FILE}" ./debian-binary ./control.tar.gz ./data.tar.gz)
+    echo "Successfully built optional priority package: ${PRIORITY_PACKAGE_FILE}"
+fi
 
 # 5. Create LuCI package
 LUCI_TMP_DIR="${TMP_DIR}/luci"

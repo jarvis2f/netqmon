@@ -84,6 +84,7 @@ const ACTIONS: PolicyActionKind[] = ["block", "allow", "limit"];
 const CAPABILITY_KEYS = [
   "client_block",
   "client_limit",
+  "client_total_limit",
   "application_block",
   "application_limit",
 ] as const;
@@ -335,7 +336,9 @@ function withVisualScope(spec: PolicySpecV1): PolicySpecV1 {
     ...spec,
     network: {
       ...spec.network,
-      scope: isClientTotalLimit(spec) ? "agent" : "internet",
+      // Keep an explicitly selected scope, including an existing Internet
+      // limit loaded from YAML. Agent scope is only valid for client limits.
+      scope: isClientTotalLimit(spec) ? spec.network.scope : "internet",
     },
   };
 }
@@ -807,7 +810,7 @@ export function PoliciesDashboard({ username }: { username: string }) {
                               <p key={capability}>
                                 {t(`capabilities.${capability}`)}:{" "}
                                 {t(
-                                  `capabilityStatus.${deployment.capabilities[capability]}`,
+                                  `capabilityStatus.${deployment.capabilities[capability] ?? "unknown"}`,
                                 )}
                               </p>
                             ))}
@@ -1175,6 +1178,12 @@ export function PoliciesDashboard({ username }: { username: string }) {
           key={editor.record?.id ?? "create"}
           record={editor.record}
           gatewayId={gatewayId}
+          internetLimitCapability={
+            deployment?.capabilities.client_limit ?? "unknown"
+          }
+          totalLimitCapability={
+            deployment?.capabilities.client_total_limit ?? "unknown"
+          }
           revision={pageData?.desired_revision ?? 0}
           onClose={() => setEditor(null)}
           onSaved={async (message) => {
@@ -1360,12 +1369,16 @@ function ActionMark({ action }: { action: PolicyActionKind }) {
 function PolicyEditor({
   record,
   gatewayId,
+  internetLimitCapability,
+  totalLimitCapability,
   revision,
   onClose,
   onSaved,
 }: {
   record: PolicyRecord | null;
   gatewayId: string;
+  internetLimitCapability: string;
+  totalLimitCapability: string;
   revision: number;
   onClose: () => void;
   onSaved: (message: string) => Promise<void>;
@@ -1842,11 +1855,73 @@ function PolicyEditor({
               </Field>
               {draft.action.type === "limit" && (
                 <>
-                  {editorScope === "agent" && (
-                    <p className="text-xs text-foreground-muted sm:col-span-2">
-                      {t("fields.clientTotalHelp")}
-                    </p>
+                  {isClientTotalLimit(draft) && (
+                    <div className="space-y-1.5 sm:col-span-2">
+                      <p className="text-xs font-semibold text-foreground">
+                        {t("fields.limitScope")}
+                      </p>
+                      <Select
+                        value={draft.network.scope}
+                        onValueChange={(scope) =>
+                          setVisual((current) => ({
+                            ...current,
+                            network: {
+                              ...current.network,
+                              scope: scope as "internet" | "agent",
+                            },
+                          }))
+                        }
+                      >
+                        <SelectTrigger
+                          className="h-10 w-full text-sm"
+                          aria-label={t("fields.limitScope")}
+                        >
+                          <SelectValue>
+                            {t(
+                              draft.network.scope === "agent"
+                                ? "scopeAgent"
+                                : "scopeInternet",
+                            )}
+                          </SelectValue>
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectGroup>
+                            <SelectItem value="internet">
+                              {t("scopeInternet")}
+                            </SelectItem>
+                            <SelectItem value="agent">
+                              {t("scopeAgent")}
+                            </SelectItem>
+                          </SelectGroup>
+                        </SelectContent>
+                      </Select>
+                      <p className="text-xs text-foreground-muted">
+                        {t(
+                          draft.network.scope === "agent"
+                            ? "fields.clientTotalHelp"
+                            : "fields.internetLimitHelp",
+                        )}
+                      </p>
+                    </div>
                   )}
+                  {editorScope === "agent" &&
+                    totalLimitCapability !== "supported" && (
+                      <p className="text-xs text-warning sm:col-span-2">
+                        {t(
+                          totalLimitCapability === "unsupported"
+                            ? "fields.clientTotalBackendUnsupported"
+                            : "fields.clientTotalBackendWarning",
+                        )}
+                      </p>
+                    )}
+                  {isClientTotalLimit(draft) &&
+                    editorScope === "internet" &&
+                    totalLimitCapability !== "unknown" &&
+                    internetLimitCapability === "unsupported" && (
+                      <p className="text-xs text-warning sm:col-span-2">
+                        {t("fields.internetLimitUnsupported")}
+                      </p>
+                    )}
                   <Field
                     label={t("fields.downloadLimit")}
                     help={t("fields.mbpsHelp")}

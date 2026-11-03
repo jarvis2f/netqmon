@@ -50,6 +50,7 @@ struct GatewayState {
     flow_evaluation_contexts: HashMap<String, FlowEvaluationContext>,
     flow_in_flight: HashMap<String, InFlightFlowCommand>,
     flow_attempts: HashMap<String, u8>,
+    flow_partial_retries: HashMap<String, DelayedPartialRetry>,
     flow_notify: Arc<Notify>,
     flow_capabilities: Option<(u64, bool, bool)>,
 }
@@ -69,6 +70,11 @@ struct InFlightFlowCommand {
     frame: PolicyWireFrame,
     sent_at: Instant,
     attempts: u8,
+}
+
+struct DelayedPartialRetry {
+    command_id: String,
+    retry_at: Instant,
 }
 
 struct ActiveSession {
@@ -655,8 +661,17 @@ impl PolicyHub {
             tracing::warn!(gateway_id, policy_flow_id, "flow command state is full");
             return Err("flow_command_backpressure".to_owned());
         }
+        if let Some(retry) = state.flow_partial_retries.remove(&key) {
+            state.flow_attempts.remove(&retry.command_id);
+        }
         state.flow_states.insert(key.clone(), frame.clone());
-        state.flow_pending.insert(key.clone(), frame.clone());
+        if let Some(previous) = state.flow_pending.insert(key.clone(), frame.clone())
+            && let Some(previous_id) = flow_command_id(&previous)
+            && Some(previous_id) != flow_command_id(frame)
+            && !state.flow_in_flight.contains_key(previous_id)
+        {
+            state.flow_attempts.remove(previous_id);
+        }
         state.fill_flow_queue();
         let notify = Arc::clone(&state.flow_notify);
         drop(gateways);
@@ -893,6 +908,26 @@ impl PolicyHub {
         {
             return;
         }
+        // A partial acknowledgement releases the in-flight window immediately.
+        // Retry later, after fresh flow/conntrack observations may have arrived.
+        let ready = state
+            .flow_partial_retries
+            .iter()
+            .filter(|(_, retry)| retry.retry_at <= Instant::now())
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in ready {
+            if let Some(retry) = state.flow_partial_retries.remove(&key) {
+                if let Some(frame) = state.flow_states.get(&key).filter(|frame| {
+                    flow_command_id(frame) == Some(retry.command_id.as_str())
+                        && flow_command_expires_at(frame).is_some_and(|expiry| expiry > now_ms())
+                }) {
+                    state.flow_pending.insert(key, frame.clone());
+                } else {
+                    state.flow_attempts.remove(&retry.command_id);
+                }
+            }
+        }
         let due = state
             .flow_in_flight
             .iter()
@@ -944,6 +979,7 @@ impl PolicyHub {
         policy_flow_id: &str,
         config_revision: u64,
         status: FlowAckStatus,
+        reason_code: Option<&str>,
     ) -> bool {
         if gateway_id != session.gateway_id || !self.is_active(session) {
             return false;
@@ -971,7 +1007,37 @@ impl PolicyHub {
             state.flow_in_flight.insert(command_id.to_owned(), sent);
             return false;
         }
-        state.flow_attempts.remove(command_id);
+        let retry_partial = status == FlowAckStatus::Partial
+            && reason_code == Some("partial_alias_coverage")
+            && matches!(
+                sent.frame,
+                PolicyWireFrame::FlowCommand {
+                    operation: FlowCommandOperation::Upsert,
+                    verdict: Some(netqmon_protocol::policy::FlowVerdict::Shape),
+                    ..
+                }
+            )
+            && sent.attempts < FLOW_COMMAND_MAX_ATTEMPTS
+            && (state.flow_partial_retries.len() < FLOW_COMMAND_STATE_CAPACITY
+                || state.flow_partial_retries.contains_key(&expected_key))
+            && state.flow_states.get(&expected_key).is_some_and(|current| {
+                flow_command_id(current) == Some(command_id)
+                    && flow_command_expires_at(current).is_some_and(|expiry| expiry > now_ms())
+            });
+        if retry_partial {
+            if let Some(previous) = state.flow_partial_retries.insert(
+                expected_key.clone(),
+                DelayedPartialRetry {
+                    command_id: command_id.to_owned(),
+                    retry_at: Instant::now() + FLOW_COMMAND_RETRY_AFTER,
+                },
+            ) && previous.command_id != command_id
+            {
+                state.flow_attempts.remove(&previous.command_id);
+            }
+        } else {
+            state.flow_attempts.remove(command_id);
+        }
         if matches!(
             sent.frame,
             PolicyWireFrame::FlowCommand {
@@ -1051,6 +1117,7 @@ fn gateway_state<'a>(
             flow_evaluation_contexts: HashMap::new(),
             flow_in_flight: HashMap::new(),
             flow_attempts: HashMap::new(),
+            flow_partial_retries: HashMap::new(),
             flow_notify: Arc::new(Notify::new()),
             flow_capabilities: None,
         }
@@ -1064,6 +1131,7 @@ impl GatewayState {
         self.flow_queued.clear();
         self.flow_in_flight.clear();
         self.flow_attempts.clear();
+        self.flow_partial_retries.clear();
     }
 
     fn clear_flow_commands(&mut self) {
@@ -1074,6 +1142,7 @@ impl GatewayState {
         self.flow_evaluation_contexts.clear();
         self.flow_in_flight.clear();
         self.flow_attempts.clear();
+        self.flow_partial_retries.clear();
     }
 
     fn fill_flow_queue(&mut self) {
@@ -1085,12 +1154,36 @@ impl GatewayState {
             .map(|identity| identity.2);
         // A previous revision can never be sent after the new snapshot.
         // Keeping it in the bounded queue can indefinitely hide current flows.
+        let discarded = self
+            .flow_pending
+            .values()
+            .filter(|frame| {
+                flow_command_expires_at(frame).is_none_or(|expires| expires <= now)
+                    || revision.is_some_and(|current| {
+                        flow_command_revision(frame).is_none_or(|value| value < current)
+                    })
+            })
+            .filter_map(flow_command_id)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         self.flow_pending.retain(|_, frame| {
             flow_command_expires_at(frame).is_some_and(|expires| expires > now)
                 && revision.is_none_or(|current| {
                     flow_command_revision(frame).is_some_and(|value| value >= current)
                 })
         });
+        if !discarded.is_empty() {
+            let delayed_ids = self
+                .flow_partial_retries
+                .values()
+                .map(|retry| retry.command_id.as_str())
+                .collect::<HashSet<_>>();
+            for id in discarded {
+                if !self.flow_in_flight.contains_key(&id) && !delayed_ids.contains(id.as_str()) {
+                    self.flow_attempts.remove(&id);
+                }
+            }
+        }
         self.flow_states
             .retain(|_, frame| flow_command_expires_at(frame).is_some_and(|expires| expires > now));
         self.flow_queue.retain(|key| {
@@ -1121,6 +1214,8 @@ impl GatewayState {
 
     fn requeue_flow_states(&mut self, now: i64) {
         self.flow_in_flight.clear();
+        self.flow_attempts.clear();
+        self.flow_partial_retries.clear();
         for (key, frame) in &self.flow_states {
             if flow_command_expires_at(frame).is_some_and(|expires| expires > now) {
                 self.flow_pending.insert(key.clone(), frame.clone());
@@ -1918,6 +2013,7 @@ fn handle_agent_frame(
                 &policy_flow_id,
                 config_revision,
                 status,
+                reason_code.as_deref(),
             ) {
                 tracing::warn!(
                     gateway_id = session.gateway_id,
@@ -2160,6 +2256,254 @@ mod tests {
     }
 
     #[test]
+    fn partial_shape_ack_retries_later_without_occupying_the_send_window() {
+        let hub = PolicyHub::new();
+        let session = hub.register("gw-test").unwrap();
+        let frame = flow_command(&hub, 1, 0, false);
+        hub.queue_flow_command(frame).unwrap();
+        for attempt in 1..=FLOW_COMMAND_MAX_ATTEMPTS {
+            let sent = hub
+                .take_flow_command(&session, 0, Some("boot-test"))
+                .unwrap();
+            hub.mark_flow_command_sent(&session, sent.clone());
+            let PolicyWireFrame::FlowCommand {
+                command_id,
+                policy_flow_id,
+                ..
+            } = &sent
+            else {
+                unreachable!()
+            };
+            assert!(hub.acknowledge_flow_command(
+                &session,
+                "gw-test",
+                "boot-test",
+                &hub.inner.controller_epoch,
+                command_id,
+                policy_flow_id,
+                0,
+                FlowAckStatus::Partial,
+                Some("partial_alias_coverage")
+            ));
+            assert!(
+                hub.take_flow_command(&session, 0, Some("boot-test"))
+                    .is_none()
+            );
+            let mut states = hub.inner.gateways.lock().unwrap();
+            let state = states.get_mut("gw-test").unwrap();
+            assert!(state.flow_in_flight.is_empty());
+            if attempt < FLOW_COMMAND_MAX_ATTEMPTS {
+                state
+                    .flow_partial_retries
+                    .get_mut(&flow_command_key("boot-test", policy_flow_id))
+                    .unwrap()
+                    .retry_at = Instant::now();
+            } else {
+                assert!(state.flow_partial_retries.is_empty());
+                assert!(state.flow_attempts.is_empty());
+            }
+            drop(states);
+            hub.retry_flow_commands(&session);
+        }
+        assert!(
+            hub.take_flow_command(&session, 0, Some("boot-test"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn delayed_partial_retry_cannot_restore_a_superseded_policy() {
+        let hub = PolicyHub::new();
+        let session = hub.register("gw-test").unwrap();
+        hub.queue_flow_command(flow_command(&hub, 1, 0, false))
+            .unwrap();
+        let sent = hub
+            .take_flow_command(&session, 0, Some("boot-test"))
+            .unwrap();
+        hub.mark_flow_command_sent(&session, sent.clone());
+        let PolicyWireFrame::FlowCommand {
+            command_id,
+            policy_flow_id,
+            ..
+        } = &sent
+        else {
+            unreachable!()
+        };
+        assert!(hub.acknowledge_flow_command(
+            &session,
+            "gw-test",
+            "boot-test",
+            &hub.inner.controller_epoch,
+            command_id,
+            policy_flow_id,
+            0,
+            FlowAckStatus::Partial,
+            Some("partial_alias_coverage")
+        ));
+        let newer = flow_command(&hub, 1, 0, true);
+        hub.queue_flow_command(newer.clone()).unwrap();
+        assert!(
+            hub.inner.gateways.lock().unwrap()["gw-test"]
+                .flow_partial_retries
+                .is_empty()
+        );
+        hub.retry_flow_commands(&session);
+        let delivered = hub
+            .take_flow_command(&session, 0, Some("boot-test"))
+            .unwrap();
+        assert_eq!(flow_command_id(&delivered), flow_command_id(&newer));
+        assert!(
+            hub.take_flow_command(&session, 0, Some("boot-test"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn only_partial_shape_alias_coverage_is_retried() {
+        let hub = PolicyHub::new();
+        let session = hub.register("gw-test").unwrap();
+        for (number, reason, revoke) in [
+            (1, "proxy_return_path_unresolved", false),
+            (2, "partial_alias_coverage", true),
+        ] {
+            hub.queue_flow_command(flow_command(&hub, number, 0, revoke))
+                .unwrap();
+            let sent = hub
+                .take_flow_command(&session, 0, Some("boot-test"))
+                .unwrap();
+            hub.mark_flow_command_sent(&session, sent.clone());
+            let PolicyWireFrame::FlowCommand {
+                command_id,
+                policy_flow_id,
+                ..
+            } = &sent
+            else {
+                unreachable!()
+            };
+            assert!(hub.acknowledge_flow_command(
+                &session,
+                "gw-test",
+                "boot-test",
+                &hub.inner.controller_epoch,
+                command_id,
+                policy_flow_id,
+                0,
+                FlowAckStatus::Partial,
+                Some(reason)
+            ));
+        }
+        let states = hub.inner.gateways.lock().unwrap();
+        assert!(states["gw-test"].flow_partial_retries.is_empty());
+        assert!(states["gw-test"].flow_attempts.is_empty());
+    }
+
+    #[test]
+    fn delayed_partial_retry_does_not_requeue_expired_commands() {
+        let hub = PolicyHub::new();
+        let session = hub.register("gw-test").unwrap();
+        let frame = flow_command(&hub, 1, 0, false);
+        hub.queue_flow_command(frame).unwrap();
+        let sent = hub
+            .take_flow_command(&session, 0, Some("boot-test"))
+            .unwrap();
+        hub.mark_flow_command_sent(&session, sent.clone());
+        let PolicyWireFrame::FlowCommand {
+            command_id,
+            policy_flow_id,
+            ..
+        } = &sent
+        else {
+            unreachable!()
+        };
+        assert!(hub.acknowledge_flow_command(
+            &session,
+            "gw-test",
+            "boot-test",
+            &hub.inner.controller_epoch,
+            command_id,
+            policy_flow_id,
+            0,
+            FlowAckStatus::Partial,
+            Some("partial_alias_coverage")
+        ));
+        let key = flow_command_key("boot-test", policy_flow_id);
+        let mut states = hub.inner.gateways.lock().unwrap();
+        let state = states.get_mut("gw-test").unwrap();
+        state.flow_partial_retries.get_mut(&key).unwrap().retry_at = Instant::now();
+        if let PolicyWireFrame::FlowCommand { expires_at_ms, .. } =
+            state.flow_states.get_mut(&key).unwrap()
+        {
+            *expires_at_ms = now_ms() - 1;
+        } else {
+            unreachable!()
+        }
+        drop(states);
+        hub.retry_flow_commands(&session);
+        assert!(
+            hub.take_flow_command(&session, 0, Some("boot-test"))
+                .is_none()
+        );
+        let states = hub.inner.gateways.lock().unwrap();
+        assert!(states["gw-test"].flow_partial_retries.is_empty());
+        assert!(states["gw-test"].flow_attempts.is_empty());
+    }
+
+    #[test]
+    fn expired_retry_waiting_for_send_releases_attempt_tracking() {
+        let hub = PolicyHub::new();
+        let session = hub.register("gw-test").unwrap();
+        hub.queue_flow_command(flow_command(&hub, 1, 0, false))
+            .unwrap();
+        let sent = hub
+            .take_flow_command(&session, 0, Some("boot-test"))
+            .unwrap();
+        hub.mark_flow_command_sent(&session, sent.clone());
+        let PolicyWireFrame::FlowCommand {
+            command_id,
+            policy_flow_id,
+            ..
+        } = &sent
+        else {
+            unreachable!()
+        };
+        assert!(hub.acknowledge_flow_command(
+            &session,
+            "gw-test",
+            "boot-test",
+            &hub.inner.controller_epoch,
+            command_id,
+            policy_flow_id,
+            0,
+            FlowAckStatus::Partial,
+            Some("partial_alias_coverage")
+        ));
+        let key = flow_command_key("boot-test", policy_flow_id);
+        {
+            let mut states = hub.inner.gateways.lock().unwrap();
+            states
+                .get_mut("gw-test")
+                .unwrap()
+                .flow_partial_retries
+                .get_mut(&key)
+                .unwrap()
+                .retry_at = Instant::now();
+        }
+        hub.retry_flow_commands(&session);
+        let mut states = hub.inner.gateways.lock().unwrap();
+        let state = states.get_mut("gw-test").unwrap();
+        if let PolicyWireFrame::FlowCommand { expires_at_ms, .. } =
+            state.flow_pending.get_mut(&key).unwrap()
+        {
+            *expires_at_ms = now_ms() - 1;
+        } else {
+            unreachable!()
+        }
+        state.fill_flow_queue();
+        assert!(state.flow_pending.is_empty());
+        assert!(state.flow_attempts.is_empty());
+    }
+
+    #[test]
     fn acknowledgement_reopens_a_full_window_and_keeps_a_newer_decision() {
         use futures_util::FutureExt as _;
         let hub = PolicyHub::new();
@@ -2201,7 +2545,8 @@ mod tests {
             command_id,
             policy_flow_id,
             0,
-            FlowAckStatus::Applied
+            FlowAckStatus::Applied,
+            None,
         ));
         assert!(session.flow_notify.notified().now_or_never().is_some());
         let states = hub.inner.gateways.lock().unwrap();

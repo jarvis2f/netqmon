@@ -8,6 +8,7 @@ MANIFEST="$TMP_DIR/manifest.json"
 RELEASES="$TMP_DIR/releases.json"
 SERVICE=/etc/init.d/netqmon
 AGENT=/usr/bin/netqmon-agent
+PRIORITY_AGENT=/usr/bin/netqmon-agent-priority
 
 json_escape() {
     printf '%s' "$1" | sed ':a;N;$!ba;s/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g; s/\r/\\r/g; s/\n/\\n/g'
@@ -190,8 +191,8 @@ download_manifest() {
 }
 
 manifest_field() {
-    local channel="$1" arch="$2" format="$3" expr="$4"
-    jsonfilter -i "$MANIFEST" -e "@.channels.${channel}.packages[@.name='netqmon-agent' && @.openwrt_arch='${arch}' && @.package_format='${format}'].${expr}" 2>/dev/null | head -n 1
+    local channel="$1" arch="$2" format="$3" expr="$4" name="${5:-netqmon-agent}"
+    jsonfilter -i "$MANIFEST" -e "@.channels.${channel}.packages[@.name='${name}' && @.openwrt_arch='${arch}' && @.package_format='${format}'].${expr}" 2>/dev/null | head -n 1
 }
 
 channel_field() {
@@ -279,7 +280,7 @@ check_call() {
 }
 
 apply_call() {
-    local actual install_log install_rc manager package rc
+    local actual install_log install_rc manager package priority_package priority_url priority_sha priority_version rc
     download_manifest
     resolve_update
     [ "$update_available" = true ] || fail "no newer package is available on the selected update channel"
@@ -289,20 +290,43 @@ apply_call() {
     actual="$(sha256sum "$package" | awk '{print $1}')"
     [ "$actual" = "$sha256" ] || fail "downloaded package checksum mismatch"
 
+    set -- "$package"
+    if [ -x "$PRIORITY_AGENT" ]; then
+        priority_url="$(manifest_field "$channel" "$arch" "$format" url netqmon-agent-priority)"
+        priority_sha="$(manifest_field "$channel" "$arch" "$format" sha256 netqmon-agent-priority)"
+        priority_version="$(manifest_field "$channel" "$arch" "$format" version netqmon-agent-priority)"
+        [ -n "$priority_url" ] && [ -n "$priority_sha" ] && [ "$priority_version" = "$latest_package_version" ] || \
+            fail "manifest has no matching priority package for the installed backend"
+        case "$format:$priority_url" in
+            ipk:https://github.com/jarvis2f/netqmon/releases/download/*/netqmon-agent-priority_*.ipk) ;;
+            apk:https://github.com/jarvis2f/netqmon/releases/download/*/netqmon-agent-priority-*.apk) ;;
+            *) fail "manifest priority package URL is not trusted" ;;
+        esac
+        priority_package="$TMP_DIR/netqmon-agent-priority.$format"
+        wget -q -O "$priority_package" "$priority_url" || fail "failed to download priority package"
+        actual="$(sha256sum "$priority_package" | awk '{print $1}')"
+        [ "$actual" = "$priority_sha" ] || fail "downloaded priority package checksum mismatch"
+        set -- "$package" "$priority_package"
+    fi
+
     "$SERVICE" stop >/dev/null 2>&1 || true
     if [ "$manager" = "opkg" ]; then
         install_log=/tmp/netqmon-opkg.log
-        opkg install "$package" >"$install_log" 2>&1
+        opkg install "$@" >"$install_log" 2>&1
         install_rc=$?
     else
         install_log=/tmp/netqmon-apk.log
-        apk add --allow-untrusted "$package" >"$install_log" 2>&1
+        apk add --allow-untrusted "$@" >"$install_log" 2>&1
         install_rc=$?
     fi
     if [ "$install_rc" -ne 0 ]; then
         "$SERVICE" start >/dev/null 2>&1 || true
-        fail "$manager install failed; existing agent was restarted"
+        fail "$manager install failed; agent restart was attempted; verify both package versions"
     fi
+    # The base package post-install hook may already have started the Agent
+    # before the optional package was upgraded. Re-select the binary only
+    # after both packages have been installed.
+    "$SERVICE" stop >/dev/null 2>&1 || true
     "$SERVICE" start >/dev/null 2>&1 || true
     "$AGENT" doctor >/tmp/netqmon-doctor.log 2>&1
     rc=$?

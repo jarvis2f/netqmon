@@ -1116,6 +1116,30 @@ fn validate_spec(
                 .to_owned(),
         );
     }
+    let client_total = netqmon_protocol::policy::is_client_total_spec(&spec);
+    let client_internet_limit = spec.network.scope == "internet"
+        && spec.action.kind == super::model::ActionKind::Limit
+        && !spec.selectors.clients.is_empty()
+        && spec.selectors.applications.is_empty()
+        && spec.selectors.categories.is_empty();
+    if (client_total || client_internet_limit) && known.gateway_exists {
+        let (agent_connected, capabilities) = state
+            .policy_service
+            .gateway_capabilities(&spec.gateway_id)
+            .map_err(|error| format!("{error:?}"))?;
+        match (client_total, capabilities.client_total_limit.as_str(), capabilities.client_limit.as_str()) {
+            (true, "unsupported", _) => warnings.push(
+                "This Agent reports that client-total limits are unsupported; an enabled policy cannot currently be applied.".to_owned(),
+            ),
+            (true, "unknown", _) => warnings.push(
+                "This Agent has not reported client-total limit support; verify the execution status after applying the policy.".to_owned(),
+            ),
+            (false, total, "unsupported") if agent_connected && total != "unknown" => warnings.push(
+                "This Agent reports that Internet-scoped client limits are unsupported; an enabled policy cannot currently be applied.".to_owned(),
+            ),
+            _ => {}
+        }
+    }
     if !spec.selectors.clients.is_empty()
         && spec.selectors.applications.is_empty()
         && spec.selectors.categories.is_empty()

@@ -44,6 +44,18 @@ var zh = {
   "Warn when interface bytes exceed captured flow bytes by more than this ratio.":
     "当接口字节数超过已采集连接流字节数且比例高于此值时告警。",
   "Agent diagnostics": "代理诊断",
+  "Policy WebSocket URL": "策略 WebSocket 地址",
+  "Optional override for the policy connection; leave empty to derive it from the Controller address.":
+    "可选的策略连接地址；留空时根据 Controller 地址自动生成。",
+  "Allow unencrypted policy WebSocket": "允许未加密的策略 WebSocket",
+  "Allow ws:// only for loopback or private IP addresses. Disable this when the Controller provides wss://.":
+    "仅允许回环或私有 IP 地址使用 ws://。Controller 提供 wss:// 时可关闭。",
+  "Client total limit backend": "客户端总限速后端",
+  "Cache blocked application endpoints": "缓存被阻止的应用端点",
+  "Blocks reconnects before identification, but may also block other applications using the same destination IP and port.":
+    "可在识别前阻止重连，但也可能误阻止使用相同目标 IP 和端口的其他应用。",
+  "Requires the matching netqmon-agent-priority package. The Agent checks topology and existing rules before enabling this backend.":
+    "需要安装与代理版本匹配的 netqmon-agent-priority 软件包。启用前代理会检查拓扑和现有规则。",
   "Expose internal agent diagnostics for troubleshooting.":
     "暴露代理内部诊断信息以便排障。",
   "Log level": "日志级别",
@@ -220,6 +232,46 @@ return view.extend({
       ),
       4,
       1,
+    );
+
+    o = s.option(form.Value, "policy_ws_url", t("Policy WebSocket URL"));
+    o.rmempty = true;
+    o.placeholder = "wss://controller.example/v1/agent/policies/stream";
+    o.description = t(
+      "Optional override for the policy connection; leave empty to derive it from the Controller address.",
+    );
+
+    o = s.option(
+      form.Flag,
+      "allow_insecure_policy_ws",
+      t("Allow unencrypted policy WebSocket"),
+    );
+    o.default = "1";
+    o.rmempty = false;
+    o.description = t(
+      "Allow ws:// only for loopback or private IP addresses. Disable this when the Controller provides wss://.",
+    );
+
+    o = s.option(
+      form.Flag,
+      "policy_client_total_enabled",
+      t("Client total limit backend"),
+    );
+    o.default = "0";
+    o.rmempty = false;
+    o.description = t(
+      "Requires the matching netqmon-agent-priority package. The Agent checks topology and existing rules before enabling this backend.",
+    );
+
+    o = s.option(
+      form.Flag,
+      "policy_application_endpoint_cache_enabled",
+      t("Cache blocked application endpoints"),
+    );
+    o.default = "0";
+    o.rmempty = false;
+    o.description = t(
+      "Blocks reconnects before identification, but may also block other applications using the same destination IP and port.",
     );
 
     o = s.option(form.Flag, "diagnostics_enabled", t("Agent diagnostics"));

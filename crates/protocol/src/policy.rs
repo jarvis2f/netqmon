@@ -10,6 +10,9 @@ pub const POLICY_WIRE_VERSION: u32 = 1;
 pub const POLICY_MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const POLICY_MAX_METRICS_FRAME_BYTES: usize = 256 * 1024;
 pub const POLICY_MAX_SNAPSHOT_BYTES: usize = 768 * 1024;
+/// Advertises support for the optional client-total capability on policy frames.
+pub const POLICY_CAPABILITIES_HEADER: &str = "x-netqmon-policy-capabilities";
+pub const POLICY_CLIENT_TOTAL_CAPABILITY: &str = "client-total-v1";
 pub const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 /// Client totals on the Agent's verified client-facing path, independent of app identification.
 pub const POLICY_CLIENT_TOTAL_SCOPE: &str = "agent";
@@ -307,6 +310,9 @@ pub struct PolicyCapabilities {
     pub client_limit: PolicyCapability,
     pub application_block: PolicyCapability,
     pub application_limit: PolicyCapability,
+    /// Omitted unless the Collector has explicitly negotiated this extension.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_total_limit: Option<PolicyCapability>,
 }
 
 impl PolicyCapabilities {
@@ -317,6 +323,7 @@ impl PolicyCapabilities {
             client_limit: PolicyCapability::Unsupported,
             application_block: PolicyCapability::Unsupported,
             application_limit: PolicyCapability::Unsupported,
+            client_total_limit: None,
         }
     }
 }
@@ -1022,6 +1029,25 @@ mod tests {
             },
             schedule: None,
         }
+    }
+
+    #[test]
+    fn client_total_capability_extension_is_optional_and_explicit() {
+        let legacy = PolicyCapabilities::unsupported();
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert!(json.get("client_total_limit").is_none());
+        assert_eq!(
+            serde_json::from_value::<PolicyCapabilities>(json).unwrap(),
+            legacy
+        );
+        let mut extended = legacy;
+        extended.client_total_limit = Some(PolicyCapability::Supported);
+        let json = serde_json::to_value(&extended).unwrap();
+        assert_eq!(json["client_total_limit"], "supported");
+        assert_eq!(
+            serde_json::from_value::<PolicyCapabilities>(json).unwrap(),
+            extended
+        );
     }
 
     #[test]

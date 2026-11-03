@@ -224,7 +224,7 @@ test.describe("traffic policies", () => {
     await expect(editor.getByLabel("Download ceiling")).toHaveValue("7.5");
     await expect(editor.getByLabel("Upload ceiling")).toHaveValue("1.5");
     await expect(
-      editor.getByText("Client total · Both directions"),
+      editor.getByText("Client total · Both directions").first(),
     ).toBeVisible();
 
     await editor.getByRole("tab", { name: "Advanced YAML" }).click();
@@ -247,7 +247,7 @@ test.describe("traffic policies", () => {
     const reopened = page.getByRole("dialog", { name: "Edit traffic policy" });
     await expect(reopened.getByLabel("Download ceiling")).toHaveValue("7.5");
     await expect(
-      reopened.getByText("Client total · Both directions"),
+      reopened.getByText("Client total · Both directions").first(),
     ).toBeVisible();
     await reopened.getByLabel("Description").fill("Updated client total");
     await reopened.getByRole("button", { name: "Validate" }).click();
@@ -263,9 +263,36 @@ test.describe("traffic policies", () => {
       .getByRole("button", { name: "Save Changes" })
       .click();
     expect((await update).postDataJSON().network.scope).toBe("agent");
+
+    await row.getByRole("button", { name: "Edit", exact: true }).click();
+    const repair = page.getByRole("dialog", { name: "Edit traffic policy" });
+    await repair.getByLabel("Limit scope").click();
+    await page
+      .getByRole("option", { name: "Internet · Both directions" })
+      .click();
+    await expect(repair.getByLabel("Download ceiling")).toHaveValue("7.5");
+    await expect(repair.getByLabel("Upload ceiling")).toHaveValue("1.5");
+    await repair.getByRole("button", { name: "Validate" }).click();
+    await expect(repair.getByText("Policy is valid")).toBeVisible();
+    await repair.getByRole("button", { name: "Save Changes" }).click();
+    const repaired = page.waitForRequest(
+      (request) =>
+        request.method() === "PUT" &&
+        new URL(request.url()).pathname.startsWith("/api/policies/"),
+    );
+    await page
+      .getByRole("dialog", { name: "Save policy changes?" })
+      .getByRole("button", { name: "Save Changes" })
+      .click();
+    const repairedSpec = (await repaired).postDataJSON();
+    expect(repairedSpec.network.scope).toBe("internet");
+    expect(repairedSpec.action).toMatchObject({
+      download_bps: 7500000,
+      upload_bps: 1500000,
+    });
   });
 
-  test("selects client-total or Internet scope when visual selectors and actions change", async ({
+  test("keeps client limit scope explicit when visual selectors and actions change", async ({
     page,
   }) => {
     await openPolicies(page);
@@ -297,35 +324,55 @@ test.describe("traffic policies", () => {
     await editor.getByLabel("Download ceiling").fill("20");
     await editor.getByLabel("Upload ceiling").fill("5");
     await expect(
-      editor.getByText("Client total · Both directions"),
+      editor.getByText("Internet · Both directions").first(),
+    ).toBeVisible();
+    await validateScope("internet");
+    await editor.getByRole("tab", { name: "Advanced YAML" }).click();
+    await expect(editor.getByLabel("Advanced policy YAML editor")).toHaveValue(
+      /scope: internet/,
+    );
+    await editor.getByRole("tab", { name: "Visual configuration" }).click();
+    await validateScope("internet");
+    await editor.getByLabel("Limit scope").click();
+    await page
+      .getByRole("option", { name: "Client total · Both directions" })
+      .click();
+    await expect(
+      editor.getByText(
+        /Client-total limits require the Agent's dedicated backend/,
+      ),
     ).toBeVisible();
     await validateScope("agent");
     const app = editor
       .getByRole("group", { name: "Applications", exact: true })
       .getByLabel("YouTube", { exact: true });
     await app.check();
-    await expect(editor.getByText("Internet · Both directions")).toBeVisible();
+    await expect(
+      editor.getByText("Internet · Both directions").first(),
+    ).toBeVisible();
     await validateScope("internet");
     await app.uncheck();
-    await validateScope("agent");
+    await validateScope("internet");
     const category = editor
       .getByRole("group", { name: "Categories", exact: true })
       .getByLabel("Streaming", { exact: true });
     await category.check();
     await validateScope("internet");
     await category.uncheck();
-    await validateScope("agent");
+    await validateScope("internet");
     await selectAction("Block");
     await validateScope("internet");
     await selectAction("Allow");
     await validateScope("internet");
     await selectAction("Limit");
     await editor.getByLabel("Download ceiling").fill("20");
-    await validateScope("agent");
+    await validateScope("internet");
     await client.uncheck();
-    await expect(editor.getByText("Internet · Both directions")).toBeVisible();
+    await expect(
+      editor.getByText("Internet · Both directions").first(),
+    ).toBeVisible();
     await client.check();
-    await validateScope("agent");
+    await validateScope("internet");
   });
 
   test("rejects Agent scope outside client-only aggregate limits", async ({
@@ -542,6 +589,37 @@ test.describe("traffic policies", () => {
     await expect(details.getByText(/Dropped bytes: 4.1 KB/)).toBeVisible();
   });
 
+  test("shows client-total capability separately from ordinary client limits", async ({
+    page,
+  }) => {
+    let totalCapability = "unsupported";
+    await page.route("**/api/policies/deployment?*", async (route) => {
+      const response = await route.fetch();
+      const payload = await response.json();
+      payload.data.capabilities.client_limit = "supported";
+      payload.data.capabilities.client_total_limit = totalCapability;
+      await route.fulfill({ response, body: JSON.stringify(payload) });
+    });
+    await openPolicies(page);
+    const deployment = page.getByRole("group", {
+      name: "Policy delivery",
+      exact: true,
+    });
+    await deployment.getByRole("status").hover();
+    await expect(page.getByRole("tooltip")).toContainText(
+      "Client Internet limit: Supported",
+    );
+    await expect(page.getByRole("tooltip")).toContainText(
+      "Client total limit: Unsupported",
+    );
+    totalCapability = "supported";
+    await page.getByRole("button", { name: "Refresh", exact: true }).click();
+    await deployment.getByRole("status").hover();
+    await expect(page.getByRole("tooltip")).toContainText(
+      "Client total limit: Supported",
+    );
+  });
+
   test("shows delivered, acknowledged and applied revisions independently", async ({
     page,
   }) => {
@@ -626,6 +704,17 @@ test.describe("traffic policies", () => {
     await expect(
       page.getByRole("tooltip").filter({ hasText: "one_arm_redirects_unsafe" }),
     ).toContainText("必须确认 ICMP 重定向已关闭，才能执行单臂限速。");
+    await expect(
+      page.getByRole("tooltip").filter({ hasText: "one_arm_redirects_unsafe" }),
+    ).toContainText("客户端总限速: 未验证");
+
+    reasonCode = "priority_backend_required";
+    reasonMessage = "Client totals require the verified priority backend";
+    await page.getByRole("button", { name: "刷新", exact: true }).click();
+    await row.getByText("已降级", { exact: true }).hover();
+    await expect(
+      page.getByRole("tooltip").filter({ hasText: reasonCode }),
+    ).toContainText("客户端总限速需要经过验证的专用执行后端");
 
     reasonCode = "future_policy_reason";
     reasonMessage = "Diagnostic from a newer Agent";

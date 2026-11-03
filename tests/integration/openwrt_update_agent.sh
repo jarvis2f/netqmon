@@ -17,7 +17,9 @@ cat > "$work/manifest" <<EOF
  {"name":"luci-app-netqmon","openwrt_arch":"aarch64_cortex-a53","package_format":"apk","version":"999","url":"wrong","sha256":"wrong"},
  {"name":"netqmon-agent","openwrt_arch":"aarch64_cortex-a72","package_format":"apk","version":"999","url":"wrong","sha256":"wrong"},
  {"name":"netqmon-agent","openwrt_arch":"aarch64_cortex-a53","package_format":"ipk","version":"1.1.1-beta.5-r1","url":"https://github.com/jarvis2f/netqmon/releases/download/v1/netqmon-agent_1.ipk","sha256":"$sha"},
- {"name":"netqmon-agent","openwrt_arch":"aarch64_cortex-a53","package_format":"apk","version":"1.1.1_beta5-r1","url":"https://github.com/jarvis2f/netqmon/releases/download/v1/netqmon-agent-1.apk","sha256":"$sha"}
+ {"name":"netqmon-agent","openwrt_arch":"aarch64_cortex-a53","package_format":"apk","version":"1.1.1_beta5-r1","url":"https://github.com/jarvis2f/netqmon/releases/download/v1/netqmon-agent-1.apk","sha256":"$sha"},
+ {"name":"netqmon-agent-priority","openwrt_arch":"aarch64_cortex-a53","package_format":"ipk","version":"1.1.1-beta.5-r1","url":"https://github.com/jarvis2f/netqmon/releases/download/v1/netqmon-agent-priority_1.ipk","sha256":"$sha"},
+ {"name":"netqmon-agent-priority","openwrt_arch":"aarch64_cortex-a53","package_format":"apk","version":"1.1.1_beta5-r1","url":"https://github.com/jarvis2f/netqmon/releases/download/v1/netqmon-agent-priority-1.apk","sha256":"$sha"}
 ]}}}
 EOF
 cat > "$work/bin/wget" <<'EOF'
@@ -27,6 +29,8 @@ out=$2
 url=$3
 case "$url" in
   *manifest*) cp "$TEST_WORK/manifest" "$out" ;;
+  *netqmon-agent-priority*)
+    if [ "${TEST_BAD_PRIORITY:-0}" = 1 ]; then printf 'bad priority\n' > "$out"; else cp "$TEST_WORK/package" "$out"; fi ;;
   *.apk|*.ipk) cp "$TEST_WORK/package" "$out" ;;
   *) exit 1 ;;
 esac
@@ -65,6 +69,7 @@ EOF
 chmod +x "$work/bin/wget" "$work/manager" "$work/service" "$work/agent"
 sed -e "s|^SERVICE=.*|SERVICE=$work/service|" \
     -e "s|^AGENT=.*|AGENT=$work/agent|" \
+    -e "s|^PRIORITY_AGENT=.*|PRIORITY_AGENT=$work/priority-agent|" \
     -e "s|/tmp/netqmon-opkg.log|$work/opkg.log|g" \
     -e "s|/tmp/netqmon-apk.log|$work/apk.log|g" \
     -e "s|/tmp/netqmon-doctor.log|$work/doctor.log|g" "$helper" > "$work/update-agent"
@@ -89,7 +94,39 @@ for manager in opkg apk; do
     result=$(/bin/sh "$work/update-agent" apply)
     assert_json "$result" ok true
     [ -s "$work/install-log" ] && [ -s "$work/service-log" ]
+    cp "$work/agent" "$work/priority-agent"
+    result=$(/bin/sh "$work/update-agent" apply)
+    assert_json "$result" ok true
+    grep -q "netqmon-agent-priority.$format" "$work/install-log"
+    rm "$work/priority-agent"
 done
+
+# An installed optional backend must be updated together, or neither package
+# should be installed and the service must not be stopped.
+cp "$work/agent" "$work/priority-agent"
+sed 's/netqmon-agent-priority/netqmon-priority-missing/g' "$work/manifest" > "$work/incomplete-manifest"
+cp "$work/manifest" "$work/complete-manifest"
+cp "$work/incomplete-manifest" "$work/manifest"
+rm -f "$work/install-log" "$work/service-log"
+result=$(/bin/sh "$work/update-agent" apply)
+assert_json "$result" ok false
+assert_json "$result" error 'manifest has no matching priority package for the installed backend'
+[ ! -e "$work/install-log" ] && [ ! -e "$work/service-log" ]
+cp "$work/complete-manifest" "$work/manifest"
+sed '/"name":"netqmon-agent-priority"/s/1.1.1_beta5-r1/1.1.1_beta6-r1/' "$work/manifest" > "$work/wrong-version-manifest"
+cp "$work/wrong-version-manifest" "$work/manifest"
+result=$(/bin/sh "$work/update-agent" apply)
+assert_json "$result" ok false
+assert_json "$result" error 'manifest has no matching priority package for the installed backend'
+[ ! -e "$work/install-log" ] && [ ! -e "$work/service-log" ]
+cp "$work/complete-manifest" "$work/manifest"
+export TEST_BAD_PRIORITY=1
+result=$(/bin/sh "$work/update-agent" apply)
+assert_json "$result" ok false
+assert_json "$result" error 'downloaded priority package checksum mismatch'
+[ ! -e "$work/install-log" ] && [ ! -e "$work/service-log" ]
+unset TEST_BAD_PRIORITY
+rm "$work/priority-agent"
 
 export TEST_CURRENT_VERSION=1.1.1-beta.5
 result=$(/bin/sh "$work/update-agent" check)

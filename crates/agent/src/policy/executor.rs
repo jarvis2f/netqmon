@@ -160,9 +160,12 @@ pub(crate) fn priority_runtime_capabilities(
     };
     PolicyCapabilities {
         client_block,
-        client_limit: PolicyCapability::Supported,
+        // The priority runtime accepts client-total limits, but deliberately
+        // rejects Internet-only client limits. These are distinct capabilities.
+        client_limit: PolicyCapability::Unsupported,
         application_block: application_capability,
         application_limit: application_capability,
+        client_total_limit: None,
     }
 }
 
@@ -1128,12 +1131,17 @@ pub(crate) fn status_json(config: &AgentConfig) -> serde_json::Value {
     let state = state::load_any(&config.policy_state_path).ok().flatten();
     let topology = capabilities::inspect(config);
     #[cfg(feature = "qos-client-priority")]
-    let policy_backend = match std::env::var_os("NETQMON_QOS_PRIORITY_CONFIG") {
-        None => "legacy",
-        Some(_) => "priority",
+    let policy_backend = if config.policy_client_total_enabled
+        || std::env::var_os("NETQMON_QOS_PRIORITY_CONFIG").is_some_and(|value| !value.is_empty())
+    {
+        "priority"
+    } else {
+        "legacy"
     };
     #[cfg(not(feature = "qos-client-priority"))]
-    let policy_backend = if std::env::var_os("NETQMON_QOS_PRIORITY_CONFIG").is_some() {
+    let policy_backend = if config.policy_client_total_enabled
+        || std::env::var_os("NETQMON_QOS_PRIORITY_CONFIG").is_some_and(|value| !value.is_empty())
+    {
         "unavailable"
     } else {
         "legacy"
@@ -2324,6 +2332,7 @@ pub(crate) fn priority_failure_ack(
             client_limit: PolicyCapability::Unsupported,
             application_block: PolicyCapability::Unsupported,
             application_limit: PolicyCapability::Unsupported,
+            client_total_limit: None,
         },
         PolicyAckStatus::Failed,
         snapshot_results(
@@ -2459,7 +2468,7 @@ mod tests {
 
         assert_eq!(supported.application_block, PolicyCapability::Supported);
         assert_eq!(supported.application_limit, PolicyCapability::Supported);
-        assert_eq!(supported.client_limit, PolicyCapability::Supported);
+        assert_eq!(supported.client_limit, PolicyCapability::Unsupported);
         assert_eq!(unsupported.application_block, PolicyCapability::Unsupported);
         assert_eq!(unsupported.application_limit, PolicyCapability::Unsupported);
         assert_eq!(unsupported.client_block, PolicyCapability::Degraded);

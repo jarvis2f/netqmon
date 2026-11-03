@@ -168,6 +168,15 @@ impl Error for AgentError {}
 pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
     let interface = config.interface.clone();
     let log_level = config.log_level;
+    #[cfg(not(feature = "qos-client-priority"))]
+    if config.policy_client_total_enabled {
+        log_warn(
+            log_level,
+            format_args!(
+                "client-total backend was requested but is not included in this Agent build"
+            ),
+        );
+    }
     let configured_interfaces = config
         .interfaces
         .iter()
@@ -201,24 +210,6 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
     let devices = Arc::new(Mutex::new(DeviceObservationCache::default()));
     let conntrack = Arc::new(RwLock::new(Arc::new(ConntrackContext::discover())));
     let conntrack_stats = Arc::new(ConntrackStats::default());
-    let priority_config_requested = {
-        #[cfg(feature = "qos-client-priority")]
-        {
-            std::env::var_os("NETQMON_QOS_PRIORITY_CONFIG").is_some_and(|value| !value.is_empty())
-        }
-        #[cfg(not(feature = "qos-client-priority"))]
-        {
-            false
-        }
-    };
-    let tcx_supported = if config.attach_backend == crate::config::AttachBackend::Netlink
-        || priority_config_requested
-    {
-        false
-    } else {
-        capabilities::probe_tcx_backend(&config).is_ok()
-    };
-    let selected_backend = tc::requested_backend(config.attach_backend, tcx_supported);
     let capture_is_bridge = network
         .snapshot
         .interfaces
@@ -277,15 +268,47 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
         .map_err(|error| AgentError::Runtime(format!("QoS priority map gate: {error:#}")))?,
     ));
     #[cfg(feature = "qos-client-priority")]
-    let qos_priority_runtime = crate::linux::qos_priority_runtime::PriorityRuntime::prepare(
+    let qos_priority_runtime = match crate::linux::qos_priority_runtime::PriorityRuntime::prepare(
         &config,
         &observation_interfaces,
         Arc::clone(&priority_maps),
-    )
-    .map_err(|error| AgentError::Runtime(format!("QoS priority runtime gate: {error:#}")))?
-    .map(|runtime| Arc::new(Mutex::new(runtime)));
+    ) {
+        Ok(runtime) => runtime.map(|runtime| Arc::new(Mutex::new(runtime))),
+        Err(error)
+            if config.policy_client_total_enabled
+                && !std::env::var_os("NETQMON_QOS_PRIORITY_CONFIG")
+                    .is_some_and(|value| !value.is_empty())
+                && error.is::<qos_priority_runtime::PriorityPreflightError>()
+                && qos_priority_runtime::safe_preflight_fallback(&config).unwrap_or(false) =>
+        {
+            log_warn(
+                log_level,
+                format_args!(
+                    "QoS priority preflight unavailable; retaining the existing policy backend: {error:#}"
+                ),
+            );
+            None
+        }
+        Err(error) => {
+            return Err(AgentError::Runtime(format!(
+                "QoS priority runtime gate: {error:#}"
+            )));
+        }
+    };
     #[cfg(feature = "qos-client-priority")]
     eprintln!("QoS priority BPF maps verified");
+    #[cfg(feature = "qos-client-priority")]
+    let priority_runtime_active = qos_priority_runtime.is_some();
+    #[cfg(not(feature = "qos-client-priority"))]
+    let priority_runtime_active = false;
+    let tcx_supported = if config.attach_backend == crate::config::AttachBackend::Netlink
+        || priority_runtime_active
+    {
+        false
+    } else {
+        capabilities::probe_tcx_backend(&config).is_ok()
+    };
+    let selected_backend = tc::requested_backend(config.attach_backend, tcx_supported);
     #[cfg(feature = "qos-client-path-probe")]
     let mut qos_path_probe = (|| -> anyhow::Result<_> {
         qos_path_probe::prepare(

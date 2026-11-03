@@ -1915,7 +1915,7 @@ async fn agent_policy_stream(
         tracing::error!(gateway_id = identity.gateway_id, %error, "could not build initial policy snapshot");
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    websocket
+    let mut response = websocket
         .max_message_size(netqmon_protocol::policy::POLICY_MAX_FRAME_BYTES)
         .max_frame_size(netqmon_protocol::policy::POLICY_MAX_FRAME_BYTES)
         .on_upgrade(move |mut socket| async move {
@@ -1943,7 +1943,14 @@ async fn agent_policy_stream(
                 session,
             )
             .await;
-        })
+        });
+    response.headers_mut().insert(
+        netqmon_protocol::policy::POLICY_CAPABILITIES_HEADER,
+        axum::http::HeaderValue::from_static(
+            netqmon_protocol::policy::POLICY_CLIENT_TOTAL_CAPABILITY,
+        ),
+    );
+    response
 }
 
 fn internal_router(state: CollectorState) -> Router {

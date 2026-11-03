@@ -77,6 +77,12 @@ jobs:
       - name: Test OpenWrt release manifest
         run: python3 -m unittest discover -s tests/release -v
 
+      - name: Test OpenWrt priority service selection
+        run: bash tests/integration/openwrt_priority_service.sh
+
+      - name: Check OpenWrt LuCI packaging
+        run: bash tests/integration/openwrt_luci_packaging.sh
+
       - name: Validate workspace and package versions
         shell: bash
         run: |
@@ -112,7 +118,7 @@ jobs:
             clang \
             llvm \
             autoconf automake libtool pkg-config \
-            iproute2 iperf3 jq netcat-openbsd nftables ripgrep \
+            ethtool iproute2 iperf3 jq netcat-openbsd nftables ripgrep \
             libelf-dev \
             linux-tools-common linux-tools-generic \
             zlib1g-dev
@@ -137,6 +143,35 @@ jobs:
 
       - name: Check Clippy
         run: cargo clippy --workspace --all-targets --all-features
+
+      - name: Test client-total priority backend
+        run: |
+          cargo test --package netqmon-agent --features qos-client-priority
+          test_binary=$(cargo test -p netqmon-agent --features qos-client-priority --no-run --message-format=json | jq -r 'select(.profile.test == true) | .executable // empty' | head -1)
+          test -n "$test_binary"
+          sudo "$test_binary" --exact policy::flow_verdict::tests::directional_shape_owners_survive_each_others_revoke --ignored --nocapture
+          sudo "$test_binary" --exact policy::flow_verdict::tests::overlapping_directional_blocks_transfer_only_to_live_compatible_owners --ignored --nocapture
+
+      - name: Test client-total opt-in on direct and bridged LANs
+        run: |
+          cargo build --package netqmon-agent --features qos-client-priority
+          sudo bash tests/integration/client_total_opt_in.sh target/debug/netqmon-agent direct
+          sudo bash tests/integration/client_total_opt_in.sh target/debug/netqmon-agent one-arm
+          sudo bash tests/integration/client_total_opt_in.sh target/debug/netqmon-agent dual-wan
+          sudo bash tests/integration/client_total_opt_in.sh target/debug/netqmon-agent bridge
+          sudo bash tests/integration/client_total_opt_in.sh target/debug/netqmon-agent foreign-filter
+          sudo bash tests/integration/client_total_opt_in.sh target/debug/netqmon-agent bridge-foreign-filter
+          sudo bash tests/integration/client_total_opt_in.sh target/debug/netqmon-agent foreign-qdisc
+          sudo bash tests/integration/client_total_opt_in.sh target/debug/netqmon-agent offload-unknown
+          sudo bash tests/integration/client_total_opt_in.sh target/debug/netqmon-agent offload-enabled
+          sudo bash tests/integration/client_total_opt_in.sh target/debug/netqmon-agent legacy-policy
+          sudo bash tests/integration/client_total_opt_in.sh target/debug/netqmon-agent legacy-saved
+          sudo bash tests/integration/client_total_opt_in.sh target/debug/netqmon-agent legacy-journal
+          sudo bash tests/integration/client_total_opt_in.sh target/debug/netqmon-agent stale-journal
+          cargo build --package netqmon-agent --no-default-features
+          legacy_test_binary=$(cargo test -p netqmon-agent --no-default-features --no-run --message-format=json | jq -r 'select(.profile.test == true) | .executable // empty' | head -1)
+          test -n "$legacy_test_binary"
+          sudo "$legacy_test_binary" --exact policy::flow_verdict::tests::overlapping_directional_blocks_transfer_only_to_live_compatible_owners --ignored --nocapture
 
       - name: Test shared egress application lifecycle on Linux
         run: |

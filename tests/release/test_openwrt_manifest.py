@@ -54,6 +54,22 @@ def make_apk_artifact(
 
 
 class OpenWrtManifestTests(unittest.TestCase):
+    def test_optional_priority_packages_do_not_shadow_the_agent_package(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            version = "1.1.1_beta5-r1"
+            make_ipk(root / "agent.ipk", "netqmon-agent", "x86_64", version)
+            make_ipk(root / "priority.ipk", "netqmon-agent-priority", "x86_64", version)
+            make_ipk(root / "luci.ipk", "luci-app-netqmon", "all", version)
+            make_apk_artifact(root, "netqmon-agent", "x86_64", version)
+            make_apk_artifact(root, "netqmon-agent-priority", "x86_64", version)
+            manifest = create_manifest("jarvis2f/netqmon", [f"beta:v1.1.1-beta.5:{root}"])
+            records = manifest["channels"]["beta"]["packages"]
+            for package in ("netqmon-agent", "netqmon-agent-priority"):
+                selected = [row for row in records if row["name"] == package]
+                self.assertEqual([row["package_format"] for row in selected], ["ipk", "apk"])
+                self.assertTrue(all(row["version"] == version for row in selected))
+
     def test_manifest_contains_versioned_architecture_assets_and_checksums(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

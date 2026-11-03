@@ -117,6 +117,11 @@ pub struct AgentConfig {
     /// Permit plain policy WebSockets only for loopback or RFC 1918/ULA IP addresses.
     pub allow_insecure_policy_ws: bool,
     pub policy_interface_capacity_bps: BTreeMap<String, u64>,
+    /// Explicitly enable the client-total QoS backend when it is compiled in.
+    pub policy_client_total_enabled: bool,
+    /// Permit endpoint-wide application block leases across new connections.
+    /// This can block unrelated applications sharing an IP address and port.
+    pub policy_application_endpoint_cache_enabled: bool,
     pub policy_one_arm_return_path_verified: bool,
     pub poll_interval_ms: u64,
     pub batch_interval_ms: u64,
@@ -230,6 +235,8 @@ impl Default for AgentConfig {
             policy_disabled_path: PathBuf::from(DEFAULT_POLICY_DISABLED_PATH),
             allow_insecure_policy_ws: true,
             policy_interface_capacity_bps: BTreeMap::new(),
+            policy_client_total_enabled: false,
+            policy_application_endpoint_cache_enabled: false,
             policy_one_arm_return_path_verified: true,
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             batch_interval_ms: DEFAULT_BATCH_INTERVAL_MS,
@@ -274,6 +281,8 @@ struct PartialConfig {
     policy_disabled_path: Option<PathBuf>,
     allow_insecure_policy_ws: Option<bool>,
     policy_interface_capacity_bps: Option<BTreeMap<String, u64>>,
+    policy_client_total_enabled: Option<bool>,
+    policy_application_endpoint_cache_enabled: Option<bool>,
     policy_one_arm_return_path_verified: Option<bool>,
     poll_interval_ms: Option<u64>,
     batch_interval_ms: Option<u64>,
@@ -358,6 +367,11 @@ impl AgentConfig {
             policy_interface_capacity_bps: env_string(&get_env, "NETQMON_POLICY_INTERFACE_CAPACITY_BPS")?
                 .map(|value| serde_json::from_str(&value).context("NETQMON_POLICY_INTERFACE_CAPACITY_BPS must be a JSON object of interface capacities"))
                 .transpose()?,
+            policy_client_total_enabled: env_bool(&get_env, "NETQMON_POLICY_CLIENT_TOTAL_ENABLED")?,
+            policy_application_endpoint_cache_enabled: env_bool(
+                &get_env,
+                "NETQMON_POLICY_APPLICATION_ENDPOINT_CACHE_ENABLED",
+            )?,
             policy_one_arm_return_path_verified: None,
             poll_interval_ms: env_number(&get_env, "NETQMON_POLL_INTERVAL_MS")?,
             batch_interval_ms: env_number(&get_env, "NETQMON_BATCH_INTERVAL_MS")?,
@@ -462,6 +476,12 @@ impl AgentConfig {
         }
         if let Some(value) = partial.policy_interface_capacity_bps {
             self.policy_interface_capacity_bps = value;
+        }
+        if let Some(value) = partial.policy_client_total_enabled {
+            self.policy_client_total_enabled = value;
+        }
+        if let Some(value) = partial.policy_application_endpoint_cache_enabled {
+            self.policy_application_endpoint_cache_enabled = value;
         }
         if let Some(value) = partial.policy_one_arm_return_path_verified {
             self.policy_one_arm_return_path_verified = value;
@@ -756,6 +776,70 @@ mod tests {
     use std::collections::HashMap;
     use std::ffi::OsString;
     use std::fs;
+
+    #[test]
+    fn client_total_backend_requires_an_explicit_configuration() {
+        assert!(
+            !AgentConfig::load_with_env(&cli(&[]), |_| None)
+                .unwrap()
+                .policy_client_total_enabled
+        );
+        let enabled = AgentConfig::load_with_env(&cli(&[]), |key| {
+            (key == "NETQMON_POLICY_CLIENT_TOTAL_ENABLED").then(|| OsString::from("1"))
+        })
+        .unwrap();
+        assert!(enabled.policy_client_total_enabled);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        fs::write(&path, "policy_client_total_enabled = true\n").unwrap();
+        let from_file =
+            AgentConfig::load_with_env(&cli(&["--config", path.to_str().unwrap()]), |_| None)
+                .unwrap();
+        assert!(from_file.policy_client_total_enabled);
+        let overridden =
+            AgentConfig::load_with_env(&cli(&["--config", path.to_str().unwrap()]), |key| {
+                (key == "NETQMON_POLICY_CLIENT_TOTAL_ENABLED").then(|| OsString::from("false"))
+            })
+            .unwrap();
+        assert!(!overridden.policy_client_total_enabled);
+        assert!(
+            AgentConfig::load_with_env(&cli(&[]), |key| {
+                (key == "NETQMON_POLICY_CLIENT_TOTAL_ENABLED").then(|| OsString::from("invalid"))
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn application_endpoint_cache_requires_explicit_opt_in() {
+        assert!(
+            !AgentConfig::load_with_env(&cli(&[]), |_| None)
+                .unwrap()
+                .policy_application_endpoint_cache_enabled
+        );
+        let enabled = AgentConfig::load_with_env(&cli(&[]), |key| {
+            (key == "NETQMON_POLICY_APPLICATION_ENDPOINT_CACHE_ENABLED")
+                .then(|| OsString::from("1"))
+        })
+        .unwrap();
+        assert!(enabled.policy_application_endpoint_cache_enabled);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        fs::write(&path, "policy_application_endpoint_cache_enabled = true\n").unwrap();
+        assert!(
+            AgentConfig::load_with_env(&cli(&["--config", path.to_str().unwrap()]), |_| None)
+                .unwrap()
+                .policy_application_endpoint_cache_enabled
+        );
+        assert!(
+            !AgentConfig::load_with_env(&cli(&["--config", path.to_str().unwrap()]), |key| {
+                (key == "NETQMON_POLICY_APPLICATION_ENDPOINT_CACHE_ENABLED")
+                    .then(|| OsString::from("0"))
+            })
+            .unwrap()
+            .policy_application_endpoint_cache_enabled
+        );
+    }
 
     #[test]
     fn nested_sample_config_and_hard_limits() {

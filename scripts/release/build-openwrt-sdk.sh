@@ -25,15 +25,16 @@ sed \
   feeds.conf.default > feeds.conf
 printf '\nsrc-link action %s\n' "$feed_dir" >> feeds.conf
 ./scripts/feeds update -a
+./scripts/feeds install -p base ethtool
 ./scripts/feeds install -p action -f netqmon luci-app-netqmon
-printf '\nCONFIG_PACKAGE_netqmon-agent=m\nCONFIG_PACKAGE_luci-app-netqmon=m\n' >> .config
+printf '\nCONFIG_PACKAGE_netqmon-agent=m\nCONFIG_PACKAGE_netqmon-agent-priority=m\nCONFIG_PACKAGE_luci-app-netqmon=m\n' >> .config
 make defconfig
 make -j"${BUILD_JOBS:-$(nproc)}" V=s \
   package/netqmon/compile package/luci-app-netqmon/compile
 
 # A successful make must produce both packages, not just dependencies.
-for package in netqmon-agent luci-app-netqmon; do
-  test -n "$(find bin/packages -type f -name "$package*.apk" -print -quit)" || {
+for package in netqmon-agent netqmon-agent-priority luci-app-netqmon; do
+  test -n "$(find bin/packages -type f -name "$package-[0-9]*.apk" -print -quit)" || {
     echo "Missing APK for $package" >&2
     exit 1
   }

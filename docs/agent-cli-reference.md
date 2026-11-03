@@ -120,6 +120,35 @@ smaller value is used. `policies status --json` reports capacity, its source and
 the physical link interfaces. Link capacity is distinct from the application's
 configured policy limit and is not an Internet bandwidth measurement.
 
+The client-total backend is available only in Agent builds compiled with
+`--features qos-client-priority` and remains disabled by default. To opt in,
+install the matching optional `netqmon-agent-priority` OpenWrt package and enable
+the setting in LuCI or UCI. The service uses the ordinary Agent if the optional
+binary is missing or its version differs. The page updater upgrades both when
+the optional backend is installed; other update methods must keep them matched. For a
+custom build, set `policy_client_total_enabled = true` in TOML or set
+`NETQMON_POLICY_CLIENT_TOTAL_ENABLED=1`. The backend checks LAN ports, queue ownership,
+capacity, hardware offload and filter order. A failed preflight retains the
+legacy backend when no priority resources remain; an incomplete transaction or
+uncertain ownership can prevent startup. Internet-only client limits are not
+supported in the same snapshot, and enabling this backend does not migrate
+existing legacy rules, saved state or incomplete transactions. Bidirectional
+application-flow correlation still needs validation on the target network;
+incomplete alias coverage is reported as partial. Check the Agent log and
+capability status. Traffic
+switched outside the Agent's hooks cannot be controlled by this backend.
+
+For partial application shaping, temporarily set `log_level = "debug"`. The
+`application shape coverage incomplete` Agent log distinguishes missing
+direction, class, unverified tuples and incomplete alias coverage.
+
+Application blocks apply to identified flows by default. New connections may
+pass some data before identification, avoiding blocks on unrelated applications
+sharing the destination IP and port. To block reconnects before identification,
+explicitly enable `policy_application_endpoint_cache_enabled` in LuCI or TOML,
+or set `NETQMON_POLICY_APPLICATION_ENDPOINT_CACHE_ENABLED=1`; this can also
+block other applications using the same destination IP and port.
+
 One-arm policy enforcement is enabled by default, assuming both directions of
 every enabled address family traverse the Agent. Configure and verify this
 routing externally; the Agent cannot independently verify the upstream return
