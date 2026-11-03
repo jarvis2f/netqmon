@@ -605,7 +605,9 @@ pub const PERF_TXN_CAPACITY_READ: _bindgen_ty_60 = 128;
 pub const PERF_TXN_MAX: _bindgen_ty_60 = 256;
 pub const PERF_TXN_ABORT_MASK: _bindgen_ty_60 = 18446744069414584320;
 pub const PERF_TXN_ABORT_SHIFT: _bindgen_ty_60 = 32;
-pub type _bindgen_ty_60 = ::std::os::raw::c_ulong;
+// These UAPI enum values include 64-bit constants and must not follow the
+// target's `c_ulong` width (which is 32 bits on mipsel/armv7).
+pub type _bindgen_ty_60 = u64;
 pub const PERF_FORMAT_TOTAL_TIME_ENABLED: perf_event_read_format = 1;
 pub const PERF_FORMAT_TOTAL_TIME_RUNNING: perf_event_read_format = 2;
 pub const PERF_FORMAT_ID: perf_event_read_format = 4;
@@ -2825,7 +2827,7 @@ pub const PERF_CONTEXT_GUEST: perf_callchain_context = 18446744073709549568;
 pub const PERF_CONTEXT_GUEST_KERNEL: perf_callchain_context = 18446744073709549440;
 pub const PERF_CONTEXT_GUEST_USER: perf_callchain_context = 18446744073709549056;
 pub const PERF_CONTEXT_MAX: perf_callchain_context = 18446744073709547521;
-pub type perf_callchain_context = ::std::os::raw::c_ulong;
+pub type perf_callchain_context = u64;
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub union perf_mem_data_src {
@@ -5141,7 +5143,7 @@ pub type _bindgen_ty_74 = ::std::os::raw::c_uint;
 pub const BPF_F_INDEX_MASK: _bindgen_ty_75 = 4294967295;
 pub const BPF_F_CURRENT_CPU: _bindgen_ty_75 = 4294967295;
 pub const BPF_F_CTXLEN_MASK: _bindgen_ty_75 = 4503595332403200;
-pub type _bindgen_ty_75 = ::std::os::raw::c_ulong;
+pub type _bindgen_ty_75 = u64;
 pub const BPF_F_CURRENT_NETNS: _bindgen_ty_76 = -1;
 pub type _bindgen_ty_76 = ::std::os::raw::c_int;
 pub const BPF_CSUM_LEVEL_QUERY: _bindgen_ty_77 = 0;
