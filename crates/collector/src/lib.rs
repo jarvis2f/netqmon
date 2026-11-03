@@ -91,6 +91,35 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(25);
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
+fn sqlite_retention_budget() -> netqmon_storage::RetentionBudget {
+    let defaults = netqmon_storage::RetentionBudget::default();
+    let positive = |name: &str, default: u64| match std::env::var(name) {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                tracing::warn!(
+                    variable = name,
+                    "invalid SQLite retention budget; using default"
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    };
+    let rows = positive(
+        "NETQMON_SQLITE_RETENTION_BATCH_ROWS",
+        defaults.max_rows_per_batch as u64,
+    );
+    netqmon_storage::RetentionBudget {
+        max_rows_per_batch: usize::try_from(rows).unwrap_or(defaults.max_rows_per_batch),
+        transaction_target: Duration::from_millis(positive(
+            "NETQMON_SQLITE_RETENTION_TRANSACTION_MS",
+            100,
+        )),
+        total_budget: Duration::from_millis(positive("NETQMON_SQLITE_RETENTION_JOB_MS", 5_000)),
+    }
+}
+
 /// Starts both Collector listeners using `NETQMON_COLLECTOR_*` environment
 /// variables.
 ///
@@ -728,12 +757,20 @@ impl CollectorState {
         let (effective_batch, attributions, device_identities) = prepared?;
         let mut ready_samples = Vec::new();
         let mut late_sample_decisions = Vec::new();
-        let result = match inner.storage.persist_classified_batch(
+        let persist_started = std::time::Instant::now();
+        let persisted = inner.storage.persist_classified_batch(
             &effective_batch,
             &attributions,
             &device_identities,
             unix_time_ms(),
-        )? {
+        );
+        tracing::debug!(
+            elapsed_us = persist_started.elapsed().as_micros(),
+            flows = effective_batch.flows.len(),
+            success = persisted.is_ok(),
+            "telemetry storage transaction completed"
+        );
+        let result = match persisted? {
             PersistDisposition::Duplicate => {
                 inner.dedupe_hits = inner.dedupe_hits.saturating_add(1);
                 Ok(BatchDisposition::Duplicate)
@@ -804,27 +841,36 @@ impl CollectorState {
         std::mem::take(&mut self.lock().pending_probe_requests)
     }
 
-    fn run_maintenance(&self, retention: bool) -> Result<(), StorageError> {
+    fn run_maintenance(&self, retention: bool) -> Result<bool, StorageError> {
         let mut inner = self.lock();
         let now = unix_time_ms();
-        inner.storage.prune_reclassification(now)?;
         self.refresh_active_flow_count(&inner.storage);
         if let Some(mut writer) = inner.storage.maintenance_writer()? {
             drop(inner);
             return if retention {
                 let policy = writer.load_retention_policy()?;
-                writer.run_retention(now, policy)
+                writer.run_retention_bounded(now, policy, sqlite_retention_budget())
             } else {
-                writer.roll_up_hour_and_day(now)
+                if !writer.prune_reclassification_bounded(now, sqlite_retention_budget())? {
+                    return Ok(false);
+                }
+                writer.roll_up_hour_and_day(now).map(|()| true)
             };
         }
         if retention {
             let policy = inner.storage.load_retention_policy()?;
-            inner.storage.run_retention(unix_time_ms(), policy)
+            inner
+                .storage
+                .run_retention_bounded(unix_time_ms(), policy, sqlite_retention_budget())
         } else {
             let now = unix_time_ms();
-            inner.storage.prune_reclassification(now)?;
-            inner.storage.roll_up_hour_and_day(now)
+            if !inner
+                .storage
+                .prune_reclassification_bounded(now, sqlite_retention_budget())?
+            {
+                return Ok(false);
+            }
+            inner.storage.roll_up_hour_and_day(now).map(|()| true)
         }
     }
 
@@ -2253,13 +2299,55 @@ fn spawn_maintenance(state: CollectorState, interval: Duration, retention: bool)
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            let state = state.clone();
-            let result =
-                tokio::task::spawn_blocking(move || state.run_maintenance(retention)).await;
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::error!(%error, retention, "SQLite maintenance failed"),
-                Err(error) => tracing::error!(%error, retention, "SQLite maintenance task failed"),
+            loop {
+                let current = state.clone();
+                let started = std::time::Instant::now();
+                let result =
+                    tokio::task::spawn_blocking(move || current.run_maintenance(retention)).await;
+                let retry = match result {
+                    Ok(Ok(complete)) => {
+                        tracing::info!(
+                            retention,
+                            complete,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "storage maintenance completed"
+                        );
+                        !complete
+                    }
+                    Ok(Err(error)) => {
+                        tracing::error!(%error, retention, "SQLite maintenance failed");
+                        retention
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, retention, "SQLite maintenance task failed");
+                        retention
+                    }
+                };
+                if !retry {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
+    });
+}
+
+fn schedule_retention_continuation(state: CollectorState) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let current = state.clone();
+            match tokio::task::spawn_blocking(move || current.run_maintenance(true)).await {
+                Ok(Ok(false)) => {}
+                Ok(Ok(true)) => break,
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "retention continuation failed");
+                    break;
+                }
+                Err(error) => {
+                    tracing::error!(%error, "retention continuation task failed");
+                    break;
+                }
             }
         }
     });

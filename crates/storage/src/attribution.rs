@@ -110,6 +110,7 @@ fn json_error(error: serde_json::Error) -> rusqlite::Error {
 }
 
 mod pending;
+pub(super) use pending::prune_bounded;
 #[cfg(test)]
 pub(super) use pending::{CORRECTION_WINDOW_MS, ENDED_GRACE_MS};
 pub(super) use pending::{prune, record, restore, restore_active};

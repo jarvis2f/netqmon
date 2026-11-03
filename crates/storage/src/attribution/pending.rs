@@ -1,8 +1,8 @@
 //! Bounded correction work and one recovery checkpoint per session.
 use super::{json_error, merge};
 use crate::{
-    ActiveFlow, FlowAttribution, FlowDelta, FlowKey, FlowLifecycle, MINUTE_MS, TelemetryBatch,
-    to_i64, write_flow_session,
+    ACTIVE_FLOW_TTL_MS, ActiveFlow, FlowAttribution, FlowDelta, FlowKey, FlowLifecycle, MINUTE_MS,
+    TelemetryBatch, to_i64, write_flow_session,
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -71,6 +71,8 @@ pub(crate) fn record(
     now: i64,
 ) -> rusqlite::Result<()> {
     let attr = &current.attribution;
+    #[cfg(test)]
+    let session_started = crate::benchmark_sql_profile_enabled().then(std::time::Instant::now);
     let (id,ended_at): (i64,Option<i64>)=tx.query_row("INSERT INTO flow_rollup_sessions
         (session_id,gateway_id,metadata_json,attribution_json,upload_bytes,download_bytes,packets,last_seen_at,updated_at,ended_at)
         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
@@ -82,14 +84,34 @@ pub(crate) fn record(
             serde_json::to_string(&RecoveryMetadata::new(key,current)).map_err(json_error)?,
             serde_json::to_string(attr).map_err(json_error)?,current.upload_bytes,current.download_bytes,
             current.packets,current.last_seen_at,now,(flow.lifecycle==FlowLifecycle::Ended as i32).then_some(now)],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    #[cfg(test)]
+    if let Some(started) = session_started {
+        crate::benchmark_sql_profile(
+            "sql:flow_rollup_sessions_upsert",
+            Some(started.elapsed()),
+            None,
+        );
+    }
     if ended_at.is_some_and(|ended| ended.saturating_add(ENDED_GRACE_MS) <= now) {
+        #[cfg(test)]
+        let delete_started = crate::benchmark_sql_profile_enabled().then(std::time::Instant::now);
         tx.execute(
             "DELETE FROM flow_rollup_contributions WHERE session_ref=?1",
             [id],
         )?;
+        #[cfg(test)]
+        if let Some(started) = delete_started {
+            crate::benchmark_sql_profile(
+                "sql:flow_rollup_contributions_delete",
+                Some(started.elapsed()),
+                None,
+            );
+        }
     }
     // An expired row may still await the minute cleanup. Its historical counts
     // stay frozen; only the newly ingested delta can enter a new correction window.
+    #[cfg(test)]
+    let contribution_started = crate::benchmark_sql_profile_enabled().then(std::time::Instant::now);
     tx.execute("INSERT INTO flow_rollup_contributions
         (session_ref,timestamp,scope,direction,device_id,remote_ip,protocol,application_id,category_id,domain,protocol_id,
          upload_bytes,download_bytes,packets,flow_count,hour_upload,hour_download,hour_packets,hour_flows,
@@ -113,6 +135,14 @@ pub(crate) fn record(
             flow.remote_ip,flow.protocol,attr.application_id,attr.category_id,attr.domain.as_deref().unwrap_or("unknown"),
             attr.protocol_id,to_i64(flow.upload_bytes),to_i64(flow.download_bytes),to_i64(flow.packets),
             now.saturating_add(CORRECTION_WINDOW_MS),now])?;
+    #[cfg(test)]
+    if let Some(started) = contribution_started {
+        crate::benchmark_sql_profile(
+            "sql:flow_rollup_contributions_upsert",
+            Some(started.elapsed()),
+            None,
+        );
+    }
     Ok(())
 }
 
@@ -226,4 +256,73 @@ pub(crate) fn prune(tx: &Transaction<'_>, now: i64) -> rusqlite::Result<()> {
         ],
     )?;
     Ok(())
+}
+
+/// Performs a bounded, restart-safe slice of recovery-state GC. Checkpointing
+/// occurs before deleting contributions; each caller commits this slice before
+/// asking for the next one.
+pub(crate) fn prune_bounded(
+    tx: &Transaction<'_>,
+    now: i64,
+    limit: usize,
+) -> rusqlite::Result<bool> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX).max(1);
+    let checkpoint_cutoff = now.saturating_sub(CORRECTION_WINDOW_MS);
+    let mut statement = tx.prepare(
+        "SELECT metadata_json,attribution_json,upload_bytes,download_bytes,packets,last_seen_at,updated_at
+         FROM flow_rollup_sessions WHERE ended_at IS NULL AND updated_at<=?1 LIMIT ?2",
+    )?;
+    let stale = statement
+        .query_map(params![checkpoint_cutoff, limit], read_recovery)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for (key, flow) in &stale {
+        if flow.last_seen_at > 0 {
+            write_flow_session(tx, key, flow, Some(flow.last_seen_at), now)?;
+        }
+    }
+
+    tx.execute(
+        "DELETE FROM flow_rollup_contributions
+         WHERE (session_ref,timestamp,scope,direction,device_id,remote_ip,protocol) IN
+           (SELECT session_ref,timestamp,scope,direction,device_id,remote_ip,protocol
+            FROM flow_rollup_contributions WHERE expires_at<=?1 LIMIT ?2)",
+        params![now, limit],
+    )?;
+    tx.execute(
+        "DELETE FROM flow_rollup_sessions WHERE id IN
+           (SELECT s.id FROM flow_rollup_sessions s
+            WHERE ((s.ended_at IS NOT NULL AND s.ended_at<=?1) OR s.updated_at<=?2)
+              AND NOT EXISTS (SELECT 1 FROM flow_rollup_contributions c WHERE c.session_ref=s.id)
+            LIMIT ?3)",
+        params![now.saturating_sub(ENDED_GRACE_MS), checkpoint_cutoff, limit],
+    )?;
+    tx.execute(
+        "UPDATE flow_sessions SET ended_at=last_seen_at WHERE rowid IN
+           (SELECT f.rowid FROM flow_sessions f
+            WHERE f.ended_at IS NULL AND f.checkpointed_at<=?1
+              AND NOT EXISTS (SELECT 1 FROM flow_rollup_sessions r
+                WHERE r.session_id=f.id AND r.ended_at IS NULL AND r.updated_at>?1)
+            LIMIT ?2)",
+        params![now.saturating_sub(ACTIVE_FLOW_TTL_MS), limit],
+    )?;
+
+    tx.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM flow_rollup_contributions WHERE expires_at<=?1
+           UNION ALL SELECT 1 FROM flow_rollup_sessions
+             WHERE (ended_at IS NOT NULL AND ended_at<=?2) OR updated_at<=?3
+           UNION ALL SELECT 1 FROM flow_sessions f
+             WHERE f.ended_at IS NULL AND f.checkpointed_at<=?4
+               AND NOT EXISTS (SELECT 1 FROM flow_rollup_sessions r
+                 WHERE r.session_id=f.id AND r.ended_at IS NULL AND r.updated_at>?4)
+         )",
+        params![
+            now,
+            now.saturating_sub(ENDED_GRACE_MS),
+            checkpoint_cutoff,
+            now.saturating_sub(ACTIVE_FLOW_TTL_MS)
+        ],
+        |row| row.get(0),
+    )
 }

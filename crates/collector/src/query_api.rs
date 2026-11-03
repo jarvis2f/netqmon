@@ -3774,7 +3774,12 @@ async fn put_retention(State(state): State<CollectorState>, body: Bytes) -> Resp
 async fn run_retention(State(state): State<CollectorState>) -> Response {
     let result = state.run_maintenance(true);
     match result {
-        Ok(()) => api_ok(json!({ "status": "completed" })),
+        Ok(complete) => {
+            if !complete {
+                crate::schedule_retention_continuation(state);
+            }
+            api_ok(json!({ "status": if complete { "completed" } else { "in_progress" } }))
+        }
         Err(error) => storage_error(error),
     }
 }
@@ -3824,6 +3829,37 @@ async fn diagnostics(State(state): State<CollectorState>) -> Response {
             .storage
             .load_retention_policy()
             .map_err(|e| e.to_string())?;
+        // Inspect file sizes and freelist without running a checkpoint. WAL file
+        // length is its allocation/high-water mark, not the live frame count.
+        let sqlite = if inner.storage.backend_name() == "sqlite" {
+            let connection = inner.storage.connection();
+            let (page_size, free_pages): (i64, i64) = connection
+                .query_row(
+                    "SELECT (SELECT page_size FROM pragma_page_size), (SELECT freelist_count FROM pragma_freelist_count)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|e| e.to_string())?;
+            let file_sizes = connection
+                .path()
+                .filter(|p| !p.is_empty() && *p != ":memory:")
+                .map(|path| {
+                    let mut wal_path = std::ffi::OsString::from(path);
+                    wal_path.push("-wal");
+                    (
+                        std::fs::metadata(path).ok().map(|m| m.len()),
+                        std::fs::metadata(wal_path).ok().map(|m| m.len()),
+                    )
+                });
+            Some(json!({
+                "page_size_bytes": page_size,
+                "freelist_pages": free_pages,
+                "database_file_bytes": file_sizes.and_then(|sizes| sizes.0),
+                "wal_file_bytes": file_sizes.and_then(|sizes| sizes.1),
+            }))
+        } else {
+            None
+        };
 
         let gateway = if let Some(ch) = inner.storage.clickhouse_storage() {
             let gw_sql = "SELECT id, name, agent_version, kernel_version, openwrt_version, last_seen FROM gateways FINAL ORDER BY created_at LIMIT 1 FORMAT JSON";
@@ -3862,6 +3898,7 @@ async fn diagnostics(State(state): State<CollectorState>) -> Response {
             "collector_version": env!("CARGO_PKG_VERSION"),
             "db_backend": inner.storage.backend_name(),
             "db_size_bytes": db_size,
+            "sqlite": sqlite,
             "gateway": gateway,
             "active_flows": active_flows,
             "unknown_ratio": unknown_ratio,

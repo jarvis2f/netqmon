@@ -1,6 +1,229 @@
 use super::*;
 
 #[test]
+fn bounded_retention_allows_another_sqlite_writer_to_make_progress() {
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("retention-concurrency.db");
+    let mut storage = open_at(&path, NOW).unwrap();
+    storage
+        .connection()
+        .execute_batch("CREATE TABLE writer_probe (value INTEGER)")
+        .unwrap();
+    storage.connection().execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<10000) INSERT INTO traffic_scope_minute(timestamp,gateway_id,scope,direction,device_id,application_id,category_id,domain,remote_ip,protocol,protocol_id,upload_bytes,download_bytes,packets,flow_count) SELECT ?1,'gateway-1',1,1,1,'app','cat','test',CAST(printf('%016x',i) AS BLOB),6,'tcp',1,1,1,1 FROM n", [to_i64(NOW)]).unwrap();
+    let running = Arc::new(AtomicBool::new(true));
+    let count = Arc::new(AtomicUsize::new(0));
+    let ready = Arc::new(Barrier::new(2));
+    let worker = {
+        let (running, count, ready, path) =
+            (running.clone(), count.clone(), ready.clone(), path.clone());
+        std::thread::spawn(move || {
+            let connection = Connection::open(path).unwrap();
+            connection.busy_timeout(Duration::from_secs(5)).unwrap();
+            ready.wait();
+            while running.load(Ordering::Relaxed) {
+                if connection
+                    .execute("INSERT INTO writer_probe VALUES(1)", [])
+                    .is_ok()
+                {
+                    count.fetch_add(1, Ordering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+    ready.wait();
+    let before = count.load(Ordering::Relaxed);
+    let result = storage.run_retention_bounded(
+        NOW + 31 * DAY_MS as u64,
+        RetentionPolicy::default(),
+        RetentionBudget::default(),
+    );
+    running.store(false, Ordering::Relaxed);
+    worker.join().unwrap();
+    assert!(result.unwrap());
+    assert!(
+        count.load(Ordering::Relaxed) > before,
+        "concurrent writer made no progress"
+    );
+}
+
+#[test]
+fn bounded_retention_resumes_after_failure_and_restart_with_scope_totals_consistent() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("bounded-retention.db");
+    let mut storage = open_at(&path, NOW).unwrap();
+    storage
+        .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
+        .unwrap();
+    let mut input = batch(1, FlowLifecycle::Ended);
+    let original = input.flows[0].clone();
+    input.flows = (1..=8)
+        .map(|i| {
+            let mut f = original.clone();
+            f.remote_ip = vec![198, 51, 100, i];
+            f
+        })
+        .collect();
+    storage
+        .persist_classified_batch(&input, &[], &[], NOW)
+        .unwrap();
+    let later = NOW + 31 * DAY_MS as u64;
+    let budget = RetentionBudget {
+        max_rows_per_batch: 1,
+        transaction_target: Duration::from_millis(100),
+        total_budget: Duration::from_secs(5),
+    };
+    assert!(
+        !storage
+            .run_retention_bounded(
+                later,
+                RetentionPolicy::default(),
+                RetentionBudget {
+                    total_budget: Duration::ZERO,
+                    ..budget
+                }
+            )
+            .unwrap()
+    );
+    storage.connection().execute_batch("CREATE TRIGGER fail_scope_expiry BEFORE DELETE ON traffic_scope_minute BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+    let mut injected_failure_seen = false;
+    for _ in 0..100 {
+        match storage.run_retention_bounded(later, RetentionPolicy::default(), budget) {
+            Err(_) => {
+                injected_failure_seen = true;
+                break;
+            }
+            Ok(true) => break,
+            Ok(false) => {}
+        }
+    }
+    assert!(injected_failure_seen);
+    let source: i64 = storage
+        .connection()
+        .query_row("SELECT count(*) FROM traffic_scope_minute", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let total: i64 = storage
+        .connection()
+        .query_row(
+            "SELECT sum(source_rows) FROM traffic_scope_total_minute",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!((source, total), (8, 8));
+    storage
+        .connection()
+        .execute_batch("DROP TRIGGER fail_scope_expiry")
+        .unwrap();
+    drop(storage);
+    let mut storage = open_at(&path, later).unwrap();
+    let mut completed = false;
+    for _ in 0..100 {
+        if storage
+            .run_retention_bounded(later, RetentionPolicy::default(), budget)
+            .unwrap()
+        {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed);
+    assert_eq!(
+        storage
+            .connection()
+            .query_row("SELECT count(*) FROM traffic_scope_minute", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        storage
+            .connection()
+            .query_row("SELECT count(*) FROM traffic_scope_total_minute", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn retention_progress_interrupt_rolls_back_current_batch_and_can_resume() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("interrupt-retention.db");
+    let mut storage = open_at(&path, NOW).unwrap();
+    storage
+        .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
+        .unwrap();
+    let mut input = batch(1, FlowLifecycle::Ended);
+    let original = input.flows[0].clone();
+    input.flows = (1..=32)
+        .map(|i| {
+            let mut flow = original.clone();
+            flow.remote_ip = vec![203, 0, 113, i];
+            flow
+        })
+        .collect();
+    storage
+        .persist_classified_batch(&input, &[], &[], NOW)
+        .unwrap();
+    let later = NOW + 31 * DAY_MS as u64;
+    let interrupted = storage
+        .run_retention_bounded(
+            later,
+            RetentionPolicy::default(),
+            RetentionBudget {
+                max_rows_per_batch: 32,
+                transaction_target: Duration::ZERO,
+                total_budget: Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+    assert!(!interrupted);
+    assert_eq!(
+        storage
+            .connection()
+            .query_row("SELECT count(*) FROM traffic_scope_minute", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        32
+    );
+    drop(storage);
+    let mut storage = open_at(&path, later).unwrap();
+    let mut complete = false;
+    for _ in 0..100 {
+        if storage
+            .run_retention_bounded(
+                later,
+                RetentionPolicy::default(),
+                RetentionBudget {
+                    max_rows_per_batch: 8,
+                    ..RetentionBudget::default()
+                },
+            )
+            .unwrap()
+        {
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete);
+    assert_eq!(
+        storage
+            .connection()
+            .query_row("SELECT count(*) FROM traffic_scope_minute", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn v8_upgrade_bootstraps_only_unmaterialized_history() {
     let mut storage = setup();
     storage

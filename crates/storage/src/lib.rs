@@ -219,6 +219,71 @@ impl Default for RetentionPolicy {
     }
 }
 
+/// Limits work per SQLite retention invocation. Transaction time is a target:
+/// an individual SQLite statement or trigger cannot be preempted safely here.
+#[derive(Clone, Copy, Debug)]
+pub struct RetentionBudget {
+    pub max_rows_per_batch: usize,
+    pub transaction_target: Duration,
+    pub total_budget: Duration,
+}
+
+impl Default for RetentionBudget {
+    fn default() -> Self {
+        Self {
+            max_rows_per_batch: 500,
+            transaction_target: Duration::from_millis(100),
+            total_budget: Duration::from_secs(5),
+        }
+    }
+}
+
+fn sqlite_is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static RETENTION_TRANSACTION_TIMES: std::cell::RefCell<Vec<Duration>> = const { std::cell::RefCell::new(Vec::new()) };
+    static RETENTION_PHASE_TIMES: std::cell::RefCell<Vec<(Duration, Duration, Duration)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+#[derive(Default, Debug)]
+struct SqlProfileEntry {
+    calls: u64,
+    nanos: u128,
+    keys: HashSet<String>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static BENCH_SQL_PROFILE: std::cell::RefCell<Option<HashMap<String, SqlProfileEntry>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn benchmark_sql_profile(label: &str, elapsed: Option<Duration>, keys: Option<&[Value]>) {
+    BENCH_SQL_PROFILE.with(|profile| {
+        if let Some(entries) = profile.borrow_mut().as_mut() {
+            let entry = entries.entry(label.to_owned()).or_default();
+            entry.calls += 1;
+            entry.nanos += elapsed.map_or(0, |duration| duration.as_nanos());
+            if let Some(keys) = keys {
+                entry.keys.insert(format!("{keys:?}"));
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+fn benchmark_sql_profile_enabled() -> bool {
+    BENCH_SQL_PROFILE.with(|profile| profile.borrow().is_some())
+}
+
 pub mod clickhouse;
 pub use clickhouse::{ClickHouseClient, ClickHouseConfig, ClickHouseStorage, from_hex, to_hex};
 
@@ -467,7 +532,13 @@ impl SqliteStorage {
         };
         let mut connection =
             Connection::open_with_flags(path, flags | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-        connection.busy_timeout(Duration::from_secs(5))?;
+        // Maintenance uses a short lock wait so it yields to Collector writes.
+        // A BUSY result leaves the current batch uncommitted and retryable.
+        connection.busy_timeout(if read_only {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_millis(50)
+        })?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "query_only", read_only)?;
         if read_only {
@@ -521,8 +592,18 @@ impl SqliteStorage {
             connection,
             active_flows: HashMap::new(),
         };
-        // Close stale persisted state before loading it into memory again.
-        storage.prune_reclassification(now_ms)?;
+        // Close stale persisted state before loading it into memory again, but
+        // commit it in bounded slices so startup cannot hold SQLite's writer
+        // lock for the full history scan.
+        storage.connection.busy_timeout(Duration::from_millis(50))?;
+        while !storage.prune_reclassification_bounded(
+            now_ms,
+            RetentionBudget::default().max_rows_per_batch,
+            RetentionBudget::default().transaction_target,
+        )? {
+            std::thread::yield_now();
+        }
+        storage.connection.busy_timeout(Duration::from_secs(5))?;
         storage.active_flows = load_active_flows(&storage.connection)?;
         Ok(storage)
     }
@@ -848,6 +929,23 @@ impl SqliteStorage {
         device_identities: &[DeviceIdentityUpdate],
         received_at_ms: u64,
     ) -> rusqlite::Result<PersistDisposition> {
+        self.persist_classified_batch_with_total_batching(
+            batch,
+            attributions,
+            device_identities,
+            received_at_ms,
+            true,
+        )
+    }
+
+    fn persist_classified_batch_with_total_batching(
+        &mut self,
+        batch: &TelemetryBatch,
+        attributions: &[FlowAttribution],
+        device_identities: &[DeviceIdentityUpdate],
+        received_at_ms: u64,
+        batch_total: bool,
+    ) -> rusqlite::Result<PersistDisposition> {
         let received_at = to_i64(received_at_ms);
         let transaction = self.connection.transaction()?;
         let inserted = transaction.execute(
@@ -876,6 +974,7 @@ impl SqliteStorage {
             batch,
             attributions,
             received_at,
+            batch_total,
         )?;
         transaction.commit()?;
         commit_active_flows(&mut self.active_flows, batch, staged_active_flows);
@@ -984,77 +1083,327 @@ impl SqliteStorage {
     ///
     /// Returns an error when the retention transaction cannot be committed.
     pub fn run_retention(&mut self, now_ms: u64, policy: RetentionPolicy) -> rusqlite::Result<()> {
+        self.run_retention_bounded(now_ms, policy, RetentionBudget::default())
+            .map(|_| ())
+    }
+
+    /// Returns true when a complete pass found no further expired rows.
+    pub fn run_retention_bounded(
+        &mut self,
+        now_ms: u64,
+        policy: RetentionPolicy,
+        budget: RetentionBudget,
+    ) -> rusqlite::Result<bool> {
+        let started = std::time::Instant::now();
         let now = to_i64(now_ms);
-        let transaction = self.connection.transaction()?;
-        prune_flow_state(&transaction, &self.active_flows, now)?;
-        delete_older_than(
-            &transaction,
-            "flow_sessions",
-            "last_seen_at",
-            now,
-            policy.flow_sessions_days,
-        )?;
-        if policy.dns_days == 0 {
-            transaction.execute("DELETE FROM dns_observations WHERE expires_at < ?1", [now])?;
-        } else {
-            let cutoff = now.saturating_sub(i64::from(policy.dns_days) * DAY_MS);
-            transaction.execute(
-                "DELETE FROM dns_observations WHERE expires_at < ?1 OR observed_at < ?2",
-                params![now, cutoff],
-            )?;
+        if !self.prune_reclassification_bounded(
+            now_ms,
+            budget.max_rows_per_batch,
+            budget.transaction_target,
+        )? {
+            return Ok(false);
         }
-        delete_older_than(
-            &transaction,
-            "ingest_batches",
-            "received_at",
-            now,
-            policy.minute_days,
-        )?;
-        // Scope data has minute resolution only and is not in DIMENSIONS.
-        // Its chart totals are removed by the same transaction's delete trigger.
-        delete_older_than(
-            &transaction,
-            "traffic_scope_minute",
-            "timestamp",
-            now,
-            policy.minute_days,
-        )?;
+        let mut tasks = Vec::new();
+        let mut add = |table: String, keys: String, column: &'static str, days: u32| {
+            if days != 0 {
+                tasks.push((
+                    table,
+                    keys,
+                    column,
+                    now.saturating_sub(i64::from(days) * DAY_MS),
+                    false,
+                ));
+            }
+        };
+        // Pending work must expire before its aggregate, otherwise another
+        // maintenance connection can rematerialize an expired aggregate.
         for dimension in DIMENSIONS {
-            delete_older_than(
-                &transaction,
-                &format!("traffic_{dimension}_minute"),
-                "timestamp",
-                now,
-                policy.minute_days,
-            )?;
-            delete_older_than(
-                &transaction,
-                &format!("traffic_{dimension}_hour"),
-                "timestamp",
-                now,
-                policy.hour_days,
-            )?;
-            delete_older_than(
-                &transaction,
-                &format!("traffic_{dimension}_day"),
-                "timestamp",
-                now,
-                policy.day_days,
-            )?;
             for (tier, days) in [("hour", policy.hour_days), ("day", policy.day_days)] {
-                delete_older_than(
-                    &transaction,
-                    &format!("traffic_{dimension}_{tier}_pending"),
+                add(
+                    format!("traffic_{dimension}_{tier}_pending"),
+                    format!("timestamp, {}", dimension_columns(dimension)),
                     "timestamp",
-                    now,
                     days,
-                )?;
+                );
             }
         }
-        transaction.commit()?;
-        self.active_flows
-            .retain(|_, flow| flow.last_received_at > now.saturating_sub(ACTIVE_FLOW_TTL_MS));
-        Ok(())
+        add(
+            "flow_sessions".into(),
+            "rowid".into(),
+            "last_seen_at",
+            policy.flow_sessions_days,
+        );
+        add(
+            "ingest_batches".into(),
+            "rowid".into(),
+            "received_at",
+            policy.minute_days,
+        );
+        add(
+            "traffic_scope_minute".into(),
+            "rowid".into(),
+            "timestamp",
+            policy.minute_days,
+        );
+        for dimension in DIMENSIONS {
+            for (tier, days) in [
+                ("minute", policy.minute_days),
+                ("hour", policy.hour_days),
+                ("day", policy.day_days),
+            ] {
+                add(
+                    format!("traffic_{dimension}_{tier}"),
+                    "rowid".into(),
+                    "timestamp",
+                    days,
+                );
+            }
+        }
+        let dns_cutoff = if policy.dns_days == 0 {
+            i64::MIN
+        } else {
+            now.saturating_sub(i64::from(policy.dns_days) * DAY_MS)
+        };
+        tasks.push((
+            "dns_observations".into(),
+            "rowid".into(),
+            "expires_at",
+            dns_cutoff,
+            true,
+        ));
+        let mut rows_limit = budget.max_rows_per_batch.clamp(1, i64::MAX as usize);
+        let mut done = vec![false; tasks.len()];
+        let mut remaining = tasks.len();
+        let mut stalled = 0;
+        // Rotate the start across invocations so a busy early table cannot
+        // permanently starve later tables when the job budget is short.
+        let mut index = usize::try_from(now_ms / 60_000).unwrap_or(0) % tasks.len();
+        while remaining != 0 {
+            if started.elapsed() >= budget.total_budget {
+                return Ok(false);
+            }
+            if done[index] {
+                index = (index + 1) % tasks.len();
+                continue;
+            }
+            let (table, keys, column, cutoff, dns) = &tasks[index];
+            let lhs = if keys == "rowid" {
+                keys.clone()
+            } else {
+                format!("({keys})")
+            };
+            let dependent = !*dns && (table.ends_with("_hour") || table.ends_with("_day"));
+            let predicate = if *dns {
+                "expires_at < ?1 OR observed_at < ?2".to_owned()
+            } else {
+                format!("{column} < ?1")
+            };
+            let sql = format!(
+                "DELETE FROM {table} WHERE {lhs} IN (SELECT {keys} FROM {table} WHERE {predicate} LIMIT ?3)"
+            );
+            let tx_started = std::time::Instant::now();
+            let begin_started = std::time::Instant::now();
+            let tx = match self.connection.transaction() {
+                Ok(tx) => tx,
+                Err(error) if sqlite_is_busy(&error) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            let begin_elapsed = begin_started.elapsed();
+            // SQLite can interrupt long VM execution inside DELETE/trigger
+            // programs. This is cooperative and does not cover lock acquisition,
+            // fsync, or an individual OS scheduling stall.
+            let statement_deadline = tx_started + budget.transaction_target;
+            tx.progress_handler(
+                1_000,
+                Some(move || std::time::Instant::now() >= statement_deadline),
+            )?;
+            let delete_started = std::time::Instant::now();
+            let work = (|| -> rusqlite::Result<(bool, usize)> {
+                let blocked = dependent
+                    && tx.query_row(
+                        &format!(
+                            "SELECT EXISTS(SELECT 1 FROM {table}_pending WHERE timestamp < ?1)"
+                        ),
+                        [cutoff],
+                        |row| row.get::<_, bool>(0),
+                    )?;
+                let deleted = if blocked {
+                    0
+                } else {
+                    tx.execute(
+                        &sql,
+                        params![
+                            if *dns { now } else { *cutoff },
+                            if *dns { *cutoff } else { 0 },
+                            i64::try_from(rows_limit).unwrap_or(i64::MAX)
+                        ],
+                    )?
+                };
+                Ok((blocked, deleted))
+            })();
+            let delete_elapsed = delete_started.elapsed();
+            tx.progress_handler(0, None::<fn() -> bool>)?;
+            let (blocked, deleted) = match work {
+                Ok(result) => result,
+                Err(error) => {
+                    drop(tx); // Drop rolls back this batch; previous commits stand.
+                    if sqlite_is_busy(&error) {
+                        return Ok(false);
+                    }
+                    if matches!(
+                        &error,
+                        rusqlite::Error::SqliteFailure(code, _)
+                            if code.code == rusqlite::ErrorCode::OperationInterrupted
+                    ) {
+                        rows_limit = (rows_limit / 2).max(1);
+                        if started.elapsed() >= budget.total_budget {
+                            return Ok(false);
+                        }
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            let commit_started = std::time::Instant::now();
+            if let Err(error) = tx.commit() {
+                if sqlite_is_busy(&error) {
+                    return Ok(false);
+                }
+                return Err(error);
+            }
+            let commit_elapsed = commit_started.elapsed();
+            let elapsed = tx_started.elapsed();
+            #[cfg(test)]
+            RETENTION_TRANSACTION_TIMES.with(|times| times.borrow_mut().push(elapsed));
+            #[cfg(test)]
+            RETENTION_PHASE_TIMES.with(|times| {
+                times
+                    .borrow_mut()
+                    .push((begin_elapsed, delete_elapsed, commit_elapsed))
+            });
+            tracing::debug!(
+                table,
+                rows = deleted,
+                elapsed_us = elapsed.as_micros(),
+                begin_us = begin_elapsed.as_micros(),
+                delete_and_trigger_us = delete_elapsed.as_micros(),
+                commit_us = commit_elapsed.as_micros(),
+                "retention batch committed"
+            );
+            if elapsed > budget.transaction_target {
+                rows_limit = (rows_limit / 2).max(1);
+            }
+            if blocked {
+                stalled += 1;
+                if stalled >= remaining {
+                    return Ok(false);
+                }
+            } else {
+                stalled = 0;
+                if deleted == 0 {
+                    done[index] = true;
+                    remaining -= 1;
+                }
+            }
+            if deleted != 0 {
+                // Allow an ingestion writer waiting in SQLite's busy handler
+                // to acquire the lock between maintenance transactions.
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            index = (index + 1) % tasks.len();
+        }
+        Ok(true)
+    }
+
+    /// Executes one bounded recovery-state checkpoint/GC transaction.
+    /// Committed slices are safe to repeat after restart; an interrupted slice
+    /// rolls back and the next maintenance pass resumes from the remaining rows.
+    pub fn prune_reclassification_bounded(
+        &mut self,
+        now_ms: u64,
+        limit: usize,
+        transaction_target: Duration,
+    ) -> rusqlite::Result<bool> {
+        let now = to_i64(now_ms);
+        let cutoff = now.saturating_sub(ACTIVE_FLOW_TTL_MS);
+        let mut candidates = Vec::new();
+        for (key, flow) in &self.active_flows {
+            if flow.last_received_at <= cutoff && flow.last_seen_at > 0 {
+                candidates.push((key.clone(), flow.clone()));
+                if candidates.len() >= limit.max(1) {
+                    break;
+                }
+            }
+        }
+        let started = std::time::Instant::now();
+        let tx = match self.connection.transaction() {
+            Ok(tx) => tx,
+            Err(error) if sqlite_is_busy(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let begin_elapsed = started.elapsed();
+        let deadline = started + transaction_target;
+        tx.progress_handler(1_000, Some(move || std::time::Instant::now() >= deadline))?;
+        let result = (|| -> rusqlite::Result<bool> {
+            for (key, flow) in &candidates {
+                write_flow_session(&tx, key, flow, Some(flow.last_seen_at), now)?;
+            }
+            attribution::prune_bounded(&tx, now, limit.max(1))
+        })();
+        tx.progress_handler(0, None::<fn() -> bool>)?;
+        let prune_elapsed = started.elapsed().saturating_sub(begin_elapsed);
+        let pending = match result {
+            Ok(pending) => pending,
+            Err(rusqlite::Error::SqliteFailure(code, _))
+                if code.code == rusqlite::ErrorCode::OperationInterrupted =>
+            {
+                drop(tx);
+                return Ok(false);
+            }
+            Err(error) if sqlite_is_busy(&error) => {
+                drop(tx);
+                return Ok(false);
+            }
+            Err(error) => {
+                drop(tx);
+                return Err(error);
+            }
+        };
+        let commit_started = std::time::Instant::now();
+        if let Err(error) = tx.commit() {
+            if sqlite_is_busy(&error) {
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        let commit_elapsed = commit_started.elapsed();
+        let elapsed = started.elapsed();
+        #[cfg(test)]
+        {
+            RETENTION_TRANSACTION_TIMES.with(|times| times.borrow_mut().push(elapsed));
+            RETENTION_PHASE_TIMES.with(|times| {
+                times
+                    .borrow_mut()
+                    .push((begin_elapsed, prune_elapsed, commit_elapsed))
+            });
+        }
+        tracing::debug!(
+            elapsed_us = elapsed.as_micros(),
+            begin_us = begin_elapsed.as_micros(),
+            recovery_gc_us = prune_elapsed.as_micros(),
+            commit_us = commit_elapsed.as_micros(),
+            "retention recovery batch committed"
+        );
+        for (key, _) in candidates {
+            self.active_flows.remove(&key);
+        }
+        if pending {
+            return Ok(false);
+        }
+        Ok(!self
+            .active_flows
+            .values()
+            .any(|flow| flow.last_received_at <= cutoff && flow.last_seen_at > 0))
     }
 
     pub fn connection(&self) -> &Connection {
@@ -1365,6 +1714,24 @@ impl Storage {
         }
     }
 
+    /// Commits one bounded, resumable recovery-state cleanup slice.
+    pub fn prune_reclassification_bounded(
+        &mut self,
+        now_ms: u64,
+        budget: RetentionBudget,
+    ) -> StorageResult<bool> {
+        match self {
+            Self::Sqlite(storage) => storage
+                .prune_reclassification_bounded(
+                    now_ms,
+                    budget.max_rows_per_batch,
+                    budget.transaction_target,
+                )
+                .map_err(Into::into),
+            Self::ClickHouse(_) => Ok(true),
+        }
+    }
+
     /// Applies late DPI metadata without inserting telemetry or changing counters.
     ///
     /// # Errors
@@ -1590,6 +1957,22 @@ impl Storage {
 
     pub fn run_retention(&mut self, now_ms: u64, policy: RetentionPolicy) -> StorageResult<()> {
         StorageBackend::run_retention(self, now_ms, policy)
+    }
+
+    pub fn run_retention_bounded(
+        &mut self,
+        now_ms: u64,
+        policy: RetentionPolicy,
+        budget: RetentionBudget,
+    ) -> StorageResult<bool> {
+        match self {
+            Self::Sqlite(storage) => storage
+                .run_retention_bounded(now_ms, policy, budget)
+                .map_err(Into::into),
+            Self::ClickHouse(storage) => {
+                StorageBackend::run_retention(storage, now_ms, policy).map(|()| true)
+            }
+        }
     }
 
     pub fn load_retention_policy(&self) -> StorageResult<RetentionPolicy> {
@@ -2366,15 +2749,6 @@ fn persist_minute_rollups(
         },
         |id| (id, "unknown"),
     );
-    upsert_rollup(
-        tx,
-        "traffic_total_minute",
-        None,
-        &[timestamp.into(), batch.gateway_id.clone().into()],
-        upload,
-        download,
-        packets,
-    )?;
     if let Some(device_id) = device_id {
         upsert_rollup(
             tx,
@@ -2465,6 +2839,148 @@ fn persist_minute_rollups(
     Ok(())
 }
 
+// Only the total dimension is batched. Its minute trigger updates one hour
+// pending row. The other dimensions participate in attribution transfers and
+// remain ordered per flow until their trigger/overflow behavior is proven.
+// This cache stores one key and four counters, regardless of batch size.
+const TOTAL_ROLLUP_MAX_DELTAS: i64 = 1024;
+
+#[cfg(test)]
+thread_local! {
+    static LAST_TOTAL_ROLLUP_COUNTS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[derive(Default)]
+struct TotalRollupBatch {
+    base: Option<([i64; 4], [i64; 4])>,
+    delta: [i64; 4],
+    disabled: bool,
+    statements: u64,
+    original: u64,
+}
+
+impl TotalRollupBatch {
+    fn read_counters(
+        tx: &Transaction<'_>,
+        sql: &str,
+        timestamp: i64,
+        gateway: &str,
+    ) -> rusqlite::Result<Option<[i64; 4]>> {
+        let values: Option<[Value; 4]> = tx
+            .query_row(sql, params![timestamp, gateway], |r| {
+                Ok([r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?])
+            })
+            .optional()?;
+        let Some(values) = values else {
+            return Ok(Some([0; 4]));
+        };
+        let mut counters = [0; 4];
+        for (i, value) in values.into_iter().enumerate() {
+            match value {
+                Value::Integer(n) if n >= 0 => counters[i] = n,
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(counters))
+    }
+
+    fn add(
+        &mut self,
+        tx: &Transaction<'_>,
+        batch: &TelemetryBatch,
+        flow: &FlowDelta,
+    ) -> rusqlite::Result<()> {
+        let timestamp = to_i64(batch.sent_at) / MINUTE_MS * MINUTE_MS;
+        #[cfg(test)]
+        if benchmark_sql_profile_enabled() {
+            benchmark_sql_profile(
+                "raw:traffic_total_minute",
+                None,
+                Some(&[timestamp.into(), batch.gateway_id.clone().into()]),
+            );
+        }
+        let values = [
+            to_i64(flow.upload_bytes),
+            to_i64(flow.download_bytes),
+            to_i64(flow.packets),
+            1,
+        ];
+        self.original += 1;
+        if !self.disabled && self.base.is_none() {
+            let old = Self::read_counters(
+                tx,
+                "SELECT upload_bytes,download_bytes,packets,flow_count FROM traffic_total_minute WHERE timestamp=?1 AND gateway_id=?2",
+                timestamp,
+                &batch.gateway_id,
+            )?;
+            let pending = Self::read_counters(
+                tx,
+                "SELECT upload_bytes,download_bytes,packets,flow_count FROM traffic_total_hour_pending WHERE timestamp=?1 AND gateway_id=?2",
+                timestamp / HOUR_MS * HOUR_MS,
+                &batch.gateway_id,
+            )?;
+            self.base = old.zip(pending);
+            if self.base.is_none() {
+                self.disabled = true;
+            }
+        }
+        if let Some((old, pending)) = self.base {
+            let mut next = [0; 4];
+            // The standard minute trigger computes pending - old + new on
+            // every update. Nonnegative integer old/pending and deltas make
+            // -old and pending-old representable; checking both endpoints
+            // below also keeps every intermediate pending+delta and new value
+            // in i64. Thus SQLite never switches to REAL in either ordering.
+            let safe = (0..4).all(|i| {
+                let Some(sum) = self.delta[i].checked_add(values[i]) else {
+                    return false;
+                };
+                next[i] = sum;
+                old[i].checked_add(sum).is_some() && pending[i].checked_add(sum).is_some()
+            });
+            if safe {
+                self.delta = next;
+                if self.delta[3] == TOTAL_ROLLUP_MAX_DELTAS {
+                    self.flush(tx, batch)?;
+                }
+                return Ok(());
+            }
+            self.flush(tx, batch)?;
+            self.disabled = true;
+        }
+        self.statements += 1;
+        upsert_rollup(
+            tx,
+            "traffic_total_minute",
+            None,
+            &[timestamp.into(), batch.gateway_id.clone().into()],
+            values[0],
+            values[1],
+            values[2],
+        )
+    }
+
+    fn flush(&mut self, tx: &Transaction<'_>, batch: &TelemetryBatch) -> rusqlite::Result<()> {
+        if self.delta[3] != 0 {
+            let timestamp = to_i64(batch.sent_at) / MINUTE_MS * MINUTE_MS;
+            adjust_rollup(
+                tx,
+                "traffic_total_minute",
+                None,
+                &[timestamp.into(), batch.gateway_id.clone().into()],
+                self.delta[0],
+                self.delta[1],
+                self.delta[2],
+                self.delta[3],
+            )?;
+            self.statements += 1;
+        }
+        self.base = None;
+        self.delta = [0; 4];
+        Ok(())
+    }
+}
+
 fn upsert_rollup(
     tx: &Transaction<'_>,
     table: &str,
@@ -2474,6 +2990,10 @@ fn upsert_rollup(
     download: i64,
     packets: i64,
 ) -> rusqlite::Result<()> {
+    #[cfg(test)]
+    if table != "traffic_total_minute" && benchmark_sql_profile_enabled() {
+        benchmark_sql_profile(&format!("raw:{table}"), None, Some(keys));
+    }
     adjust_rollup(tx, table, dimension, keys, upload, download, packets, 1)
 }
 
@@ -2516,8 +3036,14 @@ fn adjust_rollup(
         packets.into(),
         flow_count.into(),
     ]);
+    #[cfg(test)]
+    let started = benchmark_sql_profile_enabled().then(std::time::Instant::now);
     tx.prepare_cached(&sql)?
         .execute(rusqlite::params_from_iter(values))?;
+    #[cfg(test)]
+    if let Some(started) = started {
+        benchmark_sql_profile(&format!("upsert:{table}"), Some(started.elapsed()), None);
+    }
     Ok(())
 }
 
@@ -2527,9 +3053,14 @@ fn update_active_flows(
     batch: &TelemetryBatch,
     attributions: &[FlowAttribution],
     received_at: i64,
+    batch_total: bool,
 ) -> rusqlite::Result<()> {
     let unknown = FlowAttribution::default();
     let mut device_ids = HashMap::new();
+    let mut totals = TotalRollupBatch {
+        disabled: !batch_total,
+        ..TotalRollupBatch::default()
+    };
     for (index, flow) in batch.flows.iter().enumerate() {
         let attribution = attributions.get(index).unwrap_or(&unknown);
         let key = FlowKey::from_batch(&batch.gateway_id, flow);
@@ -2547,6 +3078,7 @@ fn update_active_flows(
             let previous = current.attribution.clone();
             current.add(flow, attribution, received_at);
             if current.attribution != previous {
+                totals.flush(tx, batch)?;
                 attribution::reassign(tx, &current.session_id, &current.attribution, received_at)?;
             }
             // Rollups and the contribution ledger must use the merged identity,
@@ -2558,13 +3090,26 @@ fn update_active_flows(
                 }
             };
             current.device_id = device_id.or(current.device_id);
+            totals.add(tx, batch, flow)?;
             persist_minute_rollups(tx, batch, flow, &current.attribution, current.device_id)?;
+            #[cfg(test)]
+            let ledger_started = benchmark_sql_profile_enabled().then(std::time::Instant::now);
             attribution::record(tx, &key, current, batch, flow, received_at)?;
+            #[cfg(test)]
+            if let Some(started) = ledger_started {
+                benchmark_sql_profile("attribution_record", Some(started.elapsed()), None);
+            }
             let checkpoint =
                 received_at.saturating_sub(current.checkpointed_at) >= FLOW_CHECKPOINT_MS;
             let ended_at = ended.then(|| flow_lifecycle_end_at(flow, received_at));
             if (ended || checkpoint) && current.last_seen_at > 0 {
+                #[cfg(test)]
+                let session_started = benchmark_sql_profile_enabled().then(std::time::Instant::now);
                 write_flow_session(tx, &key, current, ended_at, received_at)?;
+                #[cfg(test)]
+                if let Some(started) = session_started {
+                    benchmark_sql_profile("flow_session", Some(started.elapsed()), None);
+                }
             }
             if ended || checkpoint {
                 current.checkpointed_at = received_at;
@@ -2574,6 +3119,15 @@ fn update_active_flows(
             active.remove(&key);
         }
     }
+    totals.flush(tx, batch)?;
+    #[cfg(test)]
+    LAST_TOTAL_ROLLUP_COUNTS.set((totals.original, totals.statements));
+    tracing::debug!(
+        flows = batch.flows.len(),
+        total_rollup_original = totals.original,
+        total_rollup_upserts = totals.statements,
+        "minute total rollup batching"
+    );
     Ok(())
 }
 
@@ -2705,24 +3259,6 @@ fn aggregate(
     ))?.execute([cutoff])?;
     tx.prepare_cached(&format!("DELETE FROM {pending} WHERE timestamp<?1"))?
         .execute([cutoff])?;
-    Ok(())
-}
-
-fn delete_older_than(
-    tx: &Transaction<'_>,
-    table: &str,
-    column: &str,
-    now: i64,
-    days: u32,
-) -> rusqlite::Result<()> {
-    if days == 0 {
-        return Ok(());
-    }
-    let cutoff = now.saturating_sub(i64::from(days) * DAY_MS);
-    tx.execute(
-        &format!("DELETE FROM {table} WHERE {column} < ?1"),
-        [cutoff],
-    )?;
     Ok(())
 }
 

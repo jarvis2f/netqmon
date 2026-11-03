@@ -1,6 +1,248 @@
 use super::*;
 
 #[test]
+fn total_batch_matches_original_across_barriers_and_capacity() {
+    let mut baseline = setup();
+    let mut optimized = setup();
+    let mut input = batch(1, FlowLifecycle::Active);
+    let flow = input.flows[0].clone();
+    input.flows = (0..1300)
+        .map(|i: u32| {
+            let mut f = flow.clone();
+            f.remote_ip = i.to_be_bytes().to_vec();
+            f
+        })
+        .collect();
+    input.flows.push(input.flows[20].clone());
+    let mut attrs = vec![FlowAttribution::default(); input.flows.len()];
+    *attrs.last_mut().unwrap() = service_attribution();
+    baseline
+        .persist_classified_batch_with_total_batching(&input, &attrs, &[], NOW, false)
+        .unwrap();
+    optimized
+        .persist_classified_batch_with_total_batching(&input, &attrs, &[], NOW, true)
+        .unwrap();
+    let (original, written) = LAST_TOTAL_ROLLUP_COUNTS.get();
+    assert_eq!(original, 1301);
+    assert!(written < original);
+    for table in [
+        "traffic_total_minute",
+        "traffic_total_hour_pending",
+        "traffic_device_minute",
+        "traffic_application_minute",
+        "traffic_domain_minute",
+        "traffic_destination_minute",
+        "traffic_scope_minute",
+        "traffic_scope_total_minute",
+    ] {
+        let dump = |s: &SqliteStorage| -> Vec<String> {
+            let mut stmt = s
+                .connection()
+                .prepare(&format!("SELECT * FROM {table}"))
+                .unwrap();
+            let mut rows = stmt
+                .query_map([], |r| {
+                    Ok(format!(
+                        "{:?}",
+                        (0..r.as_ref().column_count())
+                            .map(|i| r.get::<_, Value>(i))
+                            .collect::<rusqlite::Result<Vec<_>>>()?
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows.sort();
+            rows
+        };
+        assert_eq!(dump(&baseline), dump(&optimized), "{table}");
+    }
+}
+
+#[test]
+fn batched_total_matches_original_for_numeric_boundaries_and_rollback() {
+    for initial in [
+        Value::Integer(0),
+        Value::Integer(i64::MAX - 50),
+        Value::Real(9.223372036854776e18),
+        Value::Integer(-10),
+    ] {
+        let mut baseline = setup();
+        let mut optimized = setup();
+        for s in [&mut baseline, &mut optimized] {
+            let t = to_i64(NOW + 1_000) / MINUTE_MS * MINUTE_MS;
+            s.connection().execute("INSERT INTO traffic_total_minute(timestamp,gateway_id,upload_bytes,download_bytes,packets,flow_count) VALUES(?1,'gateway-1',0,0,0,0)", [t]).unwrap();
+            s.connection()
+                .execute(
+                    "UPDATE traffic_total_minute SET upload_bytes=?1 WHERE timestamp=?2",
+                    params![initial, t],
+                )
+                .unwrap();
+            s.connection()
+                .execute(
+                    "UPDATE traffic_total_hour_pending SET upload_bytes=?1",
+                    [initial.clone()],
+                )
+                .unwrap();
+        }
+        let mut input = batch(1, FlowLifecycle::Active);
+        input.flows.push(input.flows[0].clone());
+        for (s, enabled) in [(&mut baseline, false), (&mut optimized, true)] {
+            s.persist_classified_batch_with_total_batching(&input, &[], &[], NOW, enabled)
+                .unwrap();
+            assert_eq!(
+                s.persist_classified_batch_with_total_batching(&input, &[], &[], NOW, enabled)
+                    .unwrap(),
+                PersistDisposition::Duplicate
+            );
+        }
+        assert_eq!(
+            LAST_TOTAL_ROLLUP_COUNTS.get(),
+            (2, if initial == Value::Integer(0) { 1 } else { 2 })
+        );
+        for table in [
+            "traffic_total_minute",
+            "traffic_total_hour_pending",
+            "traffic_scope_minute",
+            "traffic_scope_total_minute",
+        ] {
+            let rows = |s: &SqliteStorage| -> Vec<String> {
+                let mut stmt = s
+                    .connection()
+                    .prepare(&format!("SELECT * FROM {table}"))
+                    .unwrap();
+                let mut rows = stmt
+                    .query_map([], |r| {
+                        Ok(format!(
+                            "{:?}",
+                            (0..r.as_ref().column_count())
+                                .map(|i| r.get::<_, Value>(i))
+                                .collect::<rusqlite::Result<Vec<_>>>()?
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                rows.sort();
+                rows
+            };
+            assert_eq!(
+                rows(&baseline),
+                rows(&optimized),
+                "{table} initial={initial:?}"
+            );
+        }
+        optimized.connection().execute_batch("CREATE TRIGGER fail_batch BEFORE INSERT ON traffic_domain_minute BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+        let before: Value = optimized
+            .connection()
+            .query_row("SELECT upload_bytes FROM traffic_total_minute", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mut failing = batch(2, FlowLifecycle::Active);
+        failing.flows[0].remote_ip = vec![203, 0, 113, 2];
+        assert!(
+            optimized
+                .persist_classified_batch(&failing, &[], &[], NOW)
+                .is_err()
+        );
+        let after: Value = optimized
+            .connection()
+            .query_row("SELECT upload_bytes FROM traffic_total_minute", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(
+            optimized
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM ingest_batches WHERE sequence=2",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[test]
+fn same_batch_attribution_promotion_matches_sequential_writes() {
+    let mut combined = setup();
+    let mut sequential = setup();
+    let mut first = batch(1, FlowLifecycle::Active);
+    let mut second = first.clone();
+    second.sequence = 2;
+    first.flows[0].upload_bytes = 31;
+    second.flows[0].upload_bytes = 73;
+    let mut together = first.clone();
+    together.flows.push(second.flows[0].clone());
+
+    combined
+        .persist_classified_batch(
+            &together,
+            &[FlowAttribution::default(), service_attribution()],
+            &[],
+            NOW,
+        )
+        .unwrap();
+    sequential
+        .persist_classified_batch(&first, &[FlowAttribution::default()], &[], NOW)
+        .unwrap();
+    sequential
+        .persist_classified_batch(&second, &[service_attribution()], &[], NOW)
+        .unwrap();
+
+    for table in [
+        "traffic_total_minute",
+        "traffic_device_minute",
+        "traffic_application_minute",
+        "traffic_domain_minute",
+        "traffic_destination_minute",
+        "traffic_scope_minute",
+        "traffic_scope_total_minute",
+    ] {
+        assert_eq!(
+            metrics(combined.connection(), table, "1=1"),
+            metrics(sequential.connection(), table, "1=1"),
+            "{table}"
+        );
+    }
+    for table in [
+        "traffic_application_minute",
+        "traffic_domain_minute",
+        "traffic_scope_minute",
+    ] {
+        let rows = |s: &SqliteStorage| -> Vec<String> {
+            let mut statement = s
+                .connection()
+                .prepare(&format!("SELECT * FROM {table}"))
+                .unwrap();
+            let mut result = statement
+                .query_map([], |row| {
+                    let values = (0..row.as_ref().column_count())
+                        .map(|i| row.get::<_, Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(format!("{values:?}"))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            result.sort();
+            result
+        };
+        assert_eq!(rows(&combined), rows(&sequential), "{table}");
+    }
+    assert_eq!(
+        combined
+            .persist_classified_batch(&together, &[], &[], NOW)
+            .unwrap(),
+        PersistDisposition::Duplicate
+    );
+}
+
+#[test]
 fn missing_end_is_reclaimed_without_losing_counters_or_rollups() {
     let mut storage = setup();
     let input = batch(1, FlowLifecycle::Active);

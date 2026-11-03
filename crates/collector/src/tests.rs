@@ -3767,6 +3767,95 @@ async fn stale_gateway_enrollment_rotates_token_and_preserves_history() {
 }
 
 #[tokio::test]
+async fn collector_ingestion_remains_available_during_bounded_sqlite_retention() {
+    use std::time::Instant;
+
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join("retention-ingest.db");
+    let state = CollectorState::with_storage(
+        ENROLLMENT_TOKEN,
+        SqliteStorage::open(&database_path).unwrap(),
+        repository_rule_engine(),
+    )
+    .unwrap();
+    let router = public_router(state.clone());
+    let enrollment = enroll_agent(&router).await;
+    let now = unix_time_ms();
+    {
+        let inner = state.lock();
+        inner
+            .storage
+            .connection()
+            .execute(
+                "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<50000)
+                 INSERT INTO traffic_scope_minute(
+                   timestamp,gateway_id,scope,direction,device_id,application_id,category_id,
+                   domain,remote_ip,protocol,protocol_id,upload_bytes,download_bytes,packets,flow_count)
+                 SELECT ?1,?2,1,1,1,'app','cat','example',CAST(printf('%016x',i) AS BLOB),
+                   6,'tcp',1,1,1,1 FROM n",
+                rusqlite::params![
+                    i64::try_from(now.saturating_sub(31 * 86_400_000_u64)).unwrap(),
+                    enrollment.gateway_id
+                ],
+            )
+            .unwrap();
+    }
+
+    let maintenance_state = state.clone();
+    let retention = tokio::task::spawn_blocking(move || -> Result<std::time::Duration, String> {
+        let started = Instant::now();
+        for _ in 0..100 {
+            match maintenance_state.run_maintenance(true) {
+                Ok(true) => return Ok(started.elapsed()),
+                Ok(false) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err("retention did not finish within 100 maintenance slices".into())
+    });
+
+    let mut timings = Vec::new();
+    let mut accepted = 0;
+    const REQUESTS: u64 = 500;
+    for sequence in 1..=REQUESTS {
+        let started = Instant::now();
+        let response = router
+            .clone()
+            .oneshot(telemetry_request(
+                &sample_batch(&enrollment.gateway_id, sequence),
+                &enrollment.agent_token,
+            ))
+            .await
+            .unwrap();
+        timings.push(started.elapsed());
+        accepted += usize::from(response.status() == StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+    let cleanup_elapsed = retention.await.unwrap().unwrap();
+    timings.sort();
+    let percentile = |p: usize| {
+        timings
+            .get(
+                timings
+                    .len()
+                    .saturating_mul(p)
+                    .div_ceil(100)
+                    .saturating_sub(1),
+            )
+            .copied()
+            .unwrap_or_default()
+    };
+    eprintln!(
+        "collector_retention_ingest accepted={accepted}/{REQUESTS} cleanup_ms={} p50_us={} p95_us={} p99_us={} max_us={}",
+        cleanup_elapsed.as_millis(),
+        percentile(50).as_micros(),
+        percentile(95).as_micros(),
+        percentile(99).as_micros(),
+        timings.last().unwrap().as_micros(),
+    );
+}
+
+#[tokio::test]
 async fn concurrent_stale_enrollment_rotates_gateway_only_once() {
     let state = test_state();
     let router = public_router(state.clone());
@@ -4507,6 +4596,9 @@ async fn settings_diagnostics_endpoint() {
     assert_eq!(json["schema_version"], 1);
     assert_eq!(json["data"]["db_backend"], "sqlite");
     assert!(json["data"]["db_size_bytes"].as_i64().unwrap() > 0);
+    assert!(json["data"]["sqlite"]["page_size_bytes"].as_i64().unwrap() > 0);
+    assert!(json["data"]["sqlite"]["freelist_pages"].as_i64().unwrap() >= 0);
+    assert!(json["data"]["sqlite"]["wal_file_bytes"].is_null());
     assert!(json["data"]["gateway"].is_object());
     assert!(json["data"]["retention"].is_object());
     assert_eq!(json["data"]["collector_version"], env!("CARGO_PKG_VERSION"));
@@ -4545,6 +4637,43 @@ async fn settings_diagnostics_endpoint() {
             > 0
     );
     assert!(json["data"].get("rule_sources").is_none());
+}
+
+#[tokio::test]
+async fn sqlite_diagnostics_reports_database_and_wal_file_sizes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("diagnostics.db");
+    let storage = SqliteStorage::open(&db).unwrap();
+    storage
+        .connection()
+        .execute("CREATE TABLE diagnostic_probe (value INTEGER)", [])
+        .unwrap();
+    let wal = dir.path().join("diagnostics.db-wal");
+    let wal_before = std::fs::metadata(&wal).unwrap().len();
+    assert!(wal_before > 0);
+    let state =
+        CollectorState::with_storage(ENROLLMENT_TOKEN, storage, repository_rule_engine()).unwrap();
+    let response = internal_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/internal/settings/diagnostics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = parse_json(response).await;
+    assert_eq!(
+        json["data"]["sqlite"]["wal_file_bytes"].as_u64(),
+        Some(wal_before)
+    );
+    assert!(
+        json["data"]["sqlite"]["database_file_bytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
 }
 
 #[tokio::test]
