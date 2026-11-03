@@ -2,6 +2,13 @@ import { unstable_cache } from "next/cache";
 import { verifySession } from "@/lib/auth";
 import { compareVersions, type Release } from "@/lib/releases";
 
+// Releases change infrequently. Keep the successful result for six hours so
+// page loads and multiple clients do not consume GitHub's anonymous API quota.
+const RELEASE_CACHE_SECONDS = 6 * 60 * 60;
+const RELEASE_RETRY_DELAY_MS = 60 * 60 * 1000;
+let lastKnownGoodReleases: Release[] | undefined;
+let retryAfter = 0;
+
 // Cache the compact version list: GitHub's full response includes release notes
 // and assets and can exceed the fetch cache's 2 MB entry limit.
 const getReleases = unstable_cache(
@@ -36,16 +43,36 @@ const getReleases = unstable_cache(
     });
   },
   ["netqmon-github-releases"],
-  { revalidate: 3600 },
+  { revalidate: RELEASE_CACHE_SECONDS },
 );
 
 export async function GET() {
   if (!(await verifySession()))
     return Response.json({ error: "unauthorized" }, { status: 401 });
 
+  // Avoid turning a GitHub outage or rate limit into a request on every page
+  // load. If we have a successful result, keep serving it during the cooldown.
+  if (Date.now() < retryAfter) {
+    if (lastKnownGoodReleases)
+      return Response.json({ data: { releases: lastKnownGoodReleases } });
+    return Response.json(
+      { error: "release_check_unavailable" },
+      { status: 503 },
+    );
+  }
+
   try {
-    return Response.json({ data: { releases: await getReleases() } });
+    const releases = await getReleases();
+    lastKnownGoodReleases = releases;
+    retryAfter = 0;
+    return Response.json({ data: { releases } });
   } catch {
+    retryAfter = Date.now() + RELEASE_RETRY_DELAY_MS;
+    // A transient GitHub outage or rate limit should not hide a version list
+    // already fetched successfully by this running controller process.
+    if (lastKnownGoodReleases) {
+      return Response.json({ data: { releases: lastKnownGoodReleases } });
+    }
     return Response.json(
       { error: "release_check_unavailable" },
       { status: 503 },
