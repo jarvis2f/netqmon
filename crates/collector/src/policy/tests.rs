@@ -885,6 +885,7 @@ async fn sqlite_client_options_and_validation_use_canonical_mac_addresses() {
     let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(value["data"]["items"][0]["mac"], "AA:BB:CC:DD:EE:FF");
     assert_eq!(value["data"]["items"][0]["name"], "Office Laptop");
+    assert_eq!(value["data"]["total"], 1);
 
     let mut spec = policy_spec("internet");
     spec["selectors"]["clients"] = serde_json::json!(["aa:bb:cc:dd:ee:ff"]);

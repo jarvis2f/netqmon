@@ -498,38 +498,60 @@ async fn options(
         );
     }
     if kind != "gateways" {
-        let Some(gateway_id) = query.gateway_id.as_deref() else {
+        if query.gateway_id.is_none() {
             return api_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_query",
                 "gateway_id is required for this option kind",
                 None,
             );
-        };
-        match registered_gateway(&state, gateway_id) {
-            Ok(true) => {}
-            Ok(false) => {
-                return api_error(
-                    StatusCode::NOT_FOUND,
-                    "not_found",
-                    "gateway was not found",
-                    None,
-                );
-            }
-            Err(_) => return store_unavailable(),
         }
     }
-    match policy_options(
-        &state,
-        query.gateway_id.as_deref(),
-        kind,
-        search,
-        page,
-        page_size,
-    ) {
-        Ok(value) => success(StatusCode::OK, value),
-        Err(error) => {
+    let kind = kind.to_owned();
+    let search = search.to_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        if kind != "gateways" {
+            match state
+                .query()
+                .storage
+                .gateway()
+                .map(|gateway| {
+                    gateway.is_some_and(|gateway| {
+                        Some(gateway.id.as_str()) == query.gateway_id.as_deref()
+                    })
+                })
+                .map_err(|error| error.to_string())
+            {
+                Ok(true) => {}
+                Ok(false) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
+        policy_options(
+            &state,
+            query.gateway_id.as_deref(),
+            &kind,
+            &search,
+            page,
+            page_size,
+        )
+        .map(Some)
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(value))) => success(StatusCode::OK, value),
+        Ok(Ok(None)) => api_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "gateway was not found",
+            None,
+        ),
+        Ok(Err(error)) => {
             tracing::error!(%error, "policy options lookup failed");
+            store_unavailable()
+        }
+        Err(error) => {
+            tracing::error!(%error, "policy options worker failed");
             store_unavailable()
         }
     }
@@ -543,7 +565,7 @@ fn policy_options(
     page: u32,
     page_size: u32,
 ) -> Result<Value, String> {
-    let inner = state.lock();
+    let inner = state.query();
     let gateway = inner.storage.gateway().map_err(|error| error.to_string())?;
     let Some(gateway) = gateway else {
         if kind == "gateways" {
@@ -573,35 +595,68 @@ fn policy_options(
     }
 
     let classifier = inner.classifier.clone();
-    if let Some(clickhouse) = inner.storage.clickhouse_storage().cloned() {
-        drop(inner);
-        let storage = Storage::clickhouse(clickhouse);
-        return options_result(&PolicyOptionsQuery {
-            storage: &storage,
-            classifier: &classifier,
-            gateway_id: &gateway_id,
-            kind,
-            search,
-            page,
-            page_size,
-            offset,
-        });
-    }
-    options_result(&PolicyOptionsQuery {
+    let mut result = options_result(&PolicyOptionsQuery {
         storage: &inner.storage,
-        classifier: &classifier,
         gateway_id: &gateway_id,
         kind,
         search,
         page,
         page_size,
         offset,
-    })
+    })?;
+    drop(inner);
+    if kind == "applications" {
+        if let Some(items) = result["items"].as_array_mut() {
+            for item in items {
+                if let Some(id) = item["id"].as_str() {
+                    if let Some(metadata) = classifier.application_metadata(id) {
+                        item["name"] = json!(metadata.name);
+                    }
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod options_concurrency_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn file_backed_options_do_not_wait_for_writer_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = CollectorState::open("test-token", &dir.path().join("options.db")).unwrap();
+        state
+            .lock()
+            .storage
+            .save_gateway("gw-1", "router", "test", &[7; 32], 1)
+            .unwrap();
+        let guard = state.lock();
+        let worker_state = state.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            for kind in ["clients", "applications", "categories"] {
+                let result = policy_options(&worker_state, Some("gw-1"), kind, "", 1, 100);
+                if tx.send(result).is_err() {
+                    return;
+                }
+            }
+        });
+        let results: Vec<_> = (0..3)
+            .map(|_| rx.recv_timeout(Duration::from_secs(2)))
+            .collect();
+        drop(guard);
+        worker.join().unwrap();
+        for result in results {
+            assert!(result.unwrap().is_ok());
+        }
+    }
 }
 
 struct PolicyOptionsQuery<'a> {
     storage: &'a Storage,
-    classifier: &'a crate::classifier::ClassifierHandle,
     gateway_id: &'a str,
     kind: &'a str,
     search: &'a str,
@@ -621,7 +676,6 @@ fn options_result(query: &PolicyOptionsQuery<'_>) -> Result<Value, String> {
         )?,
         "applications" => option_applications(
             query.storage,
-            query.classifier,
             query.gateway_id,
             query.search,
             query.page_size,
@@ -707,7 +761,6 @@ fn option_clients(
 
 fn option_applications(
     storage: &Storage,
-    classifier: &crate::classifier::ClassifierHandle,
     gateway_id: &str,
     search: &str,
     page_size: u32,
@@ -750,12 +803,7 @@ fn option_applications(
     };
     Ok(ids
         .into_iter()
-        .map(|id| {
-            let name = classifier
-                .application_metadata(&id)
-                .map_or_else(|| id.clone(), |metadata| metadata.name.clone());
-            json!({ "id": id, "name": name })
-        })
+        .map(|id| json!({ "id": id, "name": id }))
         .collect())
 }
 
@@ -816,7 +864,7 @@ fn items_total(
         let count: i64 = match kind {
             "clients" => connection.query_row(
                 "SELECT COUNT(*) FROM devices WHERE gateway_id = ?1
-                 AND (?2 = '' OR instr(lower(mac), lower(?2)) > 0 OR instr(lower(display_name), lower(?2)) > 0 OR instr(lower(hostname), lower(?2)) > 0)",
+                 AND (?2 = '' OR instr(lower(hex(mac)), lower(replace(?2, ':', ''))) > 0 OR instr(lower(display_name), lower(?2)) > 0 OR instr(lower(hostname), lower(?2)) > 0)",
                 params![gateway_id, search], |row| row.get(0),
             ),
             "applications" => connection.query_row(
