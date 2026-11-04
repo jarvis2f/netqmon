@@ -9,6 +9,84 @@ use super::*;
 const NOW: u64 = 1_700_000_000_000;
 
 #[test]
+fn policy_option_queries_use_gateway_and_selector_covering_indexes() {
+    let storage = setup();
+    for (column, predicate, index) in [
+        (
+            "application_id",
+            "application_id NOT IN ('unknown', '')",
+            "flow_sessions_policy_application",
+        ),
+        (
+            "category_id",
+            "category_id IS NOT NULL AND category_id != '' AND category_id != 'unknown'",
+            "flow_sessions_policy_category",
+        ),
+    ] {
+        let sql = format!(
+            "EXPLAIN QUERY PLAN SELECT {column} FROM flow_sessions WHERE gateway_id = ?1 AND {predicate}"
+        );
+        let mut statement = storage.connection().prepare(&sql).unwrap();
+        let plan = statement
+            .query_map(["gateway-1"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains(&format!("COVERING INDEX {index}"))),
+            "{plan:?}"
+        );
+    }
+}
+
+#[test]
+fn policy_option_index_upgrade_keeps_existing_flows() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("policy-options.db");
+    let mut storage = open_at(&path, NOW).unwrap();
+    storage
+        .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
+        .unwrap();
+    storage
+        .persist_classified_batch(&batch(1, FlowLifecycle::Ended), &[], &[], NOW)
+        .unwrap();
+    let before: i64 = storage
+        .connection()
+        .query_row("SELECT COUNT(*) FROM flow_sessions", [], |row| row.get(0))
+        .unwrap();
+    storage
+        .connection()
+        .execute_batch(
+            "DROP INDEX flow_sessions_policy_application;
+         DROP INDEX flow_sessions_policy_category;
+         DELETE FROM schema_migrations WHERE version = 13;",
+        )
+        .unwrap();
+    drop(storage);
+    let upgraded = open_at(&path, NOW + 1).unwrap();
+    let after: i64 = upgraded
+        .connection()
+        .query_row("SELECT COUNT(*) FROM flow_sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(after, before);
+    for name in [
+        "flow_sessions_policy_application",
+        "flow_sessions_policy_category",
+    ] {
+        let exists: bool = upgraded
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "{name}");
+    }
+}
+
+#[test]
 fn destination_counts_use_the_covering_index() {
     let storage = setup();
     for sql in [

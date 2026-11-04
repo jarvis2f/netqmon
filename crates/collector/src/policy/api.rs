@@ -666,6 +666,17 @@ struct PolicyOptionsQuery<'a> {
 }
 
 fn options_result(query: &PolicyOptionsQuery<'_>) -> Result<Value, String> {
+    if matches!(query.kind, "applications" | "categories") {
+        if let Some(connection) = query.storage.sqlite_connection() {
+            let (items, total) = sqlite_named_options(connection, query)?;
+            return Ok(json!({
+                "items": items,
+                "page": query.page,
+                "page_size": query.page_size,
+                "total": total,
+            }));
+        }
+    }
     let items = match query.kind {
         "clients" => option_clients(
             query.storage,
@@ -696,6 +707,57 @@ fn options_result(query: &PolicyOptionsQuery<'_>) -> Result<Value, String> {
         "page_size": query.page_size,
         "total": items_total(query.storage, query.gateway_id, query.kind, query.search)?,
     }))
+}
+
+fn sqlite_named_options(
+    connection: &rusqlite::Connection,
+    query: &PolicyOptionsQuery<'_>,
+) -> Result<(Vec<Value>, u64), String> {
+    let (column, predicate) = match query.kind {
+        "applications" => ("application_id", "application_id NOT IN ('unknown', '')"),
+        "categories" => (
+            "category_id",
+            "category_id IS NOT NULL AND category_id != '' AND category_id != 'unknown'",
+        ),
+        _ => return Err("unsupported option kind".to_owned()),
+    };
+    // Materialize the filtered set once: pagination and the total must agree,
+    // including when the requested page is empty.
+    let sql = format!(
+        "WITH ids AS MATERIALIZED (
+            SELECT {column} AS id FROM flow_sessions WHERE gateway_id = ?1 AND {predicate}
+            UNION SELECT {column} AS id FROM traffic_application_minute WHERE gateway_id = ?1 AND {predicate}
+         ), filtered AS MATERIALIZED (
+            SELECT id FROM ids WHERE (?2 = '' OR instr(lower(id), lower(?2)) > 0)
+         ), page AS (
+            SELECT id FROM filtered ORDER BY id LIMIT ?3 OFFSET ?4
+         )
+         SELECT page.id, (SELECT count(*) FROM filtered) FROM (SELECT 1) LEFT JOIN page ON 1 = 1 ORDER BY page.id"
+    );
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(
+            params![
+                query.gateway_id,
+                query.search,
+                i64::from(query.page_size),
+                query.offset
+            ],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| error.to_string())?;
+    let total = rows
+        .first()
+        .map_or(0, |row| u64::try_from(row.1).unwrap_or(0));
+    let items = rows
+        .into_iter()
+        .filter_map(|(id, _)| id.map(|id| json!({ "id": id, "name": id })))
+        .collect();
+    Ok((items, total))
 }
 
 fn option_clients(

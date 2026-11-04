@@ -908,6 +908,44 @@ async fn sqlite_client_options_and_validation_use_canonical_mac_addresses() {
     );
 }
 
+#[tokio::test]
+async fn sqlite_policy_named_options_preserve_union_search_and_empty_page_totals() {
+    let state = state_with_gateway();
+    {
+        let inner = state.lock();
+        let connection = inner.storage.sqlite_connection().unwrap();
+        connection.execute_batch(
+            "INSERT INTO flow_sessions(id, gateway_id, ip_version, protocol, client_ip, client_port,
+                remote_ip, remote_port, direction, application_id, category_id, upload_bytes,
+                download_bytes, packets, started_at, last_seen_at, checkpointed_at)
+             VALUES ('flow-1', 'gw-1', 4, 6, x'01020304', 1234, x'05060708', 443, 1,
+                'app-a', 'cat-a', 1, 1, 1, 1, 1, 1);
+             INSERT INTO traffic_application_minute VALUES
+                (1, 'gw-1', 'app-a', 'cat-a', 1, 1, 1, 1),
+                (2, 'gw-1', 'app-b', 'cat-b', 1, 1, 1, 1),
+                (3, 'gw-1', 'unknown', 'unknown', 1, 1, 1, 1);",
+        ).unwrap();
+    }
+    let app = internal_router(state);
+    for (kind, search, page, total, expected) in [
+        ("applications", "", 1, 2, Some("app-a")),
+        ("applications", "APP-B", 1, 1, Some("app-b")),
+        ("categories", "", 1, 2, Some("cat-a")),
+        ("categories", "CAT-B", 1, 1, Some("cat-b")),
+        ("categories", "", 3, 2, None),
+    ] {
+        let response = app.clone().oneshot(request(
+            &format!("/internal/policies/options?gateway_id=gw-1&kind={kind}&q={search}&page={page}&page_size=1"),
+            "GET", Some("valid-session"), Body::empty(),
+        )).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["data"]["total"], total);
+        assert_eq!(value["data"]["items"][0]["id"].as_str(), expected);
+    }
+}
+
 #[test]
 fn clickhouse_analytics_keeps_a_separate_sqlite_policy_database() {
     let (config, stop_server, server) = mock_clickhouse();
