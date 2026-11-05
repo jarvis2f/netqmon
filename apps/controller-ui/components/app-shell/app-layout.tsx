@@ -10,7 +10,7 @@ interface AppLayoutProps {
   children: React.ReactNode;
   title?: string;
   subtitle?: string;
-  username?: string;
+  username?: string | null;
   toolbar?: React.ReactNode;
   warningBanner?: string | React.ReactNode;
   headerActions?: React.ReactNode;

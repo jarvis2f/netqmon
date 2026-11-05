@@ -23,7 +23,7 @@ interface HeaderProps {
   gatewayName?: string;
   gatewayStatus?: "online" | "offline" | "degraded" | "loading";
   isLive?: boolean | "loading";
-  username?: string;
+  username?: string | null;
   onMobileMenuToggle?: () => void;
   actions?: React.ReactNode;
 }
@@ -155,47 +155,49 @@ export function Header({
         </button>
 
         {/* User Menu & Logout */}
-        <div className="relative">
-          <button
-            onClick={() => setUserMenuOpen(!userMenuOpen)}
-            className="flex h-8 items-center gap-1.5 rounded-md border border-border bg-surface px-2 text-xs font-medium text-foreground hover:bg-surface-hover transition-colors cursor-pointer"
-            aria-expanded={userMenuOpen}
-            aria-haspopup="true"
-            aria-label={t("user.userMenu")}
-          >
-            <User className="size-3.5 text-foreground-muted" />
-            <span className="hidden sm:inline">{username}</span>
-          </button>
+        {username !== null && (
+          <div className="relative">
+            <button
+              onClick={() => setUserMenuOpen(!userMenuOpen)}
+              className="flex h-8 items-center gap-1.5 rounded-md border border-border bg-surface px-2 text-xs font-medium text-foreground hover:bg-surface-hover transition-colors cursor-pointer"
+              aria-expanded={userMenuOpen}
+              aria-haspopup="true"
+              aria-label={t("user.userMenu")}
+            >
+              <User className="size-3.5 text-foreground-muted" />
+              <span className="hidden sm:inline">{username}</span>
+            </button>
 
-          {/* User Dropdown */}
-          {userMenuOpen && (
-            <>
-              <div
-                className="fixed inset-0 z-20"
-                onClick={() => setUserMenuOpen(false)}
-                aria-hidden="true"
-              />
-              <div className="absolute right-0 mt-1.5 w-48 rounded-md border border-border bg-surface p-1 shadow-lg z-30 animate-in fade-in-50 zoom-in-95 duration-100">
-                <div className="px-2 py-1.5 text-xs text-foreground-muted border-b border-border">
-                  {t("user.signedInAs")}{" "}
-                  <span className="font-semibold text-foreground">
-                    {username}
-                  </span>
+            {/* User Dropdown */}
+            {userMenuOpen && (
+              <>
+                <div
+                  className="fixed inset-0 z-20"
+                  onClick={() => setUserMenuOpen(false)}
+                  aria-hidden="true"
+                />
+                <div className="absolute right-0 mt-1.5 w-48 rounded-md border border-border bg-surface p-1 shadow-lg z-30 animate-in fade-in-50 zoom-in-95 duration-100">
+                  <div className="px-2 py-1.5 text-xs text-foreground-muted border-b border-border">
+                    {t("user.signedInAs")}{" "}
+                    <span className="font-semibold text-foreground">
+                      {username}
+                    </span>
+                  </div>
+                  <div className="mt-1">
+                    <button
+                      type="button"
+                      onClick={logout}
+                      className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-xs text-danger hover:bg-danger-soft transition-colors cursor-pointer"
+                    >
+                      <LogOut className="size-3.5" />
+                      <span>{t("user.logout")}</span>
+                    </button>
+                  </div>
                 </div>
-                <div className="mt-1">
-                  <button
-                    type="button"
-                    onClick={logout}
-                    className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-xs text-danger hover:bg-danger-soft transition-colors cursor-pointer"
-                  >
-                    <LogOut className="size-3.5" />
-                    <span>{t("user.logout")}</span>
-                  </button>
-                </div>
-              </div>
-            </>
-          )}
-        </div>
+              </>
+            )}
+          </div>
+        )}
       </div>
     </header>
   );

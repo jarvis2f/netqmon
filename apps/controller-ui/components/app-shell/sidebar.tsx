@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useRef, useSyncExternalStore } from "react";
-import Link from "next/link";
+import Link, { useLinkStatus } from "next/link";
 import { usePathname } from "next/navigation";
 import { useTranslations } from "next-intl";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
@@ -18,6 +18,7 @@ import {
   X,
   ChevronLeft,
   ChevronRight,
+  LoaderCircle,
 } from "lucide-react";
 import { NetqmonLogo, NetqmonBrandText } from "@/components/brand/logo";
 import {
@@ -65,6 +66,16 @@ interface SidebarProps {
 
 const SIDEBAR_COLLAPSED_KEY = "netqmon_sidebar_collapsed";
 const SIDEBAR_CHANGE_EVENT = "netqmon-sidebar-change";
+
+function NavigationPending() {
+  const { pending } = useLinkStatus();
+  return pending ? (
+    <LoaderCircle
+      aria-hidden="true"
+      className="pointer-events-none absolute right-1 z-10 size-3.5 animate-spin"
+    />
+  ) : null;
+}
 
 function readCollapsedPreference() {
   try {
@@ -208,6 +219,7 @@ export function Sidebar({
             {item.badge}
           </span>
         )}
+        <NavigationPending />
       </Link>
     );
   };

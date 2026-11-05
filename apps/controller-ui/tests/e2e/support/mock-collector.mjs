@@ -861,13 +861,16 @@ function handleInternal(request, response, pathname, params, state) {
   }
   if (path === "auth/verify" && request.method === "POST") {
     const authorized = request.headers.authorization === `Bearer ${token}`;
-    json(
-      response,
-      authorized ? 200 : 401,
-      authorized
-        ? envelope({ user: { id: "admin", username: "admin" } })
-        : { schema_version: 1, error: { message: "unauthorized" } },
-    );
+    const respond = () =>
+      json(
+        response,
+        authorized ? 200 : 401,
+        authorized
+          ? envelope({ user: { id: "admin", username: "admin" } })
+          : { schema_version: 1, error: { message: "unauthorized" } },
+      );
+    if (state.authDelayMs) setTimeout(respond, state.authDelayMs);
+    else respond();
     return true;
   }
   if (path === "auth/logout" && request.method === "POST") {
@@ -1584,12 +1587,18 @@ function handlePolicies(request, response, path, params, state) {
 export function createMockCollectorServer() {
   const state = {
     scenario: "live",
+    authDelayMs: 0,
     policies: [],
     policyEvents: [],
     policyRevision: 0,
   };
   return http.createServer((request, response) => {
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (url.pathname === "/__auth-delay" && request.method === "POST") {
+      state.authDelayMs = Number(url.searchParams.get("ms")) || 0;
+      json(response, 200, envelope({ delay: state.authDelayMs }));
+      return;
+    }
     if (url.pathname.startsWith("/__scenario/") && request.method === "POST") {
       const scenario = url.pathname.split("/").pop();
       state.scenario = ["live", "offline", "hfo"].includes(scenario)
