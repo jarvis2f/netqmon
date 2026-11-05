@@ -30,7 +30,8 @@ updates. Ensure `/sys/fs/bpf` exists in the container; Incus mounts the delegate
 filesystem there by default. If using `security.bpffs.path`, set
 `LIBBPF_BPF_TOKEN_PATH` to that same path.
 
-Set the BPF backend in the agent's existing TOML configuration:
+To force TCX for a manual test on OpenWrt, set the backend in a TOML file such
+as `/etc/netqmon/agent.toml`. Pass the file explicitly with `--config`.
 
 ```toml
 [bpf]
@@ -41,8 +42,13 @@ Choose an actual capture interface in the container rather than assuming a
 `br-lan` bridge exists. For example:
 
 ```sh
-LIBBPF_BPF_TOKEN_PATH=/sys/fs/bpf netqmon-agent --interface eth0 doctor
+LIBBPF_BPF_TOKEN_PATH=/sys/fs/bpf \
+  netqmon-agent --config /etc/netqmon/agent.toml --interface eth0 doctor
 ```
+
+The packaged OpenWrt service uses automatic backend selection by default and
+chooses TCX when its probe succeeds. LuCI and UCI currently expose no backend
+selector.
 
 Apply the same environment to the service when an explicit/custom path is
 needed. Default `/sys/fs/bpf` discovery is optional, matching libbpf. An empty

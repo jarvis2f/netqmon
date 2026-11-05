@@ -158,7 +158,7 @@ pub(super) fn probe(config: &AgentConfig) -> CapabilityReport {
         detail: match &token {
             Ok(Some(_)) => "delegated bpffs token enabled".into(),
             Ok(None) => "disabled or no delegated bpffs; using system capabilities".into(),
-            Err(error) => format!("token creation failed: {error}"),
+            Err(error) => format!("{error:#}"),
         },
         required: true,
     });
@@ -279,7 +279,7 @@ fn attach_check(config: &AgentConfig) -> (Check, Option<tc::ActiveBackend>, Stri
                 "unknown"
             };
             let detail = format!(
-                "backend={backend}; attach=failed; order={}; conflict={conflict}; error={error}",
+                "backend={backend}; attach=failed; order={}; conflict={conflict}; error={error:#}",
                 attach_order(config, backend)
             );
             (
@@ -462,7 +462,7 @@ fn program_load_check(config: &AgentConfig) -> Check {
             Status::Fail
         },
         detail: result.map_or_else(
-            |error| format!("ingress/egress load failed: {error}; see verifier log above"),
+            |error| format!("ingress/egress load failed: {error:#}; see verifier log above"),
             |()| "full ingress/egress programs loaded; no traffic hooks changed".into(),
         ),
         required: true,
@@ -503,7 +503,7 @@ fn map_check(
 ) -> Check {
     let result = options
         .as_ref()
-        .map_err(|error| format!("BPF token unavailable: {error}"))
+        .map_err(|error| format!("BPF token unavailable: {error:#}"))
         .and_then(|options| {
             MapHandle::create(
                 map_type,

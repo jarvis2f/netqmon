@@ -2655,7 +2655,7 @@ enum BpfStage {
 fn classify_bpf_error(stage: BpfStage, error: libbpf_rs::Error) -> AgentError {
     let detail = match stage {
         BpfStage::Open => format!("could not open embedded object ({error})"),
-        BpfStage::Load => format!("could not load classifier ({error})"),
+        BpfStage::Load => format!("could not load classifier ({error:#})"),
     };
 
     match error.kind() {

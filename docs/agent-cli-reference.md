@@ -16,7 +16,7 @@ netqmon-agent [OPTIONS] [COMMAND]
 
 | Option | Short | Description | Example |
 | :--- | :---: | :--- | :--- |
-| `--config <PATH>` | `-c` | Path to the TOML configuration file (defaults to `/etc/netqmon/agent.toml`). | `-c /etc/netqmon/custom.toml` |
+| `--config <PATH>` | `-c` | Path to the TOML configuration file. Falls back to `NETQMON_CONFIG` if unset. | `-c /etc/netqmon/agent.toml` |
 | `--interface <NAME>` | `-i` | Capture network interface name. **Can be specified multiple times** to attach to multiple interfaces (defaults to `br-lan`). | `-i br-lan -i eth1` |
 | `--help` | `-h` | Print help information. | `-h` |
 | `--version` | `-V` | Print current agent version. | `-V` |
@@ -205,7 +205,7 @@ netqmon-agent diagnostics --json
 
 ## 3. Configuration File Reference (`agent.toml`)
 
-The default configuration file path is `/etc/netqmon/agent.toml`. Complete options and default values are documented below:
+To load `/etc/netqmon/agent.toml`, pass `--config /etc/netqmon/agent.toml` or set `NETQMON_CONFIG` to that path.
 
 ```toml
 # Network capture interfaces (single string or array)

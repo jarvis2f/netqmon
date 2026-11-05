@@ -6,7 +6,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 
 use libbpf_rs::skel::OpenSkel;
-use libbpf_rs::{OpenObject, ProgramAttachType, ProgramType, libbpf_sys};
+use libbpf_rs::{ErrorExt as _, OpenObject, ProgramAttachType, ProgramType, libbpf_sys};
 
 pub(super) struct BpfToken(OwnedFd);
 
@@ -25,17 +25,18 @@ impl BpfToken {
         }
         let mandatory = path.is_some();
         let result = (|| {
+            let path = path.unwrap_or_else(|| PathBuf::from("/sys/fs/bpf"));
             let directory = OpenOptions::new()
                 .read(true)
-                .write(true)
                 .custom_flags(nix::libc::O_DIRECTORY)
-                .open(path.unwrap_or_else(|| PathBuf::from("/sys/fs/bpf")))?;
+                .open(&path)
+                .with_context(|| format!("open bpffs directory {}", path.display()))?;
             // SAFETY: directory remains open for the call; libbpf takes no ownership.
             let fd = unsafe {
                 libbpf_sys::bpf_token_create(directory.as_raw_fd(), std::ptr::null_mut())
             };
             if fd < 0 {
-                return Err(libbpf_rs::Error::from_raw_os_error(-fd));
+                return Err(libbpf_rs::Error::from_raw_os_error(-fd).context("BPF_TOKEN_CREATE"));
             }
             // SAFETY: successful BPF_TOKEN_CREATE returns a new owned FD.
             Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
@@ -95,8 +96,18 @@ mod tests {
     fn explicit_token_path_failure_is_not_silently_ignored() {
         let directory = tempfile::tempdir().unwrap();
         assert!(BpfToken::at(Some(directory.path().join("missing"))).is_err());
-        assert!(BpfToken::at(Some(directory.path().to_owned())).is_err());
         assert!(BpfToken::at(Some(PathBuf::new())).unwrap().is_none());
+    }
+
+    #[test]
+    fn existing_directory_reaches_token_creation() {
+        // A regular directory can be opened but cannot supply a BPF token.
+        // This works on kernels without token support and catches O_RDWR/EISDIR.
+        let directory = tempfile::tempdir().unwrap();
+        let error = BpfToken::at(Some(directory.path().to_owned()))
+            .err()
+            .expect("a regular directory cannot supply a token");
+        assert!(error.to_string().starts_with("BPF_TOKEN_CREATE"), "{error}");
     }
 
     #[test]

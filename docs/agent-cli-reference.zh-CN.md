@@ -16,7 +16,7 @@ netqmon-agent [OPTIONS] [COMMAND]
 
 | 参数 | 短参数 | 说明 | 示例 |
 | :--- | :---: | :--- | :--- |
-| `--config <PATH>` | `-c` | 指定 TOML 格式的配置文件路径（默认读取 `/etc/netqmon/agent.toml`）。 | `-c /etc/netqmon/custom.toml` |
+| `--config <PATH>` | `-c` | 指定 TOML 配置文件路径。省略时使用 `NETQMON_CONFIG`。 | `-c /etc/netqmon/agent.toml` |
 | `--interface <NAME>` | `-i` | 指定或覆盖监听的网络接口名称。**可重复指定多次**以监听多网卡（默认 `br-lan`）。 | `-i br-lan -i eth1` |
 | `--help` | `-h` | 打印帮助信息。 | `-h` |
 | `--version` | `-V` | 打印当前 Agent 版本号。 | `-V` |
@@ -110,7 +110,7 @@ netqmon-agent diagnostics --json
 
 ## 3. 配置文件规范 (`agent.toml`)
 
-默认配置文件路径为 `/etc/netqmon/agent.toml`。完整格式与默认值说明如下：
+要读取 `/etc/netqmon/agent.toml`，请传入 `--config /etc/netqmon/agent.toml` 或将 `NETQMON_CONFIG` 设为该路径。
 
 ```toml
 # 采集接口配置：可为单一字符串或字符串数组
