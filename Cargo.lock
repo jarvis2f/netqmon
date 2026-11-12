@@ -1432,6 +1432,7 @@ dependencies = [
  "chrono-tz",
  "futures-util",
  "getrandom 0.3.4",
+ "libc",
  "moka",
  "netqmon-classifier-client",
  "netqmon-geo",
@@ -1489,6 +1490,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

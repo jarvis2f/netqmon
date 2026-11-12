@@ -9,8 +9,8 @@ use std::thread;
 
 use netqmon_protocol::v1::{DnsObservation, FlowDelta, FlowLifecycle, TelemetryBatch};
 use netqmon_storage::{
-    ClickHouseConfig, ClickHouseStorage, FlowAttribution, PersistDisposition, RetentionPolicy,
-    SqliteStorage, StorageBackend,
+    ClickHouseConfig, ClickHouseStorage, FlowAttribution, PersistDisposition, RecentDomainLookup,
+    RetentionPolicy, SqliteStorage, StorageBackend,
 };
 use serde_json::{Value, json};
 
@@ -635,6 +635,39 @@ fn backend_compatibility_identical_fixtures_and_semantic_parity() {
 
     assert_eq!(s_dom, Some("example.com".to_owned()));
     assert_eq!(ch_dom, Some("example.com".to_owned()));
+    let s_recent_dom = sqlite
+        .resolve_recent_domain(
+            "gw-100",
+            &[192, 168, 1, 100],
+            &[93, 184, 216, 34],
+            360_001,
+            60_000,
+        )
+        .unwrap();
+    let ch_recent_dom = clickhouse
+        .resolve_recent_domain(
+            "gw-100",
+            &[192, 168, 1, 100],
+            &[93, 184, 216, 34],
+            360_001,
+            60_000,
+        )
+        .unwrap();
+    assert_eq!(s_recent_dom, Some(("example.com".to_owned(), 60_000)));
+    assert_eq!(ch_recent_dom, s_recent_dom);
+    let recent_lookup = [RecentDomainLookup {
+        client_ip: &[192, 168, 1, 100],
+        answer_ip: &[93, 184, 216, 34],
+        at_ms: 360_001,
+        not_before_ms: 60_000,
+    }];
+    let s_recent_batch = sqlite
+        .resolve_recent_domains("gw-100", &recent_lookup)
+        .unwrap();
+    let ch_recent_batch =
+        StorageBackend::resolve_recent_domains(&clickhouse, "gw-100", &recent_lookup).unwrap();
+    assert_eq!(s_recent_batch, vec![s_recent_dom.clone()]);
+    assert_eq!(ch_recent_batch, s_recent_batch);
 
     // 6. Traffic Totals
     let s_traffic = sqlite.query_total_traffic(0, 120_000).unwrap();

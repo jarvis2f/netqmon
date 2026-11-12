@@ -282,6 +282,159 @@ fn repeated_maintenance_does_not_rewrite_history() {
 }
 
 #[test]
+fn bounded_rollup_resumes_across_restart_without_double_counting() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("bounded-rollup.db");
+    let mut storage = open_at(&path, NOW).unwrap();
+    storage
+        .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
+        .unwrap();
+    let mut input = batch(1, FlowLifecycle::Ended);
+    let original = input.flows[0].clone();
+    input.flows = (1..=20)
+        .map(|i| {
+            let mut flow = original.clone();
+            flow.remote_ip = vec![198, 51, 100, i];
+            flow.client_port += u32::from(i);
+            flow
+        })
+        .collect();
+    storage
+        .persist_classified_batch(&input, &[], &[], NOW)
+        .unwrap();
+    let later = NOW + 2 * DAY_MS as u64;
+    let budget = RetentionBudget {
+        max_rows_per_batch: 3,
+        transaction_target: Duration::from_millis(100),
+        total_budget: Duration::from_secs(1),
+    };
+    assert!(!storage.roll_up_hour_and_day_bounded(later, budget).unwrap());
+    drop(storage);
+
+    let mut storage = open_at(&path, NOW + 1_000).unwrap();
+    let mut complete = false;
+    for _ in 0..100 {
+        if storage.roll_up_hour_and_day_bounded(later, budget).unwrap() {
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete, "bounded rollup did not drain its pending rows");
+    for tier in ["minute", "hour", "day"] {
+        assert_eq!(
+            metrics(
+                storage.connection(),
+                &format!("traffic_total_{tier}"),
+                "1=1"
+            ),
+            (2_000, 1_000, 60, 20),
+            "incorrect {tier} totals"
+        );
+        assert_eq!(
+            metrics(
+                storage.connection(),
+                &format!("traffic_destination_{tier}"),
+                "1=1"
+            ),
+            (2_000, 1_000, 60, 20),
+            "incorrect {tier} destination totals"
+        );
+    }
+    let changes = storage.connection().total_changes();
+    assert!(storage.roll_up_hour_and_day_bounded(later, budget).unwrap());
+    assert_eq!(storage.connection().total_changes(), changes);
+}
+
+#[test]
+fn bounded_rollup_yields_to_another_file_database_writer() {
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("bounded-rollup-concurrency.db");
+    let mut storage = open_at(&path, NOW).unwrap();
+    storage
+        .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
+        .unwrap();
+    storage.connection().execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<10000) INSERT INTO traffic_destination_minute(timestamp,gateway_id,remote_ip,upload_bytes,download_bytes,packets,flow_count) SELECT ?1,'gateway-1',CAST(printf('%08x',i) AS BLOB),1,1,1,1 FROM n", [to_i64(NOW - DAY_MS as u64)]).unwrap();
+    storage
+        .connection()
+        .execute_batch("CREATE TABLE writer_probe(value INTEGER)")
+        .unwrap();
+
+    let running = Arc::new(AtomicBool::new(true));
+    let writes = Arc::new(AtomicUsize::new(0));
+    let ready = Arc::new(Barrier::new(2));
+    let worker = {
+        let (running, writes, ready, worker_path) =
+            (running.clone(), writes.clone(), ready.clone(), path.clone());
+        std::thread::spawn(move || {
+            let connection = Connection::open(worker_path).unwrap();
+            connection.busy_timeout(Duration::from_secs(5)).unwrap();
+            ready.wait();
+            while running.load(Ordering::Relaxed) {
+                if connection
+                    .execute("INSERT INTO writer_probe VALUES(1)", [])
+                    .is_ok()
+                {
+                    writes.fetch_add(1, Ordering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+    ready.wait();
+    while writes.load(Ordering::Relaxed) == 0 {
+        std::thread::yield_now();
+    }
+    let before = writes.load(Ordering::Relaxed);
+    let result = storage.roll_up_hour_and_day_bounded(
+        NOW + 2 * DAY_MS as u64,
+        RetentionBudget {
+            max_rows_per_batch: 50,
+            transaction_target: Duration::from_millis(100),
+            total_budget: Duration::from_secs(1),
+        },
+    );
+    running.store(false, Ordering::Relaxed);
+    worker.join().unwrap();
+    assert!(!result.unwrap());
+    assert!(writes.load(Ordering::Relaxed) > before);
+}
+
+#[test]
+fn rollup_marker_pages_seek_the_contribution_primary_key_without_sorting() {
+    let storage = setup();
+    let plan = storage
+        .connection()
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT session_ref,timestamp,scope,direction,device_id,remote_ip,protocol
+             FROM flow_rollup_contributions
+             WHERE (session_ref,timestamp,scope,direction,device_id,remote_ip,protocol)
+                   >(0,0,0,0,0,X'',0)
+             ORDER BY session_ref,timestamp,scope,direction,device_id,remote_ip,protocol
+             LIMIT 500",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+        .join(" | ");
+    assert!(
+        plan.contains("PRIMARY KEY"),
+        "unexpected marker page plan: {plan}"
+    );
+    assert!(
+        !plan.contains("TEMP B-TREE"),
+        "marker page should preserve primary-key order: {plan}"
+    );
+}
+
+#[test]
 fn late_classification_is_not_applied_twice_by_incremental_maintenance() {
     let mut storage = setup();
     let input = batch(1, FlowLifecycle::Ended);

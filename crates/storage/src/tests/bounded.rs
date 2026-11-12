@@ -9,6 +9,176 @@ fn count(storage: &SqliteStorage, table: &str) -> i64 {
 }
 
 #[test]
+fn owned_cache_checkpoint_is_batched_and_failed_checkpoint_keeps_entries() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("owned-cache-batches.db");
+    let mut sqlite = open_at(&path, NOW).unwrap();
+    sqlite
+        .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
+        .unwrap();
+    let mut input = batch(1, FlowLifecycle::Active);
+    for port in 50_001..50_006 {
+        let mut flow = input.flows[0].clone();
+        flow.client_port = port;
+        input.flows.push(flow);
+    }
+    sqlite
+        .persist_classified_batch(&input, &[], &[], NOW)
+        .unwrap();
+    sqlite.connection().execute_batch("CREATE TRIGGER reject_checkpoint BEFORE INSERT ON flow_sessions BEGIN SELECT RAISE(ABORT, 'checkpoint failure'); END").unwrap();
+    let mut storage = Storage::sqlite(sqlite);
+    let expired = NOW + ACTIVE_FLOW_TTL_MS as u64 + 1;
+    let budget = RetentionBudget {
+        max_rows_per_batch: 2,
+        transaction_target: Duration::from_secs(2),
+        ..RetentionBudget::default()
+    };
+    assert!(storage.prune_owned_flow_cache(expired, budget).is_err());
+    assert_eq!(storage.active_flow_count().unwrap(), 6);
+    storage
+        .connection()
+        .execute_batch("DROP TRIGGER reject_checkpoint")
+        .unwrap();
+    let mut previous = 6;
+    for _ in 0..20 {
+        let done = storage.prune_owned_flow_cache(expired, budget).unwrap();
+        let remaining = storage.active_flow_count().unwrap();
+        assert!(previous - remaining <= 2);
+        previous = remaining;
+        if done {
+            break;
+        }
+    }
+    assert_eq!(previous, 0);
+    drop(storage);
+    let reopened = open_at(&path, expired + 1).unwrap();
+    assert_eq!(
+        metrics(reopened.connection(), "traffic_total_minute", "1=1"),
+        (600, 300, 18, 6)
+    );
+    let (ended, bytes): (i64, i64) = reopened
+        .connection()
+        .query_row(
+            "SELECT COUNT(*), SUM(upload_bytes) FROM flow_sessions WHERE ended_at IS NOT NULL",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((ended, bytes), (6, 600));
+}
+
+#[test]
+fn concurrent_owner_pruning_and_ingest_preserve_counters_after_restart() {
+    use std::sync::{Arc, Barrier, Mutex};
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("owner-concurrent.db");
+    let mut sqlite = open_at(&path, NOW).unwrap();
+    sqlite
+        .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
+        .unwrap();
+    sqlite
+        .persist_classified_batch(
+            &batch(1, FlowLifecycle::Active),
+            &[service_attribution()],
+            &[],
+            NOW,
+        )
+        .unwrap();
+    let shared = Arc::new(Mutex::new(Storage::sqlite(sqlite)));
+    let barrier = Arc::new(Barrier::new(2));
+    let expired = NOW + ACTIVE_FLOW_TTL_MS as u64;
+    let worker_storage = Arc::clone(&shared);
+    let worker_barrier = Arc::clone(&barrier);
+    let worker = std::thread::spawn(move || {
+        worker_barrier.wait();
+        for sequence in 2..=101 {
+            worker_storage
+                .lock()
+                .unwrap()
+                .persist_classified_batch(
+                    &batch(sequence, FlowLifecycle::Active),
+                    &[service_attribution()],
+                    &[],
+                    expired + sequence,
+                )
+                .unwrap();
+            std::thread::yield_now();
+        }
+    });
+    barrier.wait();
+    for _ in 0..100 {
+        shared
+            .lock()
+            .unwrap()
+            .prune_owned_flow_cache(expired, RetentionBudget::default())
+            .unwrap();
+        std::thread::yield_now();
+    }
+    worker.join().unwrap();
+    let storage = Arc::try_unwrap(shared).ok().unwrap().into_inner().unwrap();
+    assert_eq!(
+        metrics(storage.connection(), "traffic_total_minute", "1=1"),
+        (10_100, 5_050, 303, 101)
+    );
+    drop(storage);
+    let reopened = open_at(&path, expired + 102).unwrap();
+    assert_eq!(
+        metrics(reopened.connection(), "traffic_total_minute", "1=1"),
+        (10_100, 5_050, 303, 101)
+    );
+    assert_eq!(reopened.active_flows.len(), 1);
+    assert_eq!(reopened.active_flows.expiry.len(), 1);
+    let active = reopened.active_flows.values().next().unwrap();
+    assert_eq!(
+        (active.upload_bytes, active.download_bytes),
+        (10_100, 5_050)
+    );
+    assert_eq!(active.attribution.application_id, "video-app");
+}
+
+#[test]
+fn interrupted_owner_checkpoint_reduces_next_batch_without_evicting() {
+    let dir = tempdir().unwrap();
+    let mut sqlite = open_at(&dir.path().join("interrupted-owner.db"), NOW).unwrap();
+    sqlite
+        .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
+        .unwrap();
+    let mut input = batch(1, FlowLifecycle::Active);
+    for port in 50_001..50_020 {
+        let mut flow = input.flows[0].clone();
+        flow.client_port = port;
+        input.flows.push(flow);
+    }
+    sqlite
+        .persist_classified_batch(&input, &[], &[], NOW)
+        .unwrap();
+    let mut storage = Storage::sqlite(sqlite);
+    let expired = NOW + ACTIVE_FLOW_TTL_MS as u64;
+    let mut budget = RetentionBudget {
+        max_rows_per_batch: 20,
+        transaction_target: Duration::from_nanos(1),
+        ..RetentionBudget::default()
+    };
+    assert!(!storage.prune_owned_flow_cache(expired, budget).unwrap());
+    let Storage::Sqlite(sqlite) = &storage else {
+        unreachable!()
+    };
+    assert_eq!(sqlite.active_flows.len(), 20);
+    assert_eq!(sqlite.owner_prune_rows, Some(10));
+    budget.transaction_target = Duration::from_secs(2);
+    for _ in 0..10 {
+        if storage.prune_owned_flow_cache(expired, budget).unwrap() {
+            break;
+        }
+    }
+    assert_eq!(storage.active_flow_count().unwrap(), 0);
+    assert_eq!(
+        metrics(storage.connection(), "traffic_total_minute", "1=1"),
+        (2_000, 1_000, 60, 20)
+    );
+}
+
+#[test]
 fn startup_recovery_gc_retries_after_progress_handler_interruptions() {
     let mut storage = setup();
     storage
@@ -37,6 +207,103 @@ fn startup_recovery_gc_retries_after_progress_handler_interruptions() {
     assert_eq!(
         metrics(storage.connection(), "traffic_total_minute", "1=1"),
         (100, 50, 3, 1)
+    );
+}
+
+#[test]
+fn maintenance_writer_retries_interrupted_recovery_with_smaller_file_db_batches() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("maintenance-recovery-adaptive.db");
+    let mut sqlite = open_at(&path, NOW).unwrap();
+    sqlite
+        .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
+        .unwrap();
+    let mut input = batch(1, FlowLifecycle::Active);
+    let base = input.flows[0].clone();
+    input.flows.clear();
+    for port in 50_000..50_100 {
+        let mut flow = base.clone();
+        flow.client_port = port;
+        input.flows.push(flow);
+    }
+    sqlite
+        .persist_classified_batch(&input, &[transport_attribution()], &[], NOW)
+        .unwrap();
+    let expired = NOW + ACTIVE_FLOW_TTL_MS as u64 + 1;
+    let mut owner = Storage::sqlite(sqlite);
+    let tiny_budget = RetentionBudget {
+        max_rows_per_batch: 100,
+        transaction_target: Duration::from_nanos(1),
+        ..RetentionBudget::default()
+    };
+
+    let mut writer = owner.maintenance_writer().unwrap().unwrap();
+    assert!(
+        !writer
+            .prune_reclassification_for_maintenance_bounded(expired, tiny_budget)
+            .unwrap()
+    );
+    owner.sync_maintenance_state_from(&writer);
+    let Storage::Sqlite(owner_sqlite) = &owner else {
+        unreachable!();
+    };
+    assert_eq!(owner_sqlite.recovery_prune_rows, Some(50));
+
+    let mut writer = owner.maintenance_writer().unwrap().unwrap();
+    assert!(
+        !writer
+            .prune_reclassification_for_maintenance_bounded(
+                expired,
+                RetentionBudget {
+                    transaction_target: Duration::from_secs(1),
+                    ..tiny_budget
+                },
+            )
+            .unwrap()
+    );
+    owner.sync_maintenance_state_from(&writer);
+    let Storage::Sqlite(owner_sqlite) = &owner else {
+        unreachable!();
+    };
+    assert_eq!(owner_sqlite.recovery_prune_rows, Some(100));
+
+    let mut complete = false;
+    for _ in 0..10 {
+        let mut writer = owner.maintenance_writer().unwrap().unwrap();
+        complete = writer
+            .prune_reclassification_for_maintenance_bounded(
+                expired,
+                RetentionBudget {
+                    transaction_target: Duration::from_secs(1),
+                    ..tiny_budget
+                },
+            )
+            .unwrap();
+        owner.sync_maintenance_state_from(&writer);
+        if complete {
+            break;
+        }
+    }
+    assert!(complete);
+    let Storage::Sqlite(owner_sqlite) = &mut owner else {
+        unreachable!();
+    };
+    assert_eq!(owner_sqlite.recovery_prune_rows, None);
+    assert_eq!(count(owner_sqlite, "flow_rollup_sessions"), 0);
+
+    // Expire and checkpoint the owner cache after the independent recovery
+    // pass; persisted traffic totals must survive closing and reopening.
+    assert!(
+        owner
+            .prune_owned_flow_cache(expired, RetentionBudget::default())
+            .unwrap()
+    );
+    drop(owner);
+    let reopened = open_at(&path, expired + 1).unwrap();
+    assert_eq!(count(&reopened, "flow_rollup_sessions"), 0);
+    assert_eq!(
+        metrics(reopened.connection(), "traffic_total_minute", "1=1"),
+        (10_000, 5_000, 300, 100)
     );
 }
 
@@ -491,6 +758,7 @@ fn v5_upgrade_preserves_history_and_enables_correction_for_new_traffic() {
          DROP TRIGGER traffic_scope_total_move;
          DROP TRIGGER traffic_scope_total_delete;
          DROP TABLE traffic_scope_total_minute;
+         DROP INDEX traffic_device_minute_device;
          ALTER TABLE devices DROP COLUMN device_type_override;
          DELETE FROM schema_migrations WHERE version>=6;",
         )

@@ -33,7 +33,9 @@ const PROTOCOL_APPLICATION_PREFIX: &str = "protocol:";
 
 pub(crate) mod destination_cache;
 mod execution;
+mod geo_accumulator;
 mod rankings;
+pub(crate) mod summary_cache;
 
 pub(crate) fn router() -> Router<CollectorState> {
     let router = Router::new()
@@ -1461,20 +1463,15 @@ async fn applications(
                 for item in &mut items {
                     let application_id = item["application_id"].as_str().unwrap_or("unknown");
                     let application = inner.classifier.application_metadata(application_id);
-                    let current_organization_id = item["organization_id"]
-                        .as_str()
-                        .filter(|id| !id.is_empty() && *id != "unknown")
-                        .map(str::to_owned);
-                    let organization_id = current_organization_id
-                        .or_else(|| {
-                            application
-                                .as_ref()
-                                .and_then(|metadata| metadata.organization_id.clone())
-                        })
-                        .unwrap_or_else(|| "unknown".to_owned());
-                    let organization = (organization_id != "unknown")
-                        .then(|| inner.classifier.organization_metadata(&organization_id))
-                        .flatten();
+                    let organization_id = normalized_application_organization_id(
+                        item["organization_id"].as_str(),
+                        application
+                            .as_ref()
+                            .and_then(|metadata| metadata.organization_id.as_deref()),
+                    );
+                    let organization = organization_id
+                        .as_deref()
+                        .and_then(|id| inner.classifier.organization_metadata(id));
                     if let Some(object) = item.as_object_mut() {
                         object.insert(
                             "name".to_owned(),
@@ -1496,127 +1493,184 @@ async fn applications(
         return rankings::applications(&inner, page, window);
     }
     let connection = inner.storage.connection();
-    let result = (|| -> rusqlite::Result<(Vec<Value>, u64)> {
-        let total = if let Some((from, to)) = window {
-            scalar(
-                connection,
-                "SELECT COUNT(*) FROM (
-                    SELECT application_id, category_id FROM traffic_application_minute
-                    WHERE timestamp >= ?1 AND timestamp < ?2
-                    GROUP BY application_id, category_id
-                 )",
-                params![from, to],
-            )?
-        } else {
-            scalar(
-                connection,
-                "SELECT COUNT(*) FROM (
-                    SELECT application_id, category_id FROM traffic_application_minute
-                    GROUP BY application_id, category_id
-                 )",
-                [],
-            )?
-        };
-        let query_sql = if window.is_some() {
-            "WITH app_totals AS (
-                 SELECT application_id, category_id, SUM(upload_bytes) AS upload_bytes,
-                        SUM(download_bytes) AS download_bytes, SUM(packets) AS packets,
-                        SUM(flow_count) AS flow_count, MAX(timestamp) AS last_seen
-                 FROM traffic_application_minute
-                 WHERE timestamp >= ?1 AND timestamp < ?2
-                 GROUP BY application_id, category_id
-             ), client_counts AS (
-                 SELECT CASE WHEN COALESCE(application_id, 'unknown') = 'unknown' AND COALESCE(NULLIF(protocol_id, ''), 'unknown') != 'unknown'
-                             THEN 'protocol:' || COALESCE(NULLIF(protocol_id, ''), 'unknown') ELSE COALESCE(application_id, 'unknown') END AS application_id,
-                        COUNT(DISTINCT device_id) AS client_count
-                 FROM flow_sessions
-                 WHERE device_id IS NOT NULL AND last_seen_at >= ?1 AND last_seen_at < ?2
-                 GROUP BY CASE WHEN COALESCE(application_id, 'unknown') = 'unknown' AND COALESCE(NULLIF(protocol_id, ''), 'unknown') != 'unknown'
-                               THEN 'protocol:' || COALESCE(NULLIF(protocol_id, ''), 'unknown') ELSE COALESCE(application_id, 'unknown') END
-             )
-             SELECT t.application_id, t.category_id, t.upload_bytes, t.download_bytes,
-                    t.packets, t.flow_count, t.last_seen, COALESCE(c.client_count, 0),
-                    CASE
-                            WHEN t.application_id IN ('unknown', 'protocol-only') OR t.application_id LIKE 'protocol:%' THEN NULL
-                        ELSE (SELECT f.organization_id FROM flow_sessions f
-                              WHERE f.application_id = t.application_id
-                                AND f.organization_id IS NOT NULL AND f.organization_id != 'unknown'
-                              LIMIT 1)
-                    END
-             FROM app_totals t LEFT JOIN client_counts c ON c.application_id = t.application_id
-             ORDER BY t.upload_bytes + t.download_bytes DESC, t.application_id
-             LIMIT ?3 OFFSET ?4"
-        } else {
-            "WITH app_totals AS (
-                 SELECT application_id, category_id, SUM(upload_bytes) AS upload_bytes,
-                        SUM(download_bytes) AS download_bytes, SUM(packets) AS packets,
-                        SUM(flow_count) AS flow_count, MAX(timestamp) AS last_seen
-                 FROM traffic_application_minute
-                 GROUP BY application_id, category_id
-             ), client_counts AS (
-                 SELECT CASE WHEN COALESCE(application_id, 'unknown') = 'unknown' AND COALESCE(NULLIF(protocol_id, ''), 'unknown') != 'unknown'
-                             THEN 'protocol:' || COALESCE(NULLIF(protocol_id, ''), 'unknown') ELSE COALESCE(application_id, 'unknown') END AS application_id,
-                        COUNT(DISTINCT device_id) AS client_count
-                 FROM flow_sessions WHERE device_id IS NOT NULL
-                 GROUP BY CASE WHEN COALESCE(application_id, 'unknown') = 'unknown' AND COALESCE(NULLIF(protocol_id, ''), 'unknown') != 'unknown'
-                               THEN 'protocol:' || COALESCE(NULLIF(protocol_id, ''), 'unknown') ELSE COALESCE(application_id, 'unknown') END
-             )
-             SELECT t.application_id, t.category_id, t.upload_bytes, t.download_bytes,
-                    t.packets, t.flow_count, t.last_seen, COALESCE(c.client_count, 0),
-                    CASE
-                            WHEN t.application_id IN ('unknown', 'protocol-only') OR t.application_id LIKE 'protocol:%' THEN NULL
-                        ELSE (SELECT f.organization_id FROM flow_sessions f
-                              WHERE f.application_id = t.application_id
-                                AND f.organization_id IS NOT NULL AND f.organization_id != 'unknown'
-                              LIMIT 1)
-                    END
-             FROM app_totals t LEFT JOIN client_counts c ON c.application_id = t.application_id
-             ORDER BY t.upload_bytes + t.download_bytes DESC, t.application_id
-             LIMIT ?1 OFFSET ?2"
-        };
-        let mut statement = connection.prepare(query_sql)?;
-        let map_row = |row: &Row<'_>| map_application_row(row, &inner);
-        let items = match window {
-            Some((from, to)) => statement
-                .query_map(
-                    params![from, to, i64::from(page.limit), to_i64(page.offset)],
-                    map_row,
+    let cache = &state.summary_pages;
+    let generation = cache.generation();
+    let page_data = if let Some(page_data) =
+        cache.get_window("applications", page.limit, page.offset, generation, window)
+    {
+        page_data
+    } else {
+        let result = (|| -> rusqlite::Result<(Vec<Value>, u64)> {
+            let query_sql = sqlite_applications_query_sql(window.is_some());
+            let mut statement = connection.prepare(&query_sql)?;
+            let map_row = |row: &Row<'_>| Ok((map_application_row(row)?, row.get::<_, i64>(9)?));
+            let items = match window {
+                Some((from, to)) => statement
+                    .query_map(
+                        params![from, to, i64::from(page.limit), to_i64(page.offset)],
+                        map_row,
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+                None => statement
+                    .query_map(params![i64::from(page.limit), to_i64(page.offset)], map_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            };
+            let total = if let Some((_, total)) = items.first() {
+                *total
+            } else if let Some((from, to)) = window {
+                scalar(
+                    connection,
+                    "SELECT COUNT(*) FROM (SELECT application_id, category_id FROM traffic_application_minute WHERE timestamp >= ?1 AND timestamp < ?2 GROUP BY application_id, category_id)",
+                    params![from, to],
                 )?
-                .collect::<rusqlite::Result<Vec<_>>>()?,
-            None => statement
-                .query_map(params![i64::from(page.limit), to_i64(page.offset)], map_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?,
-        };
-        Ok((items, to_u64(total)))
-    })();
-    result.map_or_else(storage_error, |(items, total)| page_ok(items, page, total))
+            } else {
+                scalar(
+                    connection,
+                    "SELECT COUNT(*) FROM (SELECT application_id, category_id FROM traffic_application_minute GROUP BY application_id, category_id)",
+                    [],
+                )?
+            };
+            Ok((
+                items.into_iter().map(|(item, _)| item).collect(),
+                to_u64(total),
+            ))
+        })();
+        match result {
+            Ok(page_data) => {
+                if cache.generation() == generation {
+                    cache.insert_window(
+                        "applications",
+                        page.limit,
+                        page.offset,
+                        generation,
+                        window,
+                        page_data.0.clone(),
+                        page_data.1,
+                    );
+                }
+                page_data
+            }
+            Err(error) => return storage_error(error),
+        }
+    };
+    let mut items = page_data.0;
+    for item in &mut items {
+        enrich_application_row(item, &inner);
+    }
+    page_ok(items, page, page_data.1)
 }
 
-fn map_application_row(row: &Row<'_>, inner: &crate::QueryContext<'_>) -> rusqlite::Result<Value> {
-    let application_id = row.get::<_, String>(0)?;
-    let application_metadata = inner.classifier.application_metadata(&application_id);
-    let organization_id = if matches!(application_id.as_str(), "unknown" | "protocol-only") {
-        None
-    } else if application_id.starts_with(PROTOCOL_APPLICATION_PREFIX) {
-        None
+pub(crate) fn sqlite_applications_query_sql(windowed: bool) -> String {
+    let (application_window_filter, flow_window_filter, limit_parameter, offset_parameter) =
+        if windowed {
+            (
+                "WHERE timestamp >= ?1 AND timestamp < ?2",
+                "AND f.last_seen_at >= ?1 AND f.last_seen_at < ?2",
+                "?3",
+                "?4",
+            )
+        } else {
+            ("", "", "?1", "?2")
+        };
+    let (
+        application_page_join,
+        application_page_predicate,
+        protocol_page_join,
+        protocol_page_predicate,
+    ) = if windowed {
+        (
+            "CROSS JOIN flow_sessions f",
+            "f.application_id = p.application_id AND",
+            "CROSS JOIN flow_sessions f",
+            "f.protocol_id = p.protocol_id AND",
+        )
     } else {
-        row.get::<_, Option<String>>(8)?
+        (
+            "JOIN flow_sessions f ON f.application_id = p.application_id",
+            "",
+            "JOIN flow_sessions f ON f.protocol_id = p.protocol_id",
+            "",
+        )
     };
-    let organization_id = match organization_id {
-        Some(id) if !id.is_empty() && id != "unknown" => Some(id),
-        _ => application_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.organization_id.clone()),
-    };
-    let organization_metadata = organization_id
-        .as_deref()
-        .filter(|id| !id.is_empty() && *id != "unknown")
-        .and_then(|id| inner.classifier.organization_metadata(id));
+    format!(
+        "WITH app_totals AS (
+             SELECT application_id, category_id, SUM(upload_bytes) AS upload_bytes,
+                    SUM(download_bytes) AS download_bytes, SUM(packets) AS packets,
+                    SUM(flow_count) AS flow_count, MAX(timestamp) AS last_seen,
+                    COUNT(*) OVER () AS total
+             FROM traffic_application_minute
+             {application_window_filter}
+             GROUP BY application_id, category_id
+         ), app_page AS (
+             SELECT * FROM app_totals
+             ORDER BY upload_bytes + download_bytes DESC, application_id
+             LIMIT {limit_parameter} OFFSET {offset_parameter}
+         ), page_apps AS (
+             SELECT DISTINCT application_id FROM app_page
+         ), page_protocols AS (
+             SELECT DISTINCT substr(application_id, 10) AS protocol_id
+             FROM page_apps WHERE application_id LIKE '{PROTOCOL_APPLICATION_PREFIX}%'
+         ), client_flows AS (
+             SELECT f.application_id, f.device_id
+             FROM page_apps p {application_page_join}
+             WHERE {application_page_predicate} f.device_id IS NOT NULL
+               AND f.application_id != 'unknown' {flow_window_filter}
+             UNION ALL
+             SELECT '{PROTOCOL_APPLICATION_PREFIX}' || f.protocol_id, f.device_id
+             FROM page_protocols p {protocol_page_join}
+             WHERE {protocol_page_predicate} f.device_id IS NOT NULL
+               AND f.application_id = 'unknown'
+               AND f.protocol_id != '' AND f.protocol_id != 'unknown' {flow_window_filter}
+             UNION ALL
+             SELECT '{PROTOCOL_APPLICATION_PREFIX}' || f.protocol_id, f.device_id
+             FROM page_protocols p {protocol_page_join}
+             WHERE {protocol_page_predicate} f.device_id IS NOT NULL
+               AND f.application_id IS NULL
+               AND f.protocol_id != '' AND f.protocol_id != 'unknown' {flow_window_filter}
+             UNION ALL
+             SELECT 'unknown', f.device_id
+             FROM page_apps p JOIN flow_sessions f ON f.application_id = 'unknown'
+             WHERE p.application_id = 'unknown'
+                   AND f.device_id IS NOT NULL
+               AND COALESCE(NULLIF(f.protocol_id, ''), 'unknown') = 'unknown' {flow_window_filter}
+             UNION ALL
+             SELECT 'unknown', f.device_id
+             FROM page_apps p JOIN flow_sessions f ON f.application_id IS NULL
+             WHERE p.application_id = 'unknown'
+                   AND f.device_id IS NOT NULL
+               AND COALESCE(NULLIF(f.protocol_id, ''), 'unknown') = 'unknown' {flow_window_filter}
+         ), client_counts AS (
+             SELECT application_id, COUNT(DISTINCT device_id) AS client_count
+             FROM client_flows GROUP BY application_id
+         )
+         SELECT t.application_id, t.category_id, t.upload_bytes, t.download_bytes,
+                t.packets, t.flow_count, t.last_seen, COALESCE(c.client_count, 0),
+                CASE
+                    WHEN t.application_id IN ('unknown', 'protocol-only') OR t.application_id LIKE '{PROTOCOL_APPLICATION_PREFIX}%'
+                    THEN NULL
+                    ELSE (SELECT f.organization_id FROM flow_sessions f
+                          WHERE f.application_id = t.application_id
+                            AND f.organization_id IS NOT NULL AND f.organization_id != 'unknown'
+                          LIMIT 1)
+                END, t.total
+         FROM app_page t LEFT JOIN client_counts c ON c.application_id = t.application_id
+         ORDER BY t.upload_bytes + t.download_bytes DESC, t.application_id"
+    )
+}
+
+fn map_application_row(row: &Row<'_>) -> rusqlite::Result<Value> {
+    let application_id = row.get::<_, String>(0)?;
+    let persisted_organization_id =
+        if matches!(application_id.as_str(), "unknown" | "protocol-only")
+            || application_id.starts_with(PROTOCOL_APPLICATION_PREFIX)
+        {
+            None
+        } else {
+            row.get::<_, Option<String>>(8)?
+        };
     Ok(json!({
         "application_id": application_id,
-        "name": application_metadata
-            .as_ref()
-            .map(|metadata| metadata.name.clone()),
+        "_persisted_organization_id": persisted_organization_id,
         "category_id": row.get::<_, String>(1)?,
         "upload_bytes": row.get::<_, i64>(2)?,
         "download_bytes": row.get::<_, i64>(3)?,
@@ -1624,10 +1678,56 @@ fn map_application_row(row: &Row<'_>, inner: &crate::QueryContext<'_>) -> rusqli
         "flow_count": row.get::<_, i64>(5)?,
         "last_seen": row.get::<_, i64>(6)?,
         "client_count": row.get::<_, i64>(7)?,
-        "organization_id": organization_id,
-        "organization_name": organization_metadata.as_ref().map(|metadata| metadata.name.clone()),
-        "icon": icon_json(application_metadata),
     }))
+}
+
+fn enrich_application_row(item: &mut Value, inner: &crate::QueryContext<'_>) {
+    let Some(object) = item.as_object_mut() else {
+        return;
+    };
+    let application_id = object
+        .get("application_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let application_metadata = inner.classifier.application_metadata(&application_id);
+    let persisted_organization_id = object
+        .remove("_persisted_organization_id")
+        .and_then(|value| value.as_str().map(ToOwned::to_owned));
+    let organization_id = if matches!(application_id.as_str(), "unknown" | "protocol-only")
+        || application_id.starts_with(PROTOCOL_APPLICATION_PREFIX)
+    {
+        None
+    } else {
+        normalized_application_organization_id(
+            persisted_organization_id.as_deref(),
+            application_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.organization_id.as_deref()),
+        )
+    };
+    let organization_metadata = organization_id
+        .as_deref()
+        .filter(|id| !id.is_empty() && *id != "unknown")
+        .and_then(|id| inner.classifier.organization_metadata(id));
+    object.insert(
+        "name".to_owned(),
+        json!(
+            application_metadata
+                .as_ref()
+                .map(|metadata| metadata.name.clone())
+        ),
+    );
+    object.insert("organization_id".to_owned(), json!(organization_id));
+    object.insert(
+        "organization_name".to_owned(),
+        json!(
+            organization_metadata
+                .as_ref()
+                .map(|metadata| metadata.name.clone())
+        ),
+    );
+    object.insert("icon".to_owned(), icon_json(application_metadata));
 }
 
 fn sqlite_application_flow_filter(id_parameter: &str, prefix: &str) -> String {
@@ -1638,6 +1738,16 @@ fn sqlite_application_flow_filter(id_parameter: &str, prefix: &str) -> String {
          OR ({id_parameter} = 'unknown' AND {application} = 'unknown' AND {protocol} = 'unknown') \
          OR ({id_parameter} NOT IN ('unknown', 'protocol-only') AND {id_parameter} NOT LIKE '{PROTOCOL_APPLICATION_PREFIX}%' AND {application} = {id_parameter}))"
     )
+}
+
+fn normalized_application_organization_id(
+    current: Option<&str>,
+    fallback: Option<&str>,
+) -> Option<String> {
+    current
+        .filter(|id| !id.is_empty() && *id != "unknown")
+        .or_else(|| fallback.filter(|id| !id.is_empty() && *id != "unknown"))
+        .map(str::to_owned)
 }
 
 async fn organizations(
@@ -1669,36 +1779,83 @@ async fn organizations(
             .unwrap_or_else(storage_error);
     }
     let connection = inner.storage.connection();
-    let result = (|| -> rusqlite::Result<(Vec<Value>, u64)> {
-        let total: i64 = scalar(
-            connection,
-            "SELECT COUNT(DISTINCT COALESCE(organization_id, 'unknown')) FROM flow_sessions",
-            [],
-        )?;
-        let mut statement = connection.prepare(
-            "SELECT COALESCE(organization_id, 'unknown'), SUM(upload_bytes), SUM(download_bytes), COUNT(*), MAX(last_seen_at), COUNT(DISTINCT device_id)
+    let cache = &state.summary_pages;
+    let generation = cache.generation();
+    let page_data = if let Some(page_data) =
+        cache.get("organizations", page.limit, page.offset, generation)
+    {
+        page_data
+    } else {
+        let result = (|| -> rusqlite::Result<(Vec<Value>, u64)> {
+            let mut statement = connection.prepare(
+            "SELECT COALESCE(organization_id, 'unknown'), SUM(upload_bytes), SUM(download_bytes), COUNT(*), MAX(last_seen_at), COUNT(DISTINCT device_id), COUNT(*) OVER ()
              FROM flow_sessions GROUP BY COALESCE(organization_id, 'unknown')
              ORDER BY SUM(upload_bytes + download_bytes) DESC LIMIT ?1 OFFSET ?2",
         )?;
-        let items = statement
-            .query_map(params![i64::from(page.limit), to_i64(page.offset)], |row| {
-                let id: String = row.get(0)?;
-                let metadata = inner.classifier.organization_metadata(&id);
-                Ok(json!({
-                    "id": id.clone(),
-                    "name": metadata_name(metadata.as_ref(), &id),
-                    "icon": icon_json(metadata),
-                    "upload_bytes": row.get::<_, i64>(1)?,
-                    "download_bytes": row.get::<_, i64>(2)?,
-                    "flows": row.get::<_, i64>(3)?,
-                    "last_seen": row.get::<_, i64>(4)?,
-                    "clients": row.get::<_, i64>(5)?,
-                }))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok((items, to_u64(total)))
-    })();
-    result.map_or_else(storage_error, |(items, total)| page_ok(items, page, total))
+            let items = statement
+                .query_map(params![i64::from(page.limit), to_i64(page.offset)], |row| {
+                    let id: String = row.get(0)?;
+                    Ok((
+                        json!({
+                            "id": id,
+                            "upload_bytes": row.get::<_, i64>(1)?,
+                            "download_bytes": row.get::<_, i64>(2)?,
+                            "flows": row.get::<_, i64>(3)?,
+                            "last_seen": row.get::<_, i64>(4)?,
+                            "clients": row.get::<_, i64>(5)?,
+                        }),
+                        row.get::<_, i64>(6)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let total = if let Some((_, total)) = items.first() {
+                *total
+            } else {
+                // Group the raw indexed column, then merge NULL with the literal
+                // "unknown" just as COALESCE does. This avoids a temp DISTINCT tree.
+                scalar(
+                connection,
+                "SELECT COUNT(*) - (EXISTS(SELECT 1 FROM flow_sessions WHERE organization_id IS NULL)
+                                  AND EXISTS(SELECT 1 FROM flow_sessions WHERE organization_id = 'unknown'))
+                 FROM (SELECT organization_id FROM flow_sessions GROUP BY organization_id)",
+                [],
+            )?
+            };
+            Ok((
+                items.into_iter().map(|(item, _)| item).collect(),
+                to_u64(total),
+            ))
+        })();
+        match result {
+            Ok(page_data) => {
+                if cache.generation() == generation {
+                    cache.insert(
+                        "organizations",
+                        page.limit,
+                        page.offset,
+                        generation,
+                        page_data.0.clone(),
+                        page_data.1,
+                    );
+                }
+                page_data
+            }
+            Err(error) => return storage_error(error),
+        }
+    };
+    let (mut items, total) = page_data;
+    for item in &mut items {
+        let id = item["id"].as_str().unwrap_or("unknown").to_owned();
+        let metadata = inner.classifier.organization_metadata(&id);
+        if let Some(object) = item.as_object_mut() {
+            object.insert(
+                "name".to_owned(),
+                json!(metadata_name(metadata.as_ref(), &id)),
+            );
+            object.insert("icon".to_owned(), icon_json(metadata));
+        }
+    }
+    page_ok(items, page, total)
 }
 
 async fn protocols(
@@ -1717,33 +1874,77 @@ async fn protocols(
             .unwrap_or_else(storage_error);
     }
     let connection = inner.storage.connection();
-    let result = (|| -> rusqlite::Result<(Vec<Value>, u64)> {
-        let total: i64 = scalar(
-            connection,
-            "SELECT COUNT(DISTINCT COALESCE(protocol_id, 'unknown')) FROM flow_sessions",
-            [],
-        )?;
-        let mut statement = connection.prepare(
-            "SELECT COALESCE(protocol_id, 'unknown'), SUM(upload_bytes), SUM(download_bytes), COUNT(*), MAX(last_seen_at)
+    let cache = &state.summary_pages;
+    let generation = cache.generation();
+    let page_data = if let Some(page_data) =
+        cache.get("protocols", page.limit, page.offset, generation)
+    {
+        page_data
+    } else {
+        let result = (|| -> rusqlite::Result<(Vec<Value>, u64)> {
+            let mut statement = connection.prepare(
+            "SELECT COALESCE(protocol_id, 'unknown'), SUM(upload_bytes), SUM(download_bytes), COUNT(*), MAX(last_seen_at), COUNT(*) OVER ()
              FROM flow_sessions GROUP BY COALESCE(protocol_id, 'unknown')
              ORDER BY SUM(upload_bytes + download_bytes) DESC LIMIT ?1 OFFSET ?2",
         )?;
-        let items = statement
-            .query_map(params![i64::from(page.limit), to_i64(page.offset)], |row| {
-                let id: String = row.get(0)?;
-                Ok(json!({
-                    "id": id.clone(),
-                    "name": id,
-                    "upload_bytes": row.get::<_, i64>(1)?,
-                    "download_bytes": row.get::<_, i64>(2)?,
-                    "flows": row.get::<_, i64>(3)?,
-                    "last_seen": row.get::<_, i64>(4)?,
-                }))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok((items, to_u64(total)))
-    })();
-    result.map_or_else(storage_error, |(items, total)| page_ok(items, page, total))
+            let items = statement
+                .query_map(params![i64::from(page.limit), to_i64(page.offset)], |row| {
+                    let id: String = row.get(0)?;
+                    Ok((
+                        json!({
+                            "id": id,
+                            "upload_bytes": row.get::<_, i64>(1)?,
+                            "download_bytes": row.get::<_, i64>(2)?,
+                            "flows": row.get::<_, i64>(3)?,
+                            "last_seen": row.get::<_, i64>(4)?,
+                        }),
+                        row.get::<_, i64>(5)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let total = if let Some((_, total)) = items.first() {
+                *total
+            } else {
+                // Preserve COALESCE's NULL/"unknown" equivalence while grouping
+                // the raw indexed column without a temporary DISTINCT tree.
+                scalar(
+                connection,
+                "SELECT COUNT(*) - (EXISTS(SELECT 1 FROM flow_sessions WHERE protocol_id IS NULL)
+                                  AND EXISTS(SELECT 1 FROM flow_sessions WHERE protocol_id = 'unknown'))
+                 FROM (SELECT protocol_id FROM flow_sessions GROUP BY protocol_id)",
+                [],
+            )?
+            };
+            Ok((
+                items.into_iter().map(|(item, _)| item).collect(),
+                to_u64(total),
+            ))
+        })();
+        match result {
+            Ok(page_data) => {
+                if cache.generation() == generation {
+                    cache.insert(
+                        "protocols",
+                        page.limit,
+                        page.offset,
+                        generation,
+                        page_data.0.clone(),
+                        page_data.1,
+                    );
+                }
+                page_data
+            }
+            Err(error) => return storage_error(error),
+        }
+    };
+    let (mut items, total) = page_data;
+    for item in &mut items {
+        if let Some(object) = item.as_object_mut() {
+            let name = object.get("id").cloned().unwrap_or(Value::Null);
+            object.insert("name".to_owned(), name);
+        }
+    }
+    page_ok(items, page, total)
 }
 
 async fn application_detail(
@@ -1839,53 +2040,91 @@ async fn application_detail(
     match result {
         Ok(Some(mut value)) => {
             let connection = inner.storage.connection();
-            let classifier = connection.query_row(
-                &format!("SELECT COUNT(DISTINCT device_id), COUNT(DISTINCT domain),
-                        COUNT(DISTINCT hex(remote_ip)), AVG(COALESCE(classification_confidence, 0)),
-                        COALESCE(MAX(classification_reason), 'no matching rule'),
-                        COALESCE(MAX(CASE
-                            WHEN ?1 NOT IN ('unknown', 'protocol-only') AND ?1 NOT LIKE '{PROTOCOL_APPLICATION_PREFIX}%'
-                             AND organization_id IS NOT NULL AND organization_id != 'unknown'
-                            THEN organization_id
-                        END), 'unknown')
-                 FROM flow_sessions
-                 WHERE {flow_filter}
-                   AND (?3 IS NULL OR last_seen_at >= ?3) AND (?4 IS NULL OR last_seen_at < ?4)
-                   AND (?1 LIKE '{PROTOCOL_APPLICATION_PREFIX}%' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)",
+            let classifier = (|| {
+                let mut statement = connection.prepare(&format!(
+                    "WITH filtered AS MATERIALIZED (
+                        SELECT device_id, domain, remote_ip, classification_confidence,
+                               classification_reason, organization_id,
+                               COALESCE(protocol_id, 'unknown') AS protocol_id
+                        FROM flow_sessions
+                        WHERE {flow_filter}
+                          AND (?3 IS NULL OR last_seen_at >= ?3) AND (?4 IS NULL OR last_seen_at < ?4)
+                          AND (?1 LIKE '{PROTOCOL_APPLICATION_PREFIX}%' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)
+                    ),
+                    stats AS (
+                        SELECT COUNT(DISTINCT device_id), COUNT(DISTINCT domain),
+                               COUNT(DISTINCT hex(remote_ip)),
+                               AVG(COALESCE(classification_confidence, 0)),
+                               COALESCE(MAX(classification_reason), 'no matching rule'),
+                               COALESCE(MAX(CASE
+                                   WHEN ?1 NOT IN ('unknown', 'protocol-only')
+                                    AND ?1 NOT LIKE '{PROTOCOL_APPLICATION_PREFIX}%'
+                                    AND organization_id IS NOT NULL AND organization_id != 'unknown'
+                                   THEN organization_id
+                               END), 'unknown')
+                        FROM filtered
+                    ),
+                    protocol_counts AS (
+                        SELECT protocol_id, COUNT(*) AS flows
+                        FROM filtered
+                        GROUP BY protocol_id
+                    )
+                    SELECT stats.*, protocol_counts.protocol_id, protocol_counts.flows
+                    FROM stats LEFT JOIN protocol_counts ON 1 = 1
+                    ORDER BY protocol_counts.flows DESC, protocol_counts.protocol_id",
                     flow_filter = sqlite_application_flow_filter("?1", "")
-                ),
-                params![
-                    id,
-                    category,
-                    window.map(|(from, _)| from),
-                    window.map(|(_, to)| to)
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                },
-            );
+                ))?;
+                let rows = statement.query_map(
+                    params![
+                        id,
+                        category,
+                        window.map(|(from, _)| from),
+                        window.map(|(_, to)| to)
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<i64>>(7)?,
+                        ))
+                    },
+                )?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })();
             match classifier {
-                Ok((clients, domains, destinations, confidence, reason, organization)) => {
+                Ok(rows) => {
+                    let Some((
+                        clients,
+                        domains,
+                        destinations,
+                        confidence,
+                        reason,
+                        organization,
+                        _,
+                        _,
+                    )) = rows.first()
+                    else {
+                        return storage_error(rusqlite::Error::QueryReturnedNoRows);
+                    };
+                    let observed_protocols = rows
+                        .iter()
+                        .filter_map(|row| {
+                            Some(json!({
+                                "id": row.6.as_ref()?,
+                                "flows": row.7?,
+                            }))
+                        })
+                        .collect::<Vec<_>>();
                     let organization = if id == "unknown" {
                         "unknown".to_owned()
                     } else {
-                        organization
+                        organization.clone()
                     };
-                    let observed_protocols = query_application_protocols(
-                        connection,
-                        &id,
-                        category,
-                        window.map(|(from, _)| from),
-                        window.map(|(_, to)| to),
-                    )
-                    .unwrap_or_else(|_| Vec::new());
                     let application_metadata = inner.classifier.application_metadata(&id);
                     let organization_metadata = (organization != "unknown")
                         .then(|| inner.classifier.organization_metadata(&organization))
@@ -1935,6 +2174,9 @@ async fn application_detail(
             "confidence": 0.0,
             "classifier_reason": "no matching rule",
             "organization_id": "unknown",
+            "name": null,
+            "organization_name": null,
+            "icon": null,
             "observed_protocols": [],
         })),
         Ok(None) => api_error(
@@ -1944,33 +2186,6 @@ async fn application_detail(
         ),
         Err(error) => storage_error(error),
     }
-}
-
-fn query_application_protocols(
-    connection: &Connection,
-    id: &str,
-    category: Option<&str>,
-    from: Option<i64>,
-    to: Option<i64>,
-) -> rusqlite::Result<Vec<Value>> {
-    let mut statement = connection.prepare(&format!(
-        "SELECT COALESCE(protocol_id, 'unknown'), COUNT(*)
-         FROM flow_sessions
-         WHERE {flow_filter}
-           AND (?3 IS NULL OR last_seen_at >= ?3) AND (?4 IS NULL OR last_seen_at < ?4)
-           AND (?1 LIKE '{PROTOCOL_APPLICATION_PREFIX}%' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2)
-         GROUP BY COALESCE(protocol_id, 'unknown')
-         ORDER BY COUNT(*) DESC, COALESCE(protocol_id, 'unknown')",
-        flow_filter = sqlite_application_flow_filter("?1", "")
-    ))?;
-    statement
-        .query_map(params![id, category, from, to], |row| {
-            Ok(json!({
-                "id": row.get::<_, String>(0)?,
-                "flows": row.get::<_, i64>(1)?,
-            }))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -2288,10 +2503,11 @@ fn query_application_flows(
     from: u64,
     to: u64,
 ) -> rusqlite::Result<Value> {
-    let application_name = classifier
-        .application_metadata(id)
+    let application_metadata = classifier.application_metadata(id);
+    let application_name = application_metadata
         .as_ref()
         .map(|metadata| metadata.name.clone());
+    let application_icon = icon_json(application_metadata);
     let category_filter = if id.starts_with(PROTOCOL_APPLICATION_PREFIX) {
         "?1 LIKE 'protocol:%' OR ?2 IS NULL OR COALESCE(category_id, 'unknown') = ?2"
     } else {
@@ -2318,7 +2534,7 @@ fn query_application_flows(
                 "client_port": row.get::<_, i64>(2)?, "remote_ip": format_ip(&remote_ip),
                 "remote_port": row.get::<_, i64>(4)?, "protocol": row.get::<_, i64>(5)?,
                 "direction": row.get::<_, i64>(6)?, "domain": row.get::<_, Option<String>>(7)?,
-                "application": id, "application_name": application_name,
+                "application": id, "application_name": application_name, "icon": application_icon,
                 "category": row.get::<_, Option<String>>(8)?.unwrap_or_else(|| "unknown".to_owned()),
                 "confidence": row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
                 "reason": row.get::<_, Option<String>>(10)?.unwrap_or_else(|| "no matching rule".to_owned()),
@@ -2429,21 +2645,21 @@ async fn destinations(
             .unwrap_or_else(storage_error);
     }
     let connection = inner.storage.connection();
-    let traffic = match state
-        .destination_traffic
-        .get(connection, query.from, query.to)
-    {
+    let (traffic, total) = match state.destination_traffic.page(
+        connection,
+        query.from,
+        query.to,
+        page.limit,
+        page.offset,
+    ) {
         Ok(traffic) => traffic,
         Err(error) => return storage_error(error),
     };
-    let total = traffic.len() as u64;
     let result = (|| -> rusqlite::Result<Vec<Value>> {
         let mut statement =
             connection.prepare_cached(destination_cache::destination_metadata_sql())?;
         traffic
             .iter()
-            .skip(usize::try_from(page.offset).unwrap_or(usize::MAX))
-            .take(page.limit as usize)
             .map(|row| {
                 statement.query_row(destination_cache::destination_params(row), |row| {
                     map_destination_row(row, &inner, query.lang.as_deref())
@@ -2530,9 +2746,19 @@ async fn geo_summary(
         }));
     }
     if let Some(clickhouse) = inner.storage.clickhouse_storage() {
+        let mut accumulator = geo_accumulator::GeoAccumulator::new();
         return clickhouse
-            .query_geo_traffic(query.from, query.to)
-            .map(|rows| aggregate_geo_values(&inner, rows, query.lang.as_deref()))
+            .visit_geo_traffic(query.from, query.to, |address, bytes| {
+                accumulate_geo_value(
+                    &inner,
+                    &mut accumulator,
+                    address,
+                    bytes,
+                    query.lang.as_deref(),
+                )
+                .map_err(Into::into)
+            })
+            .and_then(|()| accumulator.finish().map_err(Into::into))
             .map_or_else(storage_error, api_ok);
     }
     aggregate_geo_traffic(
@@ -2582,59 +2808,91 @@ async fn insights(
 
 fn aggregate_geo_traffic(
     inner: &crate::QueryContext<'_>,
-    cache: &destination_cache::DestinationTrafficCache,
+    _cache: &destination_cache::DestinationTrafficCache,
     from: Option<u64>,
     to: Option<u64>,
     lang: Option<&str>,
 ) -> Result<Value, Arc<rusqlite::Error>> {
-    let rows = cache.get(inner.storage.connection(), from, to)?;
-    Ok(aggregate_geo_values(
-        inner,
-        rows.iter()
-            .map(|row| (row.address.clone(), row.upload_bytes + row.download_bytes)),
-        lang,
-    ))
+    let connection = inner.storage.connection();
+    let snapshot = geo_accumulator::ReadSnapshot::begin(connection).map_err(Arc::new)?;
+    let read = |wide: bool| -> rusqlite::Result<Value> {
+        if wide {
+            geo_accumulator::register_sqlite_total(connection)?;
+        }
+        let (sql, values) = destination_cache::geo_sql(from, to, wide);
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
+            let total = if wide {
+                let bytes: Vec<u8> = row.get(1)?;
+                let word: [u8; 8] = bytes
+                    .try_into()
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                u64::from_be_bytes(word)
+            } else {
+                let sum = i128::from(row.get::<_, i64>(1)?) + i128::from(row.get::<_, i64>(2)?);
+                u64::try_from(sum).unwrap_or(0)
+            };
+            Ok((row.get(0)?, total))
+        })?;
+        aggregate_geo_values(inner, rows, lang)
+    };
+    let value = match read(false) {
+        Err(rusqlite::Error::SqliteFailure(_, Some(message))) if message == "integer overflow" => {
+            read(true)
+        }
+        other => other,
+    }
+    .map_err(Arc::new)?;
+    snapshot.finish().map_err(Arc::new)?;
+    Ok(value)
 }
 
 fn aggregate_geo_values(
     inner: &crate::QueryContext<'_>,
-    rows: impl IntoIterator<Item = (Vec<u8>, i64)>,
+    rows: impl IntoIterator<Item = rusqlite::Result<(Vec<u8>, u64)>>,
     lang: Option<&str>,
-) -> Value {
-    let mut countries: HashMap<(String, String), u64> = HashMap::new();
-    let mut asns: HashMap<(u32, String), u64> = HashMap::new();
-    let mut unknown_bytes = 0_u64;
-    for (address, bytes) in rows {
-        let bytes = to_u64(bytes);
-        let record = format_ip(&address).parse::<IpAddr>().ok().and_then(|ip| {
-            match inner.geo_provider.lookup_with_lang(ip, lang) {
-                Ok(record) => record,
-                Err(error) => {
-                    tracing::warn!(%ip, %error, "Geo lookup failed");
-                    None
-                }
-            }
-        });
-        let Some(record) = record else {
-            unknown_bytes = unknown_bytes.saturating_add(bytes);
-            continue;
-        };
-        if let Some(code) = record.country_code {
-            let name = record.country_name.unwrap_or_else(|| code.clone());
-            let total = countries.entry((code, name)).or_default();
-            *total = total.saturating_add(bytes);
-        } else {
-            unknown_bytes = unknown_bytes.saturating_add(bytes);
-        }
-        if let Some(asn) = record.asn {
-            let organization = record
-                .organization
-                .unwrap_or_else(|| "Unknown organization".to_owned());
-            let total = asns.entry((asn, organization)).or_default();
-            *total = total.saturating_add(bytes);
-        }
+) -> rusqlite::Result<Value> {
+    let mut accumulator = geo_accumulator::GeoAccumulator::new();
+    for row in rows {
+        let (address, bytes) = row?;
+        accumulate_geo_value(inner, &mut accumulator, address, bytes, lang)?;
     }
-    geo_summary_value(countries, asns, unknown_bytes)
+    accumulator.finish()
+}
+
+fn accumulate_geo_value(
+    inner: &crate::QueryContext<'_>,
+    accumulator: &mut geo_accumulator::GeoAccumulator,
+    address: Vec<u8>,
+    bytes: u64,
+    lang: Option<&str>,
+) -> rusqlite::Result<()> {
+    let record = format_ip(&address).parse::<IpAddr>().ok().and_then(|ip| {
+        match inner.geo_provider.lookup_with_lang(ip, lang) {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::warn!(%ip, %error, "Geo lookup failed");
+                None
+            }
+        }
+    });
+    let Some(record) = record else {
+        accumulator.add_unknown(bytes);
+        return Ok(());
+    };
+    if let Some(code) = record.country_code {
+        let name = record.country_name.unwrap_or_else(|| code.clone());
+        accumulator.add_country(code, name, bytes)?;
+    } else {
+        accumulator.add_unknown(bytes);
+    }
+    if let Some(asn) = record.asn {
+        let organization = record
+            .organization
+            .unwrap_or_else(|| "Unknown organization".to_owned());
+        accumulator.add_asn(asn, organization, bytes)?;
+    }
+    Ok(())
 }
 
 fn geo_summary_value(
@@ -3106,7 +3364,7 @@ fn query_flow_page_clickhouse(
                 "protocol_confidence": decimal("protocol_confidence"),
                 "confidence": decimal("classification_confidence"),
                 "reason": row["classification_reason"].as_str().unwrap_or("no matching rule"),
-                "evidence": row["classification_evidence_json"].as_str().unwrap_or("[]"),
+                "evidence": row["classification_evidence_json"].as_str().filter(|value| !value.is_empty()).unwrap_or("[]"),
                 "upload_bytes": number("upload_bytes"),
                 "download_bytes": number("download_bytes"),
                 "packets": number("packets"),
@@ -3324,12 +3582,19 @@ fn flow_row_json(
         .as_ref()
         .map(|metadata| metadata.name.clone());
     let icon = icon_json(application_metadata);
+    let organization = row
+        .get::<_, Option<String>>(8)?
+        .unwrap_or_else(|| "unknown".to_owned());
+    let organization_name = classifier
+        .organization_metadata(&organization)
+        .map(|metadata| metadata.name);
     Ok(json!({
         "id": row.get::<_, String>(0)?, "client_ip": format_ip(&client_ip),
         "client_port": row.get::<_, i64>(2)?, "remote_ip": format_ip(&remote_ip),
         "remote_port": row.get::<_, i64>(4)?, "protocol": row.get::<_, i64>(5)?,
         "direction": row.get::<_, i64>(6)?, "domain": row.get::<_, Option<String>>(7)?,
-        "organization": row.get::<_, Option<String>>(8)?.unwrap_or_else(|| "unknown".to_owned()),
+        "organization": organization,
+        "organization_name": organization_name,
         "application": application,
         "application_name": application_name,
         "icon": icon,
@@ -3341,7 +3606,7 @@ fn flow_row_json(
         "protocol_confidence": row.get::<_, Option<f64>>(15)?.unwrap_or(0.0),
         "confidence": row.get::<_, Option<f64>>(16)?.unwrap_or(0.0),
         "reason": row.get::<_, Option<String>>(17)?.unwrap_or_else(|| "no matching rule".to_owned()),
-        "evidence": row.get::<_, Option<String>>(18)?.unwrap_or_else(|| "[]".to_owned()),
+        "evidence": row.get::<_, Option<String>>(18)?.filter(|value| !value.is_empty()).unwrap_or_else(|| "[]".to_owned()),
         "upload_bytes": row.get::<_, i64>(19)?, "download_bytes": row.get::<_, i64>(20)?,
         "packets": row.get::<_, i64>(21)?, "started_at": row.get::<_, i64>(22)?,
         "last_seen": row.get::<_, i64>(23)?, "ended_at": row.get::<_, Option<i64>>(24)?,
@@ -3475,12 +3740,18 @@ fn summary_page(
         }
     }
     let connection = inner.storage.connection();
+    let domain_cache = (table == "traffic_domain_minute").then_some(&state.summary_pages);
+    let generation = domain_cache.map(|cache| cache.generation());
+    if let (Some(cache), Some(generation)) = (domain_cache, generation)
+        && let Some((items, total)) = cache.get("domains", page.limit, page.offset, generation)
+        && cache.generation() == generation
+    {
+        return page_ok(items, page, total);
+    }
     let result = (|| -> rusqlite::Result<(Vec<Value>, u64)> {
-        let count_sql = format!("SELECT COUNT(*) FROM (SELECT 1 FROM {table} GROUP BY {group})");
-        let total: i64 = scalar(connection, &count_sql, [])?;
         let sql = format!(
             "SELECT {group}, SUM(upload_bytes), SUM(download_bytes), SUM(packets),
-                    SUM(flow_count), MAX(timestamp)
+                    SUM(flow_count), MAX(timestamp), COUNT(*) OVER ()
              FROM {table} GROUP BY {group}
              ORDER BY SUM(upload_bytes + download_bytes) DESC, {group}
              LIMIT ?1 OFFSET ?2"
@@ -3488,11 +3759,37 @@ fn summary_page(
         let mut statement = connection.prepare(&sql)?;
         let items = statement
             .query_map(params![i64::from(page.limit), to_i64(page.offset)], |row| {
-                summary_row(row, names)
+                Ok((
+                    summary_row(row, names)?,
+                    row.get::<_, i64>(names.len() + 5)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok((items, to_u64(total)))
+        let total = if let Some((_, count)) = items.first() {
+            *count
+        } else {
+            // An out-of-range offset returns no window row; retain the total.
+            let count_sql =
+                format!("SELECT COUNT(*) FROM (SELECT 1 FROM {table} GROUP BY {group})");
+            scalar(connection, &count_sql, [])?
+        };
+        Ok((
+            items.into_iter().map(|(item, _)| item).collect(),
+            to_u64(total),
+        ))
     })();
+    if let (Ok((items, total)), Some(cache), Some(generation)) = (&result, domain_cache, generation)
+        && cache.generation() == generation
+    {
+        cache.insert(
+            "domains",
+            page.limit,
+            page.offset,
+            generation,
+            items.clone(),
+            *total,
+        );
+    }
     result.map_or_else(storage_error, |(items, total)| page_ok(items, page, total))
 }
 
@@ -3527,8 +3824,7 @@ fn query_clients(
     let total: i64 = scalar(connection, "SELECT COUNT(*) FROM devices", [])?;
     let traffic_join = if window.is_some() {
         "(SELECT device_id, SUM(upload_bytes) AS upload_bytes,
-                SUM(download_bytes) AS download_bytes, SUM(flow_count) AS flow_count,
-                MAX(timestamp) AS timestamp
+                SUM(download_bytes) AS download_bytes, SUM(flow_count) AS flow_count
          FROM traffic_device_minute WHERE timestamp >= ?1 AND timestamp < ?2
          GROUP BY device_id)"
     } else {
@@ -3545,7 +3841,16 @@ fn query_clients(
         "?1 OFFSET ?2"
     };
     let sql = format!(
-        "SELECT d.id, d.mac, COALESCE(d.display_name, d.hostname, ''), d.vendor,
+        "WITH client_page AS (
+             SELECT d.id AS device_id,
+                    COALESCE(SUM(t.upload_bytes), 0) AS upload_bytes,
+                    COALESCE(SUM(t.download_bytes), 0) AS download_bytes,
+                    COALESCE(SUM(t.flow_count), 0) AS flow_count,
+                    SUM(COALESCE(t.upload_bytes, 0) + COALESCE(t.download_bytes, 0)) AS sort_bytes
+             FROM devices d LEFT JOIN {traffic_join} t ON t.device_id = d.id
+             GROUP BY d.id ORDER BY sort_bytes DESC, d.id LIMIT {page_window}
+         )
+         SELECT d.id, d.mac, COALESCE(d.display_name, d.hostname, ''), d.vendor,
                 COALESCE(d.device_type_override, d.device_type), d.os_family, d.model, d.identity_confidence,
                 COALESCE((SELECT json_group_array(json_object(
                     'source', e.source, 'field', e.field, 'value', e.value,
@@ -3559,8 +3864,7 @@ fn query_clients(
                  WHERE flow_sessions.device_id = d.id
                    AND (flow_sessions.upload_bytes > 0 OR flow_sessions.download_bytes > 0
                         OR flow_sessions.packets > 0) {session_window}),
-                COALESCE(SUM(t.upload_bytes), 0), COALESCE(SUM(t.download_bytes), 0),
-                COALESCE(SUM(t.flow_count), 0),
+                p.upload_bytes, p.download_bytes, p.flow_count,
                 (SELECT ip FROM device_addresses a WHERE a.device_id = d.id
                  ORDER BY a.last_seen DESC, a.ip_version LIMIT 1),
                 CASE WHEN (SELECT COUNT(*) FROM device_addresses a WHERE a.device_id=d.id)=1
@@ -3571,10 +3875,9 @@ fn query_clients(
                      ELSE 0 END,
                 CASE WHEN (SELECT COUNT(*) FROM device_addresses a WHERE a.device_id=d.id)=1
                      THEN (SELECT application_source FROM device_addresses a WHERE a.device_id=d.id LIMIT 1)
-                END, d.device_type_override
-         FROM devices d LEFT JOIN {traffic_join} t ON t.device_id = d.id
-         GROUP BY d.id ORDER BY SUM(COALESCE(t.upload_bytes, 0) + COALESCE(t.download_bytes, 0)) DESC,
-                  d.id LIMIT {page_window}"
+                END, d.device_type_override, d.hostname
+         FROM client_page p JOIN devices d ON d.id = p.device_id
+         ORDER BY p.sort_bytes DESC, d.id"
     );
     let mut statement = connection.prepare(&sql)?;
     let map_row = |row: &Row<'_>| {
@@ -3600,6 +3903,7 @@ fn query_clients(
                 "source": row.get::<_, Option<String>>(22).ok().flatten(),
                 "role": "server",
             })),
+            "hostname": row.get::<_, Option<String>>(24)?,
         }))
     };
     let items = match window {
@@ -4159,4 +4463,31 @@ async fn post_geo_update(
         "updated_files": updated_files,
         "status": status,
     }))
+}
+
+#[cfg(test)]
+mod application_organization_tests {
+    use super::normalized_application_organization_id;
+
+    #[test]
+    fn missing_and_unknown_organizations_normalize_to_null() {
+        assert_eq!(normalized_application_organization_id(None, None), None);
+        assert_eq!(
+            normalized_application_organization_id(Some("unknown"), Some("unknown")),
+            None
+        );
+        assert_eq!(normalized_application_organization_id(Some(""), None), None);
+    }
+
+    #[test]
+    fn known_persisted_organization_precedes_classifier_fallback() {
+        assert_eq!(
+            normalized_application_organization_id(Some("org-live"), Some("org-fallback")),
+            Some("org-live".to_owned())
+        );
+        assert_eq!(
+            normalized_application_organization_id(Some("unknown"), Some("org-fallback")),
+            Some("org-fallback".to_owned())
+        );
+    }
 }

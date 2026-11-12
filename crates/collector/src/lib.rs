@@ -12,7 +12,7 @@ mod query_api;
 mod realtime;
 mod recognition_diagnostics;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::env;
 use std::error::Error;
@@ -52,7 +52,7 @@ use netqmon_protocol::{
 };
 use netqmon_storage::{
     ClickHouseConfig, ClickHouseStorage, DEFAULT_DATABASE_PATH, FlowAttribution,
-    PersistDisposition, SqliteStorage, Storage, StorageError,
+    PersistDisposition, RecentDomainLookup, SqliteStorage, Storage, StorageError,
 };
 use policy::PolicyHub;
 use prost::Message;
@@ -117,6 +117,22 @@ fn sqlite_retention_budget() -> netqmon_storage::RetentionBudget {
             100,
         )),
         total_budget: Duration::from_millis(positive("NETQMON_SQLITE_RETENTION_JOB_MS", 5_000)),
+    }
+}
+
+fn sqlite_wal_truncate_threshold_bytes() -> u64 {
+    match std::env::var("NETQMON_SQLITE_WAL_TRUNCATE_BYTES") {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                tracing::warn!(
+                    variable = "NETQMON_SQLITE_WAL_TRUNCATE_BYTES",
+                    "invalid SQLite WAL truncate threshold; checkpoint policy disabled"
+                );
+                0
+            }
+        },
+        Err(_) => 0,
     }
 }
 
@@ -344,12 +360,35 @@ struct CollectorState {
     query_classifier: ClassifierHandle,
     query_geo: Arc<RwLock<Arc<dyn GeoProvider>>>,
     destination_traffic: query_api::destination_cache::DestinationTrafficCache,
+    summary_pages: query_api::summary_cache::SummaryPageCache,
     active_flow_count: Arc<AtomicI64>,
     icon_service: Arc<IconService>,
     sampling: Arc<dpi::SamplingService>,
     license: Arc<license::LicenseCoordinator>,
     policy_service: Arc<PolicyService>,
     policy_hub: PolicyHub,
+    #[cfg(test)]
+    maintenance_phases: Arc<Mutex<Vec<MaintenancePhaseTimes>>>,
+    #[cfg(test)]
+    accept_batch_phases: Arc<Mutex<Vec<AcceptBatchPhaseTimes>>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+#[allow(dead_code)] // Read by the file-backed maintenance benchmark under cfg(test).
+struct MaintenancePhaseTimes {
+    state_lock_wait_us: u128,
+    owner_cache_us: u128,
+    recovery_gc_us: u128,
+    rollup_us: u128,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct AcceptBatchPhaseTimes {
+    state_lock_wait_us: u128,
+    storage_persist_us: u128,
+    in_memory_update_us: u128,
+    state_lock_hold_us: u128,
 }
 
 impl CollectorState {
@@ -452,6 +491,8 @@ impl CollectorState {
         let callback_processing = Arc::clone(&processing);
         let weak = Arc::downgrade(&inner);
         let callback_policy_hub = policy_hub.clone();
+        let summary_pages = query_api::summary_cache::SummaryPageCache::new();
+        let callback_summary_pages = summary_pages.clone();
         let sampling = Arc::new(dpi::SamplingService::new(
             !cfg!(test) && flow_sample_matching_enabled,
             dpi::default_engine(),
@@ -461,7 +502,8 @@ impl CollectorState {
                     let processing_guard = callback_processing
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let result = process_sample(&inner, &cached, &processing_guard);
+                    let result =
+                        process_sample(&inner, &cached, &processing_guard, &callback_summary_pages);
                     if result.as_ref().is_ok_and(Vec::is_empty) {
                         inner
                             .lock()
@@ -492,12 +534,17 @@ impl CollectorState {
             query_classifier,
             query_geo,
             destination_traffic: query_api::destination_cache::DestinationTrafficCache::new(),
+            summary_pages,
             active_flow_count,
             icon_service: Arc::new(IconService::new(icon_cache_config)),
             sampling,
             license,
             policy_service,
             policy_hub,
+            #[cfg(test)]
+            maintenance_phases: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            accept_batch_phases: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -665,6 +712,36 @@ impl CollectorState {
         };
         let analyses = self.sampling.lookup_batch(batch);
         let prepared = (|| -> Result<_, TelemetryIngestError> {
+            let recent_dns_domains = if work.dns_domains.has_live_evicted_history() {
+                let query_reader = if let Some(source) = &self.query_storage {
+                    source
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .query_reader()?
+                } else {
+                    None
+                };
+                if let Some(storage) = query_reader {
+                    resolve_evicted_dns_domains(
+                        &storage,
+                        &work.dns_domains,
+                        batch,
+                        &analyses,
+                        &domains,
+                    )?
+                } else {
+                    let inner = self.lock();
+                    resolve_evicted_dns_domains(
+                        &inner.storage,
+                        &work.dns_domains,
+                        batch,
+                        &analyses,
+                        &domains,
+                    )?
+                }
+            } else {
+                vec![None; batch.flows.len()]
+            };
             work.favicon_endpoints
                 .observe_results(&work.classifier, batch);
             let attributions = classify_resolved_batch(
@@ -677,6 +754,7 @@ impl CollectorState {
                 &analyses,
                 false,
                 &domains,
+                &recent_dns_domains,
             )?;
             let mut supplemental_evidence =
                 DeviceIdentifier::destination_evidence(&work.classifier, batch, &attributions);
@@ -752,7 +830,11 @@ impl CollectorState {
             );
             Ok((effective_batch, attributions, device_identities))
         })();
+        #[cfg(test)]
+        let state_lock_started = std::time::Instant::now();
         let mut inner = self.lock();
+        #[cfg(test)]
+        let state_lock_wait_us = state_lock_started.elapsed().as_micros();
         work.restore(&mut inner);
         let (effective_batch, attributions, device_identities) = prepared?;
         let mut ready_samples = Vec::new();
@@ -770,12 +852,18 @@ impl CollectorState {
             success = persisted.is_ok(),
             "telemetry storage transaction completed"
         );
+        #[cfg(test)]
+        let storage_persist_us = persist_started.elapsed().as_micros();
+        #[cfg(test)]
+        let in_memory_update_started = std::time::Instant::now();
         let result = match persisted? {
             PersistDisposition::Duplicate => {
                 inner.dedupe_hits = inner.dedupe_hits.saturating_add(1);
                 Ok(BatchDisposition::Duplicate)
             }
             PersistDisposition::Accepted => {
+                self.destination_traffic.invalidate_totals();
+                self.summary_pages.invalidate();
                 inner
                     .policy_flow_contexts
                     .observe(batch, std::time::Instant::now());
@@ -812,10 +900,21 @@ impl CollectorState {
             }
         };
         self.refresh_active_flow_count(&inner.storage);
+        #[cfg(test)]
+        let in_memory_update_us = in_memory_update_started.elapsed().as_micros();
+        #[cfg(test)]
+        let state_lock_hold_us = state_lock_started.elapsed().as_micros();
+        #[cfg(test)]
+        self.record_accept_batch_phases(AcceptBatchPhaseTimes {
+            state_lock_wait_us,
+            storage_persist_us,
+            in_memory_update_us,
+            state_lock_hold_us,
+        });
         if matches!(&result, Ok(BatchDisposition::Accepted)) {
             drop(inner);
             for sample in ready_samples {
-                match process_sample(&self.inner, &sample, &processing_guard) {
+                match process_sample(&self.inner, &sample, &processing_guard, &self.summary_pages) {
                     Ok(mut decisions) => late_sample_decisions.append(&mut decisions),
                     Err(error) => {
                         tracing::warn!(%error, "deferred sample classification update failed");
@@ -833,6 +932,8 @@ impl CollectorState {
                     std::slice::from_ref(&attribution),
                 );
             }
+        } else {
+            drop(inner);
         }
         result
     }
@@ -842,36 +943,212 @@ impl CollectorState {
     }
 
     fn run_maintenance(&self, retention: bool) -> Result<bool, StorageError> {
+        self.run_maintenance_at(retention, unix_time_ms())
+    }
+
+    fn run_maintenance_at(&self, retention: bool, now: u64) -> Result<bool, StorageError> {
+        let state_lock_started = std::time::Instant::now();
         let mut inner = self.lock();
-        let now = unix_time_ms();
+        let state_lock_wait_us = state_lock_started.elapsed().as_micros();
+        // The maintenance writer has an empty cache. Checkpoint expired entries
+        // on their owning storage before allowing the independent writer to GC.
+        let owner_cache_started = std::time::Instant::now();
+        let cache_complete = inner
+            .storage
+            .prune_owned_flow_cache(now, sqlite_retention_budget())?;
+        let owner_cache_us = owner_cache_started.elapsed().as_micros();
         self.refresh_active_flow_count(&inner.storage);
+        if !cache_complete {
+            self.record_maintenance_phases(MaintenancePhaseTimes {
+                state_lock_wait_us,
+                owner_cache_us,
+                ..MaintenancePhaseTimes::default()
+            });
+            return Ok(false);
+        }
         if let Some(mut writer) = inner.storage.maintenance_writer()? {
             drop(inner);
             return if retention {
                 let policy = writer.load_retention_policy()?;
-                writer.run_retention_bounded(now, policy, sqlite_retention_budget())
+                let result = writer.run_retention_bounded(now, policy, sqlite_retention_budget());
+                self.destination_traffic.invalidate_totals();
+                self.summary_pages.invalidate();
+                result
             } else {
-                if !writer.prune_reclassification_bounded(now, sqlite_retention_budget())? {
+                let recovery_gc_started = std::time::Instant::now();
+                let recovery_gc = writer
+                    .prune_reclassification_for_maintenance_bounded(now, sqlite_retention_budget());
+                let recovery_gc_us = recovery_gc_started.elapsed().as_micros();
+                // Carry adaptive recovery batch sizing across the short lived
+                // maintenance writer so an interrupted slice is retried smaller.
+                if recovery_gc.is_ok() {
+                    self.lock().storage.sync_maintenance_state_from(&writer);
+                }
+                let complete = match recovery_gc {
+                    Ok(complete) => complete,
+                    Err(error) => {
+                        self.record_maintenance_phases(MaintenancePhaseTimes {
+                            state_lock_wait_us,
+                            owner_cache_us,
+                            recovery_gc_us,
+                            ..MaintenancePhaseTimes::default()
+                        });
+                        return Err(error);
+                    }
+                };
+                if !complete {
+                    self.record_maintenance_phases(MaintenancePhaseTimes {
+                        state_lock_wait_us,
+                        owner_cache_us,
+                        recovery_gc_us,
+                        ..MaintenancePhaseTimes::default()
+                    });
                     return Ok(false);
                 }
-                writer.roll_up_hour_and_day(now).map(|()| true)
+                let rollup_started = std::time::Instant::now();
+                let rollup = writer.roll_up_hour_and_day_bounded(now, sqlite_retention_budget());
+                let rollup_us = rollup_started.elapsed().as_micros();
+                let mut owner = self.lock();
+                owner.storage.sync_maintenance_state_from(&writer);
+                drop(owner);
+                self.record_maintenance_phases(MaintenancePhaseTimes {
+                    state_lock_wait_us,
+                    owner_cache_us,
+                    recovery_gc_us,
+                    rollup_us,
+                });
+                rollup
             };
         }
         if retention {
             let policy = inner.storage.load_retention_policy()?;
-            inner
-                .storage
-                .run_retention_bounded(unix_time_ms(), policy, sqlite_retention_budget())
+            let result =
+                inner
+                    .storage
+                    .run_retention_bounded(now, policy, sqlite_retention_budget());
+            self.destination_traffic.invalidate_totals();
+            self.summary_pages.invalidate();
+            result
         } else {
-            let now = unix_time_ms();
-            if !inner
+            let recovery_gc_started = std::time::Instant::now();
+            let recovery_gc = inner
                 .storage
-                .prune_reclassification_bounded(now, sqlite_retention_budget())?
-            {
+                .prune_reclassification_bounded(now, sqlite_retention_budget());
+            let recovery_gc_us = recovery_gc_started.elapsed().as_micros();
+            let complete = match recovery_gc {
+                Ok(complete) => complete,
+                Err(error) => {
+                    self.record_maintenance_phases(MaintenancePhaseTimes {
+                        state_lock_wait_us,
+                        owner_cache_us,
+                        recovery_gc_us,
+                        ..MaintenancePhaseTimes::default()
+                    });
+                    return Err(error);
+                }
+            };
+            if !complete {
+                self.record_maintenance_phases(MaintenancePhaseTimes {
+                    state_lock_wait_us,
+                    owner_cache_us,
+                    recovery_gc_us,
+                    ..MaintenancePhaseTimes::default()
+                });
                 return Ok(false);
             }
-            inner.storage.roll_up_hour_and_day(now).map(|()| true)
+            let rollup_started = std::time::Instant::now();
+            let rollup = inner
+                .storage
+                .roll_up_hour_and_day_bounded(now, sqlite_retention_budget());
+            let rollup_us = rollup_started.elapsed().as_micros();
+            self.record_maintenance_phases(MaintenancePhaseTimes {
+                state_lock_wait_us,
+                owner_cache_us,
+                recovery_gc_us,
+                rollup_us,
+            });
+            rollup
         }
+    }
+
+    fn maybe_checkpoint_sqlite_wal(&self) {
+        self.checkpoint_sqlite_wal_if_larger_than(sqlite_wal_truncate_threshold_bytes());
+    }
+
+    fn checkpoint_sqlite_wal_if_larger_than(&self, threshold_bytes: u64) {
+        if threshold_bytes == 0 {
+            return;
+        }
+        // Copy the path while holding the Collector mutex, then open and run
+        // the checkpoint after the guard has been dropped. This keeps TRUNCATE
+        // checkpoint work off the ingestion critical section.
+        let path = { self.lock().storage.database_file_path() };
+        let Some(path) = path else {
+            return;
+        };
+        match SqliteStorage::checkpoint_wal_if_larger_than(&path, threshold_bytes) {
+            Ok(Some(stats)) if stats.busy == 0 => tracing::info!(
+                threshold_bytes,
+                wal_bytes_before = stats.wal_bytes_before,
+                wal_bytes_after = stats.wal_bytes_after,
+                elapsed_us = stats.elapsed_us,
+                log_frames = stats.log_frames,
+                checkpointed_frames = stats.checkpointed_frames,
+                "SQLite WAL threshold checkpoint completed"
+            ),
+            Ok(Some(stats)) => tracing::warn!(
+                threshold_bytes,
+                wal_bytes_before = stats.wal_bytes_before,
+                wal_bytes_after = stats.wal_bytes_after,
+                elapsed_us = stats.elapsed_us,
+                log_frames = stats.log_frames,
+                checkpointed_frames = stats.checkpointed_frames,
+                busy = stats.busy,
+                "SQLite WAL threshold checkpoint was busy"
+            ),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, threshold_bytes, "SQLite WAL threshold checkpoint failed")
+            }
+        }
+    }
+
+    fn record_maintenance_phases(&self, sample: MaintenancePhaseTimes) {
+        #[cfg(test)]
+        self.maintenance_phases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(sample);
+        #[cfg(not(test))]
+        let _ = sample;
+    }
+
+    #[cfg(test)]
+    fn record_accept_batch_phases(&self, sample: AcceptBatchPhaseTimes) {
+        self.accept_batch_phases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(sample);
+    }
+
+    #[cfg(test)]
+    fn take_maintenance_phase_times(&self) -> Vec<MaintenancePhaseTimes> {
+        std::mem::take(
+            &mut *self
+                .maintenance_phases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    #[cfg(test)]
+    fn take_accept_batch_phase_times(&self) -> Vec<AcceptBatchPhaseTimes> {
+        std::mem::take(
+            &mut *self
+                .accept_batch_phases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     fn refresh_active_flow_count(&self, storage: &Storage) {
@@ -1216,16 +1493,18 @@ struct ServiceBindingCache {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct DnsDomainKey {
-    gateway_id: String,
+    gateway_id: Arc<str>,
     client_ip: Vec<u8>,
     answer_ip: Vec<u8>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct DnsDomainValue {
     domain: String,
     observed_at: u64,
 }
+
+const DNS_DOMAIN_CACHE_MAX_ENTRIES: usize = 100_000;
 
 /// Short-lived DNS history used only when an encrypted flow has no usable SNI.
 ///
@@ -1236,6 +1515,13 @@ struct DnsDomainValue {
 struct DnsDomainCache {
     entries: HashMap<DnsDomainKey, DnsDomainValue>,
     ttl_ms: u64,
+    max_entries: usize,
+    // Highest observation time removed under capacity pressure. While this
+    // window may still be live, cache misses must consult persisted history.
+    evicted_until: Option<u64>,
+    // A conservative lower bound. Updating the oldest entry can leave it
+    // stale, but it must never exceed any live entry's observed_at.
+    oldest_observed_at: Option<u64>,
 }
 
 impl Default for DnsDomainCache {
@@ -1243,18 +1529,28 @@ impl Default for DnsDomainCache {
         Self {
             entries: HashMap::new(),
             ttl_ms: 6 * 60 * 60 * 1_000,
+            max_entries: DNS_DOMAIN_CACHE_MAX_ENTRIES,
+            evicted_until: None,
+            oldest_observed_at: None,
         }
     }
 }
 
 impl DnsDomainCache {
     fn observe(&mut self, batch: &TelemetryBatch) {
+        let mut gateway_id: Option<Arc<str>> = None;
         for observation in &batch.dns_observations {
             if observation.domain.is_empty() || observation.answer_ip.is_empty() {
                 continue;
             }
+            // Every DNS observation in a batch belongs to the same Gateway.
+            // Share that identifier across its cache keys instead of
+            // allocating one owned String per client/answer pair. Allocate
+            // lazily because most telemetry batches have no DNS observations.
+            let gateway_id =
+                Arc::clone(gateway_id.get_or_insert_with(|| Arc::from(batch.gateway_id.as_str())));
             let key = DnsDomainKey {
-                gateway_id: batch.gateway_id.clone(),
+                gateway_id,
                 client_ip: observation.client_ip.clone(),
                 answer_ip: observation.answer_ip.clone(),
             };
@@ -1266,6 +1562,26 @@ impl DnsDomainCache {
                 }
                 Some(_) => {}
                 None => {
+                    let max_entries = self.max_entries.max(1);
+                    if self.entries.len() >= max_entries
+                        && let Some((evicted, evicted_at)) = self
+                            .entries
+                            .iter()
+                            .next()
+                            .map(|(key, value)| (key.clone(), value.observed_at))
+                    {
+                        self.entries.remove(&evicted);
+                        self.evicted_until = Some(
+                            self.evicted_until
+                                .map_or(evicted_at.saturating_add(self.ttl_ms), |until| {
+                                    until.max(evicted_at.saturating_add(self.ttl_ms))
+                                }),
+                        );
+                    }
+                    self.oldest_observed_at = Some(
+                        self.oldest_observed_at
+                            .map_or(observed_at, |oldest| oldest.min(observed_at)),
+                    );
                     self.entries.insert(
                         key,
                         DnsDomainValue {
@@ -1277,7 +1593,28 @@ impl DnsDomainCache {
             }
         }
         let oldest = batch.sent_at.saturating_sub(self.ttl_ms);
-        self.entries.retain(|_, value| value.observed_at >= oldest);
+        if self.oldest_observed_at.is_some_and(|seen| seen < oldest) {
+            let mut next_oldest: Option<u64> = None;
+            self.entries.retain(|_, value| {
+                if value.observed_at < oldest {
+                    return false;
+                }
+                next_oldest =
+                    Some(next_oldest.map_or(value.observed_at, |seen| seen.min(value.observed_at)));
+                true
+            });
+            self.oldest_observed_at = next_oldest;
+        }
+        if self
+            .evicted_until
+            .is_some_and(|until| batch.sent_at > until)
+        {
+            self.evicted_until = None;
+        }
+    }
+
+    fn has_live_evicted_history(&self) -> bool {
+        self.evicted_until.is_some()
     }
 
     fn resolve(
@@ -1289,7 +1626,7 @@ impl DnsDomainCache {
     ) -> Option<&str> {
         self.entries
             .get(&DnsDomainKey {
-                gateway_id: gateway_id.to_owned(),
+                gateway_id: Arc::from(gateway_id),
                 client_ip: client_ip.to_vec(),
                 answer_ip: answer_ip.to_vec(),
             })
@@ -1483,6 +1820,7 @@ fn classify_batch(
         analyses,
         fail_open_on_classifier_error,
         &domains,
+        &vec![None; batch.flows.len()],
     )
 }
 
@@ -1516,6 +1854,141 @@ fn resolve_batch_domains(
         .collect()
 }
 
+fn resolve_evicted_dns_domains(
+    storage: &Storage,
+    dns_domains: &DnsDomainCache,
+    batch: &TelemetryBatch,
+    analyses: &[Option<dpi::SampleAnalysis>],
+    domains: &[Option<String>],
+) -> Result<Vec<Option<String>>, StorageError> {
+    let mut result = vec![None; batch.flows.len()];
+    if !dns_domains.has_live_evicted_history() {
+        return Ok(result);
+    }
+    let mut flow_lookup_ids = vec![None; batch.flows.len()];
+    let mut lookup_ids: HashMap<(Vec<u8>, Vec<u8>, u64, u64), usize> = HashMap::new();
+    let mut lookups = Vec::new();
+    for (index, flow) in batch.flows.iter().enumerate() {
+        if domains.get(index).is_some_and(Option::is_some) {
+            continue;
+        }
+        let dpi_result = analyses
+            .get(index)
+            .and_then(Option::as_ref)
+            .and_then(|analysis| analysis.dpi.as_ref());
+        if dpi_result
+            .and_then(|dpi| dpi.metadata.get("hostname"))
+            .is_some_and(|hostname| !hostname.is_empty())
+        {
+            continue;
+        }
+        let encrypted = dpi_result
+            .is_some_and(|dpi| matches!(dpi.protocol.as_str(), "tls" | "quic"))
+            || (flow.protocol == 17 && flow.remote_port == 443);
+        if !encrypted
+            || dns_domains
+                .resolve(
+                    &batch.gateway_id,
+                    &flow.client_ip,
+                    &flow.remote_ip,
+                    if flow.last_seen_unix_ms == 0 {
+                        batch.sent_at
+                    } else {
+                        flow.last_seen_unix_ms
+                    },
+                )
+                .is_some()
+        {
+            continue;
+        }
+        let at_ms = if flow.last_seen_unix_ms == 0 {
+            batch.sent_at
+        } else {
+            flow.last_seen_unix_ms
+        };
+        let not_before_ms = at_ms
+            .saturating_sub(dns_domains.ttl_ms)
+            .max(batch.sent_at.saturating_sub(dns_domains.ttl_ms));
+        let key = (
+            flow.client_ip.clone(),
+            flow.remote_ip.clone(),
+            at_ms,
+            not_before_ms,
+        );
+        let lookup_id = if let Some(lookup_id) = lookup_ids.get(&key).copied() {
+            lookup_id
+        } else {
+            let lookup_id = lookups.len();
+            lookups.push(RecentDomainLookup {
+                client_ip: &flow.client_ip,
+                answer_ip: &flow.remote_ip,
+                at_ms,
+                not_before_ms,
+            });
+            lookup_ids.insert(key, lookup_id);
+            lookup_id
+        };
+        flow_lookup_ids[index] = Some(lookup_id);
+    }
+    if lookups.is_empty() {
+        return Ok(result);
+    }
+
+    let mut wanted_endpoints: HashSet<(Vec<u8>, Vec<u8>)> = lookups
+        .iter()
+        .map(|lookup| (lookup.client_ip.to_vec(), lookup.answer_ip.to_vec()))
+        .collect();
+    let mut batch_observations: HashMap<(Vec<u8>, Vec<u8>), Vec<(u64, usize)>> =
+        HashMap::with_capacity(wanted_endpoints.len());
+    for (index, observation) in batch.dns_observations.iter().enumerate() {
+        let endpoint = (observation.client_ip.clone(), observation.answer_ip.clone());
+        if !observation.domain.is_empty()
+            && !observation.answer_ip.is_empty()
+            && (wanted_endpoints.contains(&endpoint) || batch_observations.contains_key(&endpoint))
+        {
+            wanted_endpoints.remove(&endpoint);
+            batch_observations
+                .entry(endpoint)
+                .or_default()
+                .push((observation.observed_at_unix_ms, index));
+        }
+    }
+    for observations in batch_observations.values_mut() {
+        observations.sort_unstable_by(|(left_at, left_index), (right_at, right_index)| {
+            right_at
+                .cmp(left_at)
+                .then_with(|| right_index.cmp(left_index))
+        });
+    }
+
+    let recent_domains = storage.resolve_recent_domains(&batch.gateway_id, &lookups)?;
+    for (index, lookup_id) in flow_lookup_ids.into_iter().enumerate() {
+        let Some(lookup_id) = lookup_id else {
+            continue;
+        };
+        let lookup = &lookups[lookup_id];
+        let endpoint = (lookup.client_ip.to_vec(), lookup.answer_ip.to_vec());
+        let batch_recent = batch_observations.get(&endpoint).and_then(|observations| {
+            let observation_index =
+                observations.partition_point(|(observed_at, _)| *observed_at > lookup.at_ms);
+            observations
+                .get(observation_index)
+                .and_then(|(observed_at, index)| {
+                    (*observed_at >= lookup.not_before_ms)
+                        .then(|| (batch.dns_observations[*index].domain.clone(), *observed_at))
+                })
+        });
+        let stored_recent = recent_domains[lookup_id].clone();
+        result[index] = match (stored_recent, batch_recent) {
+            (Some(stored), Some(current)) if current.1 >= stored.1 => Some(current.0),
+            (Some(stored), _) => Some(stored.0),
+            (None, Some(current)) => Some(current.0),
+            (None, None) => None,
+        };
+    }
+    Ok(result)
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn classify_resolved_batch(
     classifier: &ClassifierHandle,
@@ -1527,6 +2000,7 @@ fn classify_resolved_batch(
     analyses: &[Option<dpi::SampleAnalysis>],
     fail_open_on_classifier_error: bool,
     domains: &[Option<String>],
+    recent_dns_domains: &[Option<String>],
 ) -> Result<Vec<FlowAttribution>, TelemetryIngestError> {
     let remote_asns = lookup_batch_remote_asns(geo_provider, batch);
     batch
@@ -1570,7 +2044,8 @@ fn classify_resolved_batch(
                             &flow.remote_ip,
                             observed_at,
                         )
-                        .map(str::to_owned);
+                        .map(str::to_owned)
+                        .or_else(|| recent_dns_domains.get(index).cloned().flatten());
                 }
             }
             let Some(remote_ip) = decode_ip(&flow.remote_ip) else {
@@ -2250,7 +2725,7 @@ async fn telemetry(
             )
         }
         Err(TelemetryIngestError::Storage(storage_error)) => {
-            tracing::warn!(%storage_error, "telemetry persistence failed");
+            tracing::warn!(%storage_error, ?storage_error, "telemetry persistence failed");
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "telemetry persistence failed",
@@ -2302,8 +2777,12 @@ fn spawn_maintenance(state: CollectorState, interval: Duration, retention: bool)
             loop {
                 let current = state.clone();
                 let started = std::time::Instant::now();
-                let result =
-                    tokio::task::spawn_blocking(move || current.run_maintenance(retention)).await;
+                let result = tokio::task::spawn_blocking(move || {
+                    let result = current.run_maintenance(retention);
+                    current.maybe_checkpoint_sqlite_wal();
+                    result
+                })
+                .await;
                 let retry = match result {
                     Ok(Ok(complete)) => {
                         tracing::info!(
@@ -2315,8 +2794,9 @@ fn spawn_maintenance(state: CollectorState, interval: Duration, retention: bool)
                         !complete
                     }
                     Ok(Err(error)) => {
+                        let retry = should_retry_maintenance_after_error(retention, &error);
                         tracing::error!(%error, retention, "SQLite maintenance failed");
-                        retention
+                        retry
                     }
                     Err(error) => {
                         tracing::error!(%error, retention, "SQLite maintenance task failed");
@@ -2326,7 +2806,14 @@ fn spawn_maintenance(state: CollectorState, interval: Duration, retention: bool)
                 if !retry {
                     break;
                 }
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                // Yield between bounded slices without delaying every 500
+                // expired flows by a full maintenance interval.
+                tokio::time::sleep(if retention {
+                    Duration::from_secs(60)
+                } else {
+                    Duration::from_millis(250)
+                })
+                .await;
             }
         }
     });
@@ -2351,6 +2838,18 @@ fn schedule_retention_continuation(state: CollectorState) {
             }
         }
     });
+}
+
+fn should_retry_maintenance_after_error(retention: bool, error: &StorageError) -> bool {
+    retention
+        || matches!(
+            error,
+            StorageError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
 }
 
 /// Keeps a late-starting or restarted dynamically managed classifier visible
@@ -2753,14 +3252,29 @@ fn process_sample(
     shared: &Arc<Mutex<CollectorInner>>,
     cached: &dpi::CachedResult,
     _processing_guard: &MutexGuard<'_, ()>,
+    summary_pages: &query_api::summary_cache::SummaryPageCache,
 ) -> Result<Vec<(TelemetryBatch, FlowAttribution)>, StorageError> {
     let batch = sample_batch(cached);
-    let (mut work, domains) = {
+    let (mut work, domains, recent_dns_domains) = {
         let mut inner = shared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let domains = resolve_batch_domains(&inner.storage, &batch)?;
-        (ClassificationWork::take(&mut inner), domains)
+        let recent_dns_domains = resolve_evicted_dns_domains(
+            &inner.storage,
+            &inner.dns_domains,
+            &batch,
+            &[Some(dpi::SampleAnalysis {
+                dpi: cached.result.clone(),
+                signatures: cached.signatures.clone(),
+            })],
+            &domains,
+        )?;
+        (
+            ClassificationWork::take(&mut inner),
+            domains,
+            recent_dns_domains,
+        )
     };
     let classified = classify_resolved_batch(
         &work.classifier,
@@ -2775,13 +3289,20 @@ fn process_sample(
         })],
         false,
         &domains,
+        &recent_dns_domains,
     );
     let mut inner = shared
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     work.restore(&mut inner);
     match classified {
-        Ok(attributions) => commit_sample_result(&mut inner, cached, &batch, &attributions),
+        Ok(attributions) => {
+            let decisions = commit_sample_result(&mut inner, cached, &batch, &attributions)?;
+            // A late SNI/hostname match can change the domain dimension even
+            // when no policy context is waiting for the classification.
+            summary_pages.invalidate();
+            Ok(decisions)
+        }
         Err(TelemetryIngestError::ClassifierUnavailable(error)) => {
             tracing::debug!(%error, "skipping late DPI update while classifier is unavailable");
             Ok(Vec::new())

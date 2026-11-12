@@ -1,14 +1,16 @@
 //! SQLite-backed persistence and aggregation for netqmon.
 
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use netqmon_protocol::v1::{Direction, FlowDelta, FlowLifecycle, TelemetryBatch};
 use rusqlite::types::{Type, Value};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 
 mod attribution;
 
@@ -21,7 +23,7 @@ const PROTOCOL_ONLY_APPLICATION_MIGRATION: &str =
     include_str!("../../../migrations/sqlite/0004_protocol_only_app_rollup.sql");
 const PROTOCOL_APPLICATION_ROLLUP_MIGRATION: &str =
     include_str!("../../../migrations/sqlite/0005_protocol_application_rollup.sql");
-const MIGRATIONS: [(i64, &str); 13] = [
+const MIGRATIONS: [(i64, &str); 17] = [
     (1, INITIAL_MIGRATION),
     (2, PROTOCOL_MIGRATION),
     (3, SCOPE_TIMESTAMP_MIGRATION),
@@ -59,6 +61,22 @@ const MIGRATIONS: [(i64, &str); 13] = [
         13,
         include_str!("../../../migrations/sqlite/0013_policy_option_indexes.sql"),
     ),
+    (
+        14,
+        include_str!("../../../migrations/sqlite/0014_application_client_covering.sql"),
+    ),
+    (
+        15,
+        include_str!("../../../migrations/sqlite/0015_client_traffic_ranking.sql"),
+    ),
+    (
+        16,
+        include_str!("../../../migrations/sqlite/0016_flow_last_seen_order.sql"),
+    ),
+    (
+        17,
+        include_str!("../../../migrations/sqlite/0017_flow_sample_lookup_tuple_only.sql"),
+    ),
 ];
 const SAME_DEVICE_DNS_QUERY: &str =
     "SELECT dns.domain FROM device_addresses client
@@ -85,6 +103,12 @@ const FLOW_CHECKPOINT_MS: i64 = 5 * MINUTE_MS;
 // A safety net for missing End events, well beyond the Agent's default idle
 // timeouts. Use collector receipt time, including zero-traffic lifecycle events.
 const ACTIVE_FLOW_TTL_MS: i64 = 30 * MINUTE_MS;
+// Flow deltas and attribution remain durable in SQLite when a colder entry is
+// evicted; new deltas restore the exact session from the recovery ledger.
+const ACTIVE_FLOW_CACHE_CAPACITY: usize = 50_000;
+// One gateway plus four parameters per lookup stays below SQLite's legacy
+// 999-variable default: 1 + 4 * 249 = 997.
+const DNS_RECENT_LOOKUP_CHUNK_SIZE: usize = 249;
 const DIMENSIONS: [&str; 5] = ["total", "device", "application", "domain", "destination"];
 
 /// Default database location for the single-container deployment.
@@ -95,6 +119,15 @@ pub struct GatewayRecord {
     pub id: String,
     pub agent_token_hash: [u8; 32],
     pub last_seen_ms: u64,
+}
+
+/// One client-scoped DNS history lookup with a caller-bounded time window.
+#[derive(Clone, Copy, Debug)]
+pub struct RecentDomainLookup<'a> {
+    pub client_ip: &'a [u8],
+    pub answer_ip: &'a [u8],
+    pub at_ms: u64,
+    pub not_before_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,6 +169,23 @@ pub struct FlowAttribution {
     pub evidence_json: String,
 }
 
+impl FlowAttribution {
+    fn is_default(&self) -> bool {
+        self.domain.is_none()
+            && self.organization_id == "unknown"
+            && self.application_id == "unknown"
+            && self.category_id == "unknown"
+            && self.traffic_role == "unknown"
+            && self.protocol_id == "unknown"
+            && self.organization_confidence == 0.0
+            && self.application_confidence == 0.0
+            && self.protocol_confidence == 0.0
+            && self.confidence == 0.0
+            && self.reason == "no matching rule"
+            && self.evidence_json == "[]"
+    }
+}
+
 impl Default for FlowAttribution {
     fn default() -> Self {
         Self {
@@ -152,6 +202,19 @@ impl Default for FlowAttribution {
             reason: "no matching rule".to_owned(),
             evidence_json: "[]".to_owned(),
         }
+    }
+}
+
+fn default_active_attribution() -> &'static Arc<FlowAttribution> {
+    static DEFAULT: OnceLock<Arc<FlowAttribution>> = OnceLock::new();
+    DEFAULT.get_or_init(|| Arc::new(FlowAttribution::default()))
+}
+
+fn shared_active_attribution(attribution: FlowAttribution) -> Arc<FlowAttribution> {
+    if attribution.is_default() {
+        Arc::clone(default_active_attribution())
+    } else {
+        Arc::new(attribution)
     }
 }
 
@@ -460,6 +523,40 @@ pub trait StorageBackend {
         answer_ip: &[u8],
         at_ms: u64,
     ) -> StorageResult<Option<String>>;
+    /// Resolves the latest DNS observation within an explicit history window,
+    /// including observations whose advertised DNS TTL has elapsed.
+    fn resolve_recent_domain(
+        &self,
+        gateway_id: &str,
+        client_ip: &[u8],
+        answer_ip: &[u8],
+        at_ms: u64,
+        not_before_ms: u64,
+    ) -> StorageResult<Option<(String, u64)>> {
+        Ok(self
+            .resolve_domain(gateway_id, client_ip, answer_ip, at_ms)?
+            .map(|domain| (domain, at_ms.max(not_before_ms))))
+    }
+    /// Resolves multiple recent-domain windows in order. Backends with batch
+    /// query support should override this method to avoid one query per key.
+    fn resolve_recent_domains(
+        &self,
+        gateway_id: &str,
+        lookups: &[RecentDomainLookup<'_>],
+    ) -> StorageResult<Vec<Option<(String, u64)>>> {
+        lookups
+            .iter()
+            .map(|lookup| {
+                self.resolve_recent_domain(
+                    gateway_id,
+                    lookup.client_ip,
+                    lookup.answer_ip,
+                    lookup.at_ms,
+                    lookup.not_before_ms,
+                )
+            })
+            .collect()
+    }
     /// Queries minute totals in the half-open time range.
     ///
     /// # Errors
@@ -517,7 +614,190 @@ pub trait StorageBackend {
 #[derive(Debug)]
 pub struct SqliteStorage {
     connection: Connection,
-    active_flows: HashMap<FlowKey, ActiveFlow>,
+    active_flows: ActiveFlowCache,
+    active_flow_count: i64,
+    owner_prune_rows: Option<usize>,
+    recovery_prune_rows: Option<usize>,
+    rollup_progress: Option<RollupProgress>,
+}
+
+/// Result of an optional threshold-triggered WAL truncate checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalCheckpointStats {
+    pub wal_bytes_before: u64,
+    pub wal_bytes_after: u64,
+    pub elapsed_us: u64,
+    pub busy: i64,
+    pub log_frames: i64,
+    pub checkpointed_frames: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct RollupMarkerCursor {
+    pub(crate) session_ref: i64,
+    pub(crate) timestamp: i64,
+    pub(crate) scope: i64,
+    pub(crate) direction: i64,
+    pub(crate) device_id: i64,
+    pub(crate) remote_ip: Vec<u8>,
+    pub(crate) protocol: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RollupMarkerPhase {
+    Hour,
+    Day,
+    Complete,
+}
+
+#[derive(Clone, Debug)]
+struct RollupProgress {
+    hour_cutoff: i64,
+    day_cutoff: i64,
+    phase: RollupMarkerPhase,
+    cursor: Option<RollupMarkerCursor>,
+}
+
+/// Each live key is shared by the lookup map and the ordered expiry index.
+/// Removing an entry also removes its expiry record, so the index cannot grow
+/// with the number of updates received for a long-lived flow.
+#[derive(Debug, Default)]
+struct ActiveFlowCache {
+    flows: HashMap<Arc<FlowKey>, ActiveFlow>,
+    expiry: BTreeSet<(i64, Arc<FlowKey>)>,
+}
+
+type EmptyFlowTable = HashMap<Arc<FlowKey>, ActiveFlow>;
+
+// At most one retired table waits behind the one being freed. If that slot is
+// busy or the worker cannot be started, keep the empty table for reuse and
+// retry on a later maintenance pass instead of blocking the writer.
+fn empty_flow_table_reclaimer() -> Option<&'static mpsc::SyncSender<EmptyFlowTable>> {
+    static SENDER: OnceLock<Option<mpsc::SyncSender<EmptyFlowTable>>> = OnceLock::new();
+    SENDER
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::sync_channel::<EmptyFlowTable>(1);
+            std::thread::Builder::new()
+                .name("active-flow-reclaimer".to_owned())
+                .spawn(move || {
+                    while let Ok(table) = receiver.recv() {
+                        drop(table);
+                    }
+                })
+                .ok()
+                .map(|_| sender)
+        })
+        .as_ref()
+}
+
+impl ActiveFlowCache {
+    fn get(&self, key: &FlowKey) -> Option<&ActiveFlow> {
+        self.flows.get(key)
+    }
+    #[cfg(test)]
+    fn values(&self) -> impl Iterator<Item = &ActiveFlow> {
+        self.flows.values()
+    }
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.flows.len()
+    }
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.flows.is_empty()
+    }
+
+    fn insert(&mut self, key: FlowKey, flow: ActiveFlow) {
+        if let Some((shared, previous)) = self.flows.get_key_value(&key) {
+            let shared = Arc::clone(shared);
+            if previous.last_received_at != flow.last_received_at {
+                self.expiry
+                    .remove(&(previous.last_received_at, Arc::clone(&shared)));
+                self.expiry
+                    .insert((flow.last_received_at, Arc::clone(&shared)));
+            }
+            *self.flows.get_mut(shared.as_ref()).expect("existing flow") = flow;
+        } else {
+            let shared = Arc::new(key);
+            self.expiry
+                .insert((flow.last_received_at, Arc::clone(&shared)));
+            self.flows.insert(shared, flow);
+        }
+    }
+
+    fn remove(&mut self, key: &FlowKey) {
+        if let Some((shared, flow)) = self.flows.remove_entry(key) {
+            self.expiry.remove(&(flow.last_received_at, shared));
+        }
+    }
+
+    // Call from maintenance, not the ingestion path: freeing a large table
+    // can take measurable time. Keep small allocations for reuse.
+    fn release_large_empty_allocation(&mut self) {
+        if self.flows.is_empty() && self.flows.capacity() >= 65_536 {
+            if let Some(sender) = empty_flow_table_reclaimer() {
+                self.try_send_empty_allocation(sender);
+            }
+        }
+    }
+
+    fn try_send_empty_allocation(&mut self, sender: &mpsc::SyncSender<EmptyFlowTable>) {
+        debug_assert!(self.flows.is_empty());
+        let table = std::mem::take(&mut self.flows);
+        if let Err(error) = sender.try_send(table) {
+            self.flows = match error {
+                mpsc::TrySendError::Full(table) | mpsc::TrySendError::Disconnected(table) => table,
+            };
+        }
+    }
+
+    fn extend(&mut self, flows: impl IntoIterator<Item = (FlowKey, ActiveFlow)>) {
+        for (key, flow) in flows {
+            self.insert(key, flow);
+        }
+        self.trim_to_capacity(ACTIVE_FLOW_CACHE_CAPACITY);
+    }
+
+    fn trim_to_capacity(&mut self, capacity: usize) {
+        while self.flows.len() > capacity {
+            let Some((_, key)) = self.expiry.first() else {
+                break;
+            };
+            let key = Arc::clone(key);
+            self.remove(key.as_ref());
+        }
+    }
+
+    fn expired(&self, cutoff: i64, limit: usize) -> Vec<(Arc<FlowKey>, ActiveFlow)> {
+        self.expiry
+            .iter()
+            .take_while(|(received, _)| *received <= cutoff)
+            .take(limit.max(1))
+            .map(|(_, key)| {
+                (
+                    Arc::clone(key),
+                    self.flows
+                        .get(key.as_ref())
+                        .expect("expiry index matches cache")
+                        .clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn has_expired(&self, cutoff: i64) -> bool {
+        self.expiry
+            .first()
+            .is_some_and(|(received, _)| *received <= cutoff)
+    }
+}
+
+impl<'a> IntoIterator for &'a ActiveFlowCache {
+    type Item = (&'a Arc<FlowKey>, &'a ActiveFlow);
+    type IntoIter = std::collections::hash_map::Iter<'a, Arc<FlowKey>, ActiveFlow>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.flows.iter()
+    }
 }
 
 enum RecoveryPruneBatch {
@@ -525,6 +805,27 @@ enum RecoveryPruneBatch {
     MoreWork(Duration),
     Busy,
     Interrupted,
+}
+
+fn next_recovery_prune_rows(rows: usize, max_rows: usize, complete: bool) -> Option<usize> {
+    if complete {
+        None
+    } else {
+        Some((rows / 2).max(1).min(max_rows.max(1)))
+    }
+}
+
+fn recovery_prune_rows_after_progress(
+    rows: usize,
+    max_rows: usize,
+    elapsed: Duration,
+    transaction_target: Duration,
+) -> usize {
+    if rows < max_rows && elapsed < transaction_target / 2 {
+        rows.saturating_mul(2).min(max_rows)
+    } else {
+        rows.min(max_rows)
+    }
 }
 
 impl SqliteStorage {
@@ -561,8 +862,22 @@ impl SqliteStorage {
         }
         connection.set_prepared_statement_cache_capacity(64);
         Ok(Some(Self {
+            // This connection is a maintenance writer with no ingestion cache.
+            // The owning store recomputes its count when maintenance completes.
+            active_flow_count: 0,
             connection,
-            active_flows: HashMap::new(),
+            active_flows: ActiveFlowCache::default(),
+            owner_prune_rows: None,
+            recovery_prune_rows: if read_only {
+                None
+            } else {
+                self.recovery_prune_rows
+            },
+            rollup_progress: if read_only {
+                None
+            } else {
+                self.rollup_progress.clone()
+            },
         }))
     }
 
@@ -601,7 +916,11 @@ impl SqliteStorage {
         migrate(&connection)?;
         let mut storage = Self {
             connection,
-            active_flows: HashMap::new(),
+            active_flows: ActiveFlowCache::default(),
+            active_flow_count: 0,
+            owner_prune_rows: None,
+            recovery_prune_rows: None,
+            rollup_progress: None,
         };
         // Close stale persisted state before loading it into memory again.
         // Recovery commits bounded slices. If a slice exceeds the cooperative
@@ -612,6 +931,7 @@ impl SqliteStorage {
         storage.prune_reclassification_at_startup(now_ms)?;
         storage.connection.busy_timeout(Duration::from_secs(5))?;
         storage.active_flows = load_active_flows(&storage.connection, now_ms)?;
+        storage.active_flow_count = count_active_sessions(&storage.connection)?;
         Ok(storage)
     }
 
@@ -974,8 +1294,8 @@ impl SqliteStorage {
         persist_devices(&transaction, batch, device_identities)?;
         persist_self_host_endpoint_evidence(&transaction, batch, attributions)?;
         persist_dns(&transaction, batch)?;
-        let mut staged_active_flows = stage_active_flows(&self.active_flows, batch);
-        update_active_flows(
+        let mut staged_active_flows = stage_sqlite_active_flows(&self.active_flows, batch);
+        let active_count_delta = update_active_flows(
             &transaction,
             &mut staged_active_flows,
             batch,
@@ -984,7 +1304,17 @@ impl SqliteStorage {
             batch_total,
         )?;
         transaction.commit()?;
-        commit_active_flows(&mut self.active_flows, batch, staged_active_flows);
+        self.active_flow_count = self
+            .active_flow_count
+            .saturating_add(active_count_delta)
+            .max(0);
+        for flow in &batch.flows {
+            let key = FlowKey::from_batch(&batch.gateway_id, flow);
+            if !staged_active_flows.contains_key(&key) {
+                self.active_flows.remove(&key);
+            }
+        }
+        self.active_flows.extend(staged_active_flows);
         Ok(PersistDisposition::Accepted)
     }
 
@@ -1053,21 +1383,254 @@ impl SqliteStorage {
             .optional()
     }
 
+    /// Resolves the latest client-scoped DNS observation in a caller-bounded
+    /// history window, even when its DNS TTL has elapsed.
+    pub fn resolve_recent_domain(
+        &self,
+        gateway_id: &str,
+        client_ip: &[u8],
+        answer_ip: &[u8],
+        at_ms: u64,
+        not_before_ms: u64,
+    ) -> rusqlite::Result<Option<(String, u64)>> {
+        self.connection
+            .query_row(
+                "SELECT domain, observed_at FROM dns_observations
+                 WHERE gateway_id=?1 AND client_ip=?2 AND answer_ip=?3
+                   AND observed_at>=?4 AND observed_at<=?5
+                 ORDER BY observed_at DESC, id DESC LIMIT 1",
+                params![
+                    gateway_id,
+                    client_ip,
+                    answer_ip,
+                    to_i64(not_before_ms),
+                    to_i64(at_ms)
+                ],
+                |row| Ok((row.get(0)?, row.get::<_, i64>(1)?.max(0) as u64)),
+            )
+            .optional()
+    }
+
+    /// Resolves recent DNS history for several client/answer pairs using
+    /// bounded SQL chunks. Each lookup still uses the existing DNS index.
+    pub fn resolve_recent_domains(
+        &self,
+        gateway_id: &str,
+        lookups: &[RecentDomainLookup<'_>],
+    ) -> rusqlite::Result<Vec<Option<(String, u64)>>> {
+        let mut results = vec![None; lookups.len()];
+        for (chunk_number, chunk) in lookups.chunks(DNS_RECENT_LOOKUP_CHUNK_SIZE).enumerate() {
+            let chunk_start = chunk_number * DNS_RECENT_LOOKUP_CHUNK_SIZE;
+            let mut values = Vec::with_capacity(1 + chunk.len() * 4);
+            values.push(Value::Text(gateway_id.to_owned()));
+            let mut rows = Vec::with_capacity(chunk.len());
+            for (local_index, lookup) in chunk.iter().enumerate() {
+                let lookup_id = chunk_start + local_index;
+                let first_parameter = 2 + local_index * 4;
+                rows.push(format!(
+                    "({lookup_id},?{first_parameter},?{},?{},?{})",
+                    first_parameter + 1,
+                    first_parameter + 2,
+                    first_parameter + 3
+                ));
+                values.push(Value::Blob(lookup.client_ip.to_vec()));
+                values.push(Value::Blob(lookup.answer_ip.to_vec()));
+                values.push(Value::Integer(to_i64(lookup.at_ms)));
+                values.push(Value::Integer(to_i64(lookup.not_before_ms)));
+            }
+            let sql = format!(
+                "WITH lookups(lookup_id,client_ip,answer_ip,at_ms,not_before_ms) AS (
+                    VALUES {}
+                 )
+                 SELECT q.lookup_id,d.domain,d.observed_at
+                 FROM lookups q
+                 LEFT JOIN dns_observations d ON d.id=(
+                    SELECT id FROM dns_observations
+                    WHERE gateway_id=?1 AND client_ip=q.client_ip AND answer_ip=q.answer_ip
+                      AND observed_at>=q.not_before_ms AND observed_at<=q.at_ms
+                    ORDER BY observed_at DESC,id DESC LIMIT 1
+                 )",
+                rows.join(",")
+            );
+            let mut statement = self.connection.prepare(&sql)?;
+            let resolved = statement.query_map(params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })?;
+            for row in resolved {
+                let (lookup_id, domain, observed_at) = row?;
+                if let (Some(domain), Some(observed_at)) = (domain, observed_at) {
+                    let lookup_id = usize::try_from(lookup_id).unwrap_or(usize::MAX);
+                    if let Some(result) = results.get_mut(lookup_id) {
+                        *result = Some((domain, observed_at.max(0) as u64));
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+
     /// Aggregates complete minute buckets into hour and day tables.
     ///
     /// # Errors
     ///
     /// Returns an error when the aggregation transaction cannot be committed.
     pub fn roll_up_hour_and_day(&mut self, now_ms: u64) -> rusqlite::Result<()> {
+        let budget = RetentionBudget::default();
+        while !self.roll_up_hour_and_day_bounded(now_ms, budget)? {
+            std::thread::yield_now();
+        }
+        Ok(())
+    }
+
+    /// Commits at most one bounded slice of hour/day rollup work.
+    ///
+    /// Pending rows remain durable between calls, so callers can yield to
+    /// ingestion and resume on the next maintenance pass. Returns true when
+    /// all eligible pending rows have been materialized.
+    pub fn roll_up_hour_and_day_bounded(
+        &mut self,
+        now_ms: u64,
+        budget: RetentionBudget,
+    ) -> rusqlite::Result<bool> {
         let now = to_i64(now_ms);
-        let transaction = self.connection.transaction()?;
-        for (target, size) in [("hour", HOUR_MS), ("day", DAY_MS)] {
-            for dimension in DIMENSIONS {
-                aggregate(&transaction, dimension, target, now / size * size)?;
+        let cutoffs = [
+            ("hour", now / HOUR_MS * HOUR_MS),
+            ("day", now / DAY_MS * DAY_MS),
+        ];
+        let tasks = [
+            ("total", cutoffs[0].0, cutoffs[0].1),
+            ("device", cutoffs[0].0, cutoffs[0].1),
+            ("application", cutoffs[0].0, cutoffs[0].1),
+            ("domain", cutoffs[0].0, cutoffs[0].1),
+            ("destination", cutoffs[0].0, cutoffs[0].1),
+            ("total", cutoffs[1].0, cutoffs[1].1),
+            ("device", cutoffs[1].0, cutoffs[1].1),
+            ("application", cutoffs[1].0, cutoffs[1].1),
+            ("domain", cutoffs[1].0, cutoffs[1].1),
+            ("destination", cutoffs[1].0, cutoffs[1].1),
+        ];
+        let mut row_limit = budget.max_rows_per_batch.max(1);
+        loop {
+            let started = std::time::Instant::now();
+            let deadline = started + budget.transaction_target.max(Duration::from_millis(1));
+            let transaction = match self.connection.transaction() {
+                Ok(transaction) => transaction,
+                Err(error) if sqlite_is_busy(&error) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            transaction
+                .progress_handler(1_000, Some(move || std::time::Instant::now() >= deadline))?;
+            let initial_progress = self
+                .rollup_progress
+                .as_ref()
+                .filter(|progress| {
+                    progress.hour_cutoff == cutoffs[0].1 && progress.day_cutoff == cutoffs[1].1
+                })
+                .cloned()
+                .unwrap_or(RollupProgress {
+                    hour_cutoff: cutoffs[0].1,
+                    day_cutoff: cutoffs[1].1,
+                    phase: RollupMarkerPhase::Hour,
+                    cursor: None,
+                });
+            let result = (|| -> rusqlite::Result<(bool, Option<RollupProgress>)> {
+                let mut remaining = row_limit;
+                for (index, (dimension, target, cutoff)) in tasks.iter().enumerate() {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let tasks_left = tasks.len() - index;
+                    let slice_limit = remaining.div_ceil(tasks_left).max(1);
+                    let processed =
+                        aggregate_bounded(&transaction, dimension, target, *cutoff, slice_limit)?;
+                    remaining = remaining.saturating_sub(processed);
+                }
+                if rollup_pending(&transaction, &tasks)? {
+                    return Ok((
+                        false,
+                        Some(RollupProgress {
+                            hour_cutoff: cutoffs[0].1,
+                            day_cutoff: cutoffs[1].1,
+                            phase: RollupMarkerPhase::Hour,
+                            cursor: None,
+                        }),
+                    ));
+                }
+                if initial_progress.phase == RollupMarkerPhase::Complete {
+                    return Ok((true, Some(initial_progress.clone())));
+                }
+                if remaining == 0 {
+                    return Ok((false, Some(initial_progress.clone())));
+                }
+
+                let mut progress = initial_progress.clone();
+                if progress.phase == RollupMarkerPhase::Hour {
+                    let (marked, cursor) = attribution::mark_aggregated_batch(
+                        &transaction,
+                        RollupMarkerPhase::Hour,
+                        cutoffs[0].1,
+                        progress.cursor.as_ref(),
+                        remaining,
+                    )?;
+                    if marked == remaining {
+                        progress.cursor = cursor;
+                        return Ok((false, Some(progress)));
+                    }
+                    remaining = remaining.saturating_sub(marked);
+                    progress.phase = RollupMarkerPhase::Day;
+                    progress.cursor = None;
+                    if remaining == 0 {
+                        return Ok((false, Some(progress)));
+                    }
+                }
+                let (marked, cursor) = attribution::mark_aggregated_batch(
+                    &transaction,
+                    RollupMarkerPhase::Day,
+                    cutoffs[1].1,
+                    progress.cursor.as_ref(),
+                    remaining,
+                )?;
+                if marked == remaining {
+                    progress.cursor = cursor;
+                    return Ok((false, Some(progress)));
+                }
+                progress.phase = RollupMarkerPhase::Complete;
+                progress.cursor = None;
+                Ok((true, Some(progress)))
+            })();
+            transaction.progress_handler(0, None::<fn() -> bool>)?;
+            match result {
+                Ok((complete, progress)) => match transaction.commit() {
+                    Ok(()) => {
+                        self.rollup_progress = progress;
+                        return Ok(complete);
+                    }
+                    Err(error) if sqlite_is_busy(&error) => return Ok(false),
+                    Err(error) => return Err(error),
+                },
+                Err(rusqlite::Error::SqliteFailure(code, _))
+                    if code.code == rusqlite::ErrorCode::OperationInterrupted =>
+                {
+                    drop(transaction);
+                    if row_limit <= 1 {
+                        return Ok(false);
+                    }
+                    row_limit = (row_limit / 2).max(1);
+                }
+                Err(error) if sqlite_is_busy(&error) => {
+                    drop(transaction);
+                    return Ok(false);
+                }
+                Err(error) => {
+                    drop(transaction);
+                    return Err(error);
+                }
             }
         }
-        attribution::mark_aggregated(&transaction, now)?;
-        transaction.commit()
     }
 
     /// Removes expired correction work after checkpointing recovery state.
@@ -1078,9 +1641,16 @@ impl SqliteStorage {
         let tx = self.connection.transaction()?;
         prune_flow_state(&tx, &self.active_flows, to_i64(now_ms))?;
         tx.commit()?;
-        self.active_flows.retain(|_, flow| {
-            flow.last_received_at > to_i64(now_ms).saturating_sub(ACTIVE_FLOW_TTL_MS)
-        });
+        let cutoff = to_i64(now_ms).saturating_sub(ACTIVE_FLOW_TTL_MS);
+        while let Some((_, key)) = self.active_flows.expiry.first().cloned() {
+            if !self.active_flows.has_expired(cutoff) {
+                break;
+            }
+            self.active_flows.remove(&key);
+            self.active_flow_count = self.active_flow_count.saturating_sub(1).max(0);
+        }
+        self.active_flows.release_large_empty_allocation();
+        self.active_flow_count = count_active_sessions(&self.connection)?;
         Ok(())
     }
 
@@ -1331,10 +1901,45 @@ impl SqliteStorage {
         limit: usize,
         transaction_target: Duration,
     ) -> rusqlite::Result<bool> {
-        Ok(matches!(
-            self.prune_reclassification_batch(now_ms, limit, Some(transaction_target))?,
-            RecoveryPruneBatch::Complete
-        ))
+        self.prune_reclassification_bounded_adaptive(now_ms, limit, transaction_target, true)
+    }
+
+    fn prune_reclassification_bounded_adaptive(
+        &mut self,
+        now_ms: u64,
+        max_rows: usize,
+        transaction_target: Duration,
+        recount_active: bool,
+    ) -> rusqlite::Result<bool> {
+        let max_rows = max_rows.max(1);
+        let rows = self
+            .recovery_prune_rows
+            .unwrap_or(max_rows)
+            .min(max_rows)
+            .max(1);
+        match self.prune_reclassification_batch(now_ms, rows, Some(transaction_target), true)? {
+            RecoveryPruneBatch::Complete => {
+                self.recovery_prune_rows = next_recovery_prune_rows(rows, max_rows, true);
+                if recount_active {
+                    self.active_flow_count = count_active_sessions(&self.connection)?;
+                }
+                Ok(true)
+            }
+            RecoveryPruneBatch::Interrupted => {
+                self.recovery_prune_rows = next_recovery_prune_rows(rows, max_rows, false);
+                Ok(false)
+            }
+            RecoveryPruneBatch::MoreWork(elapsed) => {
+                self.recovery_prune_rows = Some(recovery_prune_rows_after_progress(
+                    rows,
+                    max_rows,
+                    elapsed,
+                    transaction_target,
+                ));
+                Ok(false)
+            }
+            RecoveryPruneBatch::Busy => Ok(false),
+        }
     }
 
     fn prune_reclassification_at_startup(&mut self, now_ms: u64) -> rusqlite::Result<()> {
@@ -1366,7 +1971,7 @@ impl SqliteStorage {
                 );
                 return Ok(());
             }
-            match self.prune_reclassification_batch(now_ms, rows, target)? {
+            match self.prune_reclassification_batch(now_ms, rows, target, true)? {
                 RecoveryPruneBatch::Complete => return Ok(()),
                 RecoveryPruneBatch::MoreWork(elapsed) => {
                     let ramp_threshold = target
@@ -1405,17 +2010,14 @@ impl SqliteStorage {
         now_ms: u64,
         limit: usize,
         transaction_target: Option<Duration>,
+        recovery_gc: bool,
     ) -> rusqlite::Result<RecoveryPruneBatch> {
         let now = to_i64(now_ms);
         let cutoff = now.saturating_sub(ACTIVE_FLOW_TTL_MS);
-        let mut candidates = Vec::new();
-        for (key, flow) in &self.active_flows {
-            if flow.last_received_at <= cutoff && flow.last_seen_at > 0 {
-                candidates.push((key.clone(), flow.clone()));
-                if candidates.len() >= limit.max(1) {
-                    break;
-                }
-            }
+        let candidates = self.active_flows.expired(cutoff, limit);
+        if candidates.is_empty() && !recovery_gc {
+            self.active_flows.release_large_empty_allocation();
+            return Ok(RecoveryPruneBatch::Complete);
         }
         let started = std::time::Instant::now();
         let tx = match self.connection.transaction() {
@@ -1432,9 +2034,20 @@ impl SqliteStorage {
         }
         let result = (|| -> rusqlite::Result<bool> {
             for (key, flow) in &candidates {
-                write_flow_session(&tx, key, flow, Some(flow.last_seen_at), now)?;
+                if flow.last_seen_at > 0 {
+                    write_flow_session(&tx, key, flow, Some(flow.last_seen_at), now)?;
+                }
+                tx.prepare_cached(
+                    "UPDATE flow_rollup_sessions SET ended_at=?2
+                     WHERE session_id=?1 AND ended_at IS NULL",
+                )?
+                .execute(params![flow.session_id(key).as_ref(), now])?;
             }
-            attribution::prune_bounded(&tx, now, limit.max(1))
+            if recovery_gc {
+                attribution::prune_bounded(&tx, now, limit.max(1))
+            } else {
+                Ok(false)
+            }
         })();
         tx.progress_handler(0, None::<fn() -> bool>)?;
         let prune_elapsed = started.elapsed().saturating_sub(begin_elapsed);
@@ -1482,13 +2095,10 @@ impl SqliteStorage {
         );
         for (key, _) in candidates {
             self.active_flows.remove(&key);
+            self.active_flow_count = self.active_flow_count.saturating_sub(1).max(0);
         }
-        if pending
-            || self
-                .active_flows
-                .values()
-                .any(|flow| flow.last_received_at <= cutoff && flow.last_seen_at > 0)
-        {
+        self.active_flows.release_large_empty_allocation();
+        if pending || self.active_flows.has_expired(cutoff) {
             return Ok(RecoveryPruneBatch::MoreWork(elapsed));
         }
         Ok(RecoveryPruneBatch::Complete)
@@ -1496,6 +2106,62 @@ impl SqliteStorage {
 
     pub fn connection(&self) -> &Connection {
         &self.connection
+    }
+
+    /// Returns the path for a file-backed database.
+    pub fn database_file_path(&self) -> Option<PathBuf> {
+        self.connection
+            .path()
+            .filter(|path| !path.is_empty() && *path != ":memory:")
+            .map(PathBuf::from)
+    }
+
+    /// Truncates a file-backed WAL only when its sidecar reaches `threshold_bytes`.
+    ///
+    /// This opens a short-lived independent connection so callers can run the
+    /// checkpoint after releasing the Collector's state lock. A zero threshold
+    /// disables the operation.
+    pub fn checkpoint_wal_if_larger_than(
+        path: impl AsRef<Path>,
+        threshold_bytes: u64,
+    ) -> rusqlite::Result<Option<WalCheckpointStats>> {
+        if threshold_bytes == 0 {
+            return Ok(None);
+        }
+        let path = path.as_ref();
+        let wal_path = wal_sidecar_path(path);
+        let wal_bytes_before = std::fs::metadata(&wal_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if wal_bytes_before < threshold_bytes {
+            return Ok(None);
+        }
+
+        let connection = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        // Keep the independent checkpoint connection responsive to an active
+        // writer. A busy checkpoint is reported to the caller and can retry on
+        // the next maintenance pass.
+        connection.busy_timeout(Duration::from_millis(50))?;
+        let started = std::time::Instant::now();
+        let (busy, log_frames, checkpointed_frames) =
+            connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+        let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let wal_bytes_after = std::fs::metadata(&wal_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        Ok(Some(WalCheckpointStats {
+            wal_bytes_before,
+            wal_bytes_after,
+            elapsed_us,
+            busy,
+            log_frames,
+            checkpointed_frames,
+        }))
     }
 
     /// Loads the persisted retention policy or returns the default.
@@ -1536,13 +2202,12 @@ impl SqliteStorage {
         Ok(())
     }
 
-    /// Counts cached active flows, including those not checkpointed to disk yet.
+    /// Counts active sessions across the bounded cache and SQLite recovery state.
     ///
     /// # Errors
     ///
-    /// This cached count does not execute a database query.
     pub fn active_flow_count(&self) -> rusqlite::Result<i64> {
-        Ok(i64::try_from(self.active_flows.len()).unwrap_or(i64::MAX))
+        Ok(self.active_flow_count)
     }
 
     /// Returns the ratio of unknown-classified flows to total recent flows.
@@ -1611,6 +2276,12 @@ impl SqliteStorage {
             })?
             .collect()
     }
+}
+
+fn wal_sidecar_path(database_path: &Path) -> PathBuf {
+    let mut path = database_path.as_os_str().to_os_string();
+    path.push("-wal");
+    PathBuf::from(path)
 }
 
 impl StorageBackend for SqliteStorage {
@@ -1731,6 +2402,26 @@ impl StorageBackend for SqliteStorage {
         Self::resolve_domain(self, gateway_id, client_ip, answer_ip, at_ms).map_err(Into::into)
     }
 
+    fn resolve_recent_domain(
+        &self,
+        gateway_id: &str,
+        client_ip: &[u8],
+        answer_ip: &[u8],
+        at_ms: u64,
+        not_before_ms: u64,
+    ) -> StorageResult<Option<(String, u64)>> {
+        Self::resolve_recent_domain(self, gateway_id, client_ip, answer_ip, at_ms, not_before_ms)
+            .map_err(Into::into)
+    }
+
+    fn resolve_recent_domains(
+        &self,
+        gateway_id: &str,
+        lookups: &[RecentDomainLookup<'_>],
+    ) -> StorageResult<Vec<Option<(String, u64)>>> {
+        Self::resolve_recent_domains(self, gateway_id, lookups).map_err(Into::into)
+    }
+
     fn query_total_traffic(&self, from_ms: u64, to_ms: u64) -> StorageResult<Vec<TrafficTotal>> {
         Self::query_total_traffic(self, from_ms, to_ms).map_err(Into::into)
     }
@@ -1781,6 +2472,14 @@ pub enum Storage {
 
 #[allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 impl Storage {
+    /// Returns the file path when this backend is a file-backed SQLite database.
+    pub fn database_file_path(&self) -> Option<PathBuf> {
+        match self {
+            Self::Sqlite(storage) => storage.database_file_path(),
+            Self::ClickHouse(_) => None,
+        }
+    }
+
     /// Opens an independent WAL reader without migrations or active-flow recovery.
     /// In-memory databases keep using the owning connection.
     pub fn query_reader(&self) -> StorageResult<Option<Self>> {
@@ -1802,6 +2501,14 @@ impl Storage {
         }
     }
 
+    /// Copies resumable SQLite maintenance cursors back to their owning store.
+    pub fn sync_maintenance_state_from(&mut self, maintenance: &Self) {
+        if let (Self::Sqlite(owner), Self::Sqlite(maintenance)) = (self, maintenance) {
+            owner.rollup_progress = maintenance.rollup_progress.clone();
+            owner.recovery_prune_rows = maintenance.recovery_prune_rows;
+        }
+    }
+
     /// Commits one bounded, resumable recovery-state cleanup slice.
     pub fn prune_reclassification_bounded(
         &mut self,
@@ -1816,6 +2523,73 @@ impl Storage {
                     budget.transaction_target,
                 )
                 .map_err(Into::into),
+            Self::ClickHouse(_) => Ok(true),
+        }
+    }
+
+    /// Commits one bounded recovery-state cleanup slice on an independent
+    /// maintenance connection. Its ActiveFlow count is not used by the owning
+    /// Storage, so avoid rescanning all open sessions after the slice.
+    pub fn prune_reclassification_for_maintenance_bounded(
+        &mut self,
+        now_ms: u64,
+        budget: RetentionBudget,
+    ) -> StorageResult<bool> {
+        match self {
+            Self::Sqlite(storage) => storage
+                .prune_reclassification_bounded_adaptive(
+                    now_ms,
+                    budget.max_rows_per_batch,
+                    budget.transaction_target,
+                    false,
+                )
+                .map_err(Into::into),
+            Self::ClickHouse(_) => Ok(true),
+        }
+    }
+
+    /// Checkpoints and evicts expired flows from the owning SQLite cache.
+    /// A separate maintenance connection has its own empty cache and cannot do this.
+    ///
+    /// # Errors
+    /// Returns an error if SQLite cannot checkpoint a flow or restore the busy timeout.
+    pub fn prune_owned_flow_cache(
+        &mut self,
+        now_ms: u64,
+        budget: RetentionBudget,
+    ) -> StorageResult<bool> {
+        match self {
+            Self::Sqlite(storage) => {
+                storage.connection.busy_timeout(Duration::from_millis(50))?;
+                let max_rows = budget.max_rows_per_batch.max(1);
+                let rows = storage
+                    .owner_prune_rows
+                    .unwrap_or(max_rows)
+                    .min(max_rows)
+                    .max(1);
+                let result = storage.prune_reclassification_batch(
+                    now_ms,
+                    rows,
+                    Some(budget.transaction_target),
+                    false,
+                );
+                storage.connection.busy_timeout(Duration::from_secs(5))?;
+                match result? {
+                    RecoveryPruneBatch::Complete => {
+                        storage.owner_prune_rows = None;
+                        Ok(true)
+                    }
+                    RecoveryPruneBatch::MoreWork(_) => {
+                        storage.owner_prune_rows = Some(rows.saturating_mul(2).min(max_rows));
+                        Ok(false)
+                    }
+                    RecoveryPruneBatch::Interrupted => {
+                        storage.owner_prune_rows = Some((rows / 2).max(1));
+                        Ok(false)
+                    }
+                    RecoveryPruneBatch::Busy => Ok(false),
+                }
+            }
             Self::ClickHouse(_) => Ok(true),
         }
     }
@@ -2031,6 +2805,32 @@ impl Storage {
         StorageBackend::resolve_domain(self, gateway_id, client_ip, answer_ip, at_ms)
     }
 
+    pub fn resolve_recent_domain(
+        &self,
+        gateway_id: &str,
+        client_ip: &[u8],
+        answer_ip: &[u8],
+        at_ms: u64,
+        not_before_ms: u64,
+    ) -> StorageResult<Option<(String, u64)>> {
+        StorageBackend::resolve_recent_domain(
+            self,
+            gateway_id,
+            client_ip,
+            answer_ip,
+            at_ms,
+            not_before_ms,
+        )
+    }
+
+    pub fn resolve_recent_domains(
+        &self,
+        gateway_id: &str,
+        lookups: &[RecentDomainLookup<'_>],
+    ) -> StorageResult<Vec<Option<(String, u64)>>> {
+        StorageBackend::resolve_recent_domains(self, gateway_id, lookups)
+    }
+
     pub fn query_total_traffic(
         &self,
         from_ms: u64,
@@ -2041,6 +2841,23 @@ impl Storage {
 
     pub fn roll_up_hour_and_day(&mut self, now_ms: u64) -> StorageResult<()> {
         StorageBackend::roll_up_hour_and_day(self, now_ms)
+    }
+
+    /// Runs one bounded SQLite rollup slice, yielding between maintenance passes.
+    pub fn roll_up_hour_and_day_bounded(
+        &mut self,
+        now_ms: u64,
+        budget: RetentionBudget,
+    ) -> StorageResult<bool> {
+        match self {
+            Self::Sqlite(storage) => storage
+                .roll_up_hour_and_day_bounded(now_ms, budget)
+                .map_err(Into::into),
+            Self::ClickHouse(storage) => {
+                storage.roll_up_hour_and_day(now_ms)?;
+                Ok(true)
+            }
+        }
     }
 
     pub fn run_retention(&mut self, now_ms: u64, policy: RetentionPolicy) -> StorageResult<()> {
@@ -2302,6 +3119,49 @@ impl StorageBackend for Storage {
         }
     }
 
+    fn resolve_recent_domain(
+        &self,
+        gateway_id: &str,
+        client_ip: &[u8],
+        answer_ip: &[u8],
+        at_ms: u64,
+        not_before_ms: u64,
+    ) -> StorageResult<Option<(String, u64)>> {
+        match self {
+            Self::Sqlite(s) => StorageBackend::resolve_recent_domain(
+                s,
+                gateway_id,
+                client_ip,
+                answer_ip,
+                at_ms,
+                not_before_ms,
+            ),
+            Self::ClickHouse(c) => StorageBackend::resolve_recent_domain(
+                c,
+                gateway_id,
+                client_ip,
+                answer_ip,
+                at_ms,
+                not_before_ms,
+            ),
+        }
+    }
+
+    fn resolve_recent_domains(
+        &self,
+        gateway_id: &str,
+        lookups: &[RecentDomainLookup<'_>],
+    ) -> StorageResult<Vec<Option<(String, u64)>>> {
+        match self {
+            Self::Sqlite(storage) => {
+                StorageBackend::resolve_recent_domains(storage, gateway_id, lookups)
+            }
+            Self::ClickHouse(storage) => {
+                StorageBackend::resolve_recent_domains(storage, gateway_id, lookups)
+            }
+        }
+    }
+
     fn query_total_traffic(&self, from_ms: u64, to_ms: u64) -> StorageResult<Vec<TrafficTotal>> {
         match self {
             Self::Sqlite(s) => StorageBackend::query_total_traffic(s, from_ms, to_ms),
@@ -2397,10 +3257,7 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn load_active_flows(
-    connection: &Connection,
-    now_ms: u64,
-) -> rusqlite::Result<HashMap<FlowKey, ActiveFlow>> {
+fn load_active_flows(connection: &Connection, now_ms: u64) -> rusqlite::Result<ActiveFlowCache> {
     let mut statement = connection.prepare(
         "SELECT gateway_id, ip_version, protocol, client_ip, client_port, remote_ip,
                 remote_port, direction, upload_bytes, download_bytes, packets,
@@ -2409,29 +3266,41 @@ fn load_active_flows(
                 application_confidence, protocol_confidence, classification_confidence,
                 classification_reason, classification_evidence_json, scope, path_type, nat,
                 source_segment, destination_segment, device_id, id
-         FROM flow_sessions WHERE ended_at IS NULL AND checkpointed_at>?1",
+         FROM flow_sessions WHERE ended_at IS NULL AND checkpointed_at>?1
+         ORDER BY checkpointed_at DESC LIMIT ?2",
     )?;
-    let mut active: HashMap<FlowKey, ActiveFlow> = statement
-        .query_map([to_i64(now_ms).saturating_sub(ACTIVE_FLOW_TTL_MS)], |row| {
+    let mut active = ActiveFlowCache::default();
+    let rows = statement.query_map(
+        params![
+            to_i64(now_ms).saturating_sub(ACTIVE_FLOW_TTL_MS),
+            i64::try_from(ACTIVE_FLOW_CACHE_CAPACITY).unwrap_or(i64::MAX)
+        ],
+        |row| {
+            let key = FlowKey {
+                gateway_id: row.get(0)?,
+                ip_version: row.get(1)?,
+                protocol: row.get(2)?,
+                client_ip: row.get(3)?,
+                client_port: row.get(4)?,
+                remote_ip: row.get(5)?,
+                remote_port: row.get(6)?,
+                direction: row.get(7)?,
+            };
+            let started_at: i64 = row.get(11)?;
+            let session_id: String = row.get(32)?;
+            let canonical_session_id = key.session_id(started_at);
+            let session_id_override =
+                (session_id != canonical_session_id).then(|| session_id.into_boxed_str());
             Ok((
-                FlowKey {
-                    gateway_id: row.get(0)?,
-                    ip_version: row.get(1)?,
-                    protocol: row.get(2)?,
-                    client_ip: row.get(3)?,
-                    client_port: row.get(4)?,
-                    remote_ip: row.get(5)?,
-                    remote_port: row.get(6)?,
-                    direction: row.get(7)?,
-                },
+                key,
                 ActiveFlow {
-                    session_id: row.get(32)?,
+                    session_id_override,
                     client_mac: Vec::new(),
                     device_id: row.get(31)?,
                     upload_bytes: row.get(8)?,
                     download_bytes: row.get(9)?,
                     packets: row.get(10)?,
-                    started_at: row.get(11)?,
+                    started_at,
                     last_seen_at: row.get(12)?,
                     checkpointed_at: row.get(13)?,
                     last_received_at: row.get(13)?,
@@ -2440,7 +3309,7 @@ fn load_active_flows(
                     nat: row.get(28)?,
                     source_segment: row.get(29)?,
                     destination_segment: row.get(30)?,
-                    attribution: FlowAttribution {
+                    attribution: shared_active_attribution(FlowAttribution {
                         domain: row.get(14)?,
                         organization_id: row
                             .get::<_, Option<String>>(15)?
@@ -2467,13 +3336,47 @@ fn load_active_flows(
                         evidence_json: row
                             .get::<_, Option<String>>(25)?
                             .unwrap_or_else(|| "[]".to_owned()),
-                    },
+                    }),
                 },
             ))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+        },
+    )?;
+    for row in rows {
+        let (key, flow) = row?;
+        active.insert(key, flow);
+    }
+    drop(statement);
     attribution::restore_active(connection, &mut active, to_i64(now_ms))?;
+    active.trim_to_capacity(ACTIVE_FLOW_CACHE_CAPACITY);
     Ok(active)
+}
+
+fn count_active_sessions(connection: &Connection) -> rusqlite::Result<i64> {
+    connection.query_row(
+        "SELECT
+            (SELECT COUNT(*) FROM flow_sessions WHERE ended_at IS NULL) +
+            (SELECT COUNT(*) FROM flow_rollup_sessions r WHERE r.ended_at IS NULL
+                AND NOT EXISTS (SELECT 1 FROM flow_sessions f
+                    WHERE f.id=r.session_id AND f.ended_at IS NULL))",
+        [],
+        |row| row.get(0),
+    )
+}
+
+fn stage_sqlite_active_flows(
+    active: &ActiveFlowCache,
+    batch: &TelemetryBatch,
+) -> HashMap<FlowKey, ActiveFlow> {
+    let mut staged = HashMap::new();
+    for flow in &batch.flows {
+        let key = FlowKey::from_batch(&batch.gateway_id, flow);
+        if let std::collections::hash_map::Entry::Vacant(entry) = staged.entry(key)
+            && let Some(current) = active.get(entry.key())
+        {
+            entry.insert(current.clone());
+        }
+    }
+    staged
 }
 
 fn stage_active_flows(
@@ -2506,13 +3409,18 @@ fn commit_active_flows(
 
 fn prune_flow_state(
     tx: &Transaction<'_>,
-    active: &HashMap<FlowKey, ActiveFlow>,
+    active: &ActiveFlowCache,
     now: i64,
 ) -> rusqlite::Result<()> {
     let cutoff = now.saturating_sub(ACTIVE_FLOW_TTL_MS);
     for (key, flow) in active {
         if flow.last_received_at <= cutoff && flow.last_seen_at > 0 {
             write_flow_session(tx, key, flow, Some(flow.last_seen_at), now)?;
+            tx.prepare_cached(
+                "UPDATE flow_rollup_sessions SET ended_at=?2
+                 WHERE session_id=?1 AND ended_at IS NULL",
+            )?
+            .execute(params![flow.session_id(key).as_ref(), now])?;
         }
     }
     attribution::prune(tx, now)?;
@@ -2549,11 +3457,15 @@ fn persist_devices(
     batch: &TelemetryBatch,
     identities: &[DeviceIdentityUpdate],
 ) -> rusqlite::Result<()> {
+    let mut identities_by_mac = HashMap::with_capacity(identities.len());
+    for identity in identities {
+        identities_by_mac
+            .entry(identity.mac.as_slice())
+            .or_insert(identity);
+    }
     for device in &batch.device_observations {
         let seen = to_i64(device.last_seen_unix_ms);
-        let identity = identities
-            .iter()
-            .find(|identity| identity.mac == device.mac);
+        let identity = identities_by_mac.get(device.mac.as_slice()).copied();
         tx.execute(
             "INSERT INTO devices(
                 gateway_id, mac, hostname, vendor, device_type, os_family, model,
@@ -2822,6 +3734,8 @@ fn persist_minute_rollups(
     flow: &FlowDelta,
     attribution: &FlowAttribution,
     device_id: Option<i64>,
+    device_batch: &mut RepeatedRollupBatch,
+    destination_batch: &mut RepeatedRollupBatch,
 ) -> rusqlite::Result<()> {
     let timestamp = to_i64(batch.sent_at) / MINUTE_MS * MINUTE_MS;
     let upload = to_i64(flow.upload_bytes);
@@ -2841,10 +3755,8 @@ fn persist_minute_rollups(
         |id| (id, "unknown"),
     );
     if let Some(device_id) = device_id {
-        upsert_rollup(
+        device_batch.add(
             tx,
-            "traffic_device_minute",
-            Some("device_id"),
             &[
                 timestamp.into(),
                 batch.gateway_id.clone().into(),
@@ -2886,10 +3798,8 @@ fn persist_minute_rollups(
         download,
         packets,
     )?;
-    upsert_rollup(
+    destination_batch.add(
         tx,
-        "traffic_destination_minute",
-        Some("remote_ip"),
         &[
             timestamp.into(),
             batch.gateway_id.clone().into(),
@@ -2930,11 +3840,188 @@ fn persist_minute_rollups(
     Ok(())
 }
 
-// Only the total dimension is batched. Its minute trigger updates one hour
-// pending row. The other dimensions participate in attribution transfers and
-// remain ordered per flow until their trigger/overflow behavior is proven.
-// This cache stores one key and four counters, regardless of batch size.
-const TOTAL_ROLLUP_MAX_DELTAS: i64 = 1024;
+// Total, device and destination batching each retain at most one key. Device
+// and destination rollups do not participate in attribution transfers.
+const ROLLUP_MAX_DELTAS: i64 = 1024;
+
+struct RepeatedRollupBatch {
+    table: &'static str,
+    dimension: &'static str,
+    source_sql: &'static str,
+    pending_sql: &'static str,
+    key: Option<Vec<Value>>,
+    consecutive: u8,
+    enabled: bool,
+    unsafe_key: bool,
+    base: Option<([i64; 4], [i64; 4])>,
+    delta: [i64; 4],
+}
+
+impl RepeatedRollupBatch {
+    fn new(device: bool, enabled: bool) -> Self {
+        let (table, dimension, source_sql, pending_sql) = if device {
+            (
+                "traffic_device_minute",
+                "device_id",
+                "SELECT upload_bytes,download_bytes,packets,flow_count FROM traffic_device_minute WHERE timestamp=?1 AND gateway_id=?2 AND device_id=?3",
+                "SELECT upload_bytes,download_bytes,packets,flow_count FROM traffic_device_hour_pending WHERE timestamp=?1 AND gateway_id=?2 AND device_id=?3",
+            )
+        } else {
+            (
+                "traffic_destination_minute",
+                "remote_ip",
+                "SELECT upload_bytes,download_bytes,packets,flow_count FROM traffic_destination_minute WHERE timestamp=?1 AND gateway_id=?2 AND remote_ip=?3",
+                "SELECT upload_bytes,download_bytes,packets,flow_count FROM traffic_destination_hour_pending WHERE timestamp=?1 AND gateway_id=?2 AND remote_ip=?3",
+            )
+        };
+        Self {
+            table,
+            dimension,
+            source_sql,
+            pending_sql,
+            key: None,
+            consecutive: 0,
+            enabled,
+            unsafe_key: false,
+            base: None,
+            delta: [0; 4],
+        }
+    }
+
+    fn read_counters(
+        tx: &Transaction<'_>,
+        sql: &str,
+        key: &[Value],
+    ) -> rusqlite::Result<Option<[i64; 4]>> {
+        let values: Option<[Value; 4]> = tx
+            .prepare_cached(sql)?
+            .query_row(rusqlite::params_from_iter(key), |row| {
+                Ok([row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?])
+            })
+            .optional()?;
+        let Some(values) = values else {
+            return Ok(Some([0; 4]));
+        };
+        let mut counters = [0; 4];
+        for (index, value) in values.into_iter().enumerate() {
+            match value {
+                Value::Integer(n) if n >= 0 => counters[index] = n,
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(counters))
+    }
+
+    fn add(
+        &mut self,
+        tx: &Transaction<'_>,
+        key: &[Value],
+        upload: i64,
+        download: i64,
+        packets: i64,
+    ) -> rusqlite::Result<()> {
+        if !self.enabled {
+            return upsert_rollup(
+                tx,
+                self.table,
+                Some(self.dimension),
+                key,
+                upload,
+                download,
+                packets,
+            );
+        }
+        if self.key.as_deref() != Some(key) {
+            self.flush(tx)?;
+            self.key = Some(key.to_vec());
+            self.consecutive = 0;
+            self.unsafe_key = false;
+        }
+        if upload < 0 || download < 0 || packets < 0 {
+            self.flush(tx)?;
+            self.unsafe_key = true;
+        }
+        // Short runs stay on the normal path so isolated keys and pairs do
+        // not pay two extra reads before the key changes.
+        if self.consecutive < 3 || self.unsafe_key {
+            self.consecutive = self.consecutive.saturating_add(1);
+            return upsert_rollup(
+                tx,
+                self.table,
+                Some(self.dimension),
+                key,
+                upload,
+                download,
+                packets,
+            );
+        }
+        if self.base.is_none() {
+            let old = Self::read_counters(tx, self.source_sql, key)?;
+            let mut pending_key = key.to_vec();
+            let Value::Integer(timestamp) = pending_key[0] else {
+                return Err(rusqlite::Error::InvalidQuery);
+            };
+            pending_key[0] = (timestamp / HOUR_MS * HOUR_MS).into();
+            let pending = Self::read_counters(tx, self.pending_sql, &pending_key)?;
+            self.base = old.zip(pending);
+            if self.base.is_none() {
+                self.unsafe_key = true;
+            }
+        }
+        if let Some((old, pending)) = self.base {
+            let values = [upload, download, packets, 1];
+            let mut next = [0; 4];
+            // Stored counters and incoming deltas are nonnegative here. The
+            // original trigger's pending-old intermediate is therefore in
+            // range; checking both endpoints keeps every subsequent integer
+            // addition exact and avoids SQLite's overflow-to-REAL behavior.
+            let safe = (0..4).all(|index| {
+                let Some(sum) = self.delta[index].checked_add(values[index]) else {
+                    return false;
+                };
+                next[index] = sum;
+                old[index].checked_add(sum).is_some() && pending[index].checked_add(sum).is_some()
+            });
+            if safe {
+                self.delta = next;
+                if self.delta[3] == ROLLUP_MAX_DELTAS {
+                    self.flush(tx)?;
+                }
+                return Ok(());
+            }
+            self.flush(tx)?;
+            self.unsafe_key = true;
+        }
+        upsert_rollup(
+            tx,
+            self.table,
+            Some(self.dimension),
+            key,
+            upload,
+            download,
+            packets,
+        )
+    }
+
+    fn flush(&mut self, tx: &Transaction<'_>) -> rusqlite::Result<()> {
+        if self.delta[3] != 0 {
+            let key = self.key.as_deref().expect("buffered rollup has a key");
+            adjust_rollup(
+                tx,
+                self.table,
+                Some(self.dimension),
+                key,
+                self.delta[0],
+                self.delta[1],
+                self.delta[2],
+                self.delta[3],
+            )?;
+        }
+        self.base = None;
+        self.delta = [0; 4];
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -3031,7 +4118,7 @@ impl TotalRollupBatch {
             });
             if safe {
                 self.delta = next;
-                if self.delta[3] == TOTAL_ROLLUP_MAX_DELTAS {
+                if self.delta[3] == ROLLUP_MAX_DELTAS {
                     self.flush(tx, batch)?;
                 }
                 return Ok(());
@@ -3145,32 +4232,39 @@ fn update_active_flows(
     attributions: &[FlowAttribution],
     received_at: i64,
     batch_total: bool,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<i64> {
     let unknown = FlowAttribution::default();
     let mut device_ids = HashMap::new();
     let mut totals = TotalRollupBatch {
         disabled: !batch_total,
         ..TotalRollupBatch::default()
     };
+    let mut device_batch = RepeatedRollupBatch::new(true, batch_total);
+    let mut destination_batch = RepeatedRollupBatch::new(false, batch_total);
+    let mut active_count_delta = 0_i64;
     for (index, flow) in batch.flows.iter().enumerate() {
         let attribution = attributions.get(index).unwrap_or(&unknown);
         let key = FlowKey::from_batch(&batch.gateway_id, flow);
         let ended = flow.lifecycle == FlowLifecycle::Ended as i32;
+        let mut was_active = true;
         {
             let current = match active.entry(key.clone()) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let mut restored =
                         ActiveFlow::new(&key, flow, FlowAttribution::default(), received_at);
-                    attribution::restore(tx, &mut restored)?;
+                    was_active = attribution::restore(tx, &key, &mut restored)?;
                     entry.insert(restored)
                 }
             };
-            let previous = current.attribution.clone();
-            current.add(flow, attribution, received_at);
-            if current.attribution != previous {
+            if current.add(flow, attribution, received_at) {
                 totals.flush(tx, batch)?;
-                attribution::reassign(tx, &current.session_id, &current.attribution, received_at)?;
+                attribution::reassign(
+                    tx,
+                    current.session_id(&key).as_ref(),
+                    &current.attribution,
+                    received_at,
+                )?;
             }
             // Rollups and the contribution ledger must use the merged identity,
             // including for batches with weaker or missing classifier evidence.
@@ -3182,7 +4276,15 @@ fn update_active_flows(
             };
             current.device_id = device_id.or(current.device_id);
             totals.add(tx, batch, flow)?;
-            persist_minute_rollups(tx, batch, flow, &current.attribution, current.device_id)?;
+            persist_minute_rollups(
+                tx,
+                batch,
+                flow,
+                &current.attribution,
+                current.device_id,
+                &mut device_batch,
+                &mut destination_batch,
+            )?;
             #[cfg(test)]
             let ledger_started = benchmark_sql_profile_enabled().then(std::time::Instant::now);
             attribution::record(tx, &key, current, batch, flow, received_at)?;
@@ -3208,9 +4310,16 @@ fn update_active_flows(
         }
         if ended {
             active.remove(&key);
+            if was_active {
+                active_count_delta -= 1;
+            }
+        } else if !was_active {
+            active_count_delta += 1;
         }
     }
     totals.flush(tx, batch)?;
+    device_batch.flush(tx)?;
+    destination_batch.flush(tx)?;
     #[cfg(test)]
     LAST_TOTAL_ROLLUP_COUNTS.set((totals.original, totals.statements));
     tracing::debug!(
@@ -3219,7 +4328,7 @@ fn update_active_flows(
         total_rollup_upserts = totals.statements,
         "minute total rollup batching"
     );
-    Ok(())
+    Ok(active_count_delta)
 }
 
 fn write_flow_session(
@@ -3266,7 +4375,7 @@ fn write_flow_session(
             destination_segment = excluded.destination_segment",
     )?
     .execute(params![
-        flow.session_id,
+        flow.session_id(key).as_ref(),
         key.gateway_id,
         device_id,
         key.ip_version,
@@ -3328,29 +4437,61 @@ fn dimension_columns(dimension: &str) -> &'static str {
     }
 }
 
-fn aggregate(
+fn aggregate_bounded(
     tx: &Transaction<'_>,
     dimension: &str,
     target: &str,
     cutoff: i64,
-) -> rusqlite::Result<()> {
+    limit: usize,
+) -> rusqlite::Result<usize> {
     let keys = format!("timestamp, {}", dimension_columns(dimension));
+    let qualified_keys = keys
+        .split(',')
+        .map(|column| format!("p.{}", column.trim()))
+        .collect::<Vec<_>>()
+        .join(",");
     let target_table = format!("traffic_{dimension}_{target}");
     let pending = format!("{target_table}_pending");
     tx.prepare_cached(&format!(
-        "INSERT INTO {target_table}({keys},upload_bytes,download_bytes,packets,flow_count)
-         SELECT {keys},upload_bytes,download_bytes,packets,flow_count FROM {pending} WHERE timestamp<?1
+        "WITH selected AS (
+             SELECT {keys} FROM {pending} WHERE timestamp<?1 ORDER BY {keys} LIMIT ?2
+         )
+         INSERT INTO {target_table}({keys},upload_bytes,download_bytes,packets,flow_count)
+         SELECT {qualified_keys},p.upload_bytes,p.download_bytes,p.packets,p.flow_count
+         FROM {pending} p JOIN selected s USING({keys}) WHERE 1
          ON CONFLICT({keys}) DO UPDATE SET
          upload_bytes=upload_bytes+excluded.upload_bytes,download_bytes=download_bytes+excluded.download_bytes,
          packets=packets+excluded.packets,flow_count=flow_count+excluded.flow_count"
-    ))?.execute([cutoff])?;
+    ))?
+    .execute(params![cutoff, i64::try_from(limit).unwrap_or(i64::MAX)])?;
     tx.prepare_cached(&format!(
-        "DELETE FROM {target_table} WHERE timestamp IN (SELECT timestamp FROM {pending} WHERE timestamp<?1)
+        "DELETE FROM {target_table} WHERE ({keys}) IN (
+             SELECT {keys} FROM {pending} WHERE timestamp<?1 ORDER BY {keys} LIMIT ?2
+         )
          AND upload_bytes=0 AND download_bytes=0 AND packets=0 AND flow_count=0"
-    ))?.execute([cutoff])?;
-    tx.prepare_cached(&format!("DELETE FROM {pending} WHERE timestamp<?1"))?
-        .execute([cutoff])?;
-    Ok(())
+    ))?
+    .execute(params![cutoff, i64::try_from(limit).unwrap_or(i64::MAX)])?;
+    tx.prepare_cached(&format!(
+        "DELETE FROM {pending} WHERE ({keys}) IN (
+             SELECT {keys} FROM {pending} WHERE timestamp<?1 ORDER BY {keys} LIMIT ?2
+         )"
+    ))?
+    .execute(params![cutoff, i64::try_from(limit).unwrap_or(i64::MAX)])
+}
+
+fn rollup_pending(tx: &Transaction<'_>, tasks: &[(&str, &str, i64)]) -> rusqlite::Result<bool> {
+    for (dimension, target, cutoff) in tasks {
+        let table = format!("traffic_{dimension}_{target}_pending");
+        let pending: bool = tx.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE timestamp<?1)"),
+            [cutoff],
+            |row| row.get(0),
+        )?;
+        if pending {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn ip_version(ip: &[u8]) -> Option<i64> {
@@ -3373,7 +4514,7 @@ fn unix_time_ms() -> u64 {
         })
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct FlowKey {
     gateway_id: String,
     ip_version: i64,
@@ -3433,7 +4574,9 @@ impl FlowKey {
 
 #[derive(Clone, Debug)]
 struct ActiveFlow {
-    session_id: String,
+    // Most IDs are derivable from the flow key and start time; retain an
+    // override only for historical rows that used a non-canonical ID.
+    session_id_override: Option<Box<str>>,
     client_mac: Vec<u8>,
     device_id: Option<i64>,
     upload_bytes: i64,
@@ -3443,7 +4586,9 @@ struct ActiveFlow {
     last_seen_at: i64,
     checkpointed_at: i64,
     last_received_at: i64,
-    attribution: FlowAttribution,
+    // Unknown classifications are common. Share the canonical default across
+    // cache entries and detach only when attribution receives new evidence.
+    attribution: Arc<FlowAttribution>,
     scope: i64,
     path_type: i64,
     nat: i64,
@@ -3452,8 +4597,27 @@ struct ActiveFlow {
 }
 
 impl ActiveFlow {
+    fn attribution_mut(&mut self) -> &mut FlowAttribution {
+        Arc::make_mut(&mut self.attribution)
+    }
+
+    fn merge_attribution(&mut self, incoming: &FlowAttribution) -> bool {
+        if Arc::ptr_eq(&self.attribution, default_active_attribution()) && incoming.is_default() {
+            false
+        } else {
+            attribution::merge(self.attribution_mut(), incoming)
+        }
+    }
+
+    fn session_id<'a>(&'a self, key: &'a FlowKey) -> Cow<'a, str> {
+        self.session_id_override.as_deref().map_or_else(
+            || Cow::Owned(key.session_id(self.started_at)),
+            Cow::Borrowed,
+        )
+    }
+
     fn new(
-        key: &FlowKey,
+        _key: &FlowKey,
         flow: &FlowDelta,
         attribution: FlowAttribution,
         received_at: i64,
@@ -3464,14 +4628,13 @@ impl ActiveFlow {
         } else {
             observed_started_at
         };
-        let session_id = key.session_id(started_at);
         let last_seen_at = if flow_has_traffic(flow) {
             to_i64(flow.last_seen_unix_ms).max(started_at)
         } else {
             0
         };
         Self {
-            session_id,
+            session_id_override: None,
             client_mac: flow.client_mac.clone(),
             device_id: None,
             upload_bytes: 0,
@@ -3481,7 +4644,7 @@ impl ActiveFlow {
             last_seen_at,
             checkpointed_at: started_at,
             last_received_at: received_at,
-            attribution,
+            attribution: shared_active_attribution(attribution),
             scope: i64::from(flow.scope),
             path_type: i64::from(flow.path_type),
             nat: i64::from(flow.nat),
@@ -3490,7 +4653,7 @@ impl ActiveFlow {
         }
     }
 
-    fn add(&mut self, flow: &FlowDelta, attribution: &FlowAttribution, received_at: i64) {
+    fn add(&mut self, flow: &FlowDelta, attribution: &FlowAttribution, received_at: i64) -> bool {
         self.last_received_at = self.last_received_at.max(received_at);
         if self.client_mac.is_empty() && !flow.client_mac.is_empty() {
             self.client_mac.clone_from(&flow.client_mac);
@@ -3509,7 +4672,7 @@ impl ActiveFlow {
         self.source_segment.clone_from(&flow.source_segment);
         self.destination_segment
             .clone_from(&flow.destination_segment);
-        attribution::merge(&mut self.attribution, attribution);
+        self.merge_attribution(attribution)
     }
 }
 

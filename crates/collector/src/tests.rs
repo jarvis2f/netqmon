@@ -17,7 +17,625 @@ use tower::ServiceExt;
 use super::*;
 
 const ENROLLMENT_TOKEN: &str = "test-enrollment-token";
+
+#[test]
+fn rollup_maintenance_retries_only_transient_sqlite_lock_errors() {
+    let busy = StorageError::Sqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+        None,
+    ));
+    let locked = StorageError::Sqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+        None,
+    ));
+    let io = StorageError::Sqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+        None,
+    ));
+
+    assert!(super::should_retry_maintenance_after_error(false, &busy));
+    assert!(super::should_retry_maintenance_after_error(false, &locked));
+    assert!(!super::should_retry_maintenance_after_error(false, &io));
+    assert!(super::should_retry_maintenance_after_error(true, &io));
+}
+
+#[allow(unsafe_code)]
+fn sqlite_memory_used_bytes() -> u64 {
+    // sqlite3_memory_used takes no pointers and only reads SQLite's global byte counter.
+    unsafe { rusqlite::ffi::sqlite3_memory_used() }.max(0) as u64
+}
+
+#[cfg(feature = "rust-heap-meter")]
+#[allow(unsafe_code)]
+mod rust_heap_meter {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+    struct TrackingAllocator;
+
+    fn record_allocation(size: usize) {
+        if size == 0 {
+            return;
+        }
+        let live = LIVE_BYTES.fetch_add(size, Ordering::Relaxed) + size;
+        PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
+    }
+
+    fn record_deallocation(size: usize) {
+        if size != 0 {
+            LIVE_BYTES.fetch_sub(size, Ordering::Relaxed);
+        }
+    }
+
+    // SAFETY: Each method delegates allocation to `System` and updates only
+    // atomic accounting. The original pointer and layout are passed unchanged.
+    unsafe impl GlobalAlloc for TrackingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() {
+                record_allocation(layout.size());
+            }
+            pointer
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc_zeroed(layout) };
+            if !pointer.is_null() {
+                record_allocation(layout.size());
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(pointer, layout) };
+            record_deallocation(layout.size());
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let resized = unsafe { System.realloc(pointer, layout, new_size) };
+            if !resized.is_null() {
+                if new_size >= layout.size() {
+                    record_allocation(new_size - layout.size());
+                } else {
+                    record_deallocation(layout.size() - new_size);
+                }
+            }
+            resized
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: TrackingAllocator = TrackingAllocator;
+
+    pub(crate) fn begin() -> usize {
+        let current = LIVE_BYTES.load(Ordering::Relaxed);
+        PEAK_BYTES.store(current, Ordering::Relaxed);
+        current
+    }
+
+    pub(crate) fn current() -> usize {
+        LIVE_BYTES.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn peak_growth_since(baseline: usize) -> usize {
+        PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(baseline)
+    }
+}
+
+mod clickhouse_compat;
+mod client_pagination;
 mod concurrency;
+mod file_ingest_benchmark;
+mod geo_bounded;
+
+// Original expiration behavior, used as a differential oracle.
+fn legacy_dns_observe(cache: &mut DnsDomainCache, batch: &TelemetryBatch) {
+    for observation in &batch.dns_observations {
+        if observation.domain.is_empty() || observation.answer_ip.is_empty() {
+            continue;
+        }
+        let key = DnsDomainKey {
+            gateway_id: Arc::from(batch.gateway_id.as_str()),
+            client_ip: observation.client_ip.clone(),
+            answer_ip: observation.answer_ip.clone(),
+        };
+        let observed_at = observation.observed_at_unix_ms;
+        match cache.entries.get_mut(&key) {
+            Some(value) if value.observed_at <= observed_at => {
+                value.domain.clone_from(&observation.domain);
+                value.observed_at = observed_at;
+            }
+            Some(_) => {}
+            None => {
+                cache.entries.insert(
+                    key,
+                    DnsDomainValue {
+                        domain: observation.domain.clone(),
+                        observed_at,
+                    },
+                );
+            }
+        }
+    }
+    let oldest = batch.sent_at.saturating_sub(cache.ttl_ms);
+    cache.entries.retain(|_, value| value.observed_at >= oldest);
+}
+
+#[test]
+fn dns_cache_expiration_matches_full_scan_with_out_of_order_batches() {
+    let mut optimized = DnsDomainCache {
+        ttl_ms: 100,
+        ..Default::default()
+    };
+    let mut original = DnsDomainCache {
+        ttl_ms: 100,
+        ..Default::default()
+    };
+    let mut seed = 7123_u64;
+    for step in 0..3000_u64 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let sent_at = (step / 3).saturating_sub((seed >> 20) % 50);
+        let observation = DnsObservation {
+            client_ip: vec![192, 0, 2, (seed % 5) as u8],
+            answer_ip: if seed % 41 == 0 {
+                vec![]
+            } else {
+                vec![198, 51, 100, (seed >> 8) as u8]
+            },
+            domain: if seed % 43 == 0 {
+                String::new()
+            } else {
+                format!("{}.example", seed % 100)
+            },
+            observed_at_unix_ms: sent_at.saturating_sub((seed >> 16) % 130) + (seed >> 24) % 10,
+            ..Default::default()
+        };
+        let batch = TelemetryBatch {
+            gateway_id: format!("gw-{}", seed % 3),
+            sent_at,
+            dns_observations: vec![observation],
+            ..Default::default()
+        };
+        optimized.observe(&batch);
+        legacy_dns_observe(&mut original, &batch);
+        assert_eq!(optimized.entries, original.entries, "step {step}");
+        assert!(optimized.entries.values().all(|value| {
+            optimized
+                .oldest_observed_at
+                .is_some_and(|oldest| oldest <= value.observed_at)
+        }));
+    }
+    let flush = TelemetryBatch {
+        sent_at: 10_000,
+        ..Default::default()
+    };
+    optimized.observe(&flush);
+    assert!(optimized.entries.is_empty());
+    assert!(optimized.oldest_observed_at.is_none());
+}
+
+#[test]
+fn dns_cache_refresh_of_oldest_preserves_inclusive_ttl_boundary() {
+    let mut cache = DnsDomainCache {
+        ttl_ms: 100,
+        ..Default::default()
+    };
+    let batch = |sent_at, observed_at| TelemetryBatch {
+        gateway_id: "gw".into(),
+        sent_at,
+        dns_observations: vec![DnsObservation {
+            client_ip: vec![1],
+            answer_ip: vec![2],
+            domain: "example.org".into(),
+            observed_at_unix_ms: observed_at,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    cache.observe(&batch(100, 100));
+    cache.observe(&batch(200, 200));
+    cache.observe(&TelemetryBatch {
+        sent_at: 250,
+        ..Default::default()
+    });
+    assert_eq!(cache.oldest_observed_at, Some(200));
+    cache.observe(&TelemetryBatch {
+        sent_at: 300,
+        ..Default::default()
+    });
+    assert_eq!(cache.resolve("gw", &[1], &[2], 300), Some("example.org"));
+    cache.observe(&TelemetryBatch {
+        sent_at: 301,
+        ..Default::default()
+    });
+    assert!(cache.entries.is_empty());
+    assert_eq!(cache.oldest_observed_at, None);
+}
+
+#[test]
+fn dns_cache_capacity_bounds_entries_and_expires_fallback_window() {
+    let mut cache = DnsDomainCache {
+        ttl_ms: 100,
+        max_entries: 1,
+        ..Default::default()
+    };
+    let observation = |client, answer, sent_at| TelemetryBatch {
+        gateway_id: "gw".into(),
+        sent_at,
+        dns_observations: vec![DnsObservation {
+            client_ip: vec![client],
+            answer_ip: vec![answer],
+            domain: format!("{answer}.example"),
+            observed_at_unix_ms: sent_at,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    cache.observe(&observation(1, 2, 1_000));
+    cache.observe(&observation(3, 4, 1_010));
+    assert_eq!(cache.entries.len(), 1);
+    assert!(cache.has_live_evicted_history());
+    cache.observe(&TelemetryBatch {
+        sent_at: 1_101,
+        ..Default::default()
+    });
+    assert!(!cache.has_live_evicted_history());
+}
+
+#[test]
+#[ignore = "manual DNS cache scan benchmark"]
+fn dns_cache_idle_scan_benchmark() {
+    use std::time::Instant;
+    let count: u32 = std::env::var("NETQMON_BENCH_ROWS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(100_000);
+    let mut optimized = DnsDomainCache {
+        max_entries: usize::try_from(count).unwrap().saturating_add(1),
+        ..Default::default()
+    };
+    let mut original = DnsDomainCache::default();
+    let batch = TelemetryBatch {
+        gateway_id: "benchmark".into(),
+        sent_at: 1_000,
+        dns_observations: (0..count)
+            .map(|n| DnsObservation {
+                client_ip: vec![192, 0, 2, 1],
+                answer_ip: n.to_be_bytes().to_vec(),
+                domain: format!("host-{n}.example"),
+                observed_at_unix_ms: 1_000,
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    #[cfg(feature = "rust-heap-meter")]
+    let cache_heap_before = rust_heap_meter::begin();
+    optimized.observe(&batch);
+    #[cfg(feature = "rust-heap-meter")]
+    let cache_heap_bytes = rust_heap_meter::current().saturating_sub(cache_heap_before);
+    legacy_dns_observe(&mut original, &batch);
+    #[cfg(not(feature = "rust-heap-meter"))]
+    let cache_heap_bytes: Option<usize> = None;
+    #[cfg(feature = "rust-heap-meter")]
+    let cache_heap_bytes = Some(cache_heap_bytes);
+    let idle = TelemetryBatch {
+        sent_at: 2_000,
+        ..Default::default()
+    };
+    let mut times = [Vec::new(), Vec::new()];
+    for iteration in 0..200 {
+        for pass in 0..2 {
+            let current = (iteration + pass) % 2;
+            let start = Instant::now();
+            if current == 0 {
+                legacy_dns_observe(&mut original, &idle);
+            } else {
+                optimized.observe(&idle);
+            }
+            times[current].push(start.elapsed().as_nanos());
+        }
+    }
+    assert_eq!(original.entries, optimized.entries);
+    for (name, values) in ["before", "after"].into_iter().zip(&mut times) {
+        values.sort_unstable();
+        eprintln!(
+            "dns_cache_rows={count} cache_heap_bytes={cache_heap_bytes:?} {name} p50_ns={} p95_ns={} p99_ns={}",
+            values[100], values[190], values[198]
+        );
+    }
+    // Also measure an actual expiration sweep. Clone outside the timed region
+    // and alternate order; half the entries survive the cutoff.
+    for (key, value) in &mut original.entries {
+        if key.answer_ip[3] % 2 == 0 {
+            value.observed_at = 2_000;
+        }
+    }
+    let expiration = TelemetryBatch {
+        sent_at: original.ttl_ms + 1_500,
+        ..Default::default()
+    };
+    let mut sweeps = [Vec::new(), Vec::new()];
+    for iteration in 0..10 {
+        let mut before = DnsDomainCache {
+            entries: original.entries.clone(),
+            ..Default::default()
+        };
+        let mut after = DnsDomainCache {
+            entries: original.entries.clone(),
+            oldest_observed_at: Some(1_000),
+            ..Default::default()
+        };
+        for pass in 0..2 {
+            let current = (iteration + pass) % 2;
+            let start = Instant::now();
+            if current == 0 {
+                legacy_dns_observe(&mut before, &expiration);
+            } else {
+                after.observe(&expiration);
+            }
+            sweeps[current].push(start.elapsed().as_micros());
+        }
+        assert_eq!(before.entries, after.entries);
+    }
+    for (name, values) in ["before", "after"].into_iter().zip(&mut sweeps) {
+        values.sort_unstable();
+        eprintln!(
+            "dns_cache_expiration_rows={count} {name} p50_us={} max_us={}",
+            values[5], values[9]
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual file-backed DNS cache fallback benchmark"]
+fn file_dns_history_fallback_benchmark() {
+    use std::time::Instant;
+    let count: u32 = std::env::var("NETQMON_BENCH_ROWS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1_000);
+    assert!((1..=MAX_FLOWS_PER_BATCH as u32).contains(&count));
+    let directory = tempfile::tempdir().unwrap();
+    let mut sqlite = SqliteStorage::open(directory.path().join("dns-fallback.db")).unwrap();
+    sqlite
+        .save_gateway(
+            "dns-fallback-benchmark",
+            "benchmark",
+            "test",
+            &[42; 32],
+            1_700_000_000_000,
+        )
+        .unwrap();
+    let base = 1_700_000_000_000_u64;
+    let dns_batch = TelemetryBatch {
+        gateway_id: "dns-fallback-benchmark".to_owned(),
+        boot_id: "dns-fallback-benchmark".to_owned(),
+        sequence: 1,
+        sent_at: base + 1_000,
+        dns_observations: (0..count)
+            .map(|id| DnsObservation {
+                client_ip: (0x0a00_0001_u32 + id).to_be_bytes().to_vec(),
+                answer_ip: (0xc633_6400_u32 + id).to_be_bytes().to_vec(),
+                domain: format!("host-{id}.example"),
+                observed_at_unix_ms: base,
+                ttl_seconds: 1,
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    sqlite.persist_batch(&dns_batch, base + 1_000).unwrap();
+    sqlite
+        .connection()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let mut evicted_cache = DnsDomainCache {
+        max_entries: 1,
+        ..Default::default()
+    };
+    evicted_cache.observe(&dns_batch);
+    assert!(evicted_cache.has_live_evicted_history());
+    let cached_domain_cache = DnsDomainCache {
+        max_entries: count as usize + 1,
+        ..Default::default()
+    };
+    let mut cached_domain_cache = cached_domain_cache;
+    cached_domain_cache.observe(&dns_batch);
+
+    let flow_batch = TelemetryBatch {
+        gateway_id: dns_batch.gateway_id.clone(),
+        sent_at: base + 20_000,
+        flows: (0..count)
+            .map(|id| FlowDelta {
+                client_ip: (0x0a00_0001_u32 + id).to_be_bytes().to_vec(),
+                remote_ip: (0xc633_6400_u32 + id).to_be_bytes().to_vec(),
+                protocol: 17,
+                remote_port: 443,
+                last_seen_unix_ms: base + 20_000,
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let analyses = vec![
+        Some(dpi::SampleAnalysis {
+            dpi: Some(dpi::engine::DpiResult {
+                protocol: "quic".to_owned(),
+                source: "benchmark".to_owned(),
+                confidence: 1.0,
+                metadata: std::collections::BTreeMap::new(),
+            }),
+            signatures: Vec::new(),
+        });
+        count as usize
+    ];
+    let storage = Storage::sqlite(sqlite);
+    let no_domains = vec![None; count as usize];
+    let mut cached_times = Vec::new();
+    let mut fallback_times = Vec::new();
+    for iteration in 0..5 {
+        for pass in 0..2 {
+            let cached_first = (iteration + pass) % 2 == 0;
+            let started = Instant::now();
+            let domains = resolve_batch_domains(&storage, &flow_batch).unwrap();
+            assert!(domains.iter().all(Option::is_none));
+            if cached_first {
+                let cached = flow_batch
+                    .flows
+                    .iter()
+                    .map(|flow| {
+                        cached_domain_cache
+                            .resolve(
+                                &flow_batch.gateway_id,
+                                &flow.client_ip,
+                                &flow.remote_ip,
+                                flow.last_seen_unix_ms,
+                            )
+                            .map(str::to_owned)
+                    })
+                    .collect::<Vec<_>>();
+                assert!(cached.iter().all(Option::is_some));
+                cached_times.push(started.elapsed().as_micros());
+            } else {
+                let fallback = resolve_evicted_dns_domains(
+                    &storage,
+                    &evicted_cache,
+                    &flow_batch,
+                    &analyses,
+                    &no_domains,
+                )
+                .unwrap();
+                for (index, flow) in flow_batch.flows.iter().enumerate() {
+                    let actual = evicted_cache
+                        .resolve(
+                            &flow_batch.gateway_id,
+                            &flow.client_ip,
+                            &flow.remote_ip,
+                            flow.last_seen_unix_ms,
+                        )
+                        .map(str::to_owned)
+                        .or_else(|| fallback[index].clone());
+                    assert_eq!(actual, Some(format!("host-{index}.example")));
+                }
+                fallback_times.push(started.elapsed().as_micros());
+            }
+        }
+    }
+    cached_times.sort_unstable();
+    fallback_times.sort_unstable();
+    eprintln!(
+        "dns_fallback_file rows={count} db_bytes={} wal_bytes={} cache_path_p50_us={} fallback_path_p50_us={} cache_entries={} fallback_entries={}",
+        std::fs::metadata(directory.path().join("dns-fallback.db"))
+            .unwrap()
+            .len(),
+        std::fs::metadata(directory.path().join("dns-fallback.db-wal"))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0),
+        cached_times[2],
+        fallback_times[2],
+        cached_domain_cache.entries.len(),
+        evicted_cache.entries.len()
+    );
+}
+
+#[test]
+#[ignore = "manual file-backed DNS cache capacity and memory benchmark"]
+fn file_dns_cache_capacity_memory_benchmark() {
+    let rows: u64 = std::env::var("NETQMON_BENCH_ROWS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1_000_000);
+    let batch_size = 10_000_u64;
+    assert!(rows > 0 && rows <= 10_000_000);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dns-capacity.db");
+    let mut sqlite = SqliteStorage::open(&path).unwrap();
+    sqlite
+        .save_gateway(
+            "dns-capacity-benchmark",
+            "benchmark",
+            "test",
+            &[42; 32],
+            1_700_000_000_000,
+        )
+        .unwrap();
+    let sqlite_before = sqlite_memory_used_bytes();
+    #[cfg(feature = "rust-heap-meter")]
+    let heap_before = rust_heap_meter::begin();
+    let mut cache = DnsDomainCache::default();
+    for sequence in 0..rows.div_ceil(batch_size) {
+        let first = sequence * batch_size;
+        let count = (rows - first).min(batch_size);
+        let sent_at = 1_700_000_000_000_u64 + sequence * 1_000;
+        let batch = TelemetryBatch {
+            gateway_id: "dns-capacity-benchmark".to_owned(),
+            boot_id: "dns-capacity-benchmark".to_owned(),
+            sequence: sequence + 1,
+            sent_at,
+            dns_observations: (first..first + count)
+                .map(|id| DnsObservation {
+                    client_ip: (0x0a00_0001_u32 + (id % 65_536) as u32)
+                        .to_be_bytes()
+                        .to_vec(),
+                    answer_ip: (0xc633_6400_u32 + id as u32).to_be_bytes().to_vec(),
+                    domain: format!("host-{id}.example"),
+                    observed_at_unix_ms: sent_at,
+                    ttl_seconds: 3_600,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        cache.observe(&batch);
+        sqlite.persist_batch(&batch, sent_at).unwrap();
+    }
+    assert_eq!(
+        cache.entries.len(),
+        usize::try_from(rows)
+            .unwrap()
+            .min(DNS_DOMAIN_CACHE_MAX_ENTRIES)
+    );
+    assert_eq!(
+        cache.has_live_evicted_history(),
+        rows > DNS_DOMAIN_CACHE_MAX_ENTRIES as u64
+    );
+    let persisted: i64 = sqlite
+        .connection()
+        .query_row("SELECT COUNT(*) FROM dns_observations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(persisted, rows as i64);
+    sqlite
+        .connection()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let sqlite_after = sqlite_memory_used_bytes();
+    #[cfg(feature = "rust-heap-meter")]
+    let heap_live = rust_heap_meter::current().saturating_sub(heap_before);
+    #[cfg(not(feature = "rust-heap-meter"))]
+    let heap_live: Option<usize> = None;
+    #[cfg(feature = "rust-heap-meter")]
+    let heap_live = Some(heap_live);
+    #[cfg(feature = "rust-heap-meter")]
+    let heap_peak = Some(rust_heap_meter::peak_growth_since(heap_before));
+    #[cfg(not(feature = "rust-heap-meter"))]
+    let heap_peak: Option<usize> = None;
+    eprintln!(
+        "dns_cache_capacity_file rows={rows} batches={} cache_entries={} evicted_history={} db_bytes={} wal_bytes={} cache_heap_live_bytes={heap_live:?} heap_peak_growth_bytes={heap_peak:?} sqlite_allocator_before={sqlite_before} sqlite_allocator_after={sqlite_after}",
+        rows.div_ceil(batch_size),
+        cache.entries.len(),
+        cache.has_live_evicted_history(),
+        std::fs::metadata(&path).unwrap().len(),
+        std::fs::metadata(format!("{}-wal", path.display()))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    );
+}
 
 #[test]
 fn dns_history_is_scoped_by_client_and_answer_ip() {
@@ -99,6 +717,222 @@ fn expired_dns_history_classifies_quic_without_sni() {
     )
     .unwrap();
     assert_eq!(result[0].application_id, "youtube");
+}
+
+#[test]
+fn evicted_dns_cache_history_is_recovered_from_file_database() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = CollectorState::with_storage(
+        ENROLLMENT_TOKEN,
+        SqliteStorage::open(directory.path().join("dns-history-fallback.db")).unwrap(),
+        repository_rule_engine(),
+    )
+    .unwrap();
+    let enrollment = state
+        .enroll(&EnrollRequest {
+            enrollment_token: ENROLLMENT_TOKEN.to_owned(),
+            agent_version: "0.1.0".to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+            boot_id: "dns-history-fallback".to_owned(),
+            gateway_name: "dns-history-fallback".to_owned(),
+        })
+        .unwrap();
+    let base = 1_700_000_000_000_u64;
+    let mut dns_domains = DnsDomainCache {
+        max_entries: 1,
+        ..Default::default()
+    };
+    for (sequence, client_ip, answer_ip, domain) in [
+        (
+            1,
+            vec![192, 0, 2, 88],
+            vec![198, 51, 100, 1],
+            "www.youtube.com",
+        ),
+        (
+            2,
+            vec![192, 0, 2, 89],
+            vec![198, 51, 100, 2],
+            "other.example",
+        ),
+    ] {
+        let batch = TelemetryBatch {
+            gateway_id: enrollment.gateway_id.clone(),
+            boot_id: "dns-history-fallback".to_owned(),
+            sequence,
+            sent_at: base + sequence * 1_000,
+            dns_observations: vec![DnsObservation {
+                client_ip,
+                answer_ip,
+                domain: domain.to_owned(),
+                observed_at_unix_ms: base,
+                ttl_seconds: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        dns_domains.observe(&batch);
+        state
+            .lock()
+            .storage
+            .persist_batch(&batch, batch.sent_at)
+            .unwrap();
+    }
+    assert_eq!(dns_domains.entries.len(), 1);
+    assert!(dns_domains.has_live_evicted_history());
+
+    let batch = TelemetryBatch {
+        gateway_id: enrollment.gateway_id,
+        sent_at: base + 20_000,
+        flows: vec![FlowDelta {
+            client_mac: vec![2, 0, 0, 0, 0, 1],
+            client_ip: vec![192, 0, 2, 88],
+            remote_ip: vec![198, 51, 100, 1],
+            ip_version: 4,
+            protocol: 17,
+            remote_port: 443,
+            client_port: 50_000,
+            direction: Direction::Upload as i32,
+            first_seen_unix_ms: base + 20_000,
+            last_seen_unix_ms: base + 20_000,
+            lifecycle: FlowLifecycle::Ended as i32,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    dns_domains.observe(&batch);
+    let query_reader = state
+        .query_storage
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .query_reader()
+        .unwrap()
+        .unwrap();
+    let domains = resolve_batch_domains(&query_reader, &batch).unwrap();
+    assert_eq!(domains, vec![None]);
+    let analyses = vec![Some(dpi::SampleAnalysis {
+        dpi: Some(dpi::engine::DpiResult {
+            protocol: "quic".to_owned(),
+            source: "ndpi".to_owned(),
+            confidence: 1.0,
+            metadata: std::collections::BTreeMap::new(),
+        }),
+        signatures: Vec::new(),
+    })];
+    let recovered =
+        resolve_evicted_dns_domains(&query_reader, &dns_domains, &batch, &analyses, &domains)
+            .unwrap();
+    assert_eq!(recovered, vec![Some("www.youtube.com".to_owned())]);
+    let inner = state.lock();
+    let attribution = classify_resolved_batch(
+        &inner.classifier,
+        inner.geo_provider.as_ref(),
+        &mut ServiceBindingCache::default(),
+        &dns_domains,
+        &FaviconEndpointCache::default(),
+        &batch,
+        &analyses,
+        false,
+        &domains,
+        &recovered,
+    )
+    .unwrap();
+    assert_eq!(attribution[0].application_id, "youtube");
+}
+
+#[test]
+fn batch_dns_history_overrides_an_older_persisted_observation_after_eviction() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut sqlite = SqliteStorage::open(directory.path().join("dns-batch-history.db")).unwrap();
+    let gateway_id = "dns-batch-history";
+    sqlite
+        .save_gateway(gateway_id, "router", "test", &[17; 32], 1_700_000_000_000)
+        .unwrap();
+    let base = 1_700_000_000_000_u64;
+    let old_dns_batch = TelemetryBatch {
+        gateway_id: gateway_id.to_owned(),
+        boot_id: "dns-batch-history".to_owned(),
+        sequence: 1,
+        sent_at: base + 1_000,
+        dns_observations: vec![DnsObservation {
+            client_ip: vec![192, 0, 2, 88],
+            answer_ip: vec![198, 51, 100, 88],
+            domain: "old.example".to_owned(),
+            observed_at_unix_ms: base,
+            ttl_seconds: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    sqlite
+        .persist_batch(&old_dns_batch, old_dns_batch.sent_at)
+        .unwrap();
+
+    let mut dns_domains = DnsDomainCache {
+        max_entries: 1,
+        ..Default::default()
+    };
+    dns_domains.observe(&TelemetryBatch {
+        gateway_id: gateway_id.to_owned(),
+        sent_at: base + 5_000,
+        dns_observations: vec![
+            DnsObservation {
+                client_ip: vec![192, 0, 2, 90],
+                answer_ip: vec![198, 51, 100, 90],
+                domain: "unrelated-a.example".to_owned(),
+                observed_at_unix_ms: base + 4_000,
+                ttl_seconds: 60,
+                ..Default::default()
+            },
+            DnsObservation {
+                client_ip: vec![192, 0, 2, 91],
+                answer_ip: vec![198, 51, 100, 91],
+                domain: "unrelated-b.example".to_owned(),
+                observed_at_unix_ms: base + 4_000,
+                ttl_seconds: 60,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    });
+    assert!(dns_domains.has_live_evicted_history());
+
+    let batch = TelemetryBatch {
+        gateway_id: gateway_id.to_owned(),
+        sent_at: base + 20_000,
+        flows: vec![FlowDelta {
+            client_ip: vec![192, 0, 2, 88],
+            remote_ip: vec![198, 51, 100, 88],
+            protocol: 17,
+            remote_port: 443,
+            last_seen_unix_ms: base + 20_000,
+            ..Default::default()
+        }],
+        dns_observations: vec![DnsObservation {
+            client_ip: vec![192, 0, 2, 88],
+            answer_ip: vec![198, 51, 100, 88],
+            domain: "new.example".to_owned(),
+            observed_at_unix_ms: base + 15_000,
+            ttl_seconds: 60,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let analyses = vec![Some(dpi::SampleAnalysis {
+        dpi: Some(dpi::engine::DpiResult {
+            protocol: "quic".to_owned(),
+            source: "test".to_owned(),
+            confidence: 1.0,
+            metadata: std::collections::BTreeMap::new(),
+        }),
+        signatures: Vec::new(),
+    })];
+    let storage = Storage::sqlite(sqlite);
+    let recovered =
+        resolve_evicted_dns_domains(&storage, &dns_domains, &batch, &analyses, &[None]).unwrap();
+    assert_eq!(recovered, vec![Some("new.example".to_owned())]);
 }
 
 #[test]
@@ -723,6 +1557,48 @@ fn test_state() -> CollectorState {
     CollectorState::new(ENROLLMENT_TOKEN)
 }
 
+#[test]
+fn configured_wal_checkpoint_uses_independent_connection_and_preserves_data() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("collector-wal-checkpoint.db");
+    let sqlite = SqliteStorage::open(&path).unwrap();
+    sqlite
+        .connection()
+        .execute_batch(
+            "PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE checkpoint_fixture(payload BLOB NOT NULL);
+             WITH RECURSIVE n(i) AS (
+                 VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 1024
+             )
+             INSERT INTO checkpoint_fixture(payload)
+             SELECT randomblob(4096) FROM n;",
+        )
+        .unwrap();
+    let mut wal_path = path.as_os_str().to_os_string();
+    wal_path.push("-wal");
+    assert!(std::fs::metadata(&wal_path).unwrap().len() >= 32 * 1024);
+
+    let state =
+        CollectorState::with_storage(ENROLLMENT_TOKEN, sqlite, repository_rule_engine()).unwrap();
+    state.checkpoint_sqlite_wal_if_larger_than(32 * 1024);
+    drop(state);
+    assert_eq!(
+        std::fs::metadata(&wal_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0),
+        0
+    );
+
+    let reopened = SqliteStorage::open(&path).unwrap();
+    let count: i64 = reopened
+        .connection()
+        .query_row("SELECT COUNT(*) FROM checkpoint_fixture", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1024);
+}
+
 fn repository_rule_engine() -> crate::classifier::ClassifierHandle {
     crate::classifier::ClassifierHandle::test_default()
 }
@@ -843,6 +1719,1773 @@ fn query_state() -> CollectorState {
         BatchDisposition::Accepted
     );
     state
+}
+
+#[tokio::test]
+#[ignore = "manual file-backed application API benchmark"]
+async fn file_application_api_benchmark() {
+    use std::time::Instant;
+    let rows: i64 = std::env::var("NETQMON_BENCH_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("applications.db");
+    let mut sqlite = SqliteStorage::open(&path).unwrap();
+    let base: i64 = 1_700_000_000_000;
+    sqlite
+        .save_gateway("benchmark", "router", "test", &[7; 32], base as u64)
+        .unwrap();
+    let connection = sqlite.connection();
+    connection.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1000) INSERT INTO devices(id,gateway_id,mac,first_seen,last_seen) SELECT i,'benchmark',CAST(printf('%012x',i) AS BLOB),?1,?1 FROM n", [base]).unwrap();
+    connection.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1) INSERT INTO flow_sessions(id,gateway_id,device_id,ip_version,protocol,client_ip,client_port,remote_ip,remote_port,direction,application_id,category_id,protocol_id,organization_id,upload_bytes,download_bytes,packets,started_at,last_seen_at,checkpointed_at,ended_at) SELECT printf('flow-%d',i),'benchmark',i%1000+1,4,6,CAST(printf('%08x',i%1000) AS BLOB),i%60000,CAST(printf('%08x',i%50000) AS BLOB),443,1,CASE WHEN i%10=0 THEN 'unknown' ELSE printf('app-%d',i%200) END,printf('category-%d',(i/200)%10),'tcp',printf('org-%d',i%100),i%1000,i%500,1,?2,?2+(i/2000)*60000,?2,?2 FROM n", rusqlite::params![rows,base]).unwrap();
+    connection.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1) INSERT INTO traffic_application_minute(timestamp,gateway_id,application_id,category_id,upload_bytes,download_bytes,packets,flow_count) SELECT ?2+(i/2000)*60000,'benchmark',CASE WHEN i%10=0 THEN 'protocol:tcp' ELSE printf('app-%d',i%200) END,printf('category-%d',(i/200)%10),SUM(i%1000),SUM(i%500),COUNT(*),COUNT(*) FROM n GROUP BY 1,2,3,4", rusqlite::params![rows,base]).unwrap();
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    eprintln!(
+        "app_api_rows={rows} db_bytes={}",
+        std::fs::metadata(&path).unwrap().len()
+    );
+    for (name, sql) in [(
+        "app_groups",
+        "SELECT application_id,category_id,SUM(upload_bytes),SUM(download_bytes) FROM traffic_application_minute GROUP BY application_id,category_id",
+    )] {
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        for line in statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+        {
+            eprintln!("app_plan={name} {}", line.unwrap());
+        }
+    }
+    for windowed in [false, true] {
+        let sql = crate::query_api::sqlite_applications_query_sql(windowed);
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let plan = if windowed {
+            statement
+                .query_map(
+                    rusqlite::params![base, base + (rows / 2000 + 1) * 60_000, 50_i64, 0_i64],
+                    |row| row.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        } else {
+            statement
+                .query_map([50_i64, 0_i64], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        for line in plan {
+            eprintln!("app_plan=app_list_window_{windowed} {line}");
+        }
+    }
+    if std::env::var("NETQMON_BENCH_COMPACT_APP_CLIENTS").as_deref() == Ok("1") {
+        fn query_rows(
+            connection: &rusqlite::Connection,
+            sql: &str,
+            windowed: bool,
+            from: i64,
+            to: i64,
+        ) -> rusqlite::Result<Vec<serde_json::Value>> {
+            let mut statement = connection.prepare(sql)?;
+            let map_row = |row: &rusqlite::Row<'_>| {
+                Ok(serde_json::json!([
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, i64>(9)?,
+                ]))
+            };
+            if windowed {
+                statement
+                    .query_map(rusqlite::params![from, to, 50_i64, 0_i64], map_row)?
+                    .collect()
+            } else {
+                statement.query_map([50_i64, 0_i64], map_row)?.collect()
+            }
+        }
+
+        fn compact_client_union(sql: &str, windowed: bool) -> String {
+            let (app_join, app_predicate, protocol_join, protocol_predicate, flow_window) =
+                if windowed {
+                    (
+                        "CROSS JOIN flow_sessions f",
+                        "f.application_id = p.application_id AND",
+                        "CROSS JOIN flow_sessions f",
+                        "f.protocol_id = p.protocol_id AND",
+                        "AND f.last_seen_at >= ?1 AND f.last_seen_at < ?2",
+                    )
+                } else {
+                    (
+                        "JOIN flow_sessions f ON f.application_id = p.application_id",
+                        "",
+                        "JOIN flow_sessions f ON f.protocol_id = p.protocol_id",
+                        "",
+                        "",
+                    )
+                };
+            let cte_start = sql.find("client_flows AS (").unwrap();
+            let cte_end = sql[cte_start..]
+                .find("), client_counts AS (")
+                .map(|offset| cte_start + offset + 1)
+                .unwrap();
+            let replacement = format!(
+                "client_flows AS (
+                    SELECT f.application_id, f.device_id
+                    FROM page_apps p {app_join}
+                    WHERE {app_predicate} f.device_id IS NOT NULL
+                      AND f.application_id != 'unknown' {flow_window}
+                    UNION ALL
+                    SELECT 'protocol:' || f.protocol_id, f.device_id
+                    FROM page_protocols p {protocol_join}
+                    WHERE {protocol_predicate} f.device_id IS NOT NULL
+                      AND (f.application_id = 'unknown' OR f.application_id IS NULL)
+                      AND f.protocol_id != '' AND f.protocol_id != 'unknown' {flow_window}
+                    UNION ALL
+                    SELECT 'unknown', f.device_id
+                    FROM page_apps p JOIN flow_sessions f
+                      ON (f.application_id = 'unknown' OR f.application_id IS NULL)
+                    WHERE p.application_id = 'unknown' AND f.device_id IS NOT NULL
+                      AND COALESCE(NULLIF(f.protocol_id, ''), 'unknown') = 'unknown' {flow_window}
+                )"
+            );
+            format!("{}{}{}", &sql[..cte_start], replacement, &sql[cte_end..])
+        }
+
+        let window = (
+            base + (rows / 4000) * 60_000,
+            base + (rows / 2000 + 1) * 60_000,
+        );
+        for windowed in [false, true] {
+            let original_sql = crate::query_api::sqlite_applications_query_sql(windowed);
+            let compact_sql = compact_client_union(&original_sql, windowed);
+            let (from, to) = if windowed { window } else { (0, 0) };
+            let mut original_times = Vec::new();
+            let mut compact_times = Vec::new();
+            let mut expected = None;
+            for sample in 0..20 {
+                let run = |sql: &str| {
+                    let started = Instant::now();
+                    let result = query_rows(connection, sql, windowed, from, to).unwrap();
+                    (started.elapsed().as_micros(), result)
+                };
+                let (original, compact) = if sample % 2 == 0 {
+                    let original = run(&original_sql);
+                    let compact = run(&compact_sql);
+                    (original, compact)
+                } else {
+                    let compact = run(&compact_sql);
+                    let original = run(&original_sql);
+                    (original, compact)
+                };
+                assert_eq!(original.1, compact.1, "windowed={windowed}");
+                if let Some(previous) = &expected {
+                    assert_eq!(previous, &original.1, "fixture changed between runs");
+                } else {
+                    expected = Some(original.1.clone());
+                }
+                original_times.push(original.0);
+                compact_times.push(compact.0);
+            }
+            original_times.sort_unstable();
+            compact_times.sort_unstable();
+            let mut plan = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {compact_sql}"))
+                .unwrap();
+            let plan = if windowed {
+                plan.query_map(rusqlite::params![from, to, 50_i64, 0_i64], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+            } else {
+                plan.query_map([50_i64, 0_i64], |row| row.get::<_, String>(3))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            eprintln!(
+                "app_client_union_benchmark rows={rows} windowed={windowed} original_us={}/{}/{} compact_us={}/{}/{}",
+                original_times[10],
+                original_times[18],
+                original_times[19],
+                compact_times[10],
+                compact_times[18],
+                compact_times[19]
+            );
+            for line in plan {
+                eprintln!("app_client_union_plan windowed={windowed} {line}");
+            }
+        }
+    }
+    let state =
+        CollectorState::with_storage(ENROLLMENT_TOKEN, sqlite, repository_rule_engine()).unwrap();
+    let router = internal_router(state.clone());
+    if std::env::var("NETQMON_BENCH_APPS_ONLY").as_deref() != Ok("1") {
+        let mut detail_durations = Vec::new();
+        for _ in 0..20 {
+            let start = Instant::now();
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/internal/applications/app-1?category=category-1")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let result = parse_json(response).await;
+            assert_eq!(result["data"]["application_id"], "app-1");
+            assert!(result["data"]["observed_protocols"].is_array());
+            detail_durations.push(start.elapsed().as_micros());
+        }
+        detail_durations.sort_unstable();
+        eprintln!(
+            "app_detail_api_rows={rows} p50_us={} p95_us={} p99_us={}",
+            detail_durations[10], detail_durations[18], detail_durations[19]
+        );
+    }
+    if std::env::var("NETQMON_BENCH_DETAIL_ONLY").as_deref() != Ok("1") {
+        let windows = if std::env::var("NETQMON_BENCH_ALL_TIME_ONLY").as_deref() == Ok("1") {
+            vec![false]
+        } else {
+            vec![false, true]
+        };
+        for window in windows {
+            let mut durations = Vec::new();
+            for _ in 0..20 {
+                let uri = if window {
+                    format!(
+                        "/internal/applications?limit=50&from={}&to={}",
+                        base + (rows / 4000) * 60000,
+                        base + (rows / 2000 + 1) * 60000
+                    )
+                } else {
+                    "/internal/applications?limit=50".to_owned()
+                };
+                let start = Instant::now();
+                let response = router
+                    .clone()
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let result = parse_json(response).await;
+                durations.push(start.elapsed().as_micros());
+                assert_eq!(result["data"].as_array().unwrap().len(), 50);
+                assert!(result["pagination"]["total"].as_u64().unwrap() >= 50);
+            }
+            durations.sort_unstable();
+            eprintln!(
+                "app_api_rows={rows} window={window} p50_us={} p95_us={} p99_us={}",
+                durations[10], durations[18], durations[19]
+            );
+        }
+    }
+    if std::env::var("NETQMON_BENCH_APPLICATION_COVERING_INDEX").as_deref() == Ok("1") {
+        state
+            .lock()
+            .storage
+            .connection()
+            .execute_batch(
+                "DROP INDEX flow_sessions_application_last_seen;
+                 CREATE INDEX flow_sessions_application_last_seen
+                     ON flow_sessions(application_id,last_seen_at);
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        let before_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/applications?limit=50")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let before_data = parse_json(before_response).await;
+        let mut old_durations = Vec::new();
+        for _ in 0..20 {
+            let started = Instant::now();
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/internal/applications?limit=50")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let result = parse_json(response).await;
+            assert_eq!(result["data"], before_data["data"]);
+            old_durations.push(started.elapsed().as_micros());
+        }
+        old_durations.sort_unstable();
+        let mut old_detail_durations = Vec::new();
+        for _ in 0..20 {
+            let started = Instant::now();
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/internal/applications/app-1?category=category-1")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let result = parse_json(response).await;
+            assert_eq!(result["data"]["application_id"], "app-1");
+            old_detail_durations.push(started.elapsed().as_micros());
+        }
+        old_detail_durations.sort_unstable();
+        let (old_index_bytes, old_update_us) = {
+            let inner = state.lock();
+            let connection = inner.storage.connection();
+            let bytes = connection.query_row(
+                "SELECT SUM(pgsize) FROM dbstat WHERE name='flow_sessions_application_last_seen'",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            ).unwrap().unwrap_or(0);
+            let mut updates = Vec::new();
+            for _ in 0..5 {
+                connection
+                    .execute_batch("SAVEPOINT application_index_bench")
+                    .unwrap();
+                let started = Instant::now();
+                connection
+                    .execute(
+                        "UPDATE flow_sessions SET last_seen_at=last_seen_at+1
+                     WHERE rowid IN (SELECT rowid FROM flow_sessions ORDER BY rowid LIMIT 1000)",
+                        [],
+                    )
+                    .unwrap();
+                updates.push(started.elapsed().as_micros());
+                connection
+                    .execute_batch(
+                        "ROLLBACK TO application_index_bench; RELEASE application_index_bench",
+                    )
+                    .unwrap();
+            }
+            updates.sort_unstable();
+            (bytes, updates[2])
+        };
+        state
+            .lock()
+            .storage
+            .connection()
+            .execute_batch(
+                "DROP INDEX flow_sessions_application_last_seen;
+             CREATE INDEX flow_sessions_application_last_seen
+                 ON flow_sessions(application_id,last_seen_at,protocol_id,device_id);
+             PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        let inner = state.lock();
+        let connection = inner.storage.connection();
+        let index_bytes: i64 = connection
+            .query_row(
+                "SELECT SUM(pgsize) FROM dbstat WHERE name='flow_sessions_application_last_seen'",
+                [],
+                |row| row.get::<_, Option<i64>>(0).map(|value| value.unwrap_or(0)),
+            )
+            .unwrap();
+        let app_sql = crate::query_api::sqlite_applications_query_sql(false);
+        let plan = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {app_sql}"))
+            .unwrap()
+            .query_map([50_i64, 0_i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let mut updates = Vec::new();
+        for _ in 0..5 {
+            connection
+                .execute_batch("SAVEPOINT application_index_bench")
+                .unwrap();
+            let started = Instant::now();
+            connection
+                .execute(
+                    "UPDATE flow_sessions SET last_seen_at=last_seen_at+1
+                 WHERE rowid IN (SELECT rowid FROM flow_sessions ORDER BY rowid LIMIT 1000)",
+                    [],
+                )
+                .unwrap();
+            updates.push(started.elapsed().as_micros());
+            connection
+                .execute_batch(
+                    "ROLLBACK TO application_index_bench; RELEASE application_index_bench",
+                )
+                .unwrap();
+        }
+        updates.sort_unstable();
+        drop(inner);
+        let mut durations = Vec::new();
+        for _ in 0..20 {
+            let started = Instant::now();
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/internal/applications?limit=50")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let result = parse_json(response).await;
+            assert_eq!(result["data"], before_data["data"]);
+            assert_eq!(result["pagination"], before_data["pagination"]);
+            durations.push(started.elapsed().as_micros());
+        }
+        durations.sort_unstable();
+        let mut detail_durations = Vec::new();
+        for _ in 0..20 {
+            let started = Instant::now();
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/internal/applications/app-1?category=category-1")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let result = parse_json(response).await;
+            assert_eq!(result["data"]["application_id"], "app-1");
+            detail_durations.push(started.elapsed().as_micros());
+        }
+        detail_durations.sort_unstable();
+        eprintln!(
+            "app_covering_index rows={rows} old_index_bytes={old_index_bytes} new_index_bytes={index_bytes} update_1000_us_old={old_update_us} update_1000_us_new={} old_api_p50_p95_p99_us={:?} new_api_p50_p95_p99_us={:?} old_detail_api_p50_p95_p99_us={:?} new_detail_api_p50_p95_p99_us={:?} plan={plan:?} file_bytes={}",
+            updates[2],
+            [old_durations[10], old_durations[18], old_durations[19]],
+            [durations[10], durations[18], durations[19]],
+            [
+                old_detail_durations[10],
+                old_detail_durations[18],
+                old_detail_durations[19]
+            ],
+            [
+                detail_durations[10],
+                detail_durations[18],
+                detail_durations[19]
+            ],
+            std::fs::metadata(&path).unwrap().len(),
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "manual file-backed full flow API index benchmark"]
+async fn file_flow_api_order_index_benchmark() {
+    use std::time::Instant;
+    let rows: i64 = std::env::var("NETQMON_BENCH_ROWS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(100_000);
+    let timestamp_group_size: i64 = std::env::var("NETQMON_BENCH_TIMESTAMP_GROUP_SIZE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1);
+    let index_order =
+        if std::env::var("NETQMON_BENCH_FLOW_INDEX_ORDER").as_deref() == Ok("new-first") {
+            "new-first"
+        } else {
+            "old-first"
+        };
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("flows.db");
+    let mut sqlite = SqliteStorage::open(&path).unwrap();
+    // Recreate the pre-migration schema so the benchmark remains an
+    // old-index/new-index comparison after migration 16 lands in the binary.
+    sqlite
+        .connection()
+        .execute_batch(
+            "DROP INDEX flow_sessions_last_seen_at;
+             CREATE INDEX flow_sessions_last_seen_at ON flow_sessions(last_seen_at);
+             DELETE FROM schema_migrations WHERE version=16;",
+        )
+        .unwrap();
+    let base = 1_700_000_000_000_i64;
+    sqlite
+        .save_gateway("benchmark", "router", "test", &[7; 32], base as u64)
+        .unwrap();
+    sqlite
+        .connection()
+        .execute(
+            "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1)
+             INSERT INTO flow_sessions(
+                 id,gateway_id,ip_version,protocol,client_ip,client_port,remote_ip,
+                 remote_port,direction,domain,application_id,category_id,protocol_id,
+                    organization_id,upload_bytes,download_bytes,packets,started_at,
+                 last_seen_at,checkpointed_at,ended_at
+             )
+             SELECT printf('flow-%d',i),'benchmark',4,6,
+                    CAST(printf('%08x',i%1000) AS BLOB),i%60000,
+                    CAST(printf('%08x',i%50000) AS BLOB),443,1,
+                    printf('domain-%d.example',i%10000),printf('app-%d',i%100),
+                    printf('category-%d',i%10),'tcp',printf('org-%d',i%500),
+                    i%1000,i%500,1,?2,?2+(i/?3),?2,?2
+             FROM n",
+            rusqlite::params![rows, base, timestamp_group_size],
+        )
+        .unwrap();
+    sqlite
+        .connection()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let measure_last_seen_updates = |connection: &rusqlite::Connection| {
+        let ids = (1..=1_000_i64)
+            .map(|id| (format!("flow-{id}"), base + id / timestamp_group_size))
+            .collect::<Vec<_>>();
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let started = Instant::now();
+            {
+                let mut statement = connection
+                    .prepare_cached("UPDATE flow_sessions SET last_seen_at=?2 WHERE id=?1")
+                    .unwrap();
+                for (id, timestamp) in &ids {
+                    statement
+                        .execute(rusqlite::params![id, timestamp + 1])
+                        .unwrap();
+                }
+            }
+            samples.push(started.elapsed().as_micros());
+            {
+                let mut statement = connection
+                    .prepare_cached("UPDATE flow_sessions SET last_seen_at=?2 WHERE id=?1")
+                    .unwrap();
+                for (id, timestamp) in &ids {
+                    statement.execute(rusqlite::params![id, timestamp]).unwrap();
+                }
+            }
+            connection.execute_batch("COMMIT").unwrap();
+        }
+        samples.sort_unstable();
+        (samples[2], samples[4])
+    };
+    eprintln!(
+        "flow_api_index rows={rows} timestamp_group_size={timestamp_group_size} file_bytes_before={} ",
+        std::fs::metadata(&path).unwrap().len()
+    );
+    let old_index_bytes: i64 = sqlite
+        .connection()
+        .query_row(
+            "SELECT SUM(pgsize) FROM dbstat WHERE name='flow_sessions_last_seen_at'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    let state =
+        CollectorState::with_storage(ENROLLMENT_TOKEN, sqlite, repository_rule_engine()).unwrap();
+    let router = internal_router(state.clone());
+    let migrate_index = |state: &CollectorState, ddl: &str| {
+        let started = Instant::now();
+        state
+            .lock()
+            .storage
+            .connection()
+            .execute_batch(ddl)
+            .unwrap();
+        let elapsed_us = started.elapsed().as_micros();
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        let wal_bytes = std::fs::metadata(&wal_path).map_or(0, |metadata| metadata.len());
+        (elapsed_us, wal_bytes)
+    };
+    let new_index_ddl = "BEGIN IMMEDIATE;
+             DROP INDEX flow_sessions_last_seen_at;
+             CREATE INDEX flow_sessions_last_seen_at
+                 ON flow_sessions(last_seen_at DESC,id ASC);
+             COMMIT;";
+    let old_index_ddl = "BEGIN IMMEDIATE;
+             DROP INDEX flow_sessions_last_seen_at;
+             CREATE INDEX flow_sessions_last_seen_at ON flow_sessions(last_seen_at);
+             COMMIT;";
+    let mut new_index_bytes = 0_i64;
+    let mut migration = None;
+    if index_order == "new-first" {
+        migration = Some(migrate_index(&state, new_index_ddl));
+        new_index_bytes = state
+            .lock()
+            .storage
+            .connection()
+            .query_row(
+                "SELECT SUM(pgsize) FROM dbstat WHERE name='flow_sessions_last_seen_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+    }
+    let writes_before = measure_last_seen_updates(state.lock().storage.connection());
+    let measure = |router: axum::Router| async move {
+        let mut samples = Vec::new();
+        let mut response_data: Option<serde_json::Value> = None;
+        let mut next_cursor = None;
+        for _ in 0..20 {
+            let started = Instant::now();
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/internal/flows?limit=50")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            samples.push(started.elapsed().as_micros());
+            assert_eq!(result["data"].as_array().unwrap().len(), 50);
+            if let Some(expected) = response_data.as_ref() {
+                assert_eq!(expected, &result["data"]);
+                assert_eq!(
+                    next_cursor.as_deref(),
+                    result["pagination"]["next_cursor"].as_str()
+                );
+            } else {
+                next_cursor = result["pagination"]["next_cursor"]
+                    .as_str()
+                    .map(str::to_owned);
+                response_data = Some(result["data"].clone());
+            }
+        }
+        samples.sort_unstable();
+        (samples[10], samples[18], samples[19])
+    };
+    let measure_with_concurrent_ingest = |router: axum::Router, state: CollectorState| async move {
+        let writing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer_samples = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let active_queries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let overlapping_writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer_state = state.clone();
+        let writer_flag = writing.clone();
+        let writer_timings = writer_samples.clone();
+        let queries_in_flight = active_queries.clone();
+        let overlap_count = overlapping_writes.clone();
+        let flow_templates = (0..64_u32)
+            .map(|index| FlowDelta {
+                ip_version: 4,
+                protocol: 6,
+                client_ip: vec![10, 0, (index >> 8) as u8, index as u8],
+                client_port: 10_000 + index,
+                remote_ip: vec![198, 51, 100, (index % 250) as u8],
+                remote_port: 443,
+                client_mac: vec![2, 0, 0, 0, (index >> 8) as u8, index as u8],
+                direction: Direction::Upload as i32,
+                upload_bytes: 64,
+                packets: 1,
+                first_seen_unix_ms: base as u64,
+                last_seen_unix_ms: base as u64,
+                lifecycle: FlowLifecycle::Ended as i32,
+                scope: FlowScope::Internet as i32,
+                path_type: PathType::Forwarded as i32,
+                nat: NatType::Snat as i32,
+                ..FlowDelta::default()
+            })
+            .collect::<Vec<_>>();
+        let writer = std::thread::spawn(move || {
+            let mut sequence = 1_u64;
+            while writer_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let observed_at = base as u64 + sequence;
+                let mut batch = TelemetryBatch {
+                    gateway_id: "benchmark".to_owned(),
+                    boot_id: "flow-index-concurrent-ingest".to_owned(),
+                    sequence,
+                    sent_at: observed_at,
+                    agent_version: "benchmark".to_owned(),
+                    protocol_version: PROTOCOL_VERSION,
+                    ..TelemetryBatch::default()
+                };
+                batch.flows = flow_templates
+                    .iter()
+                    .cloned()
+                    .map(|mut flow| {
+                        flow.last_seen_unix_ms = observed_at;
+                        flow
+                    })
+                    .collect();
+                let started = Instant::now();
+                if queries_in_flight.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                    overlap_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                writer_state.accept_batch(&batch).unwrap();
+                writer_timings
+                    .lock()
+                    .unwrap()
+                    .push(started.elapsed().as_micros());
+                sequence += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let mut query_samples = Vec::new();
+        let mut query_rows = 0;
+        for _ in 0..100 {
+            let started = Instant::now();
+            active_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/internal/flows?limit=50")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            active_queries.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            query_samples.push(started.elapsed().as_micros());
+            query_rows += result["data"].as_array().unwrap().len();
+        }
+        writing.store(false, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+
+        query_samples.sort_unstable();
+        let mut writer_samples = writer_samples.lock().unwrap().clone();
+        writer_samples.sort_unstable();
+        assert!(query_rows >= 5_000);
+        assert!(!writer_samples.is_empty(), "concurrent ingest did not run");
+        assert!(
+            overlapping_writes.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "no Collector write overlapped an API request"
+        );
+        (
+            (query_samples[50], query_samples[94], query_samples[99]),
+            writer_samples.len(),
+            overlapping_writes.load(std::sync::atomic::Ordering::Relaxed),
+            (
+                writer_samples[writer_samples.len() / 2],
+                writer_samples[writer_samples.len() * 95 / 100],
+                writer_samples[writer_samples.len() * 99 / 100],
+            ),
+        )
+    };
+    let before = measure(router.clone()).await;
+    let before_concurrent = measure_with_concurrent_ingest(router.clone(), state.clone()).await;
+    if index_order == "old-first" {
+        migration = Some(migrate_index(&state, new_index_ddl));
+        new_index_bytes = state
+            .lock()
+            .storage
+            .connection()
+            .query_row(
+                "SELECT SUM(pgsize) FROM dbstat WHERE name='flow_sessions_last_seen_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+    } else {
+        migrate_index(&state, old_index_ddl);
+    }
+    let (migration_elapsed_us, migration_wal_bytes) = migration.unwrap();
+    let after = measure(router.clone()).await;
+    let after_concurrent = measure_with_concurrent_ingest(router.clone(), state.clone()).await;
+    let writes_after = measure_last_seen_updates(state.lock().storage.connection());
+    eprintln!(
+        "flow_api_index rows={rows} timestamp_group_size={timestamp_group_size} index_order={index_order} before_p50_p95_p99_us={before:?} after_p50_p95_p99_us={after:?} concurrent_before_query_p50_p95_p99_us_writer_batches_writer_p50_p95_p99_us={before_concurrent:?} concurrent_after_query_p50_p95_p99_us_writer_batches_writer_p50_p95_p99_us={after_concurrent:?} last_seen_1000_updates_before_p50_max_us={writes_before:?} last_seen_1000_updates_after_p50_max_us={writes_after:?} old_index_bytes={old_index_bytes} replacement_index_bytes={new_index_bytes} net_index_bytes={} migration_elapsed_us={migration_elapsed_us} migration_wal_bytes={migration_wal_bytes} file_bytes_after={}",
+        new_index_bytes - old_index_bytes,
+        std::fs::metadata(&path).unwrap().len()
+    );
+}
+
+#[tokio::test]
+#[ignore = "manual file-backed organization and protocol API index benchmark"]
+async fn file_flow_group_api_expression_index_benchmark() {
+    use std::time::Instant;
+    let rows: i64 = std::env::var("NETQMON_BENCH_ROWS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(100_000);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("flow-groups.db");
+    let mut sqlite = SqliteStorage::open(&path).unwrap();
+    let base = 1_700_000_000_000_i64;
+    sqlite
+        .save_gateway("benchmark", "router", "test", &[7; 32], base as u64)
+        .unwrap();
+    sqlite
+        .connection()
+        .execute(
+            "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1000)
+         INSERT INTO devices(id,gateway_id,mac,first_seen,last_seen)
+         SELECT i,'benchmark',CAST(printf('%012x',i) AS BLOB),?1,?1 FROM n",
+            [base],
+        )
+        .unwrap();
+    sqlite
+        .connection()
+        .execute(
+            "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1)
+             INSERT INTO flow_sessions(
+                 id,gateway_id,device_id,ip_version,protocol,client_ip,client_port,
+                 remote_ip,remote_port,direction,application_id,category_id,protocol_id,
+                 organization_id,upload_bytes,download_bytes,packets,started_at,last_seen_at,
+                 checkpointed_at,ended_at
+             )
+             SELECT printf('flow-%d',i),'benchmark',i%1000+1,4,6,
+                    CAST(printf('%08x',i%1000) AS BLOB),i%60000,
+                    CAST(printf('%08x',i%50000) AS BLOB),443,1,'app', 'category',
+                    printf('protocol-%02d',i%20),printf('org-%03d',i%100),
+                    (i%1000)+(i%100)*17,(i%500)+(i%20)*13,1,?2,?2+i,?2,?2
+             FROM n",
+            rusqlite::params![rows, base],
+        )
+        .unwrap();
+    sqlite
+        .connection()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let state =
+        CollectorState::with_storage(ENROLLMENT_TOKEN, sqlite, repository_rule_engine()).unwrap();
+    let router = internal_router(state.clone());
+
+    async fn measure(
+        router: &axum::Router,
+        route: &str,
+        cache: &query_api::summary_cache::SummaryPageCache,
+        cold: bool,
+    ) -> ([u128; 3], serde_json::Value) {
+        let mut samples = Vec::new();
+        let mut expected = None;
+        for _ in 0..20 {
+            if cold {
+                cache.invalidate();
+            }
+            let started = Instant::now();
+            let response = router
+                .clone()
+                .oneshot(Request::builder().uri(route).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            samples.push(started.elapsed().as_micros());
+            if let Some(expected) = expected.as_ref() {
+                assert_eq!(expected, &result);
+            } else {
+                expected = Some(result);
+            }
+        }
+        samples.sort_unstable();
+        (
+            [samples[10], samples[18], samples[19]],
+            expected.expect("at least one sample"),
+        )
+    }
+
+    // Compare SQLite's per-connection page-cache limit on the same file-backed
+    // flow distribution. Negative cache_size values are kibibytes, not pages.
+    for cache_kib in [512_i64, 2_000, 8_192] {
+        {
+            let inner = state.lock();
+            let connection = inner.storage.connection();
+            connection
+                .pragma_update(None, "cache_size", -cache_kib)
+                .unwrap();
+            connection.execute_batch("PRAGMA shrink_memory").unwrap();
+        }
+        let (organization, organization_response) = measure(
+            &router,
+            "/internal/organizations?limit=50",
+            &state.summary_pages,
+            true,
+        )
+        .await;
+        let (protocol, protocol_response) = measure(
+            &router,
+            "/internal/protocols?limit=50",
+            &state.summary_pages,
+            true,
+        )
+        .await;
+        assert_eq!(organization_response["pagination"]["total"], 100);
+        assert_eq!(protocol_response["pagination"]["total"], 20);
+        let effective_cache_kib = {
+            let inner = state.lock();
+            inner
+                .storage
+                .connection()
+                .pragma_query_value(None, "cache_size", |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        let sqlite_bytes = sqlite_memory_used_bytes();
+        eprintln!(
+            "flow_group_cache_size rows={rows} configured_cache_kib={cache_kib} effective_cache_size={effective_cache_kib} organization_p50_p95_p99_us={organization:?} protocol_p50_p95_p99_us={protocol:?} sqlite_memory_bytes={sqlite_bytes}"
+        );
+    }
+    {
+        let inner = state.lock();
+        let connection = inner.storage.connection();
+        connection
+            .pragma_update(None, "cache_size", -2_000_i64)
+            .unwrap();
+        connection.execute_batch("PRAGMA shrink_memory").unwrap();
+    }
+
+    fn measure_counter_updates(connection: &rusqlite::Connection) -> [u128; 3] {
+        let mut samples = Vec::new();
+        for _ in 0..7 {
+            let started = Instant::now();
+            connection
+                .execute_batch(
+                    "SAVEPOINT flow_group_index_update_bench;
+                     UPDATE flow_sessions SET upload_bytes=upload_bytes+1,
+                         download_bytes=download_bytes+1,last_seen_at=last_seen_at+1
+                     WHERE id IN (SELECT id FROM flow_sessions ORDER BY id LIMIT 1000);
+                     ROLLBACK TO flow_group_index_update_bench;
+                     RELEASE flow_group_index_update_bench;",
+                )
+                .unwrap();
+            samples.push(started.elapsed().as_micros());
+        }
+        samples.sort_unstable();
+        [samples[3], samples[5], samples[6]]
+    }
+
+    for (kind, route, index_name, candidate_sql) in [
+        (
+            "organization",
+            "/internal/organizations?limit=50",
+            "flow_sessions_organization_last_seen",
+            "CREATE INDEX flow_sessions_organization_last_seen
+             ON flow_sessions(COALESCE(organization_id,'unknown'), device_id)",
+        ),
+        (
+            "protocol",
+            "/internal/protocols?limit=50",
+            "flow_sessions_protocol_last_seen",
+            "CREATE INDEX flow_sessions_protocol_last_seen
+             ON flow_sessions(COALESCE(protocol_id,'unknown'))",
+        ),
+    ] {
+        let (before, before_response) = measure(&router, route, &state.summary_pages, true).await;
+        let (before_warm, before_warm_response) =
+            measure(&router, route, &state.summary_pages, false).await;
+        assert_eq!(
+            before_response, before_warm_response,
+            "{kind} warm response changed"
+        );
+        let old_index_bytes = {
+            let guard = state.lock();
+            guard
+                .storage
+                .connection()
+                .query_row(
+                    "SELECT COALESCE(SUM(pgsize),0) FROM dbstat WHERE name=?1",
+                    [index_name],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        state
+            .lock()
+            .storage
+            .connection()
+            .execute_batch(&format!("DROP INDEX {index_name}; {candidate_sql}"))
+            .unwrap();
+        let (after, after_response) = measure(&router, route, &state.summary_pages, true).await;
+        let (after_warm, after_warm_response) =
+            measure(&router, route, &state.summary_pages, false).await;
+        assert_eq!(before_response, after_response, "{kind} response changed");
+        assert_eq!(
+            after_response, after_warm_response,
+            "{kind} candidate warm response changed"
+        );
+        let (plan, index_bytes) = {
+            let guard = state.lock();
+            let connection = guard.storage.connection();
+            let plan_sql = if kind == "organization" {
+                "EXPLAIN QUERY PLAN SELECT COALESCE(organization_id,'unknown'), SUM(upload_bytes), SUM(download_bytes), COUNT(*), MAX(last_seen_at), COUNT(DISTINCT device_id), COUNT(*) OVER () FROM flow_sessions GROUP BY COALESCE(organization_id,'unknown') ORDER BY SUM(upload_bytes+download_bytes) DESC LIMIT 50 OFFSET 0"
+            } else {
+                "EXPLAIN QUERY PLAN SELECT COALESCE(protocol_id,'unknown'), SUM(upload_bytes), SUM(download_bytes), COUNT(*), MAX(last_seen_at), COUNT(*) OVER () FROM flow_sessions GROUP BY COALESCE(protocol_id,'unknown') ORDER BY SUM(upload_bytes+download_bytes) DESC LIMIT 50 OFFSET 0"
+            };
+            let plan = connection
+                .prepare(plan_sql)
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let index_bytes: i64 = connection
+                .query_row(
+                    "SELECT COALESCE(SUM(pgsize),0) FROM dbstat WHERE name=?1",
+                    [index_name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (plan, index_bytes)
+        };
+        let candidate_updates = {
+            let guard = state.lock();
+            measure_counter_updates(guard.storage.connection())
+        };
+        state
+            .lock()
+            .storage
+            .connection()
+            .execute_batch(&format!(
+                "DROP INDEX {index_name};
+                 CREATE INDEX {index_name} ON flow_sessions({}, last_seen_at)",
+                if kind == "organization" {
+                    "organization_id"
+                } else {
+                    "protocol_id"
+                }
+            ))
+            .unwrap();
+        let old_updates = {
+            let guard = state.lock();
+            measure_counter_updates(guard.storage.connection())
+        };
+        eprintln!(
+            "flow_group_index kind={kind} rows={rows} old_cold_p50_p95_p99_us={before:?} old_warm_p50_p95_p99_us={before_warm:?} candidate_cold_p50_p95_p99_us={after:?} candidate_warm_p50_p95_p99_us={after_warm:?} old_update_1000_p50_p95_p99_us={old_updates:?} candidate_update_1000_p50_p95_p99_us={candidate_updates:?} old_index_bytes={old_index_bytes} candidate_index_bytes={index_bytes} db_bytes={} plan={plan:?}",
+            std::fs::metadata(&path).unwrap().len(),
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual file-backed domain day-rollup query benchmark"]
+fn file_domain_day_rollup_query_benchmark() {
+    use std::time::Instant;
+    let rows: i64 = std::env::var("NETQMON_BENCH_ROWS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1_000_000);
+    let domains: i64 = std::env::var("NETQMON_BENCH_DOMAINS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10_000);
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("domain-day-rollup.db");
+    let mut sqlite = SqliteStorage::open(&path).unwrap();
+    {
+        let connection = sqlite.connection();
+        connection
+            .execute(
+                "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1)
+             INSERT INTO traffic_domain_minute(
+                 timestamp,gateway_id,domain,upload_bytes,download_bytes,packets,flow_count
+             )
+             SELECT 1700000000000+((i-1)/200)*480000,'benchmark',
+                    printf('domain-%05d.example',(i-1)%?2),
+                    i%997,i%313,1,1 FROM n",
+                rusqlite::params![rows, domains],
+            )
+            .unwrap();
+    }
+    let rollup_now = 1_700_000_000_000_i64 + ((rows + 199) / 200) * 480_000 + 86_400_000;
+    sqlite.roll_up_hour_and_day(rollup_now as u64).unwrap();
+    let connection = sqlite.connection();
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+
+    let minute_sql = "SELECT domain,SUM(upload_bytes),SUM(download_bytes),SUM(packets),
+                             SUM(flow_count),MAX(timestamp),COUNT(*) OVER ()
+                      FROM traffic_domain_minute GROUP BY domain
+                      ORDER BY SUM(upload_bytes+download_bytes) DESC,domain LIMIT ?1 OFFSET ?2";
+    let day_sql = "WITH totals AS (
+                       SELECT domain,SUM(upload_bytes) upload_bytes,
+                              SUM(download_bytes) download_bytes,SUM(packets) packets,
+                              SUM(flow_count) flow_count
+                       FROM traffic_domain_day GROUP BY domain
+                   ), latest AS (
+                       SELECT domain,MAX(timestamp) last_seen
+                       FROM traffic_domain_minute GROUP BY domain
+                   )
+                   SELECT totals.domain,totals.upload_bytes,totals.download_bytes,
+                          totals.packets,totals.flow_count,latest.last_seen,COUNT(*) OVER ()
+                   FROM totals JOIN latest USING(domain)
+                   ORDER BY totals.upload_bytes+totals.download_bytes DESC,totals.domain
+                   LIMIT ?1 OFFSET ?2";
+    let pending_day_sql = "WITH bounds AS MATERIALIZED (
+                       SELECT MIN(timestamp) AS min_ts,MAX(timestamp) AS max_ts
+                       FROM traffic_domain_minute
+                   ), minute_totals AS (
+                       SELECT m.domain,
+                              SUM(CASE WHEN m.timestamp < (b.min_ts/86400000+1)*86400000
+                                             OR m.timestamp >= b.max_ts/86400000*86400000
+                                       THEN m.upload_bytes ELSE 0 END) AS upload_bytes,
+                              SUM(CASE WHEN m.timestamp < (b.min_ts/86400000+1)*86400000
+                                             OR m.timestamp >= b.max_ts/86400000*86400000
+                                       THEN m.download_bytes ELSE 0 END) AS download_bytes,
+                              SUM(CASE WHEN m.timestamp < (b.min_ts/86400000+1)*86400000
+                                             OR m.timestamp >= b.max_ts/86400000*86400000
+                                       THEN m.packets ELSE 0 END) AS packets,
+                              SUM(CASE WHEN m.timestamp < (b.min_ts/86400000+1)*86400000
+                                             OR m.timestamp >= b.max_ts/86400000*86400000
+                                       THEN m.flow_count ELSE 0 END) AS flow_count,
+                              MAX(m.timestamp) AS last_seen
+                       FROM traffic_domain_minute m CROSS JOIN bounds b
+                       GROUP BY m.domain
+                   ), coarse_rows AS (
+                       SELECT d.domain,d.upload_bytes,d.download_bytes,d.packets,d.flow_count
+                       FROM traffic_domain_day d CROSS JOIN bounds b
+                       WHERE d.timestamp >= (b.min_ts/86400000+1)*86400000
+                         AND d.timestamp < b.max_ts/86400000*86400000
+                       UNION ALL
+                       SELECT p.domain,p.upload_bytes,p.download_bytes,p.packets,p.flow_count
+                       FROM traffic_domain_day_pending p CROSS JOIN bounds b
+                       WHERE p.timestamp >= (b.min_ts/86400000+1)*86400000
+                         AND p.timestamp < b.max_ts/86400000*86400000
+                       UNION ALL
+                       SELECT p.domain,p.upload_bytes,p.download_bytes,p.packets,p.flow_count
+                       FROM traffic_domain_hour_pending p CROSS JOIN bounds b
+                       WHERE p.timestamp >= (b.min_ts/86400000+1)*86400000
+                         AND p.timestamp < b.max_ts/86400000*86400000
+                   ), coarse_totals AS (
+                       SELECT domain,SUM(upload_bytes) upload_bytes,
+                              SUM(download_bytes) download_bytes,SUM(packets) packets,
+                              SUM(flow_count) flow_count
+                       FROM coarse_rows GROUP BY domain
+                   )
+                   SELECT m.domain,m.upload_bytes+COALESCE(c.upload_bytes,0),
+                          m.download_bytes+COALESCE(c.download_bytes,0),
+                          m.packets+COALESCE(c.packets,0),
+                          m.flow_count+COALESCE(c.flow_count,0),m.last_seen,COUNT(*) OVER ()
+                   FROM minute_totals m LEFT JOIN coarse_totals c USING(domain)
+                   ORDER BY (m.upload_bytes+COALESCE(c.upload_bytes,0))+
+                            (m.download_bytes+COALESCE(c.download_bytes,0)) DESC,m.domain
+                   LIMIT ?1 OFFSET ?2";
+
+    fn page(connection: &rusqlite::Connection, sql: &str) -> Vec<serde_json::Value> {
+        connection
+            .prepare(sql)
+            .unwrap()
+            .query_map([50_i64, 0_i64], |row| {
+                Ok(json!([
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?
+                ]))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+    fn measure(
+        connection: &rusqlite::Connection,
+        sql: &str,
+    ) -> ([u128; 3], Vec<serde_json::Value>) {
+        let mut samples = Vec::new();
+        let mut expected = None;
+        for _ in 0..20 {
+            let started = Instant::now();
+            let result = page(connection, sql);
+            samples.push(started.elapsed().as_micros());
+            if let Some(expected) = expected.as_ref() {
+                assert_eq!(expected, &result);
+            } else {
+                expected = Some(result);
+            }
+        }
+        samples.sort_unstable();
+        (
+            [samples[10], samples[18], samples[19]],
+            expected.expect("twenty query samples"),
+        )
+    }
+
+    let (minute, minute_page) = measure(connection, minute_sql);
+    let (day, day_page) = measure(connection, day_sql);
+    let (pending_day, pending_day_page) = measure(connection, pending_day_sql);
+    assert_eq!(minute_page, day_page, "daily rollup changed API page data");
+    assert_eq!(
+        minute_page, pending_day_page,
+        "pending-aware day query changed API page data"
+    );
+    for (name, sql) in [
+        ("minute", minute_sql),
+        ("day", day_sql),
+        ("pending-day", pending_day_sql),
+    ] {
+        let plan = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map([50_i64, 0_i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        eprintln!("domain_day_plan kind={name} {plan:?}");
+    }
+    let minute_bytes: i64 = connection
+        .query_row(
+            "SELECT SUM(pgsize) FROM dbstat WHERE name='traffic_domain_minute' OR name='sqlite_autoindex_traffic_domain_minute_1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let day_bytes: i64 = connection
+        .query_row(
+            "SELECT SUM(pgsize) FROM dbstat WHERE name='traffic_domain_day' OR name='sqlite_autoindex_traffic_domain_day_1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    eprintln!(
+        "domain_day_query rows={rows} domains={domains} minute_p50_p95_p99_us={minute:?} day_plus_exact_latest_p50_p95_p99_us={day:?} pending_aware_day_query_p50_p95_p99_us={pending_day:?} minute_table_and_pk_bytes={minute_bytes} day_table_and_pk_bytes={day_bytes} file_bytes={}",
+        std::fs::metadata(&path).unwrap().len(),
+    );
+}
+
+#[tokio::test]
+#[ignore = "manual file-backed domain API benchmark"]
+async fn file_domain_api_benchmark() {
+    use std::time::Instant;
+
+    let rows: i64 = std::env::var("NETQMON_BENCH_ROWS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(100_000);
+    let groups: i64 = std::env::var("NETQMON_BENCH_GROUPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10_000)
+        .max(1);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("domains.db");
+    let mut storage = SqliteStorage::open(&path).unwrap();
+    storage
+        .save_gateway("benchmark", "router", "test", &[7; 32], 1_700_000_000_000)
+        .unwrap();
+    let insert_sql = if groups < 2_000 {
+        "WITH RECURSIVE n(i) AS (
+             VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < ?1
+         )
+         INSERT INTO traffic_domain_minute(
+             timestamp, gateway_id, domain, upload_bytes, download_bytes, packets, flow_count
+         )
+         SELECT 1700000000000 + (i / 2000) * 60000, 'benchmark',
+                printf('domain-%05d.example', i % ?2), SUM(i % 1000), SUM(i % 300),
+                COUNT(*), COUNT(*)
+         FROM n GROUP BY i / 2000, i % ?2"
+    } else {
+        "WITH RECURSIVE n(i) AS (
+             VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < ?1
+         )
+         INSERT INTO traffic_domain_minute(
+             timestamp, gateway_id, domain, upload_bytes, download_bytes, packets, flow_count
+         )
+         SELECT 1700000000000 + (i / 2000) * 60000, 'benchmark',
+                printf('domain-%05d.example', i % ?2), i % 1000, i % 300, 1, 1
+         FROM n"
+    };
+    storage
+        .connection()
+        .execute(insert_sql, rusqlite::params![rows, groups])
+        .unwrap();
+    storage
+        .connection()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let connection = storage.connection();
+    let mut plan = connection
+        .prepare("EXPLAIN QUERY PLAN SELECT domain, SUM(upload_bytes), SUM(download_bytes), SUM(packets), SUM(flow_count), MAX(timestamp), COUNT(*) OVER () FROM traffic_domain_minute GROUP BY domain ORDER BY SUM(upload_bytes + download_bytes) DESC, domain LIMIT ?1 OFFSET ?2")
+        .unwrap();
+    for detail in plan
+        .query_map([50_i64, 0_i64], |row| row.get::<_, String>(3))
+        .unwrap()
+    {
+        eprintln!("domain_api_plan={}", detail.unwrap());
+    }
+    drop(plan);
+    eprintln!(
+        "domain_api_fixture rows={rows} groups={groups} db_bytes={}",
+        std::fs::metadata(&path).unwrap().len()
+    );
+    let state =
+        CollectorState::with_storage(ENROLLMENT_TOKEN, storage, repository_rule_engine()).unwrap();
+    let router = internal_router(state);
+    let mut samples = Vec::with_capacity(20);
+    let mut first_sample = None;
+    let total_groups = rows.min(groups) as usize;
+    let page_count = (total_groups / 50).max(1);
+    for iteration in 0..20 {
+        let (limit, offset) = if page_count >= 20 {
+            (50, (iteration % page_count) * 50)
+        } else {
+            (iteration + 1, 0)
+        };
+        let started = Instant::now();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/internal/domains?limit={limit}&offset={offset}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = parse_json(response).await;
+        assert_eq!(body["pagination"]["total"], rows.min(groups) as u64);
+        assert_eq!(
+            body["data"].as_array().unwrap().len(),
+            (limit as usize).min(total_groups)
+        );
+        let elapsed = started.elapsed().as_micros();
+        first_sample.get_or_insert(elapsed);
+        samples.push(elapsed);
+    }
+    samples.sort_unstable();
+    eprintln!(
+        "domain_api rows={rows} groups={groups} db_bytes={} samples={} first_us={} p50_us={} p95_us={} p99_us={}",
+        std::fs::metadata(&path).unwrap().len(),
+        samples.len(),
+        first_sample.unwrap_or_default(),
+        samples[10],
+        samples[18],
+        samples[19],
+    );
+}
+
+#[test]
+#[ignore = "manual file-backed application summary pagination benchmark"]
+fn file_application_summary_pagination_benchmark() {
+    use std::time::Instant;
+    let rows: i64 = std::env::var("NETQMON_BENCH_ROWS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(100_000);
+    let directory = tempfile::tempdir().unwrap();
+    let sqlite = SqliteStorage::open(directory.path().join("summary.db")).unwrap();
+    let db = sqlite.connection();
+    db.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1) INSERT INTO traffic_application_minute(timestamp,gateway_id,application_id,category_id,upload_bytes,download_bytes,packets,flow_count) SELECT i,'benchmark',printf('app-%d',i%50000),printf('category-%d',i%5),i%1000,i%300,1,1 FROM n", [rows]).unwrap();
+    let sql = "SELECT application_id,category_id,SUM(upload_bytes),SUM(download_bytes),SUM(packets),SUM(flow_count),MAX(timestamp) FROM traffic_application_minute GROUP BY application_id,category_id ORDER BY SUM(upload_bytes)+SUM(download_bytes) DESC,application_id";
+    let paged = format!(
+        "SELECT application_id,category_id,SUM(upload_bytes),SUM(download_bytes),SUM(packets),SUM(flow_count),MAX(timestamp),COUNT(*) OVER () FROM traffic_application_minute GROUP BY application_id,category_id ORDER BY SUM(upload_bytes)+SUM(download_bytes) DESC,application_id LIMIT 50 OFFSET 50"
+    );
+    let mut times = [Vec::new(), Vec::new()];
+    for iteration in 0..10 {
+        for pass in 0..2 {
+            let current = (iteration + pass) % 2;
+            let start = Instant::now();
+            if current == 0 {
+                let mut stmt = db.prepare(sql).unwrap();
+                let all = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(all.len(), usize::try_from(rows.min(50_000)).unwrap());
+                std::hint::black_box(&all[50..100]);
+            } else {
+                let mut stmt = db.prepare(&paged).unwrap();
+                let page = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, i64>(3)?,
+                            r.get::<_, i64>(7)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(page.len(), 50);
+                assert_eq!(page[0].4, rows.min(50_000));
+                std::hint::black_box(page);
+            }
+            times[current].push(start.elapsed().as_micros());
+        }
+    }
+    for (name, values) in ["before", "after"].into_iter().zip(&mut times) {
+        values.sort_unstable();
+        eprintln!(
+            "summary_rows={rows} {name} p50_us={} p95_us={} p99_us={} materialized={}",
+            values[5],
+            values[9],
+            values[9],
+            if name == "before" {
+                rows.min(50_000)
+            } else {
+                50
+            }
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "manual file-backed client API benchmark"]
+async fn file_client_api_benchmark() {
+    use std::time::Instant;
+    let rows: i64 = std::env::var("NETQMON_BENCH_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000);
+    let clients: i64 = std::env::var("NETQMON_BENCH_CLIENTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_000);
+    assert!(clients >= 50 && clients <= 999_999 && rows >= clients);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("clients.db");
+    let mut sqlite = SqliteStorage::open(&path).unwrap();
+    sqlite
+        .connection()
+        .execute_batch("DROP INDEX traffic_device_minute_device")
+        .unwrap();
+    let base: i64 = 1_700_000_000_000;
+    sqlite
+        .save_gateway(
+            "benchmark",
+            "router",
+            "test",
+            &[7; 32],
+            u64::try_from(base).unwrap(),
+        )
+        .unwrap();
+    let connection = sqlite.connection();
+    connection.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1) INSERT INTO devices(id,gateway_id,mac,hostname,first_seen,last_seen) SELECT i,'benchmark',CAST(printf('%06d',i) AS BLOB),printf('client-%d',i),?2,?2 FROM n", rusqlite::params![clients,base]).unwrap();
+    connection.execute("INSERT INTO device_addresses(device_id,ip,ip_version,first_seen,last_seen,application_id,application_confidence,application_source) SELECT id,CAST(printf('%08x',id) AS BLOB),4,?1,?1,CASE WHEN id%2=0 THEN 'self-host' ELSE NULL END,0.9,'test' FROM devices", [base]).unwrap();
+    connection.execute("INSERT INTO device_evidence(gateway_id,mac,source,field,value,confidence,first_seen,last_seen) SELECT gateway_id,mac,'test','model','test-model',0.8,?1,?1 FROM devices",[base]).unwrap();
+    connection.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1) INSERT INTO flow_sessions(id,gateway_id,device_id,ip_version,protocol,client_ip,client_port,remote_ip,remote_port,direction,application_id,protocol_id,upload_bytes,download_bytes,packets,started_at,last_seen_at,checkpointed_at,ended_at) SELECT printf('flow-%d',i),'benchmark',i%?2+1,4,6,CAST(printf('%08x',i%?2) AS BLOB),i%60000,CAST(printf('%08x',i%50000) AS BLOB),443,1,printf('app-%d',i%100),'tcp',i%1000,i%500,1,?3,?3+(i/?2)*60000,?3,?3 FROM n",rusqlite::params![rows,clients,base]).unwrap();
+    connection.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1) INSERT INTO traffic_device_minute(timestamp,gateway_id,device_id,upload_bytes,download_bytes,packets,flow_count) SELECT ?3+(i/?2)*60000,'benchmark',i%?2+1,i%1000,i%500,1,1 FROM n",rusqlite::params![rows,clients,base]).unwrap();
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let plan_sql = "SELECT d.id,(SELECT MAX(f.last_seen_at) FROM flow_sessions f WHERE f.device_id=d.id AND (f.upload_bytes>0 OR f.download_bytes>0 OR f.packets>0)),COALESCE(SUM(t.upload_bytes),0),COALESCE(SUM(t.download_bytes),0),(SELECT ip FROM device_addresses a WHERE a.device_id=d.id ORDER BY a.last_seen DESC,a.ip_version LIMIT 1) FROM devices d LEFT JOIN traffic_device_minute t ON t.device_id=d.id GROUP BY d.id ORDER BY SUM(COALESCE(t.upload_bytes,0)+COALESCE(t.download_bytes,0)) DESC,d.id LIMIT 50";
+    let mut plan = connection
+        .prepare(&format!("EXPLAIN QUERY PLAN {plan_sql}"))
+        .unwrap();
+    for line in plan.query_map([], |r| r.get::<_, String>(3)).unwrap() {
+        eprintln!("client_plan={}", line.unwrap());
+    }
+    drop(plan);
+    let paged_plan_sql = "WITH client_page AS (SELECT d.id AS device_id,COALESCE(SUM(t.upload_bytes),0) AS upload_bytes,COALESCE(SUM(t.download_bytes),0) AS download_bytes,COALESCE(SUM(t.flow_count),0) AS flow_count,SUM(COALESCE(t.upload_bytes,0)+COALESCE(t.download_bytes,0)) AS sort_bytes FROM devices d LEFT JOIN traffic_device_minute t ON t.device_id=d.id GROUP BY d.id ORDER BY sort_bytes DESC,d.id LIMIT 50) SELECT d.id,(SELECT MAX(f.last_seen_at) FROM flow_sessions f WHERE f.device_id=d.id AND (f.upload_bytes>0 OR f.download_bytes>0 OR f.packets>0)),p.upload_bytes,p.download_bytes,(SELECT ip FROM device_addresses a WHERE a.device_id=d.id ORDER BY a.last_seen DESC,a.ip_version LIMIT 1) FROM client_page p JOIN devices d ON d.id=p.device_id ORDER BY p.sort_bytes DESC,d.id";
+    let mut plan = connection
+        .prepare(&format!("EXPLAIN QUERY PLAN {paged_plan_sql}"))
+        .unwrap();
+    for line in plan.query_map([], |r| r.get::<_, String>(3)).unwrap() {
+        eprintln!("client_paged_plan={}", line.unwrap());
+    }
+    drop(plan);
+    eprintln!(
+        "client_api_rows={rows} clients={clients} db_bytes={}",
+        std::fs::metadata(&path).unwrap().len()
+    );
+    let state =
+        CollectorState::with_storage(ENROLLMENT_TOKEN, sqlite, repository_rule_engine()).unwrap();
+    let router = internal_router(state.clone());
+    let mut baseline_pages = Vec::new();
+    for window in [false, true] {
+        let mut samples = Vec::new();
+        let mut page = None;
+        for _ in 0..20 {
+            let uri = if window {
+                format!(
+                    "/internal/clients?limit=50&from={}&to={}",
+                    base + (rows / clients / 2) * 60000,
+                    base + (rows / clients + 1) * 60000
+                )
+            } else {
+                "/internal/clients?limit=50".to_owned()
+            };
+            let start = Instant::now();
+            let response = router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let result: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    .unwrap();
+            samples.push(start.elapsed().as_micros());
+            assert_eq!(result["data"].as_array().unwrap().len(), 50);
+            assert_eq!(result["pagination"]["total"], clients);
+            if let Some(expected) = &page {
+                assert_eq!(&result, expected);
+            } else {
+                page = Some(result);
+            }
+        }
+        baseline_pages.push(page.expect("twenty requests produce a page"));
+        samples.sort_unstable();
+        eprintln!(
+            "client_api_rows={rows} clients={clients} indexed=false window={window} p50_us={} p95_us={} p99_us={}",
+            samples[10], samples[18], samples[19]
+        );
+    }
+
+    let measure_insert_batch = |connection: &rusqlite::Connection| {
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let start = Instant::now();
+            connection
+                .execute(
+                    "WITH RECURSIVE n(i) AS (
+                     VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<?1
+                 )
+                 INSERT INTO traffic_device_minute(
+                     timestamp,gateway_id,device_id,upload_bytes,download_bytes,packets,flow_count
+                 )
+                 SELECT ?2,'benchmark',i,1,1,1,1 FROM n WHERE i>0",
+                    rusqlite::params![clients.min(5_000) + 1, base + 86_400_000],
+                )
+                .unwrap();
+            samples.push(start.elapsed().as_micros());
+            connection.execute_batch("ROLLBACK").unwrap();
+        }
+        samples.sort_unstable();
+        samples[2]
+    };
+    {
+        let state_guard = state.lock();
+        let connection = state_guard.storage.connection();
+        let insert_p50 = measure_insert_batch(connection);
+        eprintln!("client_api_rows={rows} indexed=false insert_5000_p50_us={insert_p50}");
+        let index_build_started = Instant::now();
+        connection
+            .execute_batch(
+                "CREATE INDEX traffic_device_minute_device
+                 ON traffic_device_minute(device_id);",
+            )
+            .unwrap();
+        let index_build_elapsed_ms = index_build_started.elapsed().as_millis();
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        let index_bytes: i64 = connection
+            .query_row(
+                "SELECT COALESCE(SUM(pgsize),0) FROM dbstat
+                 WHERE name='traffic_device_minute_device'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        eprintln!(
+            "client_api_rows={rows} indexed=true index_build_elapsed_ms={index_build_elapsed_ms} db_bytes={} index_bytes={index_bytes}",
+            std::fs::metadata(&path).unwrap().len()
+        );
+        let mut plan = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {paged_plan_sql}"))
+            .unwrap();
+        for line in plan.query_map([], |row| row.get::<_, String>(3)).unwrap() {
+            eprintln!("client_indexed_paged_plan={}", line.unwrap());
+        }
+        drop(plan);
+        let insert_p50 = measure_insert_batch(connection);
+        eprintln!("client_api_rows={rows} indexed=true insert_5000_p50_us={insert_p50}");
+    }
+    for (window_index, window) in [false, true].into_iter().enumerate() {
+        let mut samples = Vec::new();
+        for _ in 0..20 {
+            let uri = if window {
+                format!(
+                    "/internal/clients?limit=50&from={}&to={}",
+                    base + (rows / clients / 2) * 60000,
+                    base + (rows / clients + 1) * 60000
+                )
+            } else {
+                "/internal/clients?limit=50".to_owned()
+            };
+            let start = Instant::now();
+            let response = router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let result: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    .unwrap();
+            samples.push(start.elapsed().as_micros());
+            assert_eq!(result["data"].as_array().unwrap().len(), 50);
+            assert_eq!(result["pagination"]["total"], clients);
+            assert_eq!(result, baseline_pages[window_index]);
+        }
+        samples.sort_unstable();
+        eprintln!(
+            "client_api_rows={rows} clients={clients} indexed=true window={window} p50_us={} p95_us={} p99_us={}",
+            samples[10], samples[18], samples[19]
+        );
+    }
+
+    // Reopen after removing the experimental index so the concurrency sample
+    // covers the current production schema and fresh per-connection caches.
+    {
+        let state_guard = state.lock();
+        state_guard
+            .storage
+            .connection()
+            .execute_batch(
+                "DROP INDEX traffic_device_minute_device;
+                 DELETE FROM schema_migrations WHERE version=15;",
+            )
+            .unwrap();
+    }
+    drop(router);
+    drop(state);
+    let sqlite = SqliteStorage::open(&path).unwrap();
+    let index_present: bool = sqlite
+        .connection()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='traffic_device_minute_device')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(index_present);
+    let state =
+        CollectorState::with_storage(ENROLLMENT_TOKEN, sqlite, repository_rule_engine()).unwrap();
+    let router = internal_router(state.clone());
+
+    let proc_rss_kib = |field: &str| {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{field}:")))?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()
+    };
+    let rss_kib = move || {
+        proc_rss_kib("VmRSS").or_else(|| {
+            let output = std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+                .output()
+                .ok()?;
+            String::from_utf8(output.stdout)
+                .ok()?
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
+    };
+    let rss_before = rss_kib();
+    let high_water_before = proc_rss_kib("VmHWM");
+    let sqlite_before = sqlite_memory_used_bytes();
+    let sampling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let sample_flag = std::sync::Arc::clone(&sampling);
+    let sampler = std::thread::spawn(move || {
+        let mut max_rss = 0;
+        let mut max_sqlite_bytes = 0;
+        while sample_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(value) = rss_kib() {
+                max_rss = max_rss.max(value);
+            }
+            max_sqlite_bytes = max_sqlite_bytes.max(sqlite_memory_used_bytes());
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        (max_rss, max_sqlite_bytes)
+    });
+
+    let concurrent_started = Instant::now();
+    let mut requests = Vec::new();
+    let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let max_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for _ in 0..8 {
+        let concurrent_router = router.clone();
+        let request_in_flight = std::sync::Arc::clone(&in_flight);
+        let request_max_in_flight = std::sync::Arc::clone(&max_in_flight);
+        requests.push(tokio::spawn(async move {
+            for _ in 0..16 {
+                let current =
+                    request_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                request_max_in_flight.fetch_max(current, std::sync::atomic::Ordering::Relaxed);
+                let response = concurrent_router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/internal/clients?limit=50")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let result: serde_json::Value = serde_json::from_slice(
+                    &to_bytes(response.into_body(), 1024 * 1024).await.unwrap(),
+                )
+                .unwrap();
+                assert_eq!(result["data"].as_array().unwrap().len(), 50);
+                assert_eq!(result["pagination"]["total"], clients);
+                request_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }));
+    }
+
+    let writer_state = state.clone();
+    let writer = tokio::task::spawn_blocking(move || {
+        let inner = writer_state.lock();
+        let connection = inner.storage.connection();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        for _ in 0..500 {
+            connection
+                .execute(
+                    "UPDATE traffic_device_minute SET upload_bytes=upload_bytes+1
+                     WHERE device_id=1
+                       AND timestamp=(SELECT MIN(timestamp) FROM traffic_device_minute WHERE device_id=1)",
+                    [],
+                )
+                .unwrap();
+        }
+        connection.execute_batch("COMMIT").unwrap();
+    });
+    let mut request_failed = false;
+    for request in requests {
+        request_failed |= request.await.is_err();
+    }
+    let writer_result = writer.await;
+    let concurrent_elapsed = concurrent_started.elapsed();
+    sampling.store(false, std::sync::atomic::Ordering::Relaxed);
+    let (peak_rss, peak_sqlite_bytes) = sampler.join().unwrap();
+    let rss_after = rss_kib();
+    let high_water_rss = proc_rss_kib("VmHWM");
+    let sqlite_after = sqlite_memory_used_bytes();
+    let max_concurrent_requests = max_in_flight.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "client_api_concurrent rows={rows} clients={clients} requests=128 max_concurrent_requests={max_concurrent_requests} concurrent_writer_updates=500 elapsed_ms={} rss_kib_before={rss_before:?} rss_kib_high_water_before={high_water_before:?} rss_kib_sampled_peak={peak_rss} rss_kib_high_water_after={high_water_rss:?} rss_kib_after={rss_after:?} sqlite_bytes_before={sqlite_before} sqlite_bytes_peak={peak_sqlite_bytes} sqlite_bytes_after={sqlite_after}",
+        concurrent_elapsed.as_millis()
+    );
+    assert!(!request_failed, "a concurrent client request failed");
+    assert!(max_concurrent_requests > 1, "requests did not overlap");
+    writer_result.unwrap();
 }
 
 fn sample_batch(gateway_id: &str, sequence: u64) -> TelemetryBatch {
@@ -1053,7 +3696,6 @@ async fn late_start_classifier_recovers_and_switches_to_ready() {
         classifier.clone(),
     )
     .unwrap();
-
     // 2. Health fails and diagnostics shows unavailable
     assert!(classifier.health().is_err());
     let router = internal_router(state);
@@ -1568,6 +4210,367 @@ async fn client_device_type_override_is_used_by_queries_and_null_restores_auto()
             value["data"][0]["client_identity"]["device_type"],
             expected_type
         );
+    }
+}
+
+#[tokio::test]
+async fn flow_group_empty_pages_count_null_and_unknown_once_on_file_database() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut sqlite = SqliteStorage::open(directory.path().join("group-counts.db")).unwrap();
+    sqlite
+        .save_gateway("gateway-1", "router", "test", &[7; 32], 1000)
+        .unwrap();
+    let state =
+        CollectorState::with_storage(ENROLLMENT_TOKEN, sqlite, repository_rule_engine()).unwrap();
+    let router = internal_router(state.clone());
+    for values in [
+        vec![],
+        vec![None],
+        vec![Some("unknown")],
+        vec![None, Some("unknown"), Some("unknown")],
+        vec![
+            None,
+            Some("unknown"),
+            Some(""),
+            Some("Unknown"),
+            Some("中文"),
+        ],
+        vec![Some(""), Some("org-a"), Some("org-a")],
+    ] {
+        {
+            let inner = state.lock();
+            let db = inner.storage.connection();
+            db.execute("DELETE FROM flow_sessions", []).unwrap();
+            for (index, value) in values.iter().enumerate() {
+                db.execute("INSERT INTO flow_sessions(id,gateway_id,ip_version,protocol,client_ip,client_port,remote_ip,remote_port,direction,organization_id,protocol_id,upload_bytes,download_bytes,packets,started_at,last_seen_at,checkpointed_at) VALUES (?1,'gateway-1',4,6,X'C0000201',1,X'C6336401',443,1,?2,?2,1,1,1,1000,1000,1000)",rusqlite::params![format!("flow-{index}"),value]).unwrap();
+            }
+        }
+        // This fixture mutates SQLite directly, outside the collector's normal
+        // accepted-ingest invalidation path.
+        state.summary_pages.invalidate();
+        let expected = values
+            .iter()
+            .map(|value| value.unwrap_or("unknown"))
+            .collect::<std::collections::HashSet<_>>()
+            .len() as u64;
+        for resource in ["organizations", "protocols"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/internal/{resource}?limit=1&offset=100"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = parse_json(response).await;
+            assert_eq!(
+                body["pagination"]["total"], expected,
+                "{resource} {values:?}"
+            );
+            assert_eq!(body["data"], json!([]));
+        }
+    }
+}
+
+#[tokio::test]
+async fn application_pages_keep_category_totals_and_window_client_counts_on_file_database() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut sqlite = SqliteStorage::open(directory.path().join("application-pages.db")).unwrap();
+    sqlite
+        .save_gateway("gateway-1", "router", "test", &[7; 32], 1000)
+        .unwrap();
+    sqlite.connection().execute_batch(
+        "INSERT INTO devices(id,gateway_id,mac,first_seen,last_seen) VALUES
+          (1,'gateway-1',X'020000000001',1000,1000),
+          (2,'gateway-1',X'020000000002',1000,1000);
+         INSERT INTO flow_sessions(id,gateway_id,device_id,ip_version,protocol,client_ip,client_port,remote_ip,remote_port,direction,application_id,category_id,protocol_id,organization_id,upload_bytes,download_bytes,packets,started_at,last_seen_at,checkpointed_at) VALUES
+          ('a','gateway-1',1,4,6,X'C0000201',1,X'C6336401',443,1,'app-a','cat-x','tcp','org-a',100,20,2,1000,1000,1000),
+          ('b','gateway-1',2,4,6,X'C0000202',2,X'C6336402',443,1,'app-a','cat-y','tcp','org-a',200,30,3,1000,2000,2000),
+          ('d','gateway-1',1,4,6,X'C0000201',4,X'C6336404',443,1,'app-a','cat-y','udp','org-a',50,10,1,1000,2000,2000),
+          ('c','gateway-1',1,4,6,X'C0000201',3,X'C6336403',443,1,'unknown','unknown','tcp','unknown',10,5,1,1000,1000,1000);
+         INSERT INTO traffic_application_minute VALUES
+          (1000,'gateway-1','app-a','cat-x',100,20,2,1),
+          (2000,'gateway-1','app-a','cat-x',50,10,1,1),
+          (2000,'gateway-1','app-a','cat-y',200,30,3,1),
+          (1000,'gateway-1','protocol:tcp','unknown',10,5,1,1)"
+    ).unwrap();
+    let sql = crate::query_api::sqlite_applications_query_sql(false);
+    let plan = sqlite
+        .connection()
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap()
+        .query_map([1_i64, 0_i64], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("COVERING INDEX flow_sessions_application_last_seen")),
+        "{plan:?}"
+    );
+    let state =
+        CollectorState::with_storage(ENROLLMENT_TOKEN, sqlite, repository_rule_engine()).unwrap();
+    let router = internal_router(state.clone());
+    for (query, total, expected_id, expected_category, clients) in [
+        ("limit=1", 3, Some("app-a"), Some("cat-y"), Some(2)),
+        ("limit=1&offset=1", 3, Some("app-a"), Some("cat-x"), Some(2)),
+        ("limit=1&offset=100", 3, None, None, None),
+        (
+            "limit=1&from=1000&to=2000",
+            2,
+            Some("app-a"),
+            Some("cat-x"),
+            Some(1),
+        ),
+        ("limit=1&from=3000&to=4000", 0, None, None, None),
+    ] {
+        let value = parse_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/internal/applications?{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let window = match query {
+            "limit=1&from=1000&to=2000" => Some((1000, 2000)),
+            "limit=1&from=3000&to=4000" => Some((3000, 4000)),
+            _ => None,
+        };
+        let offset = query
+            .split('&')
+            .find_map(|part| part.strip_prefix("offset="))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        let generation = state.summary_pages.generation();
+        assert!(
+            state
+                .summary_pages
+                .get_window("applications", 1, offset, generation, window)
+                .is_some()
+        );
+        assert!(value["data"].as_array().unwrap().iter().all(|item| {
+            item.as_object()
+                .is_some_and(|object| !object.contains_key("_persisted_organization_id"))
+        }));
+        let repeated = parse_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/internal/applications?{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(repeated, value, "cached application page: {query}");
+        let summary = parse_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/internal/applications?{query}&summary=true"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(summary["pagination"], value["pagination"], "{query}");
+        assert_eq!(
+            summary["data"].as_array().unwrap().len(),
+            value["data"].as_array().unwrap().len(),
+            "{query}"
+        );
+        for (full, compact) in value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(summary["data"].as_array().unwrap())
+        {
+            for field in [
+                "application_id",
+                "category_id",
+                "upload_bytes",
+                "download_bytes",
+                "packets",
+                "flow_count",
+                "last_seen",
+            ] {
+                assert_eq!(compact[field], full[field], "{query}: {field}");
+            }
+        }
+        assert_eq!(value["pagination"]["total"], total, "{query}");
+        if let Some(id) = expected_id {
+            assert_eq!(value["data"][0]["application_id"], id, "{query}");
+            assert_eq!(
+                value["data"][0]["category_id"],
+                expected_category.unwrap(),
+                "{query}"
+            );
+            assert_eq!(
+                value["data"][0]["client_count"],
+                clients.unwrap(),
+                "{query}"
+            );
+        } else {
+            assert_eq!(value["data"], json!([]), "{query}");
+        }
+    }
+
+    let category_detail = parse_json(
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/applications/app-a?category=cat-y")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(category_detail["data"]["client_count"], 2);
+    assert_eq!(category_detail["data"]["destination_count"], 2);
+    assert_eq!(
+        category_detail["data"]["observed_protocols"],
+        json!([
+            {"id": "tcp", "flows": 1},
+            {"id": "udp", "flows": 1},
+        ])
+    );
+
+    let generation = state.summary_pages.generation();
+    assert_eq!(
+        state.accept_batch(&sample_batch("gateway-1", 1)).unwrap(),
+        BatchDisposition::Accepted
+    );
+    assert_eq!(state.summary_pages.generation(), generation + 1);
+    let refreshed = parse_json(
+        router
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/applications?limit=50")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let upload_total: i64 = refreshed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["upload_bytes"].as_i64().unwrap())
+        .sum();
+    assert_eq!(upload_total, 460);
+}
+
+#[tokio::test]
+async fn application_page_client_counts_match_application_and_protocol_aliases() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut sqlite =
+        SqliteStorage::open(directory.path().join("application-client-counts.db")).unwrap();
+    sqlite
+        .save_gateway("gateway-1", "router", "test", &[7; 32], 1000)
+        .unwrap();
+    sqlite
+        .connection()
+        .execute_batch(
+            "INSERT INTO devices(id,gateway_id,mac,first_seen,last_seen) VALUES
+                (1,'gateway-1',X'020000000001',1000,3000),
+                (2,'gateway-1',X'020000000002',1000,3000),
+                (3,'gateway-1',X'020000000003',1000,3000);
+             INSERT INTO flow_sessions
+                (id,gateway_id,device_id,ip_version,protocol,client_ip,client_port,remote_ip,
+                 remote_port,direction,application_id,category_id,protocol_id,organization_id,
+                 upload_bytes,download_bytes,packets,started_at,last_seen_at,checkpointed_at)
+             VALUES
+                ('pseudo-tcp','gateway-1',1,4,6,X'C0000201',1,X'C6336401',443,1,'unknown','unknown','tcp','unknown',1,1,1,1000,1000,1000),
+                ('real-prefix','gateway-1',2,4,6,X'C0000202',2,X'C6336402',443,1,'protocol:tcp','unknown','udp','unknown',1,1,1,1000,2000,2000),
+                ('unknown','gateway-1',3,4,6,X'C0000203',3,X'C6336403',443,1,'unknown','unknown','unknown','unknown',1,1,1,1000,1000,1000),
+                ('null-app','gateway-1',1,4,6,X'C0000201',4,X'C6336404',443,1,NULL,'unknown',NULL,'unknown',1,1,1,1000,2000,2000),
+                ('pseudo-quic','gateway-1',2,4,6,X'C0000202',5,X'C6336405',443,1,'unknown','unknown','quic','unknown',1,1,1,1000,3000,3000),
+                ('normal','gateway-1',3,4,6,X'C0000203',6,X'C6336406',443,1,'app-a','web','tcp','unknown',1,1,1,1000,1000,1000);
+             INSERT INTO traffic_application_minute
+                (timestamp,gateway_id,application_id,category_id,upload_bytes,download_bytes,packets,flow_count)
+             VALUES
+                (1000,'gateway-1','app-a','web',1,1,1,1),
+                (1000,'gateway-1','protocol:tcp','unknown',1,1,1,1),
+                (1000,'gateway-1','unknown','unknown',1,1,1,1),
+                (3000,'gateway-1','protocol:quic','unknown',1,1,1,1);",
+        )
+        .unwrap();
+    let state =
+        CollectorState::with_storage(ENROLLMENT_TOKEN, sqlite, repository_rule_engine()).unwrap();
+    let router = internal_router(state);
+
+    for (query, expected) in [
+        (
+            "limit=50",
+            json!({
+                "app-a": 1,
+                "protocol:tcp": 2,
+                "protocol:quic": 1,
+                "unknown": 2,
+            }),
+        ),
+        (
+            "limit=50&from=1000&to=2001",
+            json!({
+                "app-a": 1,
+                "protocol:tcp": 2,
+                "unknown": 2,
+            }),
+        ),
+    ] {
+        let response = parse_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/internal/applications?{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let actual = response["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                (
+                    item["application_id"].as_str().unwrap().to_owned(),
+                    item["client_count"].as_u64().unwrap(),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let expected = expected.as_object().unwrap();
+        assert_eq!(actual.len(), expected.len(), "{query}");
+        for (application_id, count) in expected {
+            assert_eq!(
+                actual.get(application_id).copied(),
+                count.as_u64(),
+                "{query}"
+            );
+        }
     }
 }
 
@@ -2486,6 +5489,67 @@ fn insights_flag_high_upload_from_recent_history_without_blocking() {
 }
 
 #[tokio::test]
+async fn organization_protocol_pages_preserve_nulls_counts_and_empty_offsets_on_file_database() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut sqlite = SqliteStorage::open(directory.path().join("flow-groups.db")).unwrap();
+    sqlite
+        .save_gateway("gateway-1", "router", "test", &[7; 32], 1_000)
+        .unwrap();
+    sqlite.connection().execute_batch(
+        "INSERT INTO devices(id,gateway_id,mac,first_seen,last_seen) VALUES
+          (1,'gateway-1',X'020000000001',1000,1000),
+          (2,'gateway-1',X'020000000002',1000,1000);
+         INSERT INTO flow_sessions(id,gateway_id,device_id,ip_version,protocol,client_ip,client_port,remote_ip,remote_port,direction,organization_id,protocol_id,upload_bytes,download_bytes,packets,started_at,last_seen_at,checkpointed_at) VALUES
+          ('a','gateway-1',1,4,6,X'C0000201',1,X'C6336401',443,1,NULL,NULL,100,20,2,1000,1000,1000),
+          ('b','gateway-1',2,4,6,X'C0000202',2,X'C6336402',443,1,'unknown','unknown',200,30,3,1000,2000,2000),
+          ('c','gateway-1',1,4,6,X'C0000201',3,X'C6336403',443,1,'known-org','known-protocol',10,5,1,1000,3000,3000)"
+    ).unwrap();
+    let state =
+        CollectorState::with_storage(ENROLLMENT_TOKEN, sqlite, repository_rule_engine()).unwrap();
+    let router = internal_router(state);
+    for resource in ["organizations", "protocols"] {
+        for offset in [0, 1, 100] {
+            let value = parse_json(
+                router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/internal/{resource}?limit=1&offset={offset}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(value["pagination"]["total"], 2);
+            match offset {
+                0 => {
+                    let item = &value["data"][0];
+                    assert_eq!(item["id"], "unknown");
+                    assert_eq!(item["upload_bytes"], 300);
+                    assert_eq!(item["download_bytes"], 50);
+                    assert_eq!(item["flows"], 2);
+                    assert_eq!(item["last_seen"], 2000);
+                    if resource == "organizations" {
+                        assert_eq!(item["clients"], 2);
+                    }
+                }
+                1 => assert_eq!(
+                    value["data"][0]["id"],
+                    if resource == "organizations" {
+                        "known-org"
+                    } else {
+                        "known-protocol"
+                    }
+                ),
+                _ => assert_eq!(value["data"], json!([])),
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn insights_explain_each_capture_quality_warning() {
     let response = internal_router(query_state())
         .oneshot(
@@ -2633,6 +5697,238 @@ async fn topology_health_is_exposed_in_diagnostics_and_insights() {
     assert!(codes.contains("capture.software_flow_offload"));
     assert!(codes.contains("capture.topology_confidence"));
     assert!(codes.contains("capture.asymmetric_routing"));
+}
+
+#[tokio::test]
+async fn domain_pages_keep_group_totals_and_empty_offset_on_file_database() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = CollectorState::with_storage(
+        ENROLLMENT_TOKEN,
+        SqliteStorage::open(directory.path().join("domains.db")).unwrap(),
+        repository_rule_engine(),
+    )
+    .unwrap();
+    let empty = parse_json(
+        internal_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/domains?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(empty["pagination"]["total"], 0);
+    assert_eq!(empty["data"], json!([]));
+    state
+        .lock()
+        .storage
+        .connection()
+        .execute_batch(
+            "INSERT INTO traffic_domain_minute VALUES
+         (1000,'gateway','a.example',100,50,3,1),
+         (2000,'gateway','a.example',200,50,4,2),
+         (1000,'gateway','b.example',300,100,5,3),
+         (1000,'gateway','c.example',1,2,1,1)",
+        )
+        .unwrap();
+    state.summary_pages.invalidate();
+    let router = internal_router(state);
+    for (offset, expected, total) in [
+        (0, Some("a.example"), 3),
+        (1, Some("b.example"), 3),
+        (100, None, 3),
+    ] {
+        let result = parse_json(
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/internal/domains?limit=1&offset={offset}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(result["pagination"]["total"], total);
+        match expected {
+            Some(domain) => assert_eq!(result["data"][0]["domain"], domain),
+            None => assert_eq!(result["data"], json!([])),
+        }
+    }
+}
+
+#[tokio::test]
+async fn summary_page_cache_is_invalidated_after_accepted_file_ingest() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = CollectorState::with_storage(
+        ENROLLMENT_TOKEN,
+        SqliteStorage::open(directory.path().join("domain-cache-ingest.db")).unwrap(),
+        repository_rule_engine(),
+    )
+    .unwrap();
+    let enrollment = state
+        .enroll(&EnrollRequest {
+            enrollment_token: ENROLLMENT_TOKEN.to_owned(),
+            agent_version: "0.1.0".to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+            boot_id: "domain-cache-boot".to_owned(),
+            gateway_name: "domain-cache-router".to_owned(),
+        })
+        .unwrap();
+    let router = internal_router(state.clone());
+    let request = || {
+        Request::builder()
+            .uri("/internal/domains?limit=50")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let empty = parse_json(router.clone().oneshot(request()).await.unwrap()).await;
+    assert_eq!(empty["pagination"]["total"], 0);
+    for uri in [
+        "/internal/organizations?limit=50",
+        "/internal/protocols?limit=50",
+    ] {
+        let page = parse_json(
+            router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(page["pagination"]["total"], 0);
+    }
+
+    let timestamp = 1_700_000_000_000;
+    assert_eq!(
+        state
+            .accept_batch(&TelemetryBatch {
+                gateway_id: enrollment.gateway_id,
+                boot_id: "domain-cache-boot".to_owned(),
+                sequence: 1,
+                sent_at: timestamp,
+                agent_version: "0.1.0".to_owned(),
+                protocol_version: PROTOCOL_VERSION,
+                flows: vec![FlowDelta {
+                    ip_version: 4,
+                    protocol: 6,
+                    client_ip: vec![192, 0, 2, 10],
+                    client_port: 50_000,
+                    remote_ip: vec![198, 51, 100, 20],
+                    remote_port: 443,
+                    direction: Direction::Upload as i32,
+                    upload_bytes: 100,
+                    download_bytes: 25,
+                    packets: 2,
+                    first_seen_unix_ms: timestamp,
+                    last_seen_unix_ms: timestamp,
+                    lifecycle: FlowLifecycle::Ended as i32,
+                    scope: FlowScope::Internet as i32,
+                    ..FlowDelta::default()
+                }],
+                ..TelemetryBatch::default()
+            })
+            .unwrap(),
+        BatchDisposition::Accepted
+    );
+    let populated = parse_json(router.clone().oneshot(request()).await.unwrap()).await;
+    assert_eq!(populated["pagination"]["total"], 1);
+    assert_eq!(populated["data"].as_array().unwrap().len(), 1);
+    for uri in [
+        "/internal/organizations?limit=50",
+        "/internal/protocols?limit=50",
+    ] {
+        let page = parse_json(
+            router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(page["pagination"]["total"], 1);
+    }
+
+    let retention_now = timestamp + 31 * 24 * 60 * 60 * 1_000;
+    assert!(state.run_maintenance_at(true, retention_now).unwrap());
+    let router = internal_router(state);
+    let retained = parse_json(router.clone().oneshot(request()).await.unwrap()).await;
+    assert_eq!(retained["pagination"]["total"], 0);
+    assert_eq!(retained["data"], json!([]));
+    for uri in [
+        "/internal/organizations?limit=50",
+        "/internal/protocols?limit=50",
+    ] {
+        let page = parse_json(
+            router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(page["pagination"]["total"], 0);
+    }
+}
+
+#[tokio::test]
+async fn late_dpi_domain_reclassification_invalidates_cached_summary_pages() {
+    let state = query_state();
+    let router = internal_router(state.clone());
+    let request = || {
+        Request::builder()
+            .uri("/internal/domains?limit=50")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let before = parse_json(router.clone().oneshot(request()).await.unwrap()).await;
+    let previous_domain = before["data"][0]["domain"].as_str().unwrap();
+    assert_ne!(previous_domain, "www.youtube.com");
+    let generation = state.summary_pages.generation();
+    let gateway_id: String = state
+        .lock()
+        .storage
+        .connection()
+        .query_row("SELECT gateway_id FROM flow_sessions LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let sample = dpi::CachedResult::for_test(
+        gateway_id,
+        "boot-query".to_owned(),
+        netqmon_protocol::v1::FlowSampleKey {
+            ip_version: 4,
+            protocol: 6,
+            client_ip: vec![192, 0, 2, 10],
+            client_port: 50_000,
+            remote_ip: vec![198, 51, 100, 1],
+            remote_port: 443,
+            first_seen_unix_ms: 1_700_000_000_000,
+        },
+        1_700_000_000_000,
+        Some(dpi::engine::DpiResult {
+            protocol: "tls".to_owned(),
+            confidence: 1.0,
+            source: "ndpi".to_owned(),
+            metadata: std::collections::BTreeMap::from([(
+                "hostname".to_owned(),
+                "www.youtube.com".to_owned(),
+            )]),
+        }),
+    );
+    let processing = state.processing.lock().unwrap();
+    process_sample(&state.inner, &sample, &processing, &state.summary_pages).unwrap();
+    drop(processing);
+    assert_eq!(state.summary_pages.generation(), generation + 1);
+
+    let after = parse_json(router.oneshot(request()).await.unwrap()).await;
+    assert_eq!(after["pagination"]["total"], 1);
+    assert_eq!(after["data"][0]["domain"], "www.youtube.com");
 }
 
 #[tokio::test]
@@ -4413,6 +7709,111 @@ async fn logout_invalidates_session() {
     // Session is now invalid.
     let response = router.oneshot(auth_verify_request(&token)).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn retention_maintenance_checkpoints_expired_flows_from_the_owning_cache() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join("retention-owner-cache.db");
+    let now = unix_time_ms();
+    let last_received = now.saturating_sub(31 * 60 * 1_000);
+    let gateway_id = "gateway-owner-cache";
+    let mut storage = SqliteStorage::open(&database_path).unwrap();
+    storage
+        .save_gateway(gateway_id, "router", "test", &[7; 32], last_received)
+        .unwrap();
+    let mut batch = sample_batch(gateway_id, 1);
+    batch.sent_at = last_received;
+    batch.flows[0].lifecycle = FlowLifecycle::Active as i32;
+    batch.flows[0].last_seen_unix_ms = last_received;
+    storage.persist_batch(&batch, last_received).unwrap();
+    assert_eq!(
+        storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM flow_sessions", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "the active flow has not reached its regular checkpoint yet"
+    );
+
+    let state =
+        CollectorState::with_storage(ENROLLMENT_TOKEN, storage, repository_rule_engine()).unwrap();
+    assert!(state.run_maintenance(true).unwrap());
+
+    let inner = state.lock();
+    let (rows, upload, download, ended_at): (i64, i64, i64, Option<i64>) = inner
+        .storage
+        .connection()
+        .query_row(
+            "SELECT COUNT(*),SUM(upload_bytes),SUM(download_bytes),MAX(ended_at) FROM flow_sessions",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!((rows, upload, download), (1, 100, 50));
+    assert!(ended_at.is_some());
+    assert_eq!(inner.storage.active_flow_count().unwrap(), 0);
+}
+
+#[test]
+fn file_maintenance_resumes_bounded_rollup_with_owner_progress() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join("bounded-rollup-maintenance.db");
+    let flow_time = 1_700_000_000_000_u64;
+    let gateway_id = "gateway-bounded-rollup";
+    let mut storage = SqliteStorage::open(&database_path).unwrap();
+    storage
+        .save_gateway(gateway_id, "router", "test", &[7; 32], flow_time)
+        .unwrap();
+
+    let mut batch = sample_batch(gateway_id, 1);
+    batch.sent_at = flow_time;
+    batch.flows = (0..620)
+        .map(|index| FlowDelta {
+            client_ip: vec![192, 0, 2, (index % 250 + 1) as u8],
+            client_port: index as u32,
+            remote_ip: vec![198, 51, 100, (index % 250 + 1) as u8],
+            remote_port: 10_000 + index as u32,
+            first_seen_unix_ms: flow_time + index as u64,
+            last_seen_unix_ms: flow_time + index as u64,
+            upload_bytes: 100,
+            download_bytes: 50,
+            packets: 1,
+            ..FlowDelta::default()
+        })
+        .collect();
+    storage.persist_batch(&batch, flow_time).unwrap();
+
+    let state =
+        CollectorState::with_storage(ENROLLMENT_TOKEN, storage, repository_rule_engine()).unwrap();
+    let maintenance_time = flow_time + 2 * 24 * 60 * 60 * 1_000;
+    let mut completed = false;
+    for _ in 0..20 {
+        if state.run_maintenance_at(false, maintenance_time).unwrap() {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "bounded maintenance should eventually finish");
+
+    let inner = state.lock();
+    let (minute_upload, hour_upload, day_upload): (i64, i64, i64) = inner
+        .storage
+        .connection()
+        .query_row(
+            "SELECT
+                (SELECT COALESCE(SUM(upload_bytes),0) FROM traffic_total_minute),
+                (SELECT COALESCE(SUM(upload_bytes),0) FROM traffic_total_hour),
+                (SELECT COALESCE(SUM(upload_bytes),0) FROM traffic_total_day)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (minute_upload, hour_upload, day_upload),
+        (62_000, 62_000, 62_000)
+    );
 }
 
 #[tokio::test]

@@ -1,12 +1,11 @@
 //! Bounded correction work and one recovery checkpoint per session.
-use super::{json_error, merge};
+use super::{json_error, serialize_recovery_attribution};
 use crate::{
-    ACTIVE_FLOW_TTL_MS, ActiveFlow, FlowAttribution, FlowDelta, FlowKey, FlowLifecycle, MINUTE_MS,
-    TelemetryBatch, to_i64, write_flow_session,
+    ACTIVE_FLOW_TTL_MS, ActiveFlow, ActiveFlowCache, FlowAttribution, FlowDelta, FlowKey,
+    FlowLifecycle, MINUTE_MS, TelemetryBatch, to_i64, write_flow_session,
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 pub(crate) const CORRECTION_WINDOW_MS: i64 = 30 * MINUTE_MS;
 pub(crate) const ENDED_GRACE_MS: i64 = 10 * MINUTE_MS;
@@ -41,7 +40,7 @@ impl RecoveryMetadata {
     }
     fn into_flow(self, attr: FlowAttribution, counters: [i64; 4]) -> (FlowKey, ActiveFlow) {
         let flow = ActiveFlow {
-            session_id: self.key.session_id(self.started_at),
+            session_id_override: None,
             client_mac: self.client_mac,
             device_id: self.device_id,
             upload_bytes: counters[0],
@@ -51,7 +50,7 @@ impl RecoveryMetadata {
             last_seen_at: counters[3],
             checkpointed_at: self.checkpointed_at,
             last_received_at: 0, // Filled from the collector's updated_at column.
-            attribution: attr,
+            attribution: crate::shared_active_attribution(attr),
             scope: self.scope,
             path_type: self.path_type,
             nat: self.nat,
@@ -73,17 +72,23 @@ pub(crate) fn record(
     let attr = &current.attribution;
     #[cfg(test)]
     let session_started = crate::benchmark_sql_profile_enabled().then(std::time::Instant::now);
-    let (id,ended_at): (i64,Option<i64>)=tx.query_row("INSERT INTO flow_rollup_sessions
+    let (id, ended_at): (i64, Option<i64>) = tx
+        .prepare_cached("INSERT INTO flow_rollup_sessions
         (session_id,gateway_id,metadata_json,attribution_json,upload_bytes,download_bytes,packets,last_seen_at,updated_at,ended_at)
         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
         ON CONFLICT(session_id) DO UPDATE SET metadata_json=excluded.metadata_json,
         attribution_json=excluded.attribution_json,upload_bytes=excluded.upload_bytes,
         download_bytes=excluded.download_bytes,packets=excluded.packets,last_seen_at=excluded.last_seen_at,
-        updated_at=MAX(updated_at,excluded.updated_at),ended_at=COALESCE(ended_at,excluded.ended_at)
-        RETURNING id,ended_at",params![current.session_id,key.gateway_id,
+        updated_at=MAX(updated_at,excluded.updated_at),
+        ended_at=CASE WHEN excluded.ended_at IS NOT NULL THEN COALESCE(ended_at,excluded.ended_at)
+            WHEN ended_at IS NOT NULL AND excluded.updated_at>ended_at THEN NULL
+            ELSE ended_at END
+        RETURNING id,ended_at")?
+        .query_row(params![current.session_id(key).as_ref(),key.gateway_id,
             serde_json::to_string(&RecoveryMetadata::new(key,current)).map_err(json_error)?,
-            serde_json::to_string(attr).map_err(json_error)?,current.upload_bytes,current.download_bytes,
-            current.packets,current.last_seen_at,now,(flow.lifecycle==FlowLifecycle::Ended as i32).then_some(now)],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            serialize_recovery_attribution(attr.as_ref())?,current.upload_bytes,current.download_bytes,
+            current.packets,current.last_seen_at,now,(flow.lifecycle==FlowLifecycle::Ended as i32).then_some(now)],
+            |r| Ok((r.get(0)?, r.get(1)?)))?;
     #[cfg(test)]
     if let Some(started) = session_started {
         crate::benchmark_sql_profile(
@@ -95,10 +100,8 @@ pub(crate) fn record(
     if ended_at.is_some_and(|ended| ended.saturating_add(ENDED_GRACE_MS) <= now) {
         #[cfg(test)]
         let delete_started = crate::benchmark_sql_profile_enabled().then(std::time::Instant::now);
-        tx.execute(
-            "DELETE FROM flow_rollup_contributions WHERE session_ref=?1",
-            [id],
-        )?;
+        tx.prepare_cached("DELETE FROM flow_rollup_contributions WHERE session_ref=?1")?
+            .execute([id])?;
         #[cfg(test)]
         if let Some(started) = delete_started {
             crate::benchmark_sql_profile(
@@ -112,7 +115,7 @@ pub(crate) fn record(
     // stay frozen; only the newly ingested delta can enter a new correction window.
     #[cfg(test)]
     let contribution_started = crate::benchmark_sql_profile_enabled().then(std::time::Instant::now);
-    tx.execute("INSERT INTO flow_rollup_contributions
+    tx.prepare_cached("INSERT INTO flow_rollup_contributions
         (session_ref,timestamp,scope,direction,device_id,remote_ip,protocol,application_id,category_id,domain,protocol_id,
          upload_bytes,download_bytes,packets,flow_count,hour_upload,hour_download,hour_packets,hour_flows,
          day_upload,day_download,day_packets,day_flows,expires_at)
@@ -130,8 +133,8 @@ pub(crate) fn record(
         day_upload=CASE WHEN expires_at<=?16 THEN 0 ELSE day_upload END,
         day_download=CASE WHEN expires_at<=?16 THEN 0 ELSE day_download END,
         day_packets=CASE WHEN expires_at<=?16 THEN 0 ELSE day_packets END,
-        day_flows=CASE WHEN expires_at<=?16 THEN 0 ELSE day_flows END,expires_at=excluded.expires_at",
-        params![id,to_i64(batch.sent_at)/MINUTE_MS*MINUTE_MS,flow.scope,flow.direction,current.device_id.unwrap_or(0),
+        day_flows=CASE WHEN expires_at<=?16 THEN 0 ELSE day_flows END,expires_at=excluded.expires_at")?
+        .execute(params![id,to_i64(batch.sent_at)/MINUTE_MS*MINUTE_MS,flow.scope,flow.direction,current.device_id.unwrap_or(0),
             flow.remote_ip,flow.protocol,attr.application_id,attr.category_id,attr.domain.as_deref().unwrap_or("unknown"),
             attr.protocol_id,to_i64(flow.upload_bytes),to_i64(flow.download_bytes),to_i64(flow.packets),
             now.saturating_add(CORRECTION_WINDOW_MS),now])?;
@@ -156,23 +159,29 @@ fn read_recovery(row: &Row<'_>) -> rusqlite::Result<(FlowKey, ActiveFlow)> {
     Ok((key, flow))
 }
 
-pub(crate) fn restore(connection: &Connection, current: &mut ActiveFlow) -> rusqlite::Result<()> {
+pub(crate) fn restore(
+    connection: &Connection,
+    key: &FlowKey,
+    current: &mut ActiveFlow,
+) -> rusqlite::Result<bool> {
+    let session_id = current.session_id(key);
     let state = connection
         .prepare_cached(
-            "SELECT metadata_json,attribution_json,upload_bytes,download_bytes,packets,last_seen_at,updated_at
+            "SELECT metadata_json,attribution_json,upload_bytes,download_bytes,packets,last_seen_at,updated_at,ended_at
         FROM flow_rollup_sessions WHERE session_id=?1",
         )?
         .query_row(
-            [&current.session_id],
-            read_recovery,
+            [session_id.as_ref()],
+            |row| Ok((read_recovery(row)?, row.get::<_, Option<i64>>(7)?.is_none())),
         )
         .optional()?;
-    if let Some((_, restored)) = state {
-        merge(&mut current.attribution, &restored.attribution);
+    if let Some(((_, restored), was_active)) = state {
+        current.merge_attribution(&restored.attribution);
         current.upload_bytes = current.upload_bytes.max(restored.upload_bytes);
         current.download_bytes = current.download_bytes.max(restored.download_bytes);
         current.packets = current.packets.max(restored.packets);
         current.last_seen_at = current.last_seen_at.max(restored.last_seen_at);
+        return Ok(was_active);
     } else {
         // A late delta/End can arrive after cache GC. Recover the full counters
         // for this exact lifetime instead of overwriting its historical totals.
@@ -181,41 +190,50 @@ pub(crate) fn restore(connection: &Connection, current: &mut ActiveFlow) -> rusq
                 "SELECT upload_bytes,download_bytes,packets,last_seen_at,domain,organization_id,
                 application_id,category_id,traffic_role,protocol_id,organization_confidence,
                 application_confidence,protocol_confidence,classification_confidence,
-                classification_reason,classification_evidence_json
+                classification_reason,classification_evidence_json,ended_at
              FROM flow_sessions WHERE id=?1",
             )?
-            .query_row([&current.session_id], |row| {
+            .query_row([session_id.as_ref()], |row| {
                 Ok((
                     [row.get::<_, i64>(0)?, row.get(1)?, row.get(2)?, row.get(3)?],
                     super::read_attribution(row, 4)?,
+                    row.get::<_, Option<i64>>(16)?.is_none(),
                 ))
             })
             .optional()?;
-        if let Some((counters, attribution)) = historical {
+        if let Some((counters, attribution, was_active)) = historical {
             current.upload_bytes = counters[0];
             current.download_bytes = counters[1];
             current.packets = counters[2];
             current.last_seen_at = current.last_seen_at.max(counters[3]);
-            merge(&mut current.attribution, &attribution);
+            current.merge_attribution(&attribution);
+            return Ok(was_active);
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 pub(crate) fn restore_active(
     connection: &Connection,
-    active: &mut HashMap<FlowKey, ActiveFlow>,
+    active: &mut ActiveFlowCache,
     now: i64,
 ) -> rusqlite::Result<()> {
     let mut statement = connection.prepare(
         "SELECT metadata_json,attribution_json,upload_bytes,download_bytes,packets,last_seen_at,updated_at
-        FROM flow_rollup_sessions WHERE ended_at IS NULL AND updated_at>?1",
+        FROM flow_rollup_sessions WHERE ended_at IS NULL AND updated_at>?1
+        ORDER BY updated_at DESC LIMIT ?2",
     )?;
-    for state in statement.query_map([now.saturating_sub(CORRECTION_WINDOW_MS)], read_recovery)? {
+    for state in statement.query_map(
+        params![
+            now.saturating_sub(CORRECTION_WINDOW_MS),
+            i64::try_from(crate::ACTIVE_FLOW_CACHE_CAPACITY).unwrap_or(i64::MAX)
+        ],
+        read_recovery,
+    )? {
         let (key, mut restored) = state?;
-        if let Some(current) = active.get_mut(&key) {
-            if current.session_id == restored.session_id {
-                merge(&mut restored.attribution, &current.attribution);
+        if let Some(current) = active.get(&key) {
+            if current.session_id(&key) == restored.session_id(&key) {
+                restored.merge_attribution(&current.attribution);
                 restored.upload_bytes = restored.upload_bytes.max(current.upload_bytes);
                 restored.download_bytes = restored.download_bytes.max(current.download_bytes);
                 restored.packets = restored.packets.max(current.packets);

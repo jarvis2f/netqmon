@@ -15,7 +15,7 @@ fn improves(old: &str, old_score: f64, new: &str, new_score: f64) -> bool {
     known(new) && (!known(old) || new_score > old_score)
 }
 
-pub(super) fn merge(current: &mut FlowAttribution, incoming: &FlowAttribution) {
+pub(super) fn merge(current: &mut FlowAttribution, incoming: &FlowAttribution) -> bool {
     let app = improves(
         &current.application_id,
         current.application_confidence,
@@ -67,7 +67,8 @@ pub(super) fn merge(current: &mut FlowAttribution, incoming: &FlowAttribution) {
             current.traffic_role.clone_from(&incoming.traffic_role);
         }
     }
-    if incoming.domain.is_some() && (current.domain.is_none() || app) {
+    let domain = incoming.domain.is_some() && (current.domain.is_none() || app);
+    if domain {
         current.domain.clone_from(&incoming.domain);
     }
     if app || org || protocol || category || role {
@@ -94,6 +95,7 @@ pub(super) fn merge(current: &mut FlowAttribution, incoming: &FlowAttribution) {
     } else {
         current.organization_confidence
     };
+    app || org || protocol || category || role || domain
 }
 
 #[derive(Serialize, Deserialize)]
@@ -109,24 +111,111 @@ fn json_error(error: serde_json::Error) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(error))
 }
 
+/// Stores recovery attribution as a compact JSON tuple. Serde's derived
+/// deserializer accepts both this sequence form and the legacy object form.
+pub(super) fn serialize_recovery_attribution(attr: &FlowAttribution) -> rusqlite::Result<String> {
+    serde_json::to_string(&(
+        &attr.domain,
+        &attr.organization_id,
+        &attr.application_id,
+        &attr.category_id,
+        &attr.traffic_role,
+        &attr.protocol_id,
+        attr.organization_confidence,
+        attr.application_confidence,
+        attr.protocol_confidence,
+        attr.confidence,
+        &attr.reason,
+        &attr.evidence_json,
+    ))
+    .map_err(json_error)
+}
+
 mod pending;
 pub(super) use pending::prune_bounded;
 #[cfg(test)]
 pub(super) use pending::{CORRECTION_WINDOW_MS, ENDED_GRACE_MS};
 pub(super) use pending::{prune, record, restore, restore_active};
 
-pub(super) fn mark_aggregated(tx: &Transaction<'_>, now: i64) -> rusqlite::Result<()> {
-    tx.execute("UPDATE flow_rollup_contributions SET hour_upload=upload_bytes,hour_download=download_bytes,
-        hour_packets=packets,hour_flows=flow_count WHERE timestamp<?1
-        AND (hour_upload!=upload_bytes OR hour_download!=download_bytes OR hour_packets!=packets OR hour_flows!=flow_count)",
-        [now/HOUR_MS*HOUR_MS])?;
-    tx.execute(
-        "UPDATE flow_rollup_contributions SET day_upload=hour_upload,day_download=hour_download,
-        day_packets=hour_packets,day_flows=hour_flows WHERE timestamp<?1
-        AND (day_upload!=hour_upload OR day_download!=hour_download OR day_packets!=hour_packets OR day_flows!=hour_flows)",
-        [now / DAY_MS * DAY_MS],
-    )?;
-    Ok(())
+pub(super) fn mark_aggregated_batch(
+    tx: &Transaction<'_>,
+    phase: super::RollupMarkerPhase,
+    cutoff: i64,
+    cursor: Option<&super::RollupMarkerCursor>,
+    limit: usize,
+) -> rusqlite::Result<(usize, Option<super::RollupMarkerCursor>)> {
+    let (set, filter) = match phase {
+        super::RollupMarkerPhase::Hour => (
+            "hour_upload=upload_bytes,hour_download=download_bytes,
+             hour_packets=packets,hour_flows=flow_count",
+            "hour_upload!=upload_bytes OR hour_download!=download_bytes
+             OR hour_packets!=packets OR hour_flows!=flow_count",
+        ),
+        super::RollupMarkerPhase::Day => (
+            "day_upload=hour_upload,day_download=hour_download,
+             day_packets=hour_packets,day_flows=hour_flows",
+            "day_upload!=hour_upload OR day_download!=hour_download
+             OR day_packets!=hour_packets OR day_flows!=hour_flows",
+        ),
+        super::RollupMarkerPhase::Complete => unreachable!("complete rollups have no marker batch"),
+    };
+    let key = "session_ref,timestamp,scope,direction,device_id,remote_ip,protocol";
+    let cursor_filter = if cursor.is_some() {
+        format!("AND ({key})>(?2,?3,?4,?5,?6,?7,?8)")
+    } else {
+        String::new()
+    };
+    let limit_parameter = if cursor.is_some() { 9 } else { 2 };
+    let mut values = vec![Value::Integer(cutoff)];
+    if let Some(cursor) = cursor {
+        values.extend([
+            Value::Integer(cursor.session_ref),
+            Value::Integer(cursor.timestamp),
+            Value::Integer(cursor.scope),
+            Value::Integer(cursor.direction),
+            Value::Integer(cursor.device_id),
+            Value::Blob(cursor.remote_ip.clone()),
+            Value::Integer(cursor.protocol),
+        ]);
+    }
+    values.push(Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
+    // Page the primary key itself, including rows already marked, so the work
+    // limit applies to rows scanned as well as rows written. Filtering only
+    // unmarked rows here can still scan the entire contribution table in one
+    // transaction after most rows have been marked.
+    let select = format!(
+        "SELECT {key} FROM flow_rollup_contributions
+         WHERE 1 {cursor_filter} ORDER BY {key} LIMIT ?{limit_parameter}"
+    );
+    let mut statement = tx.prepare(&select)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(values.iter()), |row| {
+        Ok(super::RollupMarkerCursor {
+            session_ref: row.get(0)?,
+            timestamp: row.get(1)?,
+            scope: row.get(2)?,
+            direction: row.get(3)?,
+            device_id: row.get(4)?,
+            remote_ip: row.get(5)?,
+            protocol: row.get(6)?,
+        })
+    })?;
+    let page = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let Some(last) = page.last().cloned() else {
+        return Ok((0, None));
+    };
+
+    let update = format!(
+        "WITH selected AS MATERIALIZED (
+             SELECT {key} FROM flow_rollup_contributions
+             WHERE 1 {cursor_filter} ORDER BY {key} LIMIT ?{limit_parameter}
+         )
+         UPDATE flow_rollup_contributions SET {set}
+         WHERE ({key}) IN (SELECT {key} FROM selected)
+           AND timestamp<?1 AND ({filter})"
+    );
+    tx.execute(&update, rusqlite::params_from_iter(values))?;
+    Ok((page.len(), Some(last)))
 }
 
 // Store counts already materialized at each tier. New deltas for an old minute
@@ -150,74 +239,144 @@ pub(super) fn reassign(
     };
     let mut new: FlowAttribution = serde_json::from_str(&state).map_err(json_error)?;
     merge(&mut new, incoming);
-    let rows = tx.prepare("SELECT c.timestamp,s.gateway_id,c.scope,c.direction,c.device_id,c.remote_ip,c.protocol,
+    // The contribution table is keyed by session followed by these fields.
+    // Fetch a bounded page, finish its statement, and then update the rows.
+    // This avoids both unbounded materialization and mutating a table while
+    // an active SQLite cursor is scanning it. The enclosing transaction still
+    // makes the complete correction atomic.
+    const PAGE_SIZE: usize = 256;
+    let mut cursor: Option<(i64, i32, i32, i64, Vec<u8>, u32)> = None;
+    loop {
+        let continuation = if cursor.is_some() {
+            " AND (c.timestamp,c.scope,c.direction,c.device_id,c.remote_ip,c.protocol) > (?5,?6,?7,?8,?9,?10)"
+        } else {
+            ""
+        };
+        let sql = format!("SELECT c.timestamp,s.gateway_id,c.scope,c.direction,c.device_id,c.remote_ip,c.protocol,
         c.application_id,c.category_id,c.domain,c.protocol_id,
         c.upload_bytes,c.download_bytes,c.packets,c.flow_count,c.hour_upload,c.hour_download,c.hour_packets,c.hour_flows,
         c.day_upload,c.day_download,c.day_packets,c.day_flows,c.session_ref
         FROM flow_rollup_contributions c JOIN flow_rollup_sessions s ON s.id=c.session_ref
         WHERE s.session_id=?1 AND c.expires_at>?2 AND s.updated_at>?3
-            AND (s.ended_at IS NULL OR s.ended_at>?4)")?
-        .query_map(params![session,now,now.saturating_sub(pending::CORRECTION_WINDOW_MS),now.saturating_sub(pending::ENDED_GRACE_MS)], |row| {
-            let mut counts = [[0_i64;4];3];
-            for (tier, values) in counts.iter_mut().enumerate() {
-                for (metric,value) in values.iter_mut().enumerate() { *value=row.get(11+tier*4+metric)?; }
-            }
-            Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,RollupMetadata {
-                scope:row.get(2)?,direction:row.get(3)?,device_id:row.get(4)?,remote_ip:row.get(5)?,protocol:row.get(6)? },
-                FlowAttribution { application_id:row.get(7)?,category_id:row.get(8)?,domain:Some(row.get(9)?),
-                    protocol_id:row.get(10)?,..FlowAttribution::default() }, counts,row.get::<_,i64>(23)?))
-        })?.collect::<rusqlite::Result<Vec<_>>>()?;
-    for (timestamp, gateway, metadata, old, counts, id) in rows {
-        if application_keys(&old) == application_keys(&new)
-            && domain(&old) == domain(&new)
-            && scope_keys(&metadata, &old) == scope_keys(&metadata, &new)
-        {
-            continue;
+            AND (s.ended_at IS NULL OR s.ended_at>?4){continuation}
+        ORDER BY c.timestamp,c.scope,c.direction,c.device_id,c.remote_ip,c.protocol LIMIT {PAGE_SIZE}");
+        let mut values: Vec<Value> = vec![
+            session.to_owned().into(),
+            now.into(),
+            now.saturating_sub(pending::CORRECTION_WINDOW_MS).into(),
+            now.saturating_sub(pending::ENDED_GRACE_MS).into(),
+        ];
+        if let Some((timestamp, scope, direction, device_id, remote_ip, protocol)) = &cursor {
+            values.extend([
+                (*timestamp).into(),
+                i64::from(*scope).into(),
+                i64::from(*direction).into(),
+                (*device_id).into(),
+                remote_ip.clone().into(),
+                i64::from(*protocol).into(),
+            ]);
         }
-        for (tier, size, metrics) in [
-            ("minute", MINUTE_MS, counts[0]),
-            ("hour", HOUR_MS, counts[1]),
-            ("day", DAY_MS, counts[2]),
-        ] {
-            if metrics == [0; 4] {
+        let rows = tx
+            .prepare_cached(&sql)?
+            .query_map(rusqlite::params_from_iter(values), |row| {
+                let mut counts = [[0_i64; 4]; 3];
+                for (tier, values) in counts.iter_mut().enumerate() {
+                    for (metric, value) in values.iter_mut().enumerate() {
+                        *value = row.get(11 + tier * 4 + metric)?;
+                    }
+                }
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    RollupMetadata {
+                        scope: row.get(2)?,
+                        direction: row.get(3)?,
+                        device_id: row.get(4)?,
+                        remote_ip: row.get(5)?,
+                        protocol: row.get(6)?,
+                    },
+                    FlowAttribution {
+                        application_id: row.get(7)?,
+                        category_id: row.get(8)?,
+                        domain: Some(row.get(9)?),
+                        protocol_id: row.get(10)?,
+                        ..FlowAttribution::default()
+                    },
+                    counts,
+                    row.get::<_, i64>(23)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if rows.is_empty() {
+            break;
+        }
+        let has_more = rows.len() == PAGE_SIZE;
+        if has_more {
+            let (timestamp, _, metadata, _, _, _) = rows.last().expect("nonempty page");
+            cursor = Some((
+                *timestamp,
+                metadata.scope,
+                metadata.direction,
+                metadata.device_id,
+                metadata.remote_ip.clone(),
+                metadata.protocol,
+            ));
+        }
+        for (timestamp, gateway, metadata, old, counts, id) in rows {
+            if application_keys(&old) == application_keys(&new)
+                && domain(&old) == domain(&new)
+                && scope_keys(&metadata, &old) == scope_keys(&metadata, &new)
+            {
                 continue;
             }
-            let bucket = timestamp / size * size;
-            transfer(
-                tx,
-                &format!("traffic_application_{tier}"),
-                "application_id, category_id",
-                &[bucket.into(), gateway.clone().into()],
-                &application_keys(&old),
-                &application_keys(&new),
-                metrics,
-            )?;
-            transfer(
-                tx,
-                &format!("traffic_domain_{tier}"),
-                "domain",
-                &[bucket.into(), gateway.clone().into()],
-                &[domain(&old).into()],
-                &[domain(&new).into()],
-                metrics,
-            )?;
-            if tier == "minute" {
+            for (tier, size, metrics) in [
+                ("minute", MINUTE_MS, counts[0]),
+                ("hour", HOUR_MS, counts[1]),
+                ("day", DAY_MS, counts[2]),
+            ] {
+                if metrics == [0; 4] {
+                    continue;
+                }
+                let bucket = timestamp / size * size;
                 transfer(
                     tx,
-                    "traffic_scope_minute",
-                    "scope, direction, device_id, application_id, category_id, domain, remote_ip, protocol, protocol_id",
+                    &format!("traffic_application_{tier}"),
+                    "application_id, category_id",
                     &[bucket.into(), gateway.clone().into()],
-                    &scope_keys(&metadata, &old),
-                    &scope_keys(&metadata, &new),
+                    &application_keys(&old),
+                    &application_keys(&new),
                     metrics,
                 )?;
+                transfer(
+                    tx,
+                    &format!("traffic_domain_{tier}"),
+                    "domain",
+                    &[bucket.into(), gateway.clone().into()],
+                    &[domain(&old).into()],
+                    &[domain(&new).into()],
+                    metrics,
+                )?;
+                if tier == "minute" {
+                    transfer(
+                        tx,
+                        "traffic_scope_minute",
+                        "scope, direction, device_id, application_id, category_id, domain, remote_ip, protocol, protocol_id",
+                        &[bucket.into(), gateway.clone().into()],
+                        &scope_keys(&metadata, &old),
+                        &scope_keys(&metadata, &new),
+                        metrics,
+                    )?;
+                }
             }
-        }
-        tx.execute("UPDATE flow_rollup_contributions SET application_id=?1,category_id=?2,domain=?3,protocol_id=?4
+            tx.prepare_cached("UPDATE flow_rollup_contributions SET application_id=?1,category_id=?2,domain=?3,protocol_id=?4
             WHERE session_ref=?5 AND timestamp=?6 AND scope=?7 AND direction=?8 AND device_id=?9 AND remote_ip=?10 AND protocol=?11",
-            params![new.application_id,new.category_id,domain(&new),new.protocol_id,id,timestamp,metadata.scope,metadata.direction,metadata.device_id,metadata.remote_ip,metadata.protocol])?;
+            )?.execute(params![new.application_id,new.category_id,domain(&new),new.protocol_id,id,timestamp,metadata.scope,metadata.direction,metadata.device_id,metadata.remote_ip,metadata.protocol])?;
+        }
+        if !has_more {
+            break;
+        }
     }
-    let updated = serde_json::to_string(&new).map_err(json_error)?;
+    let updated = serialize_recovery_attribution(&new)?;
     if updated != state {
         tx.execute(
             "UPDATE flow_rollup_sessions SET attribution_json=?1 WHERE session_id=?2",
@@ -276,11 +435,11 @@ fn transfer(
         .map(|(i, col)| format!("{}=?{}", col.trim(), i + 1))
         .collect::<Vec<_>>()
         .join(" AND ");
-    let exists: bool = tx.query_row(
-        &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {predicate})"),
-        rusqlite::params_from_iter(&old_keys),
-        |r| r.get(0),
-    )?;
+    let exists: bool = tx
+        .prepare_cached(&format!(
+            "SELECT EXISTS(SELECT 1 FROM {table} WHERE {predicate})"
+        ))?
+        .query_row(rusqlite::params_from_iter(&old_keys), |r| r.get(0))?;
     // Retention may have removed the source bucket; never recreate expired data.
     if !exists {
         return Ok(());
@@ -331,7 +490,8 @@ fn transfer(
             -metrics[3],
         )?;
     }
-    tx.execute(&format!("DELETE FROM {table} WHERE {predicate} AND upload_bytes=0 AND download_bytes=0 AND packets=0 AND flow_count=0"),rusqlite::params_from_iter(&old_keys))?;
+    tx.prepare_cached(&format!("DELETE FROM {table} WHERE {predicate} AND upload_bytes=0 AND download_bytes=0 AND packets=0 AND flow_count=0"))?
+        .execute(rusqlite::params_from_iter(&old_keys))?;
     Ok(())
 }
 
@@ -353,16 +513,20 @@ pub(super) fn reclassify_sqlite(
     let mut sessions: HashMap<String,FlowAttribution> = tx.prepare_cached("SELECT id,domain,organization_id,
         application_id,category_id,traffic_role,protocol_id,organization_confidence,application_confidence,
         protocol_confidence,classification_confidence,classification_reason,classification_evidence_json
-        FROM flow_sessions WHERE gateway_id=?1 AND ip_version=?2 AND protocol=?3 AND client_ip=?4
+        FROM flow_sessions INDEXED BY flow_sessions_sample_lookup
+        WHERE gateway_id=?1 AND ip_version=?2 AND protocol=?3 AND client_ip=?4
         AND client_port=?5 AND remote_ip=?6 AND remote_port=?7 AND started_at<=?8 AND last_seen_at>=?9")?
         .query_map(params![gateway,flow.ip_version,flow.protocol,flow.client_ip,flow.client_port,
             flow.remote_ip,flow.remote_port,to_i64(flow.last_seen_unix_ms.saturating_add(1)),
             to_i64(flow.first_seen_unix_ms.saturating_sub(1))],|row| {
             Ok((row.get(0)?, read_attribution(row, 1)?))
         })?.collect::<rusqlite::Result<_>>()?;
-    for current in staged.values_mut() {
-        merge(&mut current.attribution, incoming);
-        sessions.insert(current.session_id.clone(), current.attribution.clone());
+    for (key, current) in &mut staged {
+        current.merge_attribution(incoming);
+        sessions.insert(
+            current.session_id(key).into_owned(),
+            current.attribution.as_ref().clone(),
+        );
     }
     for (id, mut attr) in sessions {
         merge(&mut attr, incoming);

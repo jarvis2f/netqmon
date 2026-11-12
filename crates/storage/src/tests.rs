@@ -87,6 +87,184 @@ fn policy_option_index_upgrade_keeps_existing_flows() {
 }
 
 #[test]
+fn application_client_covering_index_upgrade_keeps_existing_flows() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("application-covering-index.db");
+    let mut storage = open_at(&path, NOW).unwrap();
+    storage
+        .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
+        .unwrap();
+    storage
+        .persist_classified_batch(&batch(1, FlowLifecycle::Ended), &[], &[], NOW)
+        .unwrap();
+    let before: i64 = storage
+        .connection()
+        .query_row("SELECT COUNT(*) FROM flow_sessions", [], |row| row.get(0))
+        .unwrap();
+    storage
+        .connection()
+        .execute_batch(
+            "DROP INDEX flow_sessions_application_last_seen;
+             CREATE INDEX flow_sessions_application_last_seen
+                 ON flow_sessions(application_id,last_seen_at);
+             DELETE FROM schema_migrations WHERE version=14;",
+        )
+        .unwrap();
+    drop(storage);
+
+    let upgraded = open_at(&path, NOW + 1).unwrap();
+    let after: i64 = upgraded
+        .connection()
+        .query_row("SELECT COUNT(*) FROM flow_sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(after, before);
+    let columns = upgraded
+        .connection()
+        .prepare("PRAGMA index_info(flow_sessions_application_last_seen)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(2))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        columns,
+        ["application_id", "last_seen_at", "protocol_id", "device_id"]
+    );
+}
+
+#[test]
+fn flow_last_seen_order_index_upgrade_preserves_rows_and_uses_tie_order() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("flow-last-seen-order.db");
+    let mut storage = open_at(&path, NOW).unwrap();
+    storage
+        .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
+        .unwrap();
+    storage
+        .persist_classified_batch(&batch(1, FlowLifecycle::Ended), &[], &[], NOW)
+        .unwrap();
+    let before: (i64, i64) = storage
+        .connection()
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(upload_bytes+download_bytes),0) FROM flow_sessions",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    storage
+        .connection()
+        .execute_batch(
+            "DROP INDEX flow_sessions_last_seen_at;
+             CREATE INDEX flow_sessions_last_seen_at ON flow_sessions(last_seen_at);
+             DELETE FROM schema_migrations WHERE version=16;",
+        )
+        .unwrap();
+    drop(storage);
+
+    let upgraded = open_at(&path, NOW + 1).unwrap();
+    let after: (i64, i64) = upgraded
+        .connection()
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(upload_bytes+download_bytes),0) FROM flow_sessions",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after, before);
+    let columns = upgraded
+        .connection()
+        .prepare("PRAGMA index_info(flow_sessions_last_seen_at)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(2))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(columns, ["last_seen_at", "id"]);
+    let plan = upgraded
+        .connection()
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT id FROM flow_sessions ORDER BY last_seen_at DESC,id ASC LIMIT 51",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("flow_sessions_last_seen_at")),
+        "{plan:?}"
+    );
+    assert!(
+        plan.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+        "{plan:?}"
+    );
+}
+
+#[test]
+fn client_traffic_ranking_index_upgrade_keeps_existing_traffic() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("client-traffic-ranking-index.db");
+    let mut storage = open_at(&path, NOW).unwrap();
+    storage
+        .save_gateway("gateway-1", "router", "test", &[7; 32], NOW)
+        .unwrap();
+    storage
+        .persist_classified_batch(&batch(1, FlowLifecycle::Ended), &[], &[], NOW)
+        .unwrap();
+    let before: i64 = storage
+        .connection()
+        .query_row("SELECT COUNT(*) FROM traffic_device_minute", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    storage
+        .connection()
+        .execute_batch(
+            "DROP INDEX traffic_device_minute_device;
+             DELETE FROM schema_migrations WHERE version=15;",
+        )
+        .unwrap();
+    drop(storage);
+
+    let upgraded = open_at(&path, NOW + 1).unwrap();
+    let after: i64 = upgraded
+        .connection()
+        .query_row("SELECT COUNT(*) FROM traffic_device_minute", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(after, before);
+    let columns = upgraded
+        .connection()
+        .prepare("PRAGMA index_info(traffic_device_minute_device)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(2))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(columns, ["device_id"]);
+    let plan = upgraded
+        .connection()
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT device_id, SUM(upload_bytes + download_bytes)
+             FROM traffic_device_minute GROUP BY device_id",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("traffic_device_minute_device")),
+        "client traffic query did not use the new index: {plan:?}"
+    );
+}
+
+#[test]
 fn destination_counts_use_the_covering_index() {
     let storage = setup();
     for sql in [
@@ -301,6 +479,51 @@ fn migration_and_gateway_survive_reopen() {
         )
         .unwrap();
     assert!(scope_timestamp_index_exists);
+}
+
+#[test]
+fn wal_truncate_checkpoint_respects_threshold_and_preserves_file_database_data() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("wal-checkpoint.db");
+    {
+        let storage = SqliteStorage::open(&path).unwrap();
+        storage
+            .connection()
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE checkpoint_fixture(payload BLOB NOT NULL);
+                 WITH RECURSIVE n(i) AS (
+                     VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 1024
+                 )
+                 INSERT INTO checkpoint_fixture(payload)
+                 SELECT randomblob(4096) FROM n;",
+            )
+            .unwrap();
+        let wal_path = wal_sidecar_path(&path);
+        let wal_bytes = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(wal_bytes >= 32 * 1024);
+
+        assert!(
+            SqliteStorage::checkpoint_wal_if_larger_than(&path, wal_bytes + 1)
+                .unwrap()
+                .is_none()
+        );
+        let checkpoint = SqliteStorage::checkpoint_wal_if_larger_than(&path, 32 * 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.busy, 0);
+        assert!(checkpoint.wal_bytes_before >= 32 * 1024);
+        assert_eq!(checkpoint.wal_bytes_after, 0);
+    }
+
+    let reopened = SqliteStorage::open(&path).unwrap();
+    let count: i64 = reopened
+        .connection()
+        .query_row("SELECT COUNT(*) FROM checkpoint_fixture", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1024);
 }
 
 #[test]
@@ -570,6 +793,115 @@ fn dns_resolution_is_time_aware_and_client_scoped() {
             .unwrap(),
         None
     );
+    assert_eq!(
+        storage
+            .resolve_recent_domain(
+                "gateway-1",
+                &[192, 0, 2, 10],
+                &[198, 51, 100, 1],
+                NOW + 60_000,
+                NOW,
+            )
+            .unwrap(),
+        Some(("video.example".to_owned(), NOW))
+    );
+    assert_eq!(
+        storage
+            .resolve_recent_domain(
+                "gateway-1",
+                &[192, 0, 2, 10],
+                &[198, 51, 100, 1],
+                NOW + 60_000,
+                NOW + 1,
+            )
+            .unwrap(),
+        None
+    );
+    let batched_lookups = (0..251)
+        .map(|index| RecentDomainLookup {
+            client_ip: if index % 2 == 0 {
+                &[192, 0, 2, 10]
+            } else {
+                &[192, 0, 2, 11]
+            },
+            answer_ip: &[198, 51, 100, 1],
+            at_ms: NOW + 60_000,
+            not_before_ms: if index == 249 { NOW + 1 } else { NOW },
+        })
+        .collect::<Vec<_>>();
+    let batched = storage
+        .resolve_recent_domains("gateway-1", &batched_lookups)
+        .unwrap();
+    assert_eq!(batched.len(), batched_lookups.len());
+    assert_eq!(batched[0], Some(("video.example".to_owned(), NOW)));
+    assert_eq!(batched[1], Some(("chat.example".to_owned(), NOW)));
+    assert_eq!(batched[248], Some(("video.example".to_owned(), NOW)));
+    assert_eq!(batched[249], None);
+    assert_eq!(batched[250], Some(("video.example".to_owned(), NOW)));
+    let mut plan = storage
+        .connection()
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT domain, observed_at FROM dns_observations
+             WHERE gateway_id=?1 AND client_ip=?2 AND answer_ip=?3
+               AND observed_at>=?4 AND observed_at<=?5
+             ORDER BY observed_at DESC, id DESC LIMIT 1",
+        )
+        .unwrap();
+    let plan = plan
+        .query_map(
+            params![
+                "gateway-1",
+                &[192_u8, 0, 2, 10][..],
+                &[198_u8, 51, 100, 1][..],
+                NOW as i64,
+                (NOW + 60_000) as i64
+            ],
+            |row| row.get::<_, String>(3),
+        )
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("INDEX dns_observations_lookup")),
+        "unexpected recent DNS history query plan: {plan:?}"
+    );
+    let mut batch_plan = storage
+        .connection()
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             WITH lookups(lookup_id,client_ip,answer_ip,at_ms,not_before_ms) AS (
+                 VALUES (0,?2,?3,?4,?5)
+             )
+             SELECT q.lookup_id,d.domain,d.observed_at FROM lookups q
+             LEFT JOIN dns_observations d ON d.id=(
+                 SELECT id FROM dns_observations
+                 WHERE gateway_id=?1 AND client_ip=q.client_ip AND answer_ip=q.answer_ip
+                   AND observed_at>=q.not_before_ms AND observed_at<=q.at_ms
+                 ORDER BY observed_at DESC,id DESC LIMIT 1
+             )",
+        )
+        .unwrap();
+    let batch_plan = batch_plan
+        .query_map(
+            params![
+                "gateway-1",
+                &[192_u8, 0, 2, 10][..],
+                &[198_u8, 51, 100, 1][..],
+                (NOW + 60_000) as i64,
+                NOW as i64
+            ],
+            |row| row.get::<_, String>(3),
+        )
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        batch_plan
+            .iter()
+            .any(|step| step.contains("INDEX dns_observations_lookup")),
+        "unexpected batched recent DNS query plan: {batch_plan:?}"
+    );
 }
 
 #[test]
@@ -827,6 +1159,50 @@ fn device_upsert_keeps_identity_when_ip_changes() {
             .unwrap();
         assert_eq!(count, expected, "{table}");
     }
+}
+
+#[test]
+fn duplicate_device_identity_updates_keep_first_match() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("duplicate-device-identities.db");
+    let mut storage = open_at(&path, NOW).unwrap();
+    storage
+        .save_gateway("gateway-1", "router", "0.1.0", &[7; 32], NOW)
+        .unwrap();
+    let input = batch(1, FlowLifecycle::Ended);
+    let first = DeviceIdentityUpdate {
+        mac: vec![2, 0, 0, 0, 0, 1],
+        vendor: Some("first-match".to_owned()),
+        device_type: None,
+        os_family: None,
+        model: None,
+        confidence: Some("medium".to_owned()),
+        vendor_confidence: 0.7,
+        device_type_confidence: 0.0,
+        os_confidence: 0.0,
+        model_confidence: 0.0,
+        private_mac: false,
+        evidence_json: "[]".to_owned(),
+        evidence: Vec::new(),
+    };
+    let mut second = first.clone();
+    second.vendor = Some("second-match".to_owned());
+
+    assert_eq!(
+        storage
+            .persist_classified_batch(&input, &[], &[first, second], NOW)
+            .unwrap(),
+        PersistDisposition::Accepted
+    );
+    let vendor: Option<String> = storage
+        .connection()
+        .query_row(
+            "SELECT vendor FROM devices WHERE gateway_id='gateway-1' AND mac=?1",
+            [vec![2, 0, 0, 0, 0, 1]],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(vendor.as_deref(), Some("first-match"));
 }
 
 #[test]
@@ -1158,6 +1534,24 @@ fn late_application_dpi_upgrades_an_unknown_flow_identity() {
     assert_eq!(current.domain.as_deref(), Some("v11-hcd.douyinvod.com"));
     assert_eq!(current.category_id, "streaming");
     assert!((current.application_confidence - 0.96).abs() < f64::EPSILON);
+}
+
+#[test]
+fn attribution_merge_reports_only_material_changes() {
+    let incoming = service_attribution();
+    let mut current = FlowAttribution::default();
+    assert!(super::attribution::merge(&mut current, &incoming));
+    let merged = current.clone();
+    assert!(!super::attribution::merge(&mut current, &incoming));
+    assert_eq!(current, merged);
+
+    let mut domain_only = FlowAttribution::default();
+    let domain = FlowAttribution {
+        domain: Some("only.example".into()),
+        ..Default::default()
+    };
+    assert!(super::attribution::merge(&mut domain_only, &domain));
+    assert!(!super::attribution::merge(&mut domain_only, &domain));
 }
 
 #[test]

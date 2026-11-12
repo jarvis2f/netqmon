@@ -13,7 +13,7 @@
 )]
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -88,6 +88,96 @@ const DAY_MS: i64 = 24 * HOUR_MS;
 const FLOW_CHECKPOINT_MS: i64 = 5 * MINUTE_MS;
 const MAX_DNS_CACHE_KEYS: usize = 16_384;
 const PROTOCOL_APPLICATION_PREFIX: &str = "protocol:";
+
+struct ChunkedBody<R> {
+    reader: R,
+    remaining: usize,
+    needs_crlf: bool,
+    ended: bool,
+}
+
+impl<R: BufRead> Read for ChunkedBody<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() || self.ended {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            if self.needs_crlf {
+                let mut terminator = [0; 2];
+                self.reader.read_exact(&mut terminator)?;
+                if terminator != *b"\r\n" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid chunk terminator",
+                    ));
+                }
+            }
+            let mut line = String::new();
+            self.reader.by_ref().take(129).read_line(&mut line)?;
+            if !line.ends_with("\r\n") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid chunk header",
+                ));
+            }
+            let size = line.trim().split(';').next().unwrap_or("");
+            self.remaining = usize::from_str_radix(size, 16)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk size"))?;
+            if self.remaining == 0 {
+                loop {
+                    let mut trailer = String::new();
+                    self.reader.by_ref().take(8193).read_line(&mut trailer)?;
+                    if !trailer.ends_with("\r\n") {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid chunk trailer",
+                        ));
+                    }
+                    if trailer == "\r\n" {
+                        break;
+                    }
+                }
+                self.ended = true;
+                return Ok(0);
+            }
+            self.needs_crlf = true;
+        }
+        let length = output.len().min(self.remaining);
+        let read = self.reader.read(&mut output[..length])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated chunk",
+            ));
+        }
+        self.remaining -= read;
+        Ok(read)
+    }
+}
+
+struct ExactBody<R> {
+    reader: R,
+    remaining: u64,
+}
+impl<R: Read> Read for ExactBody<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 || output.is_empty() {
+            return Ok(0);
+        }
+        let length = output
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        let read = self.reader.read(&mut output[..length])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated HTTP body",
+            ));
+        }
+        self.remaining -= u64::try_from(read).unwrap_or(u64::MAX);
+        Ok(read)
+    }
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct DnsLookupKey {
@@ -220,7 +310,12 @@ impl ClickHouseClient {
         Ok(())
     }
 
-    fn post(&self, path_and_query: &str, body: &[u8], content_type: &str) -> StorageResult<String> {
+    fn post_head(
+        &self,
+        path_and_query: &str,
+        body: &[u8],
+        content_type: &str,
+    ) -> StorageResult<(BufReader<TcpStream>, u16, Option<usize>, bool)> {
         let (host, port) = parse_host_port(&self.config.url)?;
         let addr = format!("{host}:{port}");
         let socket_addrs = addr
@@ -299,6 +394,12 @@ impl ClickHouseClient {
             }
         }
 
+        Ok((reader, status_code, content_length, is_chunked))
+    }
+
+    fn post(&self, path_and_query: &str, body: &[u8], content_type: &str) -> StorageResult<String> {
+        let (mut reader, status_code, content_length, is_chunked) =
+            self.post_head(path_and_query, body, content_type)?;
         let mut body_bytes = Vec::new();
         if is_chunked {
             loop {
@@ -341,6 +442,71 @@ impl ClickHouseClient {
         }
         Ok(body_str)
     }
+
+    fn query_json_each_row(
+        &self,
+        sql: &str,
+        mut visit: impl FnMut(Value) -> StorageResult<()>,
+    ) -> StorageResult<()> {
+        let path = format!("/?database={}", url_encode(&self.config.database));
+        let (reader, status, length, chunked) =
+            self.post_head(&path, sql.as_bytes(), "text/plain; charset=utf-8")?;
+        let body: Box<dyn Read> = if chunked {
+            Box::new(ChunkedBody {
+                reader,
+                remaining: 0,
+                needs_crlf: false,
+                ended: false,
+            })
+        } else if let Some(length) = length {
+            Box::new(ExactBody {
+                reader,
+                remaining: u64::try_from(length).unwrap_or(u64::MAX),
+            })
+        } else {
+            Box::new(reader)
+        };
+        let mut reader = BufReader::new(body);
+        if status != 200 {
+            let mut error = String::new();
+            reader
+                .take(65_536)
+                .read_to_string(&mut error)
+                .map_err(|e| {
+                    StorageError::Connection(format!("read error response failed: {e}"))
+                })?;
+            return Err(StorageError::ClickHouse(format!(
+                "HTTP {status}: {}",
+                error.trim()
+            )));
+        }
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let read = reader
+                .by_ref()
+                .take(1_048_577)
+                .read_until(b'\n', &mut line)
+                .map_err(|e| {
+                    StorageError::Connection(format!("read ClickHouse row failed: {e}"))
+                })?;
+            if read == 0 {
+                return Ok(());
+            }
+            if read > 1_048_576 {
+                return Err(StorageError::Serialization(
+                    "ClickHouse row exceeds 1 MiB".into(),
+                ));
+            }
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let row = serde_json::from_slice(&line).map_err(|e| {
+                StorageError::Serialization(format!("invalid ClickHouse JSON row: {e}"))
+            })?;
+            visit(row)?;
+        }
+    }
 }
 
 /// ClickHouse-backed implementation of the netqmon storage contract.
@@ -375,7 +541,7 @@ impl ClickHouseStorage {
             matched_active_flow = true;
             if attribution.protocol_confidence >= current.attribution.protocol_confidence {
                 let previous = current.attribution.clone();
-                crate::apply_late_protocol(&mut current.attribution, attribution);
+                crate::apply_late_protocol(current.attribution_mut(), attribution);
                 attribution_changed |= current.attribution != previous;
             }
         }
@@ -460,10 +626,14 @@ impl ClickHouseStorage {
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned)
                 };
+                let started_at = json_i64(&row["started_at"]);
+                let actual_session_id = row["id"].as_str().unwrap_or_default();
+                let canonical_session_id = key.session_id(started_at);
                 active.insert(
                     key,
                     ActiveFlow {
-                        session_id: row["id"].as_str().unwrap_or_default().to_owned(),
+                        session_id_override: (actual_session_id != canonical_session_id)
+                            .then(|| actual_session_id.into()),
                         client_mac: Vec::new(),
                         device_id: row
                             .get("device_id")
@@ -472,11 +642,11 @@ impl ClickHouseStorage {
                         upload_bytes: json_i64(&row["upload_bytes"]),
                         download_bytes: json_i64(&row["download_bytes"]),
                         packets: json_i64(&row["packets"]),
-                        started_at: json_i64(&row["started_at"]),
+                        started_at,
                         last_seen_at: json_i64(&row["last_seen_at"]),
                         checkpointed_at: json_i64(&row["checkpointed_at"]),
                         last_received_at: json_i64(&row["checkpointed_at"]),
-                        attribution: FlowAttribution {
+                        attribution: super::shared_active_attribution(FlowAttribution {
                             domain: optional_string("domain"),
                             organization_id: optional_string("organization_id")
                                 .unwrap_or_else(|| "unknown".to_owned()),
@@ -498,7 +668,7 @@ impl ClickHouseStorage {
                                 .as_str()
                                 .unwrap_or("[]")
                                 .to_owned(),
-                        },
+                        }),
                         scope: json_i64(&row["scope"]),
                         path_type: json_i64(&row["path_type"]),
                         nat: json_i64(&row["nat"]),
@@ -629,6 +799,39 @@ impl ClickHouseStorage {
         }
         let cached = cache.entry(key).or_insert(observations);
         Ok(resolve_cached_dns(cached, at))
+    }
+
+    /// Resolves the latest client-scoped DNS observation in a caller-bounded
+    /// history window, even when its advertised DNS TTL has elapsed.
+    pub fn resolve_recent_domain_ch(
+        &self,
+        gateway_id: &str,
+        client_ip: &[u8],
+        answer_ip: &[u8],
+        at_ms: u64,
+        not_before_ms: u64,
+    ) -> StorageResult<Option<(String, u64)>> {
+        let sql = format!(
+            "SELECT domain, observed_at FROM dns_observations
+             WHERE gateway_id = '{}' AND client_ip = '{}' AND answer_ip = '{}'
+               AND observed_at >= {} AND observed_at <= {}
+             ORDER BY observed_at DESC, id DESC LIMIT 1 FORMAT JSON",
+            escape_sql(gateway_id),
+            to_hex(client_ip),
+            to_hex(answer_ip),
+            to_i64(not_before_ms),
+            to_i64(at_ms)
+        );
+        let result = self.client.query_json(&sql)?;
+        Ok(result["data"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .and_then(|row| {
+                Some((
+                    row["domain"].as_str()?.to_owned(),
+                    json_i64(&row["observed_at"]).max(0) as u64,
+                ))
+            }))
     }
 
     fn invalidate_dns_cache(&self, batch: &TelemetryBatch) {
@@ -976,12 +1179,12 @@ impl ClickHouseStorage {
         let direction_clause =
             direction.map_or_else(String::new, |value| format!(" AND direction = {value}"));
         let points_sql = format!(
-            "SELECT intDiv(timestamp, {bucket}) * {bucket} AS timestamp,
+            "SELECT intDiv(timestamp, {bucket}) * {bucket} AS bucket_timestamp,
                     sum(upload_bytes) AS upload_bytes, sum(download_bytes) AS download_bytes,
                     sum(packets) AS packets, sum(flow_count) AS flow_count
              FROM traffic_scope_minute
              WHERE timestamp >= {from} AND timestamp < {to}{scope_clause}{direction_clause}
-             GROUP BY timestamp ORDER BY timestamp FORMAT JSON"
+             GROUP BY bucket_timestamp ORDER BY bucket_timestamp FORMAT JSON"
         );
         let points_result = self.client.query_json(&points_sql)?;
         let points = points_result["data"]
@@ -990,7 +1193,7 @@ impl ClickHouseStorage {
             .flatten()
             .map(|row| {
                 json!({
-                    "timestamp": json_i64(&row["timestamp"]),
+                    "timestamp": json_i64(&row["bucket_timestamp"]),
                     "upload_bytes": json_i64(&row["upload_bytes"]),
                     "download_bytes": json_i64(&row["download_bytes"]),
                     "packets": json_i64(&row["packets"]),
@@ -1218,7 +1421,7 @@ impl ClickHouseStorage {
                     d.os_confidence AS os_confidence, d.model_confidence AS model_confidence,
                     d.private_mac AS private_mac,
                     d.first_seen AS first_seen, d.last_seen AS last_seen,
-                    f.last_traffic_seen AS last_traffic_seen,
+                    nullIf(f.last_traffic_seen, 0) AS last_traffic_seen,
                     coalesce(sum(t.upload_bytes), 0) AS up,
                     coalesce(sum(t.download_bytes), 0) AS down,
                     coalesce(sum(t.flow_count), 0) AS flow_count
@@ -1563,12 +1766,12 @@ impl ClickHouseStorage {
             let bucket_ms = duration.div_ceil(180).max(60_000).div_ceil(60_000) * 60_000;
             let bucket = to_i64(bucket_ms);
             let sql = format!(
-                "SELECT intDiv(timestamp, {bucket}) * {bucket} AS timestamp,
+                "SELECT intDiv(timestamp, {bucket}) * {bucket} AS bucket_timestamp,
                         sum(upload_bytes) AS upload_bytes, sum(download_bytes) AS download_bytes,
                         sum(packets) AS packets, sum(flow_count) AS flow_count
                  FROM traffic_scope_minute
                  WHERE device_id = {id} AND timestamp >= {from} AND timestamp < {to}{scope_clause}
-                 GROUP BY timestamp ORDER BY timestamp FORMAT JSON"
+                 GROUP BY bucket_timestamp ORDER BY bucket_timestamp FORMAT JSON"
             );
             let result = self.client.query_json(&sql)?;
             let points = result["data"]
@@ -1577,7 +1780,7 @@ impl ClickHouseStorage {
                 .flatten()
                 .map(|row| {
                     json!({
-                        "timestamp": json_i64(&row["timestamp"]),
+                        "timestamp": json_i64(&row["bucket_timestamp"]),
                         "upload_bytes": json_i64(&row["upload_bytes"]),
                         "download_bytes": json_i64(&row["download_bytes"]),
                         "packets": json_i64(&row["packets"]),
@@ -1882,7 +2085,7 @@ impl ClickHouseStorage {
             |value| format!("'{value}'"),
         );
         let summary_sql = format!(
-            "SELECT application_id, {category_select} AS category_id,
+            "SELECT application_id, {category_select} AS selected_category_id,
                     sum(upload_bytes) AS upload_bytes, sum(download_bytes) AS download_bytes,
                     sum(packets) AS packets, sum(flow_count) AS flow_count,
                     max(timestamp) AS last_seen
@@ -1960,7 +2163,7 @@ impl ClickHouseStorage {
             };
         Ok(Some(json!({
             "application_id": summary["application_id"].as_str().unwrap_or(application_id),
-            "category_id": summary["category_id"].as_str().unwrap_or("unknown"),
+            "category_id": summary["selected_category_id"].as_str().unwrap_or("unknown"),
             "upload_bytes": json_i64(&summary["upload_bytes"]),
             "download_bytes": json_i64(&summary["download_bytes"]),
             "packets": json_i64(&summary["packets"]),
@@ -2019,13 +2222,13 @@ impl ClickHouseStorage {
             let bucket_ms = duration.div_ceil(180).max(60_000).div_ceil(60_000) * 60_000;
             let bucket = to_i64(bucket_ms);
             let sql = format!(
-                "SELECT intDiv(timestamp, {bucket}) * {bucket} AS timestamp,
+                "SELECT intDiv(timestamp, {bucket}) * {bucket} AS bucket_timestamp,
                         sum(upload_bytes) AS upload_bytes, sum(download_bytes) AS download_bytes,
                         sum(packets) AS packets, sum(flow_count) AS flow_count
                  FROM traffic_application_minute
                  WHERE application_id = '{app}'{traffic_category_filter}
                    AND timestamp >= {from} AND timestamp < {to}
-                 GROUP BY timestamp ORDER BY timestamp FORMAT JSON"
+                 GROUP BY bucket_timestamp ORDER BY bucket_timestamp FORMAT JSON"
             );
             let result = self.client.query_json(&sql)?;
             let points = result["data"]
@@ -2034,7 +2237,7 @@ impl ClickHouseStorage {
                 .flatten()
                 .map(|row| {
                     json!({
-                        "timestamp": json_i64(&row["timestamp"]),
+                        "timestamp": json_i64(&row["bucket_timestamp"]),
                         "upload_bytes": json_i64(&row["upload_bytes"]),
                         "download_bytes": json_i64(&row["download_bytes"]),
                         "packets": json_i64(&row["packets"]),
@@ -2067,7 +2270,7 @@ impl ClickHouseStorage {
 
         let sql = match relation {
             "clients" => format!(
-                "SELECT d.id, d.mac, coalesce(d.display_name, d.hostname, '') AS name,
+                "SELECT d.id AS id, d.mac, coalesce(d.display_name, d.hostname, '') AS name,
                         d.gateway_id, d.vendor, coalesce(d.device_type_override, d.device_type) AS device_type,
                         d.device_type_override, d.os_family, d.model,
                         d.identity_confidence, d.vendor_confidence,
@@ -2533,6 +2736,34 @@ impl ClickHouseStorage {
             }
         }
         Ok(rows)
+    }
+
+    /// Visits per-destination traffic without materializing the response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on query, decoding, or visitor failure.
+    pub fn visit_geo_traffic(
+        &self,
+        from_ms: Option<u64>,
+        to_ms: Option<u64>,
+        mut visit: impl FnMut(Vec<u8>, u64) -> StorageResult<()>,
+    ) -> StorageResult<()> {
+        let time_filter = match (from_ms, to_ms) {
+            (Some(from), Some(to)) => format!(
+                " AND timestamp >= {} AND timestamp < {}",
+                to_i64(from),
+                to_i64(to)
+            ),
+            _ => String::new(),
+        };
+        let sql = format!(
+            "SELECT remote_ip, toString(least(greatest(sum(toInt128(upload_bytes) + toInt128(download_bytes)), toInt128(0)), toInt128('18446744073709551615'))) AS bytes FROM traffic_scope_minute WHERE scope = 1{time_filter} GROUP BY remote_ip FORMAT JSONEachRow"
+        );
+        self.client.query_json_each_row(&sql, |row| {
+            let address = from_hex(row["remote_ip"].as_str().unwrap_or_default())?;
+            visit(address, json_u64(&row["bytes"]))
+        })
     }
 
     /// Queries paginated flows.
@@ -3623,7 +3854,7 @@ impl StorageBackend for ClickHouseStorage {
                 let dev_id = current.device_id;
                 let current_attribution = &current.attribution;
                 session_rows.push(json!({
-                    "id": current.session_id,
+                    "id": current.session_id(&key).as_ref(),
                     "gateway_id": key.gateway_id,
                     "device_id": dev_id,
                     "ip_version": key.ip_version,
@@ -3733,6 +3964,17 @@ impl StorageBackend for ClickHouseStorage {
         at_ms: u64,
     ) -> StorageResult<Option<String>> {
         self.resolve_domain_ch(gateway_id, client_ip, answer_ip, at_ms)
+    }
+
+    fn resolve_recent_domain(
+        &self,
+        gateway_id: &str,
+        client_ip: &[u8],
+        answer_ip: &[u8],
+        at_ms: u64,
+        not_before_ms: u64,
+    ) -> StorageResult<Option<(String, u64)>> {
+        self.resolve_recent_domain_ch(gateway_id, client_ip, answer_ip, at_ms, not_before_ms)
     }
 
     fn device_evidence(
@@ -4078,7 +4320,107 @@ fn format_mac_bytes(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CachedDnsObservation, resolve_cached_dns};
+    use super::{
+        CachedDnsObservation, ChunkedBody, ClickHouseClient, ClickHouseConfig, ExactBody,
+        resolve_cached_dns,
+    };
+    use std::io::{BufReader, Cursor, Read, Write};
+
+    #[test]
+    fn streamed_http_body_handles_fragmented_chunks_and_truncation() {
+        let input = BufReader::with_capacity(
+            2,
+            Cursor::new(b"3;ext=x\r\nabc\r\n2\r\nde\r\n0\r\nX-Test: yes\r\n\r\n"),
+        );
+        let mut body = ChunkedBody {
+            reader: input,
+            remaining: 0,
+            needs_crlf: false,
+            ended: false,
+        };
+        let mut output = Vec::new();
+        body.read_to_end(&mut output).unwrap();
+        assert_eq!(output, b"abcde");
+        for input in [
+            &b"4\r\nabc"[..],
+            &b"3\r\nabcXY0\r\n\r\n"[..],
+            &b"1\r\na\r\n0\r\n"[..],
+        ] {
+            let mut body = ChunkedBody {
+                reader: BufReader::new(Cursor::new(input)),
+                remaining: 0,
+                needs_crlf: false,
+                ended: false,
+            };
+            assert!(body.read_to_end(&mut Vec::new()).is_err());
+        }
+        let mut body = ExactBody {
+            reader: Cursor::new(b"ab"),
+            remaining: 3,
+        };
+        assert_eq!(
+            body.read_to_end(&mut Vec::new()).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn streamed_rows_reject_server_errors_and_incomplete_responses() {
+        fn serve(response: &'static [u8]) -> (ClickHouseClient, std::thread::JoinHandle<()>) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut input = BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    std::io::BufRead::read_line(&mut input, &mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.strip_prefix("Content-Length: ") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut request = vec![0; length];
+                input.read_exact(&mut request).unwrap();
+                stream.write_all(response).unwrap();
+            });
+            (
+                ClickHouseClient::new(ClickHouseConfig {
+                    url: format!("http://{address}"),
+                    ..Default::default()
+                }),
+                worker,
+            )
+        }
+        let (client, worker) = serve(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n{\"a\":\r\n4\r\n1}\n\n\r\n0\r\n\r\n");
+        let mut rows = Vec::new();
+        client
+            .query_json_each_row("SELECT 1 FORMAT JSONEachRow", |row| {
+                rows.push(row);
+                Ok(())
+            })
+            .unwrap();
+        worker.join().unwrap();
+        assert_eq!(rows, vec![serde_json::json!({"a":1})]);
+        for response in [
+            &b"HTTP/1.1 500 Error\r\nContent-Length: 4\r\n\r\noops"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n{\"a\":1}\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n{\"a\""[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nnot-json"[..],
+            &b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"a\":1}\nserver error\n"[..],
+        ] {
+            let (client, worker) = serve(response);
+            assert!(
+                client
+                    .query_json_each_row("SELECT 1 FORMAT JSONEachRow", |_| Ok(()))
+                    .is_err()
+            );
+            worker.join().unwrap();
+        }
+    }
 
     #[test]
     fn cached_dns_resolution_respects_expiry_and_newest_valid_observation() {
