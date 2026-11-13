@@ -52,6 +52,14 @@ struct {
     __type(value, __u8);
 } observed_ifindexes SEC(".maps");
 
+/* TC sees an IP header rather than an Ethernet header on RAW IP devices. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, __u32);
+    __type(value, __u8);
+} l3_ifindexes SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, DNS_RING_BUFFER_SIZE);
@@ -1101,6 +1109,21 @@ static __always_inline int parse_packet(struct __sk_buff *skb, void *data,
     __u8 *cursor;
     __u32 cursor_offset;
     __u16 ethernet_protocol;
+
+    if (bpf_map_lookup_elem(&l3_ifindexes, &ifindex)) {
+        __u8 *ip = data;
+        __u8 ethernet_addresses[12] = {};
+
+        if (ip + 1 > (__u8 *)data_end)
+            return TC_ACT_OK;
+        if ((*ip >> 4) == 4)
+            return parse_ipv4(skb, ip, data_end, ifindex, packet_length,
+                              0, hook, ethernet_addresses + 6, policy_only);
+        if ((*ip >> 4) == 6)
+            return parse_ipv6(skb, ip, data_end, ifindex, packet_length,
+                              0, hook, ethernet_addresses + 6, policy_only);
+        return TC_ACT_OK;
+    }
 
     if ((void *)(ethernet + 1) > data_end)
         return TC_ACT_OK;

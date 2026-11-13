@@ -329,8 +329,9 @@ pub(crate) fn prune_bounded(
     tx.query_row(
         "SELECT EXISTS(
            SELECT 1 FROM flow_rollup_contributions WHERE expires_at<=?1
-           UNION ALL SELECT 1 FROM flow_rollup_sessions
-             WHERE (ended_at IS NOT NULL AND ended_at<=?2) OR updated_at<=?3
+           UNION ALL SELECT 1 FROM flow_rollup_sessions s
+             WHERE ((s.ended_at IS NOT NULL AND s.ended_at<=?2) OR s.updated_at<=?3)
+               AND NOT EXISTS (SELECT 1 FROM flow_rollup_contributions c WHERE c.session_ref=s.id)
            UNION ALL SELECT 1 FROM flow_sessions f
              WHERE f.ended_at IS NULL AND f.checkpointed_at<=?4
                AND NOT EXISTS (SELECT 1 FROM flow_rollup_sessions r

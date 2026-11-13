@@ -167,6 +167,47 @@ def check_policy(pins, work):
         assert result["retval"] == 2, result
 
 
+def check_raw_ip(pins, work):
+    maps = pins / "maps"
+    update(maps / "l3_ifindexes", struct.pack("=I", 1), bytes([1]))
+    context = bytearray(192)
+    (work / "ctx").write_bytes(context)
+
+    for version in (4, 6):
+        client = ipaddress.ip_address("203.0.113.3" if version == 4 else "2001:db8:1::3").packed
+        remote = ipaddress.ip_address("198.51.100.4" if version == 4 else "2001:db8:2::4").packed
+        for hook, program in ((1, "netqmon_ingress"), (2, "netqmon_egress")):
+            source, destination = (client, remote) if hook == 1 else (remote, client)
+            ports = (12346, 443) if hook == 1 else (443, 12346)
+            udp = struct.pack("!HHHH", *ports, 8, 0)
+            if version == 4:
+                network = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 28, 0, 0, 64, 17, 0,
+                                      source, destination)
+            else:
+                network = struct.pack("!IHBB16s16s", 6 << 28, 8, 17, 64, source, destination)
+            (work / "packet").write_bytes(network + udp)
+            key = (struct.pack("=BBBBI", version, 17, 0, hook, 1)
+                   + source.ljust(16, b"\0") + destination.ljust(16, b"\0")
+                   + struct.pack("!HH", *ports))
+
+            def packet(expected_action, expected_packets):
+                result = json.loads(bpf(
+                    "-j", "prog", "run", "pinned", pins / "progs" / program,
+                    "data_in", work / "packet", "ctx_in", work / "ctx"))
+                assert result["retval"] == expected_action, (version, hook, result)
+                assert lookup_u64(maps / "flow_map", key) == expected_packets
+
+            packet(0, 1)
+            update(maps / "flow_verdict_map", key, verdict(1))
+            packet(2, 2)
+            bpf("map", "delete", "pinned", maps / "flow_verdict_map", "key", "hex",
+                *key.hex(" ").split())
+
+    # Four RAW IP samples contribute only the IP datagrams, with no L2 offset.
+    assert lookup_u64(maps / "sample_counters", struct.pack("=I", 4)) == 12
+    assert lookup_u64(maps / "sample_counters", struct.pack("=I", 1)) == 456
+
+
 def main():
     if os.geteuid() != 0:
         raise SystemExit("Run as root")
@@ -206,6 +247,7 @@ def main():
                     bpf("prog", "loadall", obj, pins / "progs", "type", "classifier",
                         "pinmaps", pins / "maps")
                     check_policy(pins, work)
+                    check_raw_ip(pins, work)
                 finally:
                     # bpffs files must be unlinked before removing their directories.
                     shutil.rmtree(pins / "progs", ignore_errors=True)

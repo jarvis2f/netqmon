@@ -350,6 +350,7 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
             .update(&key, &[1], MapFlags::ANY)
             .map_err(|error| AgentError::Runtime(error.to_string()))?;
     }
+    publish_l3_ifindices(&skeleton.maps.l3_ifindexes, &observation_interfaces)?;
     let attach_tcx = |targets: &[(String, i32)]| {
         targets
             .iter()
@@ -792,7 +793,6 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                         if interfaces_changed {
                             hooks.clear();
                             hooks_attached = false;
-                            observation_interfaces = refreshed_observation.clone();
                             if let Ok(mut aliases) = flow_alias_cache.lock() {
                                 aliases.clear();
                             }
@@ -807,11 +807,14 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                                     }
                                 }
                             }
-                            let observed_ifindex_keys =
-                                skeleton.maps.observed_ifindexes.keys().collect::<Vec<_>>();
-                            for key in observed_ifindex_keys {
-                                if let Err(error) = skeleton.maps.observed_ifindexes.delete(&key) {
-                                    cleanup_errors.push(error.to_string());
+                            for map in [
+                                &skeleton.maps.observed_ifindexes,
+                                &skeleton.maps.l3_ifindexes,
+                            ] {
+                                for key in map.keys().collect::<Vec<_>>() {
+                                    if let Err(error) = map.delete(&key) {
+                                        cleanup_errors.push(error.to_string());
+                                    }
                                 }
                             }
                             if !cleanup_errors.is_empty() {
@@ -825,6 +828,7 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                                 last_interface_reconcile_error = Some(detail);
                                 continue;
                             }
+                            observation_interfaces = refreshed_observation.clone();
                         }
                         if !refreshed_observation.is_empty() {
                             observation_interfaces = refreshed_observation;
@@ -852,6 +856,18 @@ pub(super) fn run(config: AgentConfig) -> Result<(), AgentError> {
                                     }
                                     last_interface_reconcile_error = Some(detail);
                                 }
+                            }
+                            if let Err(error) = publish_l3_ifindices(
+                                &skeleton.maps.l3_ifindexes,
+                                &observation_interfaces,
+                            ) {
+                                observed_map_ready = false;
+                                let detail =
+                                    format!("could not refresh L3 interface indices: {error}");
+                                if last_interface_reconcile_error.as_ref() != Some(&detail) {
+                                    log_warn(log_level, format_args!("{detail}"));
+                                }
+                                last_interface_reconcile_error = Some(detail);
                             }
                             if observed_map_ready {
                                 let attached = match active_backend {
@@ -1548,6 +1564,26 @@ fn observation_hooks() -> (bool, bool) {
     // The dedicated egress program suppresses packets whose ingress interface
     // is already observed while retaining host-originated proxy replies.
     (true, true)
+}
+
+fn publish_l3_ifindices<M: MapCore>(map: &M, targets: &[(String, i32)]) -> Result<(), AgentError> {
+    // ARPHRD_NONE (65534) covers TUN and WireGuard RAW IP interfaces.
+    for (name, ifindex) in targets {
+        let path = Path::new("/sys/class/net").join(name).join("type");
+        let kind = fs::read_to_string(&path).map_err(|error| {
+            AgentError::MissingInterface(format!("could not read link type for {name}: {error}"))
+        })?;
+        if kind.trim() != "65534" {
+            continue;
+        }
+        let key = u32::try_from(*ifindex)
+            .map_err(|_| AgentError::Runtime("interface index overflow".to_owned()))?
+            .to_ne_bytes();
+        map.update(&key, &[1], MapFlags::ANY).map_err(|error| {
+            AgentError::Runtime(format!("could not mark {name} as L3: {error}"))
+        })?;
+    }
+    Ok(())
 }
 
 fn resolve_observation_interfaces(
