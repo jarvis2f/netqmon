@@ -159,14 +159,6 @@ def check_policy(pins, work):
     assert lookup_u64(maps / "sample_counters", struct.pack("=I", 4)) == 8
     assert lookup_u64(maps / "sample_counters", struct.pack("=I", 1)) == 304
 
-    if (maps / "packet_stages").exists():
-        # A missing QoS continuation must not silently bypass enforcement.
-        bpf("map", "delete", "pinned", maps / "packet_stages", "key", "hex", "04", "00", "00", "00")
-        result = json.loads(bpf("-j", "prog", "run", "pinned", pins / "progs" / "netqmon_ingress",
-                                "data_in", work / "packet", "ctx_in", work / "ctx"))
-        assert result["retval"] == 2, result
-
-
 def check_raw_ip(pins, work):
     maps = pins / "maps"
     update(maps / "l3_ifindexes", struct.pack("=I", 1), bytes([1]))
@@ -206,6 +198,16 @@ def check_raw_ip(pins, work):
     # Four RAW IP samples contribute only the IP datagrams, with no L2 offset.
     assert lookup_u64(maps / "sample_counters", struct.pack("=I", 4)) == 12
     assert lookup_u64(maps / "sample_counters", struct.pack("=I", 1)) == 456
+
+
+def check_missing_continuation(pins, work):
+    maps = pins / "maps"
+    # A missing QoS continuation must not silently bypass enforcement. Run
+    # this last because deleting the stage intentionally leaves the map altered.
+    bpf("map", "delete", "pinned", maps / "packet_stages", "key", "hex", "04", "00", "00", "00")
+    result = json.loads(bpf("-j", "prog", "run", "pinned", pins / "progs" / "netqmon_ingress",
+                            "data_in", work / "packet", "ctx_in", work / "ctx"))
+    assert result["retval"] == 2, result
 
 
 def main():
@@ -248,6 +250,8 @@ def main():
                         "pinmaps", pins / "maps")
                     check_policy(pins, work)
                     check_raw_ip(pins, work)
+                    if (pins / "maps" / "packet_stages").exists():
+                        check_missing_continuation(pins, work)
                 finally:
                     # bpffs files must be unlinked before removing their directories.
                     shutil.rmtree(pins / "progs", ignore_errors=True)
