@@ -12,7 +12,7 @@ export default function NavigationLoading() {
     <AppLayout title={label} username={null}>
       <div
         role="status"
-        className="flex items-center gap-2 text-sm text-foreground-muted"
+        className="flex min-h-[calc(100vh-92px)] items-center justify-center gap-2 text-sm text-foreground-muted"
       >
         <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
         {label}

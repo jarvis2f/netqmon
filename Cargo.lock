@@ -1362,7 +1362,7 @@ dependencies = [
 
 [[package]]
 name = "netqmon-agent"
-version = "1.1.1-beta.11"
+version = "1.1.1-beta.12"
 dependencies = [
  "anyhow",
  "clap",
@@ -1393,7 +1393,7 @@ dependencies = [
 
 [[package]]
 name = "netqmon-classifier-client"
-version = "1.1.1-beta.11"
+version = "1.1.1-beta.12"
 dependencies = [
  "serde",
  "serde_json",
@@ -1403,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "netqmon-classifier-manager"
-version = "1.1.1-beta.11"
+version = "1.1.1-beta.12"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -1423,7 +1423,7 @@ dependencies = [
 
 [[package]]
 name = "netqmon-collector"
-version = "1.1.1-beta.11"
+version = "1.1.1-beta.12"
 dependencies = [
  "argon2",
  "axum",
@@ -1459,7 +1459,7 @@ dependencies = [
 
 [[package]]
 name = "netqmon-geo"
-version = "1.1.1-beta.11"
+version = "1.1.1-beta.12"
 dependencies = [
  "maxminddb",
  "serde",
@@ -1468,7 +1468,7 @@ dependencies = [
 
 [[package]]
 name = "netqmon-protocol"
-version = "1.1.1-beta.11"
+version = "1.1.1-beta.12"
 dependencies = [
  "prost",
  "prost-build",
@@ -1482,7 +1482,7 @@ dependencies = [
 
 [[package]]
 name = "netqmon-storage"
-version = "1.1.1-beta.11"
+version = "1.1.1-beta.12"
 dependencies = [
  "netqmon-protocol",
  "rusqlite",
