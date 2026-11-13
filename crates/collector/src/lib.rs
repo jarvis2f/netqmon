@@ -984,7 +984,7 @@ impl CollectorState {
                 if recovery_gc.is_ok() {
                     self.lock().storage.sync_maintenance_state_from(&writer);
                 }
-                let complete = match recovery_gc {
+                let recovery_complete = match recovery_gc {
                     Ok(complete) => complete,
                     Err(error) => {
                         self.record_maintenance_phases(MaintenancePhaseTimes {
@@ -996,15 +996,6 @@ impl CollectorState {
                         return Err(error);
                     }
                 };
-                if !complete {
-                    self.record_maintenance_phases(MaintenancePhaseTimes {
-                        state_lock_wait_us,
-                        owner_cache_us,
-                        recovery_gc_us,
-                        ..MaintenancePhaseTimes::default()
-                    });
-                    return Ok(false);
-                }
                 let rollup_started = std::time::Instant::now();
                 let rollup = writer.roll_up_hour_and_day_bounded(now, sqlite_retention_budget());
                 let rollup_us = rollup_started.elapsed().as_micros();
@@ -1017,7 +1008,7 @@ impl CollectorState {
                     recovery_gc_us,
                     rollup_us,
                 });
-                rollup
+                rollup.map(|rollup_complete| recovery_complete && rollup_complete)
             };
         }
         if retention {
@@ -1035,7 +1026,7 @@ impl CollectorState {
                 .storage
                 .prune_reclassification_bounded(now, sqlite_retention_budget());
             let recovery_gc_us = recovery_gc_started.elapsed().as_micros();
-            let complete = match recovery_gc {
+            let recovery_complete = match recovery_gc {
                 Ok(complete) => complete,
                 Err(error) => {
                     self.record_maintenance_phases(MaintenancePhaseTimes {
@@ -1047,15 +1038,6 @@ impl CollectorState {
                     return Err(error);
                 }
             };
-            if !complete {
-                self.record_maintenance_phases(MaintenancePhaseTimes {
-                    state_lock_wait_us,
-                    owner_cache_us,
-                    recovery_gc_us,
-                    ..MaintenancePhaseTimes::default()
-                });
-                return Ok(false);
-            }
             let rollup_started = std::time::Instant::now();
             let rollup = inner
                 .storage
@@ -1067,7 +1049,7 @@ impl CollectorState {
                 recovery_gc_us,
                 rollup_us,
             });
-            rollup
+            rollup.map(|rollup_complete| recovery_complete && rollup_complete)
         }
     }
 
@@ -2774,12 +2756,15 @@ fn spawn_maintenance(state: CollectorState, interval: Duration, retention: bool)
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
+            let mut backoff = Duration::from_millis(250);
             loop {
                 let current = state.clone();
                 let started = std::time::Instant::now();
                 let result = tokio::task::spawn_blocking(move || {
                     let result = current.run_maintenance(retention);
-                    current.maybe_checkpoint_sqlite_wal();
+                    if matches!(&result, Ok(true)) || retention {
+                        current.maybe_checkpoint_sqlite_wal();
+                    }
                     result
                 })
                 .await;
@@ -2791,11 +2776,17 @@ fn spawn_maintenance(state: CollectorState, interval: Duration, retention: bool)
                             elapsed_ms = started.elapsed().as_millis(),
                             "storage maintenance completed"
                         );
+                        if !complete {
+                            backoff = (backoff * 2).min(Duration::from_secs(2));
+                        }
                         !complete
                     }
                     Ok(Err(error)) => {
                         let retry = should_retry_maintenance_after_error(retention, &error);
                         tracing::error!(%error, retention, "SQLite maintenance failed");
+                        if retry {
+                            backoff = (backoff * 2).min(Duration::from_secs(10));
+                        }
                         retry
                     }
                     Err(error) => {
@@ -2811,7 +2802,7 @@ fn spawn_maintenance(state: CollectorState, interval: Duration, retention: bool)
                 tokio::time::sleep(if retention {
                     Duration::from_secs(60)
                 } else {
-                    Duration::from_millis(250)
+                    backoff
                 })
                 .await;
             }
