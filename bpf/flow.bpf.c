@@ -261,8 +261,8 @@ static NETQMON_BPF_SUBPROGRAM int apply_flow_policy(
         .mark = skb->mark,
         .priority = skb->priority,
     };
-    /* parse_packet has already checked the complete Ethernet header. Copy it
-     * to the stack so the global helper never receives a packet pointer. */
+    /* The parser supplies a verified Ethernet address pair, or zeroes for
+     * RAW IP. Copy it so the global helper never receives a packet pointer. */
     __builtin_memcpy(packet.ethernet_addresses, source_mac - 6,
                      sizeof(packet.ethernet_addresses));
     int action = evaluate_flow_policy(&packet, key);

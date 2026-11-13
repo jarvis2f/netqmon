@@ -252,7 +252,7 @@ def main():
                     # bpffs files must be unlinked before removing their directories.
                     shutil.rmtree(pins / "progs", ignore_errors=True)
                     shutil.rmtree(pins / "maps", ignore_errors=True)
-            print(f"{name}: context-independent loading and IPv4/IPv6 policy checks passed", flush=True)
+            print(f"{name}: context-independent loading, policy, and RAW IP checks passed", flush=True)
 
 
 if __name__ == "__main__":
