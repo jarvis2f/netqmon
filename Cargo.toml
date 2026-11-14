@@ -16,7 +16,7 @@ exclude = ["crates/libbpf-sys"]
 libbpf-sys = { path = "crates/libbpf-sys" }
 
 [workspace.package]
-version = "1.1.1-beta.12"
+version = "1.1.1"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
